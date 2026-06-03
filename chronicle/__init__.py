@@ -31,9 +31,11 @@ if EXT_BASE.exists():
 
 import ladybug as lb
 
+from agent.memory_provider import MemoryProvider
 
-class ChronicleProvider:
-    """Hermes Memory Provider plugin for Chronicle graph database."""
+
+class ChronicleProvider(MemoryProvider):
+    """Graph-native memory provider built on LadybugDB."""
     
     def __init__(self):
         self.db_path = None
@@ -223,36 +225,26 @@ class ChronicleProvider:
         return [
             {
                 'name': 'chronicle_remember',
-                'description': 'Store a fact or entity in Chronicle. Fast-path storage.',
+                'description': 'Store a fact or entity in Chronicle.',
                 'parameters': {
                     'type': 'object',
                     'properties': {
-                        'name': {'type': 'string', 'description': 'Entity name'},
-                        'entity_type': {'type': 'string', 'description': 'Type: Person, Place, Concept, Thing, Organization, Event'},
-                        'description': {'type': 'string', 'description': 'Description'},
-                        'source': {'type': 'string', 'description': 'Source skill'},
-                        'relationships': {
-                            'type': 'array',
-                            'items': {
-                                'type': 'object',
-                                'properties': {
-                                    'target_id': {'type': 'string'},
-                                    'relationship_type': {'type': 'string'},
-                                }
-                            }
-                        }
+                        'name': {'type': 'string'},
+                        'entity_type': {'type': 'string'},
+                        'description': {'type': 'string'},
+                        'source': {'type': 'string'},
                     },
                     'required': ['name', 'entity_type']
                 }
             },
             {
                 'name': 'chronicle_query',
-                'description': 'Query Chronicle for entities and relationships.',
+                'description': 'Query Chronicle for entities.',
                 'parameters': {
                     'type': 'object',
                     'properties': {
-                        'query': {'type': 'string', 'description': 'Search query'},
-                        'entity_id': {'type': 'string', 'description': 'Specific entity ID'},
+                        'query': {'type': 'string'},
+                        'entity_id': {'type': 'string'},
                         'limit': {'type': 'integer', 'default': 10},
                         'mode': {'type': 'string', 'enum': ['search', 'recall', 'list'], 'default': 'search'}
                     }
@@ -278,17 +270,18 @@ class ChronicleProvider:
     def handle_tool_call(self, tool_name, args, **kwargs):
         try:
             if tool_name == 'chronicle_remember':
-                return self._tool_remember(args)
+                result = self._tool_remember(args)
             elif tool_name == 'chronicle_query':
-                return self._tool_query(args)
+                result = self._tool_query(args)
             elif tool_name == 'chronicle_analyze':
-                return self._tool_analyze(args)
+                result = self._tool_analyze(args)
             elif tool_name == 'chronicle_status':
-                return self._tool_status(args)
+                result = self._tool_status(args)
             else:
-                return {'error': f'Unknown tool: {tool_name}'}
+                return json.dumps({'error': f'Unknown tool: {tool_name}'})
+            return json.dumps(result)
         except Exception as e:
-            return {'error': str(e)}
+            return json.dumps({'error': str(e)})
     
     def _tool_remember(self, args):
         name = args.get('name', '')
@@ -296,19 +289,16 @@ class ChronicleProvider:
         description = args.get('description', '')
         source = args.get('source', 'agent')
         eid = self._store_entity(name, entity_type, description, source)
-        for rel in args.get('relationships', []):
-            self._create_relationship(eid, rel.get('target_id', ''), rel.get('relationship_type', 'related_to'))
         return {'id': eid, 'name': name, 'type': entity_type, 'stored': True}
     
     def _tool_query(self, args):
         query = args.get('query', '')
         entity_id = args.get('entity_id', '')
         limit = args.get('limit', 10)
-        mode = args.get('mode', 'search')
         if entity_id:
             return self._get_entity(entity_id)
         if query:
-            return self._search(query, limit, mode)
+            return self._search(query, limit)
         return self._list_recent(limit)
     
     def _tool_analyze(self, args):
@@ -366,18 +356,6 @@ class ChronicleProvider:
             ''')
         return eid
     
-    def _create_relationship(self, source_id, target_id, rel_type):
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            self._conn.execute(f'''
-                MATCH (a:Entity {{id: '{source_id}'}}),
-                      (b:Entity {{id: '{target_id}'}})
-                MERGE (a)-[r:Relates {{relationship_type: '{rel_type}'}}]->(b)
-                ON CREATE SET r.confidence = 'med', r.record_time = '{now}'
-            ''')
-        except Exception:
-            pass
-    
     def _get_embedding(self, text):
         try:
             if self._embed_model is None:
@@ -396,7 +374,7 @@ class ChronicleProvider:
             pass
         return None
     
-    def _search(self, query, limit=10, mode='search'):
+    def _search(self, query, limit=10):
         results = []
         safe_query = query.replace("'", "\\'")[:200]
         
@@ -580,7 +558,7 @@ class ChronicleProvider:
     def prefetch(self, query, *, session_id=''):
         if not query or len(query.strip()) < 2:
             return ''
-        results = self._search(query, limit=5, mode='search')
+        results = self._search(query, limit=5)
         if not results:
             return ''
         lines = ['## Relevant Knowledge']
@@ -600,9 +578,9 @@ class ChronicleProvider:
             try:
                 text = f'{user_content} {assistant_content}'
                 names = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b', text)
-                skip_words = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'have', 'will', 'what', 'when', 'where', 'which', 'could', 'would', 'should', 'there', 'their', 'about', 'while', 'were', 'been', 'being', 'them', 'they', 'then', 'than', 'just', 'also', 'some', 'more', 'very', 'only', 'over', 'under', 'each', 'such', 'both', 'because', 'between', 'using', 'used', 'user', 'agent', 'good', 'great', 'nice', 'well', 'like', 'know', 'think', 'make', 'take'}
+                skip = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'have', 'will', 'what', 'when', 'where', 'which', 'could', 'would', 'should', 'there', 'their', 'about', 'while', 'were', 'been', 'being', 'them', 'they', 'then', 'than', 'just', 'also', 'some', 'more', 'very', 'only', 'over', 'under', 'each', 'such', 'both', 'because', 'between', 'using', 'used', 'user', 'agent', 'good', 'great', 'nice', 'well', 'like', 'know', 'think', 'make', 'take', 'good', 'great', 'nice', 'well', 'like', 'know', 'think', 'make', 'take', 'come', 'look', 'want', 'give', 'tell', 'work', 'call', 'try', 'ask', 'need', 'feel', 'seem', 'leave', 'keep', 'let', 'begin', 'show', 'hear', 'play', 'run', 'move', 'live', 'believe', 'bring', 'happen', 'write', 'provide', 'sit', 'stand', 'lose', 'pay', 'meet', 'include', 'continue', 'set', 'learn', 'change', 'lead', 'understand', 'watch', 'follow', 'stop', 'create', 'speak', 'read', 'allow', 'add', 'spend', 'grow', 'open', 'walk', 'win', 'offer', 'remember', 'love', 'consider', 'appear', 'buy', 'wait', 'serve', 'die', 'send', 'expect', 'build', 'stay', 'fall', 'cut', 'reach', 'kill', 'remain', 'suggest', 'raise', 'pass', 'sell', 'require', 'report', 'decide', 'pull', 'develop', 'thank', 'receive', 'join', 'agree', 'pick', 'wear', 'support', 'end', 'describe', 'hit', 'produce', 'eat', 'fill', 'prepare', 'yes', 'not', 'all', 'any', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'day', 'get', 'has', 'him', 'his', 'how', 'its', 'may', 'new', 'now', 'old', 'see', 'two', 'way', 'who', 'boy', 'did', 'own', 'say', 'she', 'too', 'use', 'her', 'than', 'them', 'into', 'just', 'your', 'come', 'could', 'state', 'over', 'such', 'make', 'like', 'long', 'look', 'many', 'most', 'much', 'name', 'next', 'only', 'other', 'part', 'place', 'point', 'right', 'same', 'small', 'still', 'turn', 'very', 'want', 'work', 'year'}
                 for name in set(names):
-                    if name.lower() in skip_words or len(name) < 3:
+                    if name.lower() in skip or len(name) < 3:
                         continue
                     safe_name = name.replace("'", "\\'")
                     try:
