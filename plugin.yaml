@@ -1,0 +1,6 @@
+name: chronicle
+version: 4.0.0
+description: "Graph-native memory provider. Replaces ocas-elephas and ocas-corvus skills."
+hooks:
+  - on_session_end
+  - on_pre_compress
