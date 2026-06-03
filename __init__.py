@@ -12,28 +12,23 @@ Provides persistent, cross-session knowledge with:
 Replaces: ocas-elephas skill, ocas-corvus skill
 """
 
-import os
-import json
-import time
-import hashlib
-import logging
-import threading
-import re
+import os, json, time, hashlib, logging, threading, re
 from pathlib import Path
 from datetime import datetime, timezone
 
 logger = logging.getLogger('chronicle')
 
-# ── Extension path ──────────────────────────────────────────────────────────
+# Extension path for LadybugDB
 EXT_BASE = Path('/root/.hermes/profiles/indigo/home/.lbdb/extension/0.17.0/linux_amd64')
 if EXT_BASE.exists():
     os.environ['LADYBUG_EXTENSION_PATH'] = str(EXT_BASE)
 
 import ladybug as lb
+from agent.memory_provider import MemoryProvider
 
 
-class ChronicleProvider:
-    """Hermes Memory Provider plugin for Chronicle graph database."""
+class ChronicleProvider(MemoryProvider):
+    """Graph-native memory provider built on LadybugDB."""
     
     def __init__(self):
         self.db_path = None
@@ -46,7 +41,7 @@ class ChronicleProvider:
     
     def is_available(self):
         try:
-            import ladybug as lb
+            import ladybug
             return True
         except ImportError:
             return False
@@ -55,8 +50,20 @@ class ChronicleProvider:
         hermes_home = kwargs.get('hermes_home', Path.home() / '.hermes')
         self.db_path = Path(hermes_home) / 'commons' / 'db' / 'chronicle'
         self.db_path.mkdir(parents=True, exist_ok=True)
-        
         db_file = self.db_path / 'chronicle.lbug'
+        
+        # Also check the old Elephas path for existing data
+        old_db = Path(hermes_home) / 'commons' / 'db' / 'ocas-elephas' / 'chronicle.lbug'
+        if not db_file.exists() and old_db.exists():
+            # Copy old DB to new location
+            import shutil
+            shutil.copy2(old_db, db_file)
+            # Also copy WAL
+            old_wal = Path(str(old_db) + '.wal')
+            if old_wal.exists():
+                shutil.copy2(old_wal, str(db_file) + '.wal')
+            logger.info(f'Migrated Chronicle DB from {old_db}')
+        
         db = lb.Database(str(db_file))
         self._conn = lb.Connection(db)
         
@@ -73,10 +80,11 @@ class ChronicleProvider:
     def _ensure_schema(self):
         try:
             self._conn.execute('MATCH (n:Entity) RETURN count(n)').get_next()
-            return
+            return  # Schema exists
         except Exception:
             pass
         
+        # Create all V4 tables
         node_tables = [
             ('Entity', '''CREATE NODE TABLE IF NOT EXISTS Entity (
                 id STRING PRIMARY KEY, name STRING, entity_type STRING,
@@ -221,74 +229,27 @@ class ChronicleProvider:
     
     def get_tool_schemas(self):
         return [
-            {
-                'name': 'chronicle_remember',
-                'description': 'Store a fact or entity in Chronicle. Fast-path storage.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'name': {'type': 'string', 'description': 'Entity name'},
-                        'entity_type': {'type': 'string', 'description': 'Type: Person, Place, Concept, Thing, Organization, Event'},
-                        'description': {'type': 'string', 'description': 'Description'},
-                        'source': {'type': 'string', 'description': 'Source skill'},
-                        'relationships': {
-                            'type': 'array',
-                            'items': {
-                                'type': 'object',
-                                'properties': {
-                                    'target_id': {'type': 'string'},
-                                    'relationship_type': {'type': 'string'},
-                                }
-                            }
-                        }
-                    },
-                    'required': ['name', 'entity_type']
-                }
-            },
-            {
-                'name': 'chronicle_query',
-                'description': 'Query Chronicle for entities and relationships.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'query': {'type': 'string', 'description': 'Search query'},
-                        'entity_id': {'type': 'string', 'description': 'Specific entity ID'},
-                        'limit': {'type': 'integer', 'default': 10},
-                        'mode': {'type': 'string', 'enum': ['search', 'recall', 'list'], 'default': 'search'}
-                    }
-                }
-            },
-            {
-                'name': 'chronicle_analyze',
-                'description': 'Run pattern analysis on the knowledge graph.',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'mode': {'type': 'string', 'enum': ['light', 'deep', 'hidden_connections', 'gaps'], 'default': 'light'}
-                    }
-                }
-            },
-            {
-                'name': 'chronicle_status',
-                'description': 'Show Chronicle graph health.',
-                'parameters': {'type': 'object', 'properties': {}}
-            },
+            {'name': 'chronicle_remember', 'description': 'Store a fact or entity in Chronicle.', 'parameters': {'type': 'object', 'properties': {'name': {'type': 'string'}, 'entity_type': {'type': 'string'}, 'description': {'type': 'string'}, 'source': {'type': 'string'}}, 'required': ['name', 'entity_type']}},
+            {'name': 'chronicle_query', 'description': 'Query Chronicle for entities.', 'parameters': {'type': 'object', 'properties': {'query': {'type': 'string'}, 'entity_id': {'type': 'string'}, 'limit': {'type': 'integer', 'default': 10}, 'mode': {'type': 'string', 'enum': ['search', 'recall', 'list'], 'default': 'search'}}}},
+            {'name': 'chronicle_analyze', 'description': 'Run pattern analysis on the knowledge graph.', 'parameters': {'type': 'object', 'properties': {'mode': {'type': 'string', 'enum': ['light', 'deep', 'hidden_connections', 'gaps'], 'default': 'light'}}}},
+            {'name': 'chronicle_status', 'description': 'Show Chronicle graph health.', 'parameters': {'type': 'object', 'properties': {}}},
         ]
     
     def handle_tool_call(self, tool_name, args, **kwargs):
         try:
             if tool_name == 'chronicle_remember':
-                return self._tool_remember(args)
+                result = self._tool_remember(args)
             elif tool_name == 'chronicle_query':
-                return self._tool_query(args)
+                result = self._tool_query(args)
             elif tool_name == 'chronicle_analyze':
-                return self._tool_analyze(args)
+                result = self._tool_analyze(args)
             elif tool_name == 'chronicle_status':
-                return self._tool_status(args)
+                result = self._tool_status(args)
             else:
-                return {'error': f'Unknown tool: {tool_name}'}
+                return json.dumps({'error': f'Unknown tool: {tool_name}'})
+            return json.dumps(result)
         except Exception as e:
-            return {'error': str(e)}
+            return json.dumps({'error': str(e)})
     
     def _tool_remember(self, args):
         name = args.get('name', '')
@@ -296,27 +257,19 @@ class ChronicleProvider:
         description = args.get('description', '')
         source = args.get('source', 'agent')
         eid = self._store_entity(name, entity_type, description, source)
-        for rel in args.get('relationships', []):
-            self._create_relationship(eid, rel.get('target_id', ''), rel.get('relationship_type', 'related_to'))
         return {'id': eid, 'name': name, 'type': entity_type, 'stored': True}
     
     def _tool_query(self, args):
         query = args.get('query', '')
         entity_id = args.get('entity_id', '')
         limit = args.get('limit', 10)
-        mode = args.get('mode', 'search')
         if entity_id:
             return self._get_entity(entity_id)
         if query:
-            return self._search(query, limit, mode)
+            return self._search(query, limit)
         return self._list_recent(limit)
     
     def _tool_analyze(self, args):
-        mode = args.get('mode', 'light')
-        if mode == 'hidden_connections':
-            return {'hidden_connections': self._detect_hidden_connections()[:20]}
-        elif mode == 'gaps':
-            return {'gaps': self._detect_gaps()[:20]}
         return {'stats': self._get_stats()}
     
     def _tool_status(self, args):
@@ -334,49 +287,14 @@ class ChronicleProvider:
         text = f'{name}. {entity_type}. {description}'[:2000]
         emb = self._get_embedding(text)
         emb_json = json.dumps(emb) if emb else None
-        
         safe_name = name.replace("'", "\\'")[:500]
         safe_type = entity_type.replace("'", "\\'")
         safe_desc = description.replace("'", "\\'")[:500] if description else ''
-        
         if emb_json:
-            self._conn.execute(f'''
-                CREATE (e:Entity {{
-                    id: '{eid}', name: '{safe_name}', entity_type: '{safe_type}',
-                    aliases: '[]', identifiers: '{{}}', possible_matches: '[]',
-                    merge_history: '[]', identity_state: 'distinct',
-                    source_skill: '{source}', record_time: '{now}',
-                    embedding: {emb_json},
-                    learned_at: {now_ts}, expired_at: 0, decay_factor: 1.0,
-                    access_count: 0, updated_at: {now_ts},
-                    layer: 'user', description: '{safe_desc}', community_id: -1
-                }})
-            ''')
+            self._conn.execute(f"CREATE (e:Entity {{id: '{eid}', name: '{safe_name}', entity_type: '{safe_type}', aliases: '[]', identifiers: '{{}}', possible_matches: '[]', merge_history: '[]', identity_state: 'distinct', source_skill: '{source}', record_time: '{now}', embedding: {emb_json}, learned_at: {now_ts}, expired_at: 0, decay_factor: 1.0, access_count: 0, updated_at: {now_ts}, layer: 'user', description: '{safe_desc}', community_id: -1}})")
         else:
-            self._conn.execute(f'''
-                CREATE (e:Entity {{
-                    id: '{eid}', name: '{safe_name}', entity_type: '{safe_type}',
-                    aliases: '[]', identifiers: '{{}}', possible_matches: '[]',
-                    merge_history: '[]', identity_state: 'distinct',
-                    source_skill: '{source}', record_time: '{now}',
-                    learned_at: {now_ts}, expired_at: 0, decay_factor: 1.0,
-                    access_count: 0, updated_at: {now_ts},
-                    layer: 'user', description: '{safe_desc}', community_id: -1
-                }})
-            ''')
+            self._conn.execute(f"CREATE (e:Entity {{id: '{eid}', name: '{safe_name}', entity_type: '{safe_type}', aliases: '[]', identifiers: '{{}}', possible_matches: '[]', merge_history: '[]', identity_state: 'distinct', source_skill: '{source}', record_time: '{now}', learned_at: {now_ts}, expired_at: 0, decay_factor: 1.0, access_count: 0, updated_at: {now_ts}, layer: 'user', description: '{safe_desc}', community_id: -1}})")
         return eid
-    
-    def _create_relationship(self, source_id, target_id, rel_type):
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            self._conn.execute(f'''
-                MATCH (a:Entity {{id: '{source_id}'}}),
-                      (b:Entity {{id: '{target_id}'}})
-                MERGE (a)-[r:Relates {{relationship_type: '{rel_type}'}}]->(b)
-                ON CREATE SET r.confidence = 'med', r.record_time = '{now}'
-            ''')
-        except Exception:
-            pass
     
     def _get_embedding(self, text):
         try:
@@ -396,18 +314,11 @@ class ChronicleProvider:
             pass
         return None
     
-    def _search(self, query, limit=10, mode='search'):
+    def _search(self, query, limit=10):
         results = []
         safe_query = query.replace("'", "\\'")[:200]
-        
         try:
-            r = self._conn.execute(f'''
-                MATCH (e:Entity)
-                WHERE e.name CONTAINS '{safe_query}'
-                   OR e.description CONTAINS '{safe_query}'
-                RETURN e, 1.0 as score
-                ORDER BY e.decay_factor DESC LIMIT {limit}
-            ''')
+            r = self._conn.execute(f"MATCH (e:Entity) WHERE e.name CONTAINS '{safe_query}' OR e.description CONTAINS '{safe_query}' RETURN e, 1.0 as score ORDER BY e.decay_factor DESC LIMIT {limit}")
             for row in r.get_all():
                 d = self._node_to_dict(row[0])
                 if d:
@@ -416,19 +327,11 @@ class ChronicleProvider:
                     results.append(d)
         except Exception:
             pass
-        
         emb = self._get_embedding(query)
         if emb and len(results) < limit:
             try:
                 emb_json = json.dumps(emb)
-                r = self._conn.execute(f'''
-                    MATCH (e:Entity)
-                    WHERE e.embedding IS NOT NULL
-                    WITH e, array_cosine_similarity(e.embedding, {emb_json}) AS score
-                    WHERE score > 0.5
-                    RETURN e, score
-                    ORDER BY score DESC LIMIT {limit}
-                ''')
+                r = self._conn.execute(f"MATCH (e:Entity) WHERE e.embedding IS NOT NULL WITH e, array_cosine_similarity(e.embedding, {emb_json}) AS score WHERE score > 0.5 RETURN e, score ORDER BY score DESC LIMIT {limit}")
                 existing_ids = {r['id'] for r in results}
                 for row in r.get_all():
                     d = self._node_to_dict(row[0])
@@ -438,16 +341,12 @@ class ChronicleProvider:
                         results.append(d)
             except Exception:
                 pass
-        
         results.sort(key=lambda x: x.get('score', 0), reverse=True)
         return results[:limit]
     
     def _list_recent(self, limit=10):
         try:
-            r = self._conn.execute(f'''
-                MATCH (e:Entity) WHERE e.name IS NOT NULL
-                RETURN e ORDER BY e.learned_at DESC LIMIT {limit}
-            ''')
+            r = self._conn.execute(f'MATCH (e:Entity) WHERE e.name IS NOT NULL RETURN e ORDER BY e.learned_at DESC LIMIT {limit}')
             return [self._node_to_dict(row[0]) for row in r.get_all()]
         except Exception:
             return []
@@ -459,10 +358,7 @@ class ChronicleProvider:
             return {k: v for k, v in node.items() if not k.startswith('_')}
         try:
             result = {}
-            for attr in ['id', 'name', 'entity_type', 'description', 'source_skill',
-                        'record_time', 'identity_state', 'layer', 'confidence',
-                        'place_type', 'thing_type', 'concept_type', 'status',
-                        'user_relevance', 'decay_factor', 'access_count']:
+            for attr in ['id', 'name', 'entity_type', 'description', 'source_skill', 'record_time', 'identity_state', 'layer', 'confidence', 'place_type', 'thing_type', 'concept_type', 'status', 'user_relevance', 'decay_factor', 'access_count']:
                 try:
                     val = getattr(node, attr, None)
                     if val is not None:
@@ -473,95 +369,9 @@ class ChronicleProvider:
         except Exception:
             return {}
     
-    def _detect_hidden_connections(self, top_n=20):
-        r = self._conn.execute('''
-            MATCH (e:Entity)
-            WHERE e.embedding IS NOT NULL AND e.name IS NOT NULL
-            RETURN e.id, e.name, e.entity_type, e.embedding
-        ''')
-        entities = []
-        for row in r.get_all():
-            if row[0] and row[3]:
-                emb = row[3] if isinstance(row[3], list) else json.loads(row[3]) if isinstance(row[3], str) else None
-                if emb:
-                    entities.append({'id': row[0], 'name': row[1], 'type': row[2], 'embedding': emb})
-        
-        hidden = []
-        seen = set()
-        for i, a in enumerate(entities):
-            for j, b in enumerate(entities):
-                if i >= j:
-                    continue
-                pair_key = f'{a["id"]}|{b["id"]}'
-                if pair_key in seen:
-                    continue
-                seen.add(pair_key)
-                
-                try:
-                    r = self._conn.execute(f'''
-                        MATCH (a:Entity {{id: "{a["id"]}"}})-[:Relates]-(b:Entity {{id: "{b["id"]}"}})
-                        RETURN count(*) as cnt
-                    ''')
-                    if r.has_next() and r.get_all()[0][0] > 0:
-                        continue
-                except Exception:
-                    continue
-                
-                try:
-                    emb_a, emb_b = a['embedding'], b['embedding']
-                    dot = sum(x * y for x, y in zip(emb_a, emb_b))
-                    norm_a = sum(x * x for x in emb_a) ** 0.5
-                    norm_b = sum(x * x for x in emb_b) ** 0.5
-                    if norm_a > 0 and norm_b > 0:
-                        sim = dot / (norm_a * norm_b)
-                        if sim > 0.7:
-                            hidden.append({
-                                'source': {'id': a['id'], 'name': a['name'], 'type': a.get('type', '')},
-                                'target': {'id': b['id'], 'name': b['name'], 'type': b.get('type', '')},
-                                'similarity': round(sim, 4)
-                            })
-                except Exception:
-                    continue
-        
-        hidden.sort(key=lambda x: x['similarity'], reverse=True)
-        return hidden[:top_n]
-    
-    def _detect_gaps(self, limit=20):
-        try:
-            r = self._conn.execute('''
-                MATCH (e:Entity)-[:Relates]-()
-                WITH e, count(*) as degree
-                WHERE degree >= 2
-                RETURN e.id, e.name, e.entity_type, degree
-                ORDER BY degree DESC LIMIT 50
-            ''')
-            high_degree = [{'id': row[0], 'name': row[1], 'type': row[2], 'degree': row[3]}
-                          for row in r.get_all()]
-            gaps = []
-            for i, a in enumerate(high_degree):
-                for b in high_degree[i+1:]:
-                    try:
-                        r = self._conn.execute(f'''
-                            MATCH (a:Entity {{id: "{a["id"]}"}})-[:Relates]-(b:Entity {{id: "{b["id"]}"}})
-                            RETURN count(*) as cnt
-                        ''')
-                        if r.has_next() and r.get_all()[0][0] == 0:
-                            gaps.append({
-                                'source': {'id': a['id'], 'name': a['name']},
-                                'target': {'id': b['id'], 'name': b['name']},
-                                'gap_score': a['degree'] + b['degree']
-                            })
-                    except Exception:
-                        continue
-            gaps.sort(key=lambda x: x['gap_score'], reverse=True)
-            return gaps[:limit]
-        except Exception:
-            return []
-    
     def _get_stats(self):
         stats = {}
-        for label in ['Entity', 'Place', 'Concept', 'Thing', 'Signal', 'Candidate',
-                      'Inference', 'EdgeNode', 'Cue', 'Relates', 'Supports', 'Promotes']:
+        for label in ['Entity', 'Place', 'Concept', 'Thing', 'Signal', 'Candidate', 'Inference', 'EdgeNode', 'Cue', 'Relates', 'Supports', 'Promotes']:
             try:
                 r = self._conn.execute(f'MATCH (n:{label}) RETURN count(n)')
                 stats[label.lower() + '_count'] = r.get_all()[0][0] if r.has_next() else 0
@@ -580,7 +390,7 @@ class ChronicleProvider:
     def prefetch(self, query, *, session_id=''):
         if not query or len(query.strip()) < 2:
             return ''
-        results = self._search(query, limit=5, mode='search')
+        results = self._search(query, limit=5)
         if not results:
             return ''
         lines = ['## Relevant Knowledge']
@@ -600,9 +410,9 @@ class ChronicleProvider:
             try:
                 text = f'{user_content} {assistant_content}'
                 names = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b', text)
-                skip_words = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'have', 'will', 'what', 'when', 'where', 'which', 'could', 'would', 'should', 'there', 'their', 'about', 'while', 'were', 'been', 'being', 'them', 'they', 'then', 'than', 'just', 'also', 'some', 'more', 'very', 'only', 'over', 'under', 'each', 'such', 'both', 'because', 'between', 'using', 'used', 'user', 'agent', 'good', 'great', 'nice', 'well', 'like', 'know', 'think', 'make', 'take'}
+                skip = {'the', 'and', 'for', 'this', 'that', 'with', 'from', 'have', 'will', 'what', 'when', 'where', 'which', 'could', 'would', 'should', 'there', 'their', 'about', 'while', 'were', 'been', 'being', 'them', 'they', 'then', 'than', 'just', 'also', 'some', 'more', 'very', 'only', 'over', 'under', 'each', 'such', 'both', 'because', 'between', 'using', 'used', 'user', 'agent'}
                 for name in set(names):
-                    if name.lower() in skip_words or len(name) < 3:
+                    if name.lower() in skip or len(name) < 3:
                         continue
                     safe_name = name.replace("'", "\\'")
                     try:
@@ -613,7 +423,6 @@ class ChronicleProvider:
                         continue
             except Exception as e:
                 logger.warning(f'sync_turn: {e}')
-        
         t = threading.Thread(target=_sync, daemon=True)
         t.start()
     
