@@ -16,7 +16,6 @@ venv/
 .mypy_cache/
 .coverage
 htmlcov/
-dist/
 *.sqlite
 *.sqlite3
 .DS_Store

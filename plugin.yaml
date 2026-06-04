@@ -1,6 +1,6 @@
 name: chronicle
 version: 5.0.0
-description: "Chronicle Memory Provider — event-sourced, dual-tier memory for Hermes Agent. Replaces ocas-elephas."
+description: "Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas."
 entrypoint: plugins.memory_provider:ChronicleMemoryProvider
 hooks:
   - on_session_end
