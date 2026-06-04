@@ -1,4 +1,4 @@
-# Chronicle Plugin
+# Chronicle Plugins
 
 Two plugins, one core. A local-first memory system for Hermes Agent.
 
@@ -121,6 +121,7 @@ Tests run against an in-memory SQLite database. No external services needed.
 ```
 chronicle-plugin/
   __init__.py          # Package init, version
+  pyproject.toml       # Package metadata
   plugin.yaml          # Hermes plugin manifest
   engine/              # Core modules (shared by both plugins)
     core.py            # ChronicleCore singleton + Scope
