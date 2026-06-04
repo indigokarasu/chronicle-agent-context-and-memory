@@ -1,3 +1,61 @@
 name: chronicle
-version: 4.0.0
-description: "Graph-native memory provider for Hermes Agent. Replaces ocas-elephas and ocas-corvus skills."
+version: 5.0.0
+description: "Chronicle Memory Provider — event-sourced, dual-tier memory for Hermes Agent. Replaces ocas-elephas."
+entrypoint: plugins.memory_provider:ChronicleMemoryProvider
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
+  - on_delegation
+  - on_turn_start
+  - on_session_switch
+  - system_prompt_block
+  - prefetch
+  - queue_prefetch
+tools:
+  - chronicle_remember
+  - chronicle_search
+  - chronicle_answer
+  - chronicle_forget
+  - chronicle_list_directives
+config:
+  memory:
+    provider: chronicle
+    store: sqlite
+    db_path: ~/.hermes/commons/db/chronicle/chronicle.db
+    git_repo: ~/.hermes/commons/db/chronicle/git
+    git_remote: null
+    embeddings:
+      model: embeddinggemma-300m
+      dimensions: 768
+    vector_index:
+      backend: sqlite-vec
+      bruteforce_ceiling: 100000
+    reaper:
+      enabled: true
+      schedule: "*/5 * * * *"
+      idle_threshold: "20m"
+      reap_threshold: "45m"
+      startup_recovery: true
+    extraction:
+      version: "extractor-v1"
+      promote_on_read: true
+    retrieval:
+      fts_weight: 0.4
+      vector_weight: 0.6
+      rrf_k: 60
+      default_limit: 10
+      raw_tier:
+        enabled: true
+    capture:
+      sync_turn:
+        mode: observe_only
+    forgetting:
+      raw_retention:
+        keep_verbatim_days: 365
+        then: gist
+    health:
+      schedule: "0 4 * * *"
+    learning:
+      max_active_deltas: 8
+      max_delta_magnitude: 0.15
