@@ -10,10 +10,10 @@ Replaces: ocas-elephas skill. Version: 5.0.0.
 
 Both plugins share a process-singleton `ChronicleCore` that owns:
 
-- **MemoryStore** — SQLite WAL mode, single-writer with thread-local connections
-- **CaptureEngine** — observes turns, extracts salient spans, runs the reaper
-- **Reducer** — folds events into the belief store (facts, entities, episodes)
-- **RetrievalEngine** — dual-tier recall: FTS5 + structured lookup over beliefs, plus raw event access
+- **MemoryStore**: SQLite WAL mode, single-writer with thread-local connections
+- **CaptureEngine**: observes turns, extracts salient spans, runs the reaper
+- **Reducer**: folds events into the belief store (facts, entities, episodes)
+- **RetrievalEngine**: dual-tier recall: FTS5 + structured lookup over beliefs, plus raw event access
 
 The context engine hooks into `on_pre_compress` and owns compression when active. The memory provider hooks into `on_session_end`, `on_turn_start`, `on_delegation`, and `on_memory_write`.
 
@@ -94,16 +94,16 @@ Back up by copying the `.db` and `.db-wal` files while Hermes is stopped.
 
 The memory provider exposes these tools to the agent:
 
-- **chronicle_remember** — Store a fact or observation explicitly
-- **chronicle_search** — Search the belief store and raw events
-- **chronicle_answer** — Ask a question against stored memory
-- **chronicle_forget** — Remove a memory entry
-- **chronicle_list_directives** — List active memory directives
+- **chronicle_remember**: Store a fact or observation explicitly
+- **chronicle_search**: Search the belief store and raw events
+- **chronicle_answer**: Ask a question against stored memory
+- **chronicle_forget**: Remove a memory entry
+- **chronicle_list_directives**: List active memory directives
 
 The context engine adds:
 
-- **chronicle_pin_context** — Pin a context span so compression never evicts it
-- **chronicle_focus** — Set the focus topic for memory-aware compression
+- **chronicle_pin_context**: Pin a context span so compression never evicts it
+- **chronicle_focus**: Set the focus topic for memory-aware compression
 
 ## Development
 
