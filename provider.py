@@ -74,8 +74,11 @@ class ChronicleMemoryProvider(MemoryProvider):
              "default": "~/.hermes/commons/db/chronicle/chronicle.db", "secret": False, "required": False},
             {"key": "git_repo", "description": "Git mirror directory for the event log",
              "default": "~/.hermes/commons/db/chronicle/git", "secret": False, "required": False},
-            {"key": "embeddings_model", "description": "Embedding model (offline hashing default if unset)",
-             "default": "embeddinggemma-300m", "secret": False, "required": False},
+            {"key": "embeddings_model",
+             "description": "Embedding model. 'hashing' = built-in offline embedder (default; no model or "
+                            "network). A real model (e.g. embeddinggemma-300m) is used only if a local "
+                            "embedding runtime is wired; otherwise it falls back to 'hashing'.",
+             "default": "hashing", "secret": False, "required": False},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:

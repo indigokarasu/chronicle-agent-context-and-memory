@@ -16,7 +16,7 @@ relative imports below resolve). Activate the slots in ``~/.hermes/config.yaml``
 
 from __future__ import annotations
 
-__version__ = "5.1.0"
+__version__ = "5.1.1"
 
 
 def register(ctx) -> None:

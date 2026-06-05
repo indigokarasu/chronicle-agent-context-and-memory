@@ -11,12 +11,16 @@ Vectors serialize to a compact little-endian float32 blob (no numpy needed).
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import struct
 from typing import List, Optional, Protocol
 
+logger = logging.getLogger("chronicle.embeddings")
+
 _TOKEN = re.compile(r"[a-z0-9]+")
+_HASHING_NAMES = {"", "hashing", "hashing-v1", "offline", "none"}
 
 
 class Embedder(Protocol):
@@ -53,6 +57,33 @@ class HashingEmbedder:
         if norm > 0:
             vec = [v / norm for v in vec]
         return vec
+
+
+def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None) -> "Embedder":
+    """Return the active embedder.
+
+    The offline HashingEmbedder is the default and the always-available fallback
+    (no model, no network). A real model is used only if its runtime actually
+    loads; otherwise we log and fall back to hashing — so configuring a model
+    name never silently breaks retrieval.
+    """
+    dims = int(dimensions) if dimensions else 256
+    name = (model or "hashing").strip().lower()
+    if name in _HASHING_NAMES:
+        return HashingEmbedder(dimensions=dims)
+    try:
+        return _load_model_embedder(model, dims)
+    except Exception as e:
+        logger.warning("embedding model %r unavailable (%s); using offline hashing embedder", model, e)
+        return HashingEmbedder(dimensions=dims)
+
+
+def _load_model_embedder(model: str, dims: int) -> "Embedder":
+    """Pluggable hook for a real local embedder (sentence-transformers, an Ollama
+    endpoint, etc.). Not bundled — raises so callers fall back to hashing. Wire a
+    real loader here to enable model-based embeddings without touching the rest
+    of the pipeline (§24.4)."""
+    raise RuntimeError("no local embedding runtime configured")
 
 
 def _stable_hash(s: str) -> int:
