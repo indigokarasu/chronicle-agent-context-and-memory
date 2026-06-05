@@ -169,6 +169,29 @@ class ChronicleCore:
     def flush_git(self) -> int:
         return self.gitmirror.flush()
 
+    def embedding_status(self) -> dict:
+        """Report whether the active embedder is a real local model (and whether it
+        currently embeds) or the offline hashing fallback. Does a strict live test
+        embed against the endpoint."""
+        from .embeddings import OpenAICompatEmbedder, HashingEmbedder
+        e = self.embedder
+        info = {"embedder": type(e).__name__, "model": getattr(e, "model", None),
+                "endpoint": getattr(e, "base_url", None), "dimensions": getattr(e, "dimensions", None)}
+        if isinstance(e, HashingEmbedder):
+            info.update(mode="offline_hashing", supports_embeddings=False,
+                        detail="No local embedding model selected (server unreachable or model can't "
+                               "embed). FTS retrieval still works; vector search is lexical.")
+            return info
+        try:
+            v = e._embed_raw("chronicle embedding self-test", timeout=getattr(e, "timeout", 10))
+            info.update(mode="local_model", supports_embeddings=True, dimensions=len(v),
+                        detail=f"Live test embed OK ({len(v)}-dim) from {e.base_url} model {e.model!r}.")
+        except Exception as ex:
+            info.update(mode="local_model_failing", supports_embeddings=False,
+                        detail=f"Selected endpoint {e.base_url} failed a live embed: {ex}. "
+                               "Runtime will degrade to offline hashing.")
+        return info
+
 
 class Scope:
     def __init__(self, core, session_id, principal_id):
