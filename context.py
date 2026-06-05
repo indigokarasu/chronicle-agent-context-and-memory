@@ -14,10 +14,13 @@ import json
 import logging
 from typing import Any, Dict, List
 
-try:
+try:  # real Hermes base when present …
     from agent.context_engine import ContextEngine  # type: ignore
-except Exception:  # pragma: no cover
-    from ._base import ContextEngine
+except Exception:  # … else a local stand-in (plugin-package or top-level)
+    try:
+        from ._base import ContextEngine
+    except Exception:  # pragma: no cover
+        from _base import ContextEngine
 
 logger = logging.getLogger("chronicle.context_engine")
 
@@ -36,13 +39,23 @@ class ChronicleContextEngine(ContextEngine):
         self.protect_first_n = 3
         self.protect_last_n = 6
         self.focus_topic = None
+        # Required class attributes the host expects a context engine to maintain.
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.threshold_tokens = 0
+        self.context_length = 0
+        self.compression_count = 0
 
     # lifecycle
     def on_session_start(self, session_id, *, hermes_home="~/.hermes", principal_id="default", config=None, **kw):
         self._session_id = session_id
         self._principal_id = principal_id
         try:
-            from engine.core import ChronicleCore
+            try:
+                from .engine.core import ChronicleCore
+            except Exception:
+                from engine.core import ChronicleCore
             self.core = ChronicleCore.get(hermes_home, config)
             self.core.has_context_engine = True
             self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
@@ -169,3 +182,17 @@ class ChronicleContextEngine(ContextEngine):
             self.focus_topic = args.get("topic")
             return json.dumps({"status": "focus_set", "topic": self.focus_topic})
         return json.dumps({"error": f"unknown tool: {name}"})
+
+    # status
+    def should_compress_preflight(self, messages) -> bool:
+        return False  # Chronicle compresses reactively on token threshold, not preflight
+
+    def get_status(self) -> dict:
+        return {
+            "engine": self.name,
+            "context_length": self.context_length,
+            "threshold_tokens": self.threshold_tokens,
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_total_tokens": self.last_total_tokens,
+            "compression_count": self.compression_count,
+        }

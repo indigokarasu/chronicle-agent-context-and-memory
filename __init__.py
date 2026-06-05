@@ -1,21 +1,44 @@
 """
-Chronicle Memory System for Hermes Agent.
+Chronicle — event-sourced memory + working-memory context for Hermes.
 
-A local-first, crash-safe, self-improving, multi-agent memory system.
-Provides persistent, cross-session knowledge with:
-- Event-sourced architecture (append-only log + reducer → belief store)
-- Dual-tier retrieval (belief layer + raw layer with read-and-answer)
-- Truth maintenance & guarded derivation
-- Multi-agent access control (default-allow within user)
-- Context Engine (memory-aware compression)
-- Bounded self-improvement (learning loop)
+Two plugins over one shared in-process core (`ChronicleCore`):
+- ChronicleMemoryProvider — memory-provider slot (long-term memory: capture + recall)
+- ChronicleContextEngine  — context-engine slot (working memory: memory-aware compression)
 
-Two plugins, one core:
-- ChronicleMemoryProvider (memory-provider slot)
-- ChronicleContextEngine (context-engine slot)
+This package is the Hermes plugin entry point. The Hermes loader discovers it by
+text-scanning this file for ``register_memory_provider`` / ``register_context_engine``
+and calls ``register(ctx)`` (it registers a synthetic parent package so the
+relative imports below resolve). Activate the slots in ``~/.hermes/config.yaml``:
 
-Replaces: ocas-elephas skill
-Version: 5.0.0
+    memory:  { provider: chronicle }
+    context: { engine: chronicle }
+
+Replaces: ocas-elephas.
 """
 
+from __future__ import annotations
+
 __version__ = "5.0.0"
+
+
+def register(ctx) -> None:
+    """Register Chronicle's memory provider and context engine.
+
+    Defensive across all three discovery paths: the memory loader's simulated ctx
+    exposes ``register_memory_provider``; the context-engine loader's exposes
+    ``register_context_engine``; a general ``PluginContext`` exposes both. Each
+    registers only the slot it understands.
+    """
+    if hasattr(ctx, "register_memory_provider"):
+        try:
+            from .provider import ChronicleMemoryProvider
+        except Exception:
+            from provider import ChronicleMemoryProvider
+        ctx.register_memory_provider(ChronicleMemoryProvider())
+
+    if hasattr(ctx, "register_context_engine"):
+        try:
+            from .context import ChronicleContextEngine
+        except Exception:
+            from context import ChronicleContextEngine
+        ctx.register_context_engine(ChronicleContextEngine())
