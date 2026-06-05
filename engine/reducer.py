@@ -69,10 +69,10 @@ class Reducer:
         if excerpt:
             self.store.fts_index_observed(eid, excerpt)
             if self.embedder is not None:
-                from .embeddings import pack
-                self.store.add_observed_vector(
-                    eid, pack(self.embedder.embed(excerpt)), self.embedder.model,
-                    event.get("owner", "default"))
+                blob = self._safe_vec(excerpt)
+                if blob is not None:
+                    self.store.add_observed_vector(eid, blob, self.embedder.model,
+                                                   event.get("owner", "default"))
         # Skip extraction for branch-abandoned spans (I16).
         if event.get("branch_id") == "__abandoned__":
             return
@@ -444,9 +444,22 @@ class Reducer:
                 "purpose_scope": '["*"]', "provenance": provenance})
 
         if self.embedder is not None and kind in ("fact", "episode", "note", "reference", "procedure"):
-            from .embeddings import pack
             text = body or key.get("name", "") or key.get("topic", "")
-            self.store.add_memory_vector(b_id, kind, pack(self.embedder.embed(text)), self.embedder.model)
+            blob = self._safe_vec(text)
+            if blob is not None:
+                self.store.add_memory_vector(b_id, kind, blob, self.embedder.model)
+
+    def _safe_vec(self, text):
+        """Pack an embedding, or return None on ANY failure — so the embedding
+        backend can never roll back a durable capture (I12). The embedder itself
+        also degrades to hashing, but this is the belt-and-suspenders guard on the
+        transactional write path."""
+        try:
+            from .embeddings import pack
+            return pack(self.embedder.embed(text))
+        except Exception as e:
+            logger.debug("embedding skipped (%s)", e)
+            return None
 
     def _confirm(self, b_id, table, source_event, event):
         row = self.store.get_belief(table, b_id)

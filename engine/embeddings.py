@@ -69,15 +69,26 @@ _DEFAULT_ENDPOINTS = [
 
 
 class OpenAICompatEmbedder:
-    """Calls a local OpenAI-compatible ``/v1/embeddings`` endpoint (stdlib only)."""
+    """Calls a local OpenAI-compatible ``/v1/embeddings`` endpoint (stdlib only).
 
-    def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = ""):
+    `healthcheck()` is strict (raises) so init can decide real-model vs hashing.
+    `embed()` is resilient: it NEVER raises at runtime — on the first failure
+    (server died, timeout, a model that doesn't actually support embeddings, a
+    rejected input) it trips permanently to an offline hashing embedder (same
+    dimensionality) for the rest of the session and logs once. Callers — including
+    the durable capture path — therefore can't be broken by the embedding backend;
+    FTS retrieval continues regardless.
+    """
+
+    def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.dimensions = dimensions
         self.api_key = api_key or ""
+        self.timeout = timeout
+        self._fallback: Optional["HashingEmbedder"] = None
 
-    def embed(self, text: str) -> List[float]:
+    def _embed_raw(self, text: str, timeout: float) -> List[float]:
         import json as _json
         import urllib.request
         body = _json.dumps({"model": self.model, "input": text or ""}).encode("utf-8")
@@ -85,18 +96,29 @@ class OpenAICompatEmbedder:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         req = urllib.request.Request(self.base_url + "/embeddings", data=body, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = _json.loads(resp.read().decode("utf-8"))
-        vec = data["data"][0]["embedding"]
+        vec = (data.get("data") or [{}])[0].get("embedding")
         if not isinstance(vec, list) or not vec:
-            raise ValueError("empty embedding")
+            raise ValueError("response had no embedding (model may not support embeddings)")
         return [float(x) for x in vec]
 
     def healthcheck(self) -> bool:
-        v = self.embed("ok")
-        if self.dimensions != len(v):
-            self.dimensions = len(v)  # trust the server's real dimensionality
+        v = self._embed_raw("ok", timeout=min(self.timeout, 4.0))  # raises if the endpoint/model can't embed
+        self.dimensions = len(v)  # trust the server's real dimensionality
         return True
+
+    def embed(self, text: str) -> List[float]:
+        if self._fallback is not None:
+            return self._fallback.embed(text)
+        try:
+            return self._embed_raw(text, timeout=self.timeout)
+        except Exception as e:
+            logger.warning("Chronicle embeddings: endpoint %s failed at runtime (%s); "
+                           "switching to offline hashing for this session (FTS retrieval continues)",
+                           self.base_url, e)
+            self._fallback = HashingEmbedder(dimensions=self.dimensions)
+            return self._fallback.embed(text)
 
 
 def _candidate_urls(base_url: Optional[str]) -> List[str]:

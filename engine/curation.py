@@ -241,10 +241,14 @@ class CurationWorker:
             return
         summary = " ".join(excerpts)[:1000]
         owner = events[0]["owner"] if events else "default"
-        emb = self.core.embedder
-        from .embeddings import pack
-        self.store.add_session_vector(sid, summary, pack(emb.embed(summary)) if emb else b"",
-                                      owner, events[0].get("occurred_at", now_iso()))
+        vec = b""
+        if self.core.embedder is not None:
+            try:
+                from .embeddings import pack
+                vec = pack(self.core.embedder.embed(summary))
+            except Exception:
+                vec = b""
+        self.store.add_session_vector(sid, summary, vec, owner, events[0].get("occurred_at", now_iso()))
 
     def _task_journal_ingest(self, payload):
         """OCAS journals → observed events, deduped by content addressing (§14.1)."""

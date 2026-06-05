@@ -4,7 +4,7 @@ Two plugins, one core. A local-first memory system for Hermes Agent.
 
 **ChronicleMemoryProvider** persists conversation history, facts, and agent knowledge across sessions using an event-sourced SQLite store. **ChronicleContextEngine** replaces the default context compressor with memory-aware compaction that evicts only durable spans and re-injects relevant long-term memory.
 
-Version: 5.2.0.
+Version: 5.2.1.
 
 ## 🤖 If you are an agent: how to install & set up
 
@@ -50,7 +50,7 @@ plugins: { enabled: [chronicle] }  # if not auto-enabled on install
 **4. Verify it works**
 
 ```bash
-python -m pytest tests/ -q        # 38 property/acceptance tests (P1–P21, B.1–B.6)
+python -m pytest tests/ -q        # property/acceptance tests (P1–P21, B.1–B.6)
 ```
 
 **5. How you drive it at runtime.** Under Hermes the hooks fire for you (`sync_turn` captures every turn durably; `on_turn_start` drains a slice of background work; `on_pre_compress`/`compress` handle the window). You get agent tools via `get_tool_schemas` — `chronicle_remember`, `chronicle_search`, `chronicle_answer`, `chronicle_ask_about`, `chronicle_get_context`, `chronicle_explain`, `chronicle_correct`, `chronicle_forget`, plus ACL/derivation/reasoning tools (see [Tools](#tools)).
