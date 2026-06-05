@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chronicle-plugin"
-version = "5.1.1"
+version = "5.2.0"
 description = "Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent"
 license = {text = "MIT"}
 requires-python = ">=3.9"
