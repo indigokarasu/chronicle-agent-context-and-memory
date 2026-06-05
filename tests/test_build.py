@@ -83,6 +83,15 @@ class TestSerialization(unittest.TestCase):
         self.assertEqual(e.dimensions, 768)
         self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
 
+    def test_openai_embedder_runtime_resilient(self):
+        # A reachable-at-init-but-then-failing endpoint must not raise from embed()
+        # — it trips to offline hashing (same dim) instead.
+        from engine.embeddings import OpenAICompatEmbedder
+        emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768)
+        v = emb.embed("hello")          # endpoint dead → must NOT raise
+        self.assertEqual(len(v), 768)
+        self.assertEqual(len(emb.embed("again")), 768)
+
 
 # --------------------------------------------------------------------------
 # §6/§24 Event log & store
@@ -325,6 +334,26 @@ class TestInvariants(unittest.TestCase):
                                             predicate="phone", value="555-1234", owner="assistant")
         self.assertGreaterEqual(self.core.store.count_rows("pointers"), 1)
         self.assertEqual(self.core.store.count_rows("facts", "predicate_canonical='phone'"), before)
+
+    def test_embed_failure_never_breaks_capture(self):  # I12 robustness
+        # Worst case: an embedder that ALWAYS raises (server died mid-session, or a
+        # model that accepted the healthcheck but rejects real input). Capture,
+        # extraction, and retrieval must all still work — FTS carries recall.
+        class BoomEmbedder:
+            model = "boom"; dimensions = 768
+            def embed(self, text):
+                raise RuntimeError("embedding server down")
+        boom = BoomEmbedder()
+        self.core.embedder = boom
+        self.core.reducer.embedder = boom
+        self.core.retrieval.embedder = boom
+        eid = self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.assertIsNotNone(self.core.store.get_event(eid))   # durable capture survived
+        self.core.process_pending()
+        self.assertTrue(any(f["value"] == "Jared"
+                            for f in self.core.store.query_beliefs("facts", "status='active'")))
+        ans = self.core.retrieval.answer("what is my name")    # query path survives too
+        self.assertIn("tier", ans)
 
     def test_B1_crash_capture(self):
         eid = self.core.capture.observe("Remember my flight is at 9am", "ok", session_id="s1")

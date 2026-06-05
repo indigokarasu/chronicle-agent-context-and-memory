@@ -53,7 +53,12 @@ class RetrievalEngine:
         for t in list(tokens):
             for syn in self.store.predicate_synonyms(t):
                 expansions.add(syn)
-        emb = self.embedder.embed(" ".join(expansions) or query) if self.embedder else None
+        emb = None
+        if self.embedder is not None:
+            try:
+                emb = self.embedder.embed(" ".join(expansions) or query)
+            except Exception:
+                emb = None  # vector channel drops out; FTS + structured still answer
         return {"raw": query, "tokens": tokens, "expanded": list(expansions), "embedding": emb}
 
     # -- Tier 1 (§18.1) ----------------------------------------------------

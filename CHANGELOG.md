@@ -3,6 +3,20 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.2.1
+
+- Graceful failure when a local model is configured but can't embed. `embed()` is
+  now resilient: a model with no embeddings support, a missing `/v1/embeddings`
+  route, a wrong model id, a timeout, or a server that dies mid-session no longer
+  raises — the embedder trips to the offline hashing embedder (same dimensions)
+  for the session and logs once.
+- The durable capture path is guarded independently (`reducer._safe_vec`), so the
+  embedding backend can never roll back a `sync_turn` write (I12); retrieval and
+  session-summary embedding are guarded too. FTS retrieval continues regardless.
+- `healthcheck()` stays strict (init still cleanly falls back to hashing when the
+  endpoint/model can't embed) and uses a short timeout so a hung server can't
+  stall startup.
+
 ## 5.2.0
 
 - **Local embedding model is now the default.** Embeddings use a real local
