@@ -35,13 +35,12 @@ DEFAULTS: Dict[str, Any] = {
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",
     "git_remote": None,
-    # Default = a LOCAL embedding model over an OpenAI-compatible /v1/embeddings
-    # endpoint. base_url null → auto-detect (LM Studio :1234, Ollama :11434,
-    # llama.cpp :8080, or $CHRONICLE_EMBED_BASE_URL). If no local server is
-    # reachable, Chronicle falls back to the offline hashing embedder (set
-    # model: hashing to force offline).
-    "embeddings": {"model": "embeddinggemma-300m", "dimensions": 768,
-                   "base_url": None, "api_key": None},
+    # Default = auto: detect a running local OpenAI-compatible server (base_url
+    # null → LM Studio :1234, Ollama :11434, llama.cpp :8080, or
+    # $CHRONICLE_EMBED_BASE_URL) and use whatever embedding model IT serves — no
+    # model id is hardcoded. Falls back to the offline hashing embedder if none is
+    # reachable. Set model: hashing to force offline, or a specific id to pin one.
+    "embeddings": {"model": "auto", "dimensions": 768, "base_url": None, "api_key": None},
     "vector_index": {"backend": "bruteforce", "bruteforce_ceiling": 100000},
 
     "principals": {

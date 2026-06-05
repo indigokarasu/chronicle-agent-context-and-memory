@@ -75,11 +75,11 @@ class ChronicleMemoryProvider(MemoryProvider):
             {"key": "git_repo", "description": "Git mirror directory for the event log",
              "default": "~/.hermes/commons/db/chronicle/git", "secret": False, "required": False},
             {"key": "embeddings_model",
-             "description": "Local embedding model served over an OpenAI-compatible /v1/embeddings "
-                            "endpoint (auto-detected: LM Studio :1234, Ollama :11434, llama.cpp :8080). "
-                            "Falls back to the offline 'hashing' embedder if no local server is reachable. "
-                            "Set 'hashing' to force offline.",
-             "default": "embeddinggemma-300m", "secret": False, "required": False},
+             "description": "'auto' detects a running local OpenAI-compatible server (LM Studio :1234, "
+                            "Ollama :11434, llama.cpp :8080) and uses whatever embedding model it serves — "
+                            "no model id assumed. Or pin a specific model id. Falls back to the offline "
+                            "'hashing' embedder if none is reachable; set 'hashing' to force offline.",
+             "default": "auto", "secret": False, "required": False},
             {"key": "embeddings_base_url",
              "description": "Embeddings endpoint base URL (e.g. http://localhost:1234/v1). Leave blank to "
                             "auto-detect a local server or use $CHRONICLE_EMBED_BASE_URL.",

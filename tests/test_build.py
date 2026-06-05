@@ -81,6 +81,8 @@ class TestSerialization(unittest.TestCase):
         e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
         self.assertIsInstance(e, HashingEmbedder)
         self.assertEqual(e.dimensions, 768)
+        # 'auto' with no reachable server also falls back to hashing
+        self.assertIsInstance(get_embedder("auto", 768, base_url="http://127.0.0.1:9"), HashingEmbedder)
         self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
 
     def test_openai_embedder_runtime_resilient(self):

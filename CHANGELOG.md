@@ -3,6 +3,15 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.3.0
+
+- Embedding model default is now **`auto`** (no hardcoded `embeddinggemma-300m`).
+  Auto-detects a running local OpenAI-compatible server and uses **whatever
+  embedding model it serves** — queries `/v1/models`, picks an embedding-looking
+  id (or test-embeds candidates), so it adapts to Ollama / LM Studio / llama.cpp
+  naming instead of assuming an id. Pin a specific id to override; `hashing`
+  forces offline; falls back to hashing if nothing is reachable.
+
 ## 5.2.1
 
 - Graceful failure when a local model is configured but can't embed. `embed()` is

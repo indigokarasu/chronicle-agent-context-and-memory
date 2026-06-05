@@ -20,7 +20,10 @@ from typing import List, Optional, Protocol
 logger = logging.getLogger("chronicle.embeddings")
 
 _TOKEN = re.compile(r"[a-z0-9]+")
-_HASHING_NAMES = {"", "hashing", "hashing-v1", "offline", "none"}
+_HASHING_NAMES = {"hashing", "hashing-v1", "offline", "none"}
+_AUTO_NAMES = {"", "auto", "auto-detect", "autodetect", "local", "default"}
+# Model ids that look like embedding models (used to auto-pick from /v1/models).
+_EMBED_RE = re.compile(r"embed|bge|gte|nomic|e5|minilm|mxbai|arctic|stella|gemma|qwen.*embed", re.I)
 
 
 class Embedder(Protocol):
@@ -131,32 +134,56 @@ def _candidate_urls(base_url: Optional[str]) -> List[str]:
     return list(_DEFAULT_ENDPOINTS)
 
 
+def _discover_embedding_models(base_url: str, api_key: str) -> List[str]:
+    """List candidate embedding model ids from an OpenAI-compatible /v1/models.
+
+    Prefers ids that look like embedding models; if none match the heuristic,
+    returns all ids (the test-embed in get_embedder filters out chat models that
+    can't actually embed). Returns [] if the server can't be queried."""
+    import json as _json
+    import urllib.request
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    req = urllib.request.Request(base_url.rstrip("/") + "/models", headers=headers)
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        data = _json.loads(resp.read().decode("utf-8"))
+    ids = [m.get("id", "") for m in (data.get("data") or []) if m.get("id")]
+    return [i for i in ids if _EMBED_RE.search(i)] or ids
+
+
 def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
                  base_url: Optional[str] = None, api_key: Optional[str] = None) -> "Embedder":
     """Return the active embedder.
 
-    Default assumption is a **local model** (e.g. embeddinggemma-300m) served over
-    an OpenAI-compatible ``/v1/embeddings`` endpoint. We auto-detect a running
-    local server (configured base_url / $CHRONICLE_EMBED_BASE_URL, else common
-    LM Studio / Ollama / llama.cpp ports). If none is reachable we fall back to
-    the built-in offline HashingEmbedder with a warning — so retrieval (FTS +
-    vectors) never hard-breaks and the box still works without a model running.
+    Default is ``auto``: find a running local OpenAI-compatible server (configured
+    base_url / $CHRONICLE_EMBED_BASE_URL, else common LM Studio / Ollama /
+    llama.cpp ports) and use whatever embedding model it actually serves — no
+    model id is hardcoded. An explicit model name is used as-is. If nothing is
+    reachable (or only chat models are loaded), fall back to the built-in offline
+    HashingEmbedder with a warning — retrieval (FTS + vectors) never hard-breaks.
+    Set model to 'hashing' to force offline.
     """
     dims = int(dimensions) if dimensions else 768
-    name = (model or "").strip().lower()
+    name = (model or "auto").strip().lower()
     if name in _HASHING_NAMES:
         return HashingEmbedder(dimensions=int(dimensions) if dimensions else 256)
+    auto = name in _AUTO_NAMES
     for url in _candidate_urls(base_url):
         try:
-            emb = OpenAICompatEmbedder(url, model, dims, api_key or "")
-            if emb.healthcheck():
-                logger.info("Chronicle embeddings: local model %r via %s (dim %d)", model, url, emb.dimensions)
-                return emb
+            candidates = _discover_embedding_models(url, api_key or "") if auto else [model]
         except Exception:
-            continue  # connection refused / model not loaded → try next / fall back
-    logger.warning("Chronicle embeddings: local model %r unreachable on %s; "
-                   "using offline hashing embedder (set embeddings.base_url or start the server)",
-                   model, ", ".join(_candidate_urls(base_url)))
+            continue  # /models unreachable on this endpoint → try next
+        for mid in candidates:
+            try:
+                emb = OpenAICompatEmbedder(url, mid, dims, api_key or "")
+                if emb.healthcheck():
+                    logger.info("Chronicle embeddings: using local model %r via %s (dim %d)",
+                                mid, url, emb.dimensions)
+                    return emb
+            except Exception:
+                continue  # not an embedding model / rejected → try next candidate
+    logger.warning("Chronicle embeddings: no local embedding model reachable (%s on %s); "
+                   "using offline hashing embedder",
+                   "auto-detect" if auto else repr(model), ", ".join(_candidate_urls(base_url)))
     return HashingEmbedder(dimensions=dims)
 
 
