@@ -5,10 +5,12 @@ Two plugins over one shared in-process core (`ChronicleCore`):
 - ChronicleMemoryProvider — memory-provider slot (long-term memory: capture + recall)
 - ChronicleContextEngine  — context-engine slot (working memory: memory-aware compression)
 
-This package is the Hermes plugin entry point. The Hermes loader discovers it by
-text-scanning this file for ``register_memory_provider`` / ``register_context_engine``
-and calls ``register(ctx)`` (it registers a synthetic parent package so the
-relative imports below resolve). Activate the slots in ``~/.hermes/config.yaml``:
+This package is the Hermes plugin entry point. Loaders discover it by text-scanning
+this file for ``register_memory_provider`` / ``register_context_engine`` and either
+call ``register(ctx)`` or scan the module for a ContextEngine/MemoryProvider
+subclass. Both classes are therefore exposed at module top level (so the
+subclass-fallback path works) AND wired in ``register(ctx)`` (so the register
+path works). Activate the slots in ``~/.hermes/config.yaml``:
 
     memory:  { provider: chronicle }
     context: { engine: chronicle }
@@ -16,7 +18,27 @@ relative imports below resolve). Activate the slots in ``~/.hermes/config.yaml``
 
 from __future__ import annotations
 
-__version__ = "5.3.2"
+import logging
+
+__version__ = "5.3.3"
+
+logger = logging.getLogger("chronicle.plugin")
+
+# Expose the slot classes at module top level so a context-engine loader that
+# only scans for a ContextEngine subclass (the subclass-fallback path) can find
+# and instantiate ChronicleContextEngine even if register(ctx) is never called.
+# Dual-mode import: relative under the loader's synthetic package, absolute for
+# local dev/tests.
+try:
+    from .provider import ChronicleMemoryProvider
+    from .context import ChronicleContextEngine
+except Exception:  # pragma: no cover
+    try:
+        from provider import ChronicleMemoryProvider
+        from context import ChronicleContextEngine
+    except Exception:
+        ChronicleMemoryProvider = None
+        ChronicleContextEngine = None
 
 
 def _active_core():
@@ -57,26 +79,41 @@ def chronicle_status_command(raw_args: str = "") -> str:
 def register(ctx) -> None:
     """Register Chronicle's memory provider, context engine, and `/chronicle` command.
 
-    Defensive across all discovery paths: the memory loader's simulated ctx exposes
+    Defensive across every discovery path: the memory loader's ctx exposes
     ``register_memory_provider``; the context-engine loader's exposes
     ``register_context_engine``; the general ``PluginContext`` exposes both plus
-    ``register_command``. Each registers only what it understands.
+    ``register_command``. EACH registration is independently guarded so a failure
+    in one (e.g. a collector that rejects command registration) can never discard
+    an already-registered engine.
     """
-    if hasattr(ctx, "register_memory_provider"):
+    mp_cls, ce_cls = ChronicleMemoryProvider, ChronicleContextEngine
+    if mp_cls is None or ce_cls is None:  # top-level import was deferred — retry now
         try:
-            from .provider import ChronicleMemoryProvider
+            from .provider import ChronicleMemoryProvider as mp_cls  # type: ignore
+            from .context import ChronicleContextEngine as ce_cls  # type: ignore
         except Exception:
-            from provider import ChronicleMemoryProvider
-        ctx.register_memory_provider(ChronicleMemoryProvider())
+            try:
+                from provider import ChronicleMemoryProvider as mp_cls  # type: ignore
+                from context import ChronicleContextEngine as ce_cls  # type: ignore
+            except Exception:
+                pass
 
-    if hasattr(ctx, "register_context_engine"):
+    if hasattr(ctx, "register_memory_provider") and mp_cls is not None:
         try:
-            from .context import ChronicleContextEngine
-        except Exception:
-            from context import ChronicleContextEngine
-        ctx.register_context_engine(ChronicleContextEngine())
+            ctx.register_memory_provider(mp_cls())
+        except Exception as e:
+            logger.warning("Chronicle: register_memory_provider failed: %s", e)
+
+    if hasattr(ctx, "register_context_engine") and ce_cls is not None:
+        try:
+            ctx.register_context_engine(ce_cls())
+        except Exception as e:
+            logger.warning("Chronicle: register_context_engine failed: %s", e)
 
     if hasattr(ctx, "register_command"):
-        ctx.register_command(
-            "chronicle", chronicle_status_command,
-            description="Show Chronicle status: embedder (local model vs offline hashing) + store counts.")
+        try:
+            ctx.register_command(
+                "chronicle", chronicle_status_command,
+                description="Show Chronicle status: embedder (local model vs offline hashing) + store counts.")
+        except Exception as e:
+            logger.warning("Chronicle: register_command failed: %s", e)
