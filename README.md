@@ -1,4 +1,4 @@
-# Chronicle Plugins
+# Chronicle Agent Memory and Context (for Hermes)
 
 Two plugins, one core. A local-first memory system for Hermes Agent.
 
