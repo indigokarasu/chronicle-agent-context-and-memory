@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.1.1
+
+- Embeddings are honest about the default: the built-in **offline hashing**
+  embedder is the default and always-available fallback. `engine/config.py`,
+  the core, and the setup-wizard field now agree (no more `embeddinggemma-300m`
+  shown as the default when hashing is what actually runs).
+- The core now builds its embedder from config via `get_embedder(...)`; setting
+  a real model name attempts to load a local runtime and **falls back to hashing
+  with a warning** if unavailable (`engine/embeddings.py:_load_model_embedder`
+  is the pluggable hook), instead of being ignored.
+
 ## 5.1.0
 
 - Bumped version so the version-checked installer/updater detects changes since

@@ -35,7 +35,10 @@ DEFAULTS: Dict[str, Any] = {
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",
     "git_remote": None,
-    "embeddings": {"model": "embeddinggemma-300m", "dimensions": 768},
+    # Default = built-in offline hashing embedder (no model/network). Set model to
+    # a real embedder (e.g. embeddinggemma-300m) only with a local runtime wired in
+    # engine/embeddings.py:_load_model_embedder; it falls back to hashing otherwise.
+    "embeddings": {"model": "hashing", "dimensions": 256},
     "vector_index": {"backend": "bruteforce", "bruteforce_ceiling": 100000},
 
     "principals": {

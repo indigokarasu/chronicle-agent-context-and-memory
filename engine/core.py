@@ -17,7 +17,7 @@ from typing import Optional
 
 from .config import Config
 from .store import MemoryStore, now_iso
-from .embeddings import HashingEmbedder
+from .embeddings import get_embedder
 from .reducer import Reducer
 from .capture import CaptureEngine, Reaper
 from .retrieval import RetrievalEngine
@@ -52,7 +52,8 @@ class ChronicleCore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.store = MemoryStore(db_path)
-        self.embedder = HashingEmbedder()
+        self.embedder = get_embedder(self.cfg.get("embeddings.model"),
+                                     self.cfg.get("embeddings.dimensions"))
         self.reducer = Reducer(self.store, self.embedder)
         self.store.reducer = self.reducer                       # inline reduce on append (I7)
         self.capture = CaptureEngine(self.store, self.reducer,
