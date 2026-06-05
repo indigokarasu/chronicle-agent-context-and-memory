@@ -1,99 +1,134 @@
 """
 Chronicle — Core singleton (§11).
 
-Process-singleton that owns the shared state: store, reducer, capture, retrieval.
-Both plugins obtain the same instance.
+`ChronicleCore` owns all shared state (log, store, retrieval, scoring, curation,
+capability registry, principals/ACL) and is a process-singleton keyed by
+hermes_home. Both plugins obtain the same instance and record their presence so
+each can pick its mode (§13.4). Cooperation between the plugins is an
+optimization, never a correctness dependency (either runs alone).
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
+
+from .config import Config
+from .store import MemoryStore, now_iso
+from .embeddings import HashingEmbedder
+from .reducer import Reducer
+from .capture import CaptureEngine, Reaper
+from .retrieval import RetrievalEngine
+from .extraction import HeuristicExtractor, PREDICATE_MAP
+from .derivation import DerivationEngine
+from .curation import CurationWorker
+from .federation import CapabilityRegistry
+from .forgetting import ForgettingEngine
+from .health import HealthEngine
+from .learning import LearningLoop
+from .reasoning import ReasoningLayer, EpistemicModel
+from .gitmirror import GitMirror
+from .tools import Tools
 
 logger = logging.getLogger("chronicle.core")
 
 
 class ChronicleCore:
-    """Shared core for both Chronicle plugins.
+    _instances = {}
+    _lock = threading.Lock()
 
-    Process-singleton keyed by hermes_home.
-    """
-
-    _instances: dict[str, "ChronicleCore"] = {}
-
-    def __init__(self, hermes_home: str):
-        from .store import MemoryStore
-        from .reducer import Reducer
-        from .capture import CaptureEngine, Reaper
-        from .retrieval import RetrievalEngine
-
+    def __init__(self, hermes_home: str, config: Optional[dict] = None):
         self.hermes_home = hermes_home
+        self.cfg = Config(config or {})
         self.has_memory_provider = False
         self.has_context_engine = False
-
-        # Initialize store
-        db_path = Path(hermes_home) / "commons" / "db" / "chronicle" / "chronicle.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.store = MemoryStore(db_path)
-
-        # Initialize subsystems
-        self.reducer = Reducer(self.store)
-        self.capture = CaptureEngine(self.store, self.reducer)
-        self.retrieval = RetrievalEngine(self.store)
-        self.reaper = Reaper(self.store, self.capture)
-
-        # Active principal
         self.active_principal = "default"
 
-        logger.info(f"ChronicleCore initialized at {db_path}")
+        db_path = self.cfg.get("db_path") or str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
+        db_path = db_path.replace("~/.hermes", str(Path(hermes_home))) if db_path.startswith("~/.hermes") \
+            else str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        self.store = MemoryStore(db_path)
+        self.embedder = HashingEmbedder()
+        self.reducer = Reducer(self.store, self.embedder)
+        self.store.reducer = self.reducer                       # inline reduce on append (I7)
+        self.capture = CaptureEngine(self.store, self.reducer,
+                                     extractor_version=self.cfg.get("extraction.version", "extractor-v1"))
+        self.extractor = HeuristicExtractor()
+        self.derivation = DerivationEngine(self.store, self.cfg, self.capture.append)
+        self.federation = CapabilityRegistry(self.store, self.cfg)
+        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation)
+        self.forgetting = ForgettingEngine(self.store, self.cfg, self.capture.append)
+        self.health = HealthEngine(self)
+        self.learning = LearningLoop(self)
+        self.epistemic = EpistemicModel(self.store, self.cfg)
+        self.reasoning = ReasoningLayer(self)
+        self.gitmirror = GitMirror(self.store, self.cfg)
+        self.tools = Tools(self)
+        self.curation = CurationWorker(self)
+        self.reaper = Reaper(self.store, self.capture,
+                             idle_threshold=self.cfg.get("reaper.idle_threshold", "20m"),
+                             reap_threshold=self.cfg.get("reaper.reap_threshold", "45m"))
+
+        self._seed()
+        logger.info("ChronicleCore initialized at %s (hash=%s)", db_path, _hash_name())
+
+    def _seed(self):
+        for surface, (canon, card) in PREDICATE_MAP.items():
+            if self.store.get_predicate(surface) is None:
+                self.store.upsert_predicate(surface, canon, card)
+        self.derivation.seed_rules()
 
     @classmethod
-    def get(cls, hermes_home: str) -> "ChronicleCore":
-        """Get or create the singleton for a given hermes_home."""
-        if hermes_home not in cls._instances:
-            cls._instances[hermes_home] = cls(hermes_home)
-        return cls._instances[hermes_home]
+    def get(cls, hermes_home: str, config=None) -> "ChronicleCore":
+        with cls._lock:
+            if hermes_home not in cls._instances:
+                cls._instances[hermes_home] = cls(hermes_home, config)
+            return cls._instances[hermes_home]
 
-    def initialize(self, session_id: str, *,
-                   hermes_home: str,
-                   principal_id: str = "default",
-                   **kwargs):
-        """Initialize for a session."""
+    # -- lifecycle ---------------------------------------------------------
+
+    def initialize(self, session_id, *, hermes_home=None, principal_id="default", **kw):
+        self.set_active_principal(principal_id)
+        self.store.upsert_principal({"principal_id": principal_id, "type": "agent", "display": principal_id,
+                                     "default_visibility": "shared", "created_at": now_iso()})
+        # Register configured agents/principals (§27 principals.agents).
+        for ag in self.cfg.get("principals.agents", []) or []:
+            if self.store.get_principal(ag["id"]) is None:
+                self.store.upsert_principal({"principal_id": ag["id"], "type": "agent", "display": ag["id"],
+                                             "default_visibility": ag.get("default_visibility", "shared"),
+                                             "created_at": now_iso()})
+        self.on_startup_recovery()
+        self.start_sources()
+        self.bind_capabilities()
+        return self.open_scope(session_id, principal_id)
+
+    def set_active_principal(self, principal_id):
         self.active_principal = principal_id
         self.retrieval.active_principal = principal_id
         self.capture.owner = principal_id
 
-        # Startup recovery
-        self.reaper.startup_recovery()
-
-        # Ensure principal exists
-        self.store.upsert_principal({
-            "principal_id": principal_id,
-            "type": "agent",
-            "display": principal_id,
-            "default_visibility": "shared",
-            "created_at": self.capture._now(),
-        })
-
-        # Open scope
-        self.open_scope(session_id, principal_id)
-
-    def open_scope(self, session_id: str, principal_id: str) -> "Scope":
-        """Open a session scope."""
+    def open_scope(self, session_id, principal_id):
         return Scope(self, session_id, principal_id)
 
-    def switch_scope(self, new_session_id: str, parent_session_id: str = "",
-                     reset: bool = False, rewound: bool = False,
-                     principal_id: str = "default") -> "Scope":
-        """Switch to a new session scope."""
-        if reset:
-            # Fresh scope
-            pass
+    def switch_scope(self, new_session_id, parent_session_id="", reset=False, rewound=False,
+                     principal_id="default"):
+        if rewound:
+            # Mark the abandoned branch: events after the rewind point are not promoted (I16).
+            old = self.store.get_session(new_session_id)
+            if old:
+                self.store.upsert_session({"session_id": new_session_id,
+                                           "branch_point_seq": old.get("last_extracted_seq") or self.store.max_seq()})
+        if parent_session_id:
+            self.store.upsert_session({"session_id": new_session_id, "parent_session_id": parent_session_id,
+                                       "status": "active", "started_at": now_iso(),
+                                       "last_activity_at": now_iso()})
         return Scope(self, new_session_id, principal_id)
 
     def local_ok(self) -> bool:
-        """Check if the local store is functional (no network)."""
         try:
             self.store.count_rows("events")
             return True
@@ -101,22 +136,44 @@ class ChronicleCore:
             return False
 
     def on_startup_recovery(self):
-        """Run startup recovery."""
         self.reaper.startup_recovery()
+        self.process_pending()         # drain crash-recovered extraction (I13)
 
     def start_sources(self):
-        """Start input sources (hooks always present)."""
-        pass
+        if self.cfg.get("sources.ocas_journals.enabled") in (True, "auto"):
+            self.store.enqueue_curation("journal_ingest", {})
 
     def bind_capabilities(self):
-        """Bind capability providers."""
-        pass
+        self.federation.bind()
+
+    def abandon_after(self, session_id, branch_point_seq):
+        """Mark a session's post-rewind observed events as abandoned (I16)."""
+        self.store.upsert_session({"session_id": session_id, "branch_point_seq": branch_point_seq})
+
+    def set_agent_privacy(self, agent, private=True):
+        self.store.upsert_principal({"principal_id": agent,
+                                     "default_visibility": "private" if private else "shared"})
+
+    # -- work pumps --------------------------------------------------------
+
+    def process_pending(self, max_jobs=1000) -> int:
+        return self.curation.drain(max_jobs)
+
+    def tick(self):
+        """on_turn_start: drain a bounded curation slice + decay tick (§12.3)."""
+        self.curation.drain(max_jobs=16)
+
+    def flush_git(self) -> int:
+        return self.gitmirror.flush()
 
 
 class Scope:
-    """Per-session scope."""
-
-    def __init__(self, core: ChronicleCore, session_id: str, principal_id: str):
+    def __init__(self, core, session_id, principal_id):
         self.core = core
         self.session_id = session_id
         self.principal_id = principal_id
+
+
+def _hash_name():
+    from .serialize import HASH_NAME
+    return HASH_NAME
