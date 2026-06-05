@@ -6,6 +6,72 @@ Two plugins, one core. A local-first memory system for Hermes Agent.
 
 Replaces: ocas-elephas skill. Version: 5.0.0.
 
+## 🤖 If you are an agent: how to install & set up
+
+> Read this first if you're an AI agent installing or wiring up Chronicle. It is self-contained and matches the actual code in `engine/` and `plugins/`.
+
+**What you're installing.** Two Hermes plugins over one shared in-process core (`ChronicleCore`): a **memory provider** (long-term memory) and a **context engine** (working memory). Either runs without the other. Pure Python standard library — no required dependencies, no network, no model server.
+
+**1. Install**
+
+```bash
+# Managed by Hermes (registers both plugin slots from plugin.yaml):
+hermes plugins install indigokarasu/chronicle-agent-context-and-memory
+
+# OR local/dev install:
+git clone https://github.com/indigokarasu/chronicle-agent-context-and-memory.git
+cd chronicle-agent-context-and-memory
+pip install -e .            # add ".[dev]" for pytest, ".[hash]" for spec-exact BLAKE3
+```
+
+Requires **Python ≥ 3.9**. Without the optional `blake3` package, content addressing falls back to BLAKE2b-256 (set `CHRONICLE_REQUIRE_BLAKE3=1` to require BLAKE3).
+
+**2. Register both slots.** `plugin.yaml` already declares them:
+
+```yaml
+memory_provider: plugins.memory_provider:ChronicleMemoryProvider
+context_engine:  plugins.context_engine:ChronicleContextEngine
+```
+
+In `~/.hermes/config.yaml`, the minimal config is just:
+
+```yaml
+memory:  { provider: chronicle }   # everything else has safe defaults (engine/config.py)
+context: { engine: chronicle }     # optional — enables memory-aware compression
+```
+
+**3. First run is zero-setup.** On the first `initialize(...)` the SQLite database and full schema are created automatically at `~/.hermes/commons/db/chronicle/chronicle.db`. There is no migration or `createdb` step. Startup recovery + the reaper finalize any sessions left by a crash.
+
+**4. Verify it works**
+
+```bash
+python -m pytest tests/ -q        # 38 property/acceptance tests (P1–P21, B.1–B.6)
+```
+
+**5. How you drive it at runtime.** Under Hermes the hooks fire for you (`sync_turn` captures every turn durably; `on_turn_start` drains a slice of background work; `on_pre_compress`/`compress` handle the window). You get agent tools via `get_tool_schemas` — `chronicle_remember`, `chronicle_search`, `chronicle_answer`, `chronicle_ask_about`, `chronicle_get_context`, `chronicle_explain`, `chronicle_correct`, `chronicle_forget`, plus ACL/derivation/reasoning tools (see [Tools](#tools)).
+
+**Programmatic quickstart (no Hermes needed — good for validating an install):**
+
+```python
+from engine.core import ChronicleCore
+
+core = ChronicleCore.get("/tmp/hermes_home")          # singleton; auto-creates the db
+core.initialize(session_id="s1", principal_id="assistant")
+
+core.capture.observe("My name is Jared. I work at Innovaccer.", "Hi Jared!", session_id="s1")
+core.capture.observe("My office is in downtown", "noted", session_id="s1")
+core.process_pending()                                 # run extraction → derivation → curation
+
+print(core.retrieval.answer("where is my workplace"))  # dual-tier read-and-answer (abstains if unknown)
+print(core.tools.dispatch("assistant", "chronicle_search", {"query": "Innovaccer"}))
+```
+
+**Good to know.**
+- **Capture is durable and cheap; understanding is deferred.** `sync_turn`/`observe` only appends one local event; extraction, derivation, and curation run in the background (drained by `on_turn_start` or `core.process_pending()`).
+- **Recall floor:** anything captured is answerable even if eager extraction missed it — the raw tier + read step recover it and write the belief back. The system abstains rather than fabricates when there's no support.
+- **Extraction & read-and-answer use a deterministic offline heuristic** behind a pluggable `Extractor` interface (`engine/extraction.py`). Swap in a local model there for higher precision — nothing else changes.
+- **Multi-agent default is open within one user** (every agent reads the user's and siblings' memory); restriction is explicit via `chronicle_set_acl` / `chronicle_revoke_read`.
+
 ## Architecture
 
 Both plugins share a process-singleton `ChronicleCore` that owns:
@@ -20,10 +86,10 @@ The context engine hooks into `on_pre_compress` and owns compression when active
 ## Installation
 
 ```bash
-hermes plugins install indigokarasu/chronicle-plugin
+hermes plugins install indigokarasu/chronicle-agent-context-and-memory
 ```
 
-Requires Hermes Agent with plugin support. Python 3.12+.
+Requires Hermes Agent with plugin support. Python 3.9+.
 
 ## Configuration
 
