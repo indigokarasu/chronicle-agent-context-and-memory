@@ -3,6 +3,13 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.3.2
+
+- Added a user-facing **`/chronicle`** slash command (registered via the general
+  plugin system) that prints status in-session — including whether embeddings are
+  a live local model or the offline hashing fallback, plus store counts. Tools are
+  agent-invoked; this gives the user a direct handle Hermes understands.
+
 ## 5.3.1
 
 - Added an embedding diagnostic so you can confirm whether the selected model

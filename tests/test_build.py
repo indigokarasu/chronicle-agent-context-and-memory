@@ -425,6 +425,14 @@ class TestCurationHealth(unittest.TestCase):
         self.core.forgetting.decay_sweep(now=future)
         self.assertEqual(self.core.store.get_belief("facts", f["belief_id"])["fidelity"], "verbatim")
 
+    def test_embedding_status(self):  # diagnostic
+        st = self.core.embedding_status()
+        self.assertIn("supports_embeddings", st)
+        self.assertEqual(st["mode"], "offline_hashing")   # make_core forces hashing
+        self.assertFalse(st["supports_embeddings"])
+        t = json.loads(self.core.tools.dispatch("assistant", "chronicle_embedding_status", {}))
+        self.assertIn("mode", t)
+
     def test_git_mirror_flush(self):  # §26
         self.core.capture.observe("My name is Jared", "ok", session_id="s1")
         flushed = self.core.gitmirror.flush()
