@@ -52,6 +52,8 @@ class Tools:
             s("list_derivation_rules", "List derivation rules.", {}),
             s("set_rule_enabled", "Enable/disable a derivation rule.", {"rule_id": text, "enabled": {"type": "boolean"}}, ["rule_id", "enabled"]),
             s("list_capabilities", "List federated capability providers.", {}),
+            s("embedding_status", "Report the active embedder: real local model (with a live test "
+                                  "embed) vs offline hashing fallback.", {}),
             s("plan_context", "Bundle facts + procedures + reflections for a goal.", {"goal": text}, ["goal"]),
             s("reflect", "Record a reflection lesson.", {"situation": text, "action": text, "outcome": text, "lesson": text}, ["situation", "lesson"]),
             s("remember_goal", "Add a standing goal.", {"goal": text}, ["goal"]),
@@ -201,6 +203,9 @@ class Tools:
 
     def _t_list_capabilities(self, principal, a):
         return {"capabilities": self.core.federation.list_capabilities() if self.core.federation else []}
+
+    def _t_embedding_status(self, principal, a):
+        return self.core.embedding_status()
 
     def _t_plan_context(self, principal, a):
         return self.core.reasoning.plan_context(a["goal"])

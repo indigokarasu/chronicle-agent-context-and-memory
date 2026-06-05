@@ -3,6 +3,15 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.3.1
+
+- Added an embedding diagnostic so you can confirm whether the selected model
+  actually embeds: `scripts/embedding_check.py` (shell) reports the configured
+  model, visible local servers/models, the resolved embedder, and a strict live
+  test embed (exit 0 = real model, 2 = offline hashing, 3 = selected-but-failing).
+  Also exposed as the `chronicle_embedding_status` tool / `core.embedding_status()`
+  for checking the live runtime selection from within Hermes.
+
 ## 5.3.0
 
 - Embedding model default is now **`auto`** (no hardcoded `embeddinggemma-300m`).
