@@ -12,13 +12,11 @@ relative imports below resolve). Activate the slots in ``~/.hermes/config.yaml``
 
     memory:  { provider: chronicle }
     context: { engine: chronicle }
-
-Replaces: ocas-elephas.
 """
 
 from __future__ import annotations
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 
 
 def register(ctx) -> None:

@@ -3,10 +3,18 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.1.0
+
+- Bumped version so the version-checked installer/updater detects changes since
+  5.0.0 (the proper-Hermes-plugin restructure — `register(ctx)`, relative
+  imports, root-level adapters — is in the 5.0.0 notes below).
+- Removed references to other OCAS skills from the plugin (no longer names
+  predecessor/sibling skills in manifest, docs, or code).
+
 ## 5.0.0
 
 First complete build of the Chronicle memory system — the canonical event-sourced
-memory + working-memory context for Hermes. Replaces the `ocas-elephas` skill.
+memory + working-memory context for Hermes.
 
 ### Added — packaging
 - Hermes **plugin** package: `plugin.yaml` manifest + a `register(ctx)` entry
