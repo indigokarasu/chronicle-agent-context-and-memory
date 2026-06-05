@@ -1,8 +1,12 @@
 name: chronicle
 version: 5.0.0
 description: "Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas."
+# Two plugins, one shared in-process core (§1.2). Either runs without the other.
+memory_provider: plugins.memory_provider:ChronicleMemoryProvider
+context_engine: plugins.context_engine:ChronicleContextEngine
 entrypoint: plugins.memory_provider:ChronicleMemoryProvider
 hooks:
+  - sync_turn
   - on_session_end
   - on_pre_compress
   - on_memory_write
@@ -12,12 +16,39 @@ hooks:
   - system_prompt_block
   - prefetch
   - queue_prefetch
+# Full tool surface (§23); schemas served at runtime via get_tool_schemas.
 tools:
   - chronicle_remember
   - chronicle_search
   - chronicle_answer
-  - chronicle_forget
+  - chronicle_ask_about
+  - chronicle_timeline
+  - chronicle_history
+  - chronicle_get_context
+  - chronicle_explain
   - chronicle_list_directives
+  - chronicle_list_contradictions
+  - chronicle_correct
+  - chronicle_forget
+  - chronicle_withdraw_consent
+  - chronicle_verify
+  - chronicle_grant_read
+  - chronicle_revoke_read
+  - chronicle_set_acl
+  - chronicle_set_agent_privacy
+  - chronicle_list_principals
+  - chronicle_list_derivation_rules
+  - chronicle_set_rule_enabled
+  - chronicle_list_capabilities
+  - chronicle_plan_context
+  - chronicle_reflect
+  - chronicle_remember_goal
+  - chronicle_active_goals
+  - chronicle_what_user_knows
+  - chronicle_note_informed
+  - chronicle_unmerge
+  - chronicle_pin_context
+  - chronicle_focus
 config:
   memory:
     provider: chronicle

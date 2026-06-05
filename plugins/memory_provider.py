@@ -1,8 +1,9 @@
 """
-Chronicle — Memory Provider Plugin.
+Chronicle — Memory Provider plugin (Hermes memory-provider slot).
 
-Implements the Hermes MemoryProvider interface.
-Provides persistent, cross-session knowledge via the Chronicle event-sourced core.
+Long-term memory: capture + recall. Methods map 1:1 to the §12.3 hook table and
+delegate to the shared `ChronicleCore`. `sync_turn` is the durability anchor
+(I12); `on_pre_compress` yields to the Context Engine when it is active (§13.4).
 """
 
 from __future__ import annotations
@@ -10,177 +11,99 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from agent.memory_provider import MemoryProvider
+try:  # real Hermes base when present, else a local stand-in
+    from agent.memory_provider import MemoryProvider  # type: ignore
+except Exception:  # pragma: no cover
+    from ._base import MemoryProvider
 
 logger = logging.getLogger("chronicle.provider")
 
 
 class ChronicleMemoryProvider(MemoryProvider):
-    """Chronicle Memory Provider for Hermes Agent.
-
-    Implements the MemoryProvider ABC, delegating to ChronicleCore.
-    """
+    name = "chronicle"
 
     def __init__(self):
-        self.core: Any = None
-        self.scope: Any = None
-        self._session_id: str = ""
-        self._principal_id: str = "default"
-
-    @property
-    def name(self) -> str:
-        return "chronicle"
+        self.core = None
+        self.scope = None
+        self._session_id = ""
+        self._principal_id = "default"
 
     def is_available(self) -> bool:
-        """Check if Chronicle is available (local-only, no network)."""
-        try:
-            from .engine.core import ChronicleCore
-            return True
-        except ImportError:
-            return False
+        return self.core.local_ok() if self.core else True
 
-    def initialize(self, session_id: str, **kwargs) -> None:
-        """Initialize Chronicle for a session."""
-        hermes_home = kwargs.get("hermes_home", str(Path.home() / ".hermes"))
-        principal_id = kwargs.get("principal_id", "default")
-
-        from .engine.core import ChronicleCore
-        self.core = ChronicleCore.get(hermes_home)
+    def initialize(self, session_id, *, hermes_home=None, principal_id="default", config=None, **kw):
+        from engine.core import ChronicleCore
+        hermes_home = hermes_home or str(Path.home() / ".hermes")
+        self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
-        self.core.initialize(
-            session_id,
-            hermes_home=hermes_home,
-            principal_id=principal_id,
-            **kwargs,
-        )
         self._session_id = session_id
         self._principal_id = principal_id
-        self.scope = self.core.open_scope(session_id, principal_id)
-        logger.info(f"Chronicle MemoryProvider initialized for session {session_id}")
+        self.scope = self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
+        logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
-    def system_prompt_block(self) -> str:
-        """Return directives for the system prompt."""
-        if not self.core:
-            return ""
-        return self.core.retrieval.get_directives()
-
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall relevant context for the upcoming turn."""
-        if not self.core:
-            return ""
-        return self.core.retrieval.get_context(query)
-
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Queue background recall for the next turn."""
-        # No-op for now; could warm a semantic cache
-        pass
-
-    def sync_turn(
-        self,
-        user_content: str,
-        assistant_content: str,
-        *,
-        session_id: str = "",
-        messages: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """Persist a completed turn (durability anchor, I12)."""
-        if not self.core:
-            return
-        sid = session_id or self._session_id
-        self.core.capture.observe(
-            user_content, assistant_content,
-            session_id=sid,
-            messages=messages,
-        )
-
-    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Called at the start of each turn."""
+    # capture (§12.3)
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
         if self.core:
-            self.core.capture._touch_session(self._session_id)
+            self.core.capture.observe(user_content, assistant_content,
+                                      session_id=session_id or self._session_id, messages=messages)
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Called when a session ends."""
-        if self.core:
-            self.core.capture.finalize_session(self._session_id, "clean_exit")
-
-    def on_session_switch(
-        self,
-        new_session_id: str,
-        *,
-        parent_session_id: str = "",
-        reset: bool = False,
-        rewound: bool = False,
-        **kwargs,
-    ) -> None:
-        """Called when the agent switches session."""
-        if self.core:
-            self.scope = self.core.switch_scope(
-                new_session_id, parent_session_id, reset, rewound,
-                self._principal_id
-            )
-            self._session_id = new_session_id
-
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Called before context compression.
-
-        Returns "" when the Chronicle Context Engine is active (it owns compression).
-        Otherwise does rescue extraction.
-        """
+    def on_pre_compress(self, messages) -> str:
         if not self.core:
             return ""
         if self.core.has_context_engine:
-            return ""  # Context Engine owns this
-        _, summary = self.core.capture.rescue_extract(messages)
+            return ""  # the Context Engine owns compression (§13.4)
+        _, summary = self.core.capture.rescue(messages, session_id=self._session_id)
         return summary
 
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
-        """Called when a subagent completes."""
+    def on_session_end(self, messages):
+        if self.core:
+            self.core.capture.finalize_session(self._session_id, "clean_exit")
+
+    def on_memory_write(self, action, target, content, metadata=None):
+        if self.core:
+            self.core.capture.agent_explicit(action, target, content, metadata)
+            self.core.tick()
+
+    def on_delegation(self, task, result, *, child_session_id="", **kw):
         if self.core:
             self.core.capture.delegation(task, result, child_session_id=child_session_id)
 
-    def on_memory_write(
-        self,
-        action: str,
-        target: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Called when the built-in memory tool writes an entry."""
+    def on_turn_start(self, turn_number, message, **kw):
         if self.core:
-            self.core.capture.agent_explicit(action, target, content, metadata)
+            self.core.capture._touch_session(self._session_id)
+            self.core.tick()
+
+    def on_session_switch(self, new_session_id, *, parent_session_id="", reset=False, rewound=False, **kw):
+        if self.core:
+            self.scope = self.core.switch_scope(new_session_id, parent_session_id, reset, rewound,
+                                                self._principal_id)
+            self._session_id = new_session_id
+
+    # recall (§12.3)
+    def prefetch(self, query, *, session_id="") -> str:
+        if not self.core:
+            return ""
+        return self.core.retrieval.get_context(
+            query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
+            principal=self._principal_id, epistemic=self.core.epistemic)
+
+    def queue_prefetch(self, query, *, session_id=""):
+        pass  # predictive warm-cache hook; no-op in the local build
+
+    def system_prompt_block(self) -> str:
+        return self.core.retrieval.static_block(self._principal_id) if self.core else ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas for Chronicle tools."""
-        if not self.core:
-            return []
-        return self.core.retrieval.get_tool_schemas()
+        return self.core.tools.schemas() if self.core else []
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Handle a Chronicle tool call."""
+    def handle_tool_call(self, tool_name, args, **kw) -> str:
         if not self.core:
             return json.dumps({"error": "Chronicle not initialized"})
-        return self.core.retrieval.dispatch_tool(tool_name, args)
+        return self.core.tools.dispatch(self._principal_id, tool_name, args)
 
-    def shutdown(self) -> None:
-        """Clean shutdown."""
+    def shutdown(self):
         if self.core:
-            self.core.capture.finalize_session(self._session_id, "shutdown")
-            logger.info("Chronicle MemoryProvider shut down")
-
-    def get_config_schema(self) -> List[Dict[str, Any]]:
-        """Return config fields Chronicle needs."""
-        return [
-            {
-                "key": "db_path",
-                "description": "Path to the Chronicle SQLite database",
-                "default": "~/.hermes/commons/db/chronicle/chronicle.db",
-                "required": False,
-            },
-        ]
-
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
-        """Write non-secret config."""
-        pass  # Config is read from the main config.yaml
+            self.core.capture.flush_best_effort()
+            self.core.flush_git()

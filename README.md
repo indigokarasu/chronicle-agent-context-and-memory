@@ -122,20 +122,50 @@ Tests run against an in-memory SQLite database. No external services needed.
 chronicle-plugin/
   __init__.py          # Package init, version
   pyproject.toml       # Package metadata
-  plugin.yaml          # Hermes plugin manifest
+  plugin.yaml          # Hermes plugin manifest (both slots)
   engine/              # Core modules (shared by both plugins)
-    core.py            # ChronicleCore singleton + Scope
-    store.py           # MemoryStore (SQLite backend)
-    capture.py         # CaptureEngine + Reaper
-    reducer.py         # Reducer (event folding)
-    retrieval.py       # RetrievalEngine (dual-tier)
-    serialize.py       # Serialization helpers
+    core.py            # ChronicleCore singleton + Scope, wires every subsystem (§11)
+    config.py          # Configuration reference + defaults (§27)
+    serialize.py       # CJSON + content addressing, BLAKE3/BLAKE2b (§5)
+    store.py           # MemoryStore: atomic append = reduce+git+curation (§6/§24, I7)
+    reducer.py         # Pure projection: events → belief store (§7)
+    trust.py           # Trust ceilings + confidence + calibration (§10)
+    criticality.py     # Criticality rules floor (§20.1)
+    access.py          # ACL logic: default-allow within a user (§15)
+    capture.py         # CaptureEngine + Reaper (§12)
+    extraction.py      # Pluggable Extractor + heuristic default (§16)
+    derivation.py      # Guarded compositional inference + TMS (§9, I24)
+    curation.py        # Curation worker + DAG (§17)
+    retrieval.py       # Dual-tier + read-and-answer + promote-on-read (§18)
+    federation.py      # Capability registry: reference, don't own (§14, I20)
+    forgetting.py      # Asymmetric decay + fidelity ladder + unlearning (§20)
+    health.py          # Auditor + consistency sweep + self-heal (§21)
+    learning.py        # Bounded learning loop, champion/challenger (§22, I19)
+    reasoning.py       # Procedures, reflections, plan_context, epistemic (§19, §23)
+    gitmirror.py       # Git mirror flusher + disk recovery (§26)
+    embeddings.py      # Pluggable embedder + offline default (§24.4)
+    tools.py           # Full agent tool surface (§23)
+    errors.py          # Error codes (§32)
   plugins/             # Hermes plugin adapters
-    memory_provider.py # ChronicleMemoryProvider
-    context_engine.py  # ChronicleContextEngine
+    memory_provider.py # ChronicleMemoryProvider (memory-provider slot)
+    context_engine.py  # ChronicleContextEngine (context-engine slot, I17)
+    _base.py           # Minimal ABCs for offline import/testing
   tests/
-    test_build.py      # Build verification tests
+    test_build.py      # Unit + property tests P1–P21 + worked examples B.1–B.6
 ```
+
+### Implementation status
+
+All six build phases (§31) are implemented and exercised by the test suite:
+data plane + capture + principals + federation (Phase 1); recall-oriented
+extraction + dual-tier retrieval + read-and-answer (Phase 2); TMS + guarded
+derivation + provenance/trust/ACL (Phase 3); curation + representation +
+health/self-heal (Phase 4); context engine + bounded learning + reasoning +
+epistemic + procedures (Phase 5); git-mirror recovery + the property suite
+(Phase 6). Extraction and read-and-answer use a deterministic offline heuristic
+behind a pluggable interface — a real deployment swaps in a local model without
+touching the pipeline. Deferred per spec: the distributed CRDT tier (§24.5),
+L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
 
 ## Contributing
 

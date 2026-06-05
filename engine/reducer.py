@@ -1,564 +1,545 @@
 """
 Chronicle — Reducer / Projection engine (§7).
 
-Pure function: (state, event) → state.
-Folds the event log into the belief store.
+A pure fold over the event log: (state, event) → state. No clock, network, or
+RNG enters a derived value; ties break by event order (seq), never wall-clock or
+hash (§7.2). Every active belief it writes gets ≥1 justification in the same
+transaction (I5), so readers never see an unjustified belief. Drop the projection
+and replay the log → byte-identical state (I3).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Optional
 
-from .serialize import belief_id as compute_belief_id
+from . import access
+from .serialize import belief_id as compute_belief_id, hash_str
+from .criticality import classify as classify_criticality
+from .trust import raw_confidence, clamp_to_ceiling, base_confidence
+from .store import now_iso, KIND_TABLE, BELIEF_TABLES
 
 logger = logging.getLogger("chronicle.reducer")
 
-# Trust ceiling C(level) (§10.3)
-TRUST_CEILING = {0: 0.40, 1: 0.60, 2: 0.75, 3: 0.90, 4: 1.00}
-
-# Fact conflict policy (§8.5)
-DOMAIN_DECAY = {
-    "user": {"auto_decay": False, "contradiction": "flag_for_review"},
-    "agent": {"auto_decay": True, "decay_days": 90, "contradiction": "newer_wins"},
-    "general": {"auto_decay": True, "decay_days": 30, "contradiction": "refetch"},
+DOMAIN_POLICY = {
+    "user": {"contradiction": "flag_for_review"},
+    "agent": {"contradiction": "newer_wins"},
+    "general": {"contradiction": "refetch"},
 }
 
 
 class Reducer:
-    """Pure reducer: events → belief store."""
-
-    def __init__(self, store):
+    def __init__(self, store, embedder=None):
         self.store = store
+        self.embedder = embedder
+
+    # -- dispatch ----------------------------------------------------------
 
     def reduce(self, event: dict):
-        """Apply a single event to the belief store."""
         handler = self._HANDLERS.get(event["type"])
         if handler is None:
-            logger.warning(f"Unknown event type: {event['type']}")
+            logger.warning("Unknown event type: %s", event.get("type"))
             return
-        try:
-            handler(self, event)
-        except Exception as e:
-            logger.error(f"Reducer error for {event['type']}/{event.get('event_id','?')}: {e}")
-            raise
+        handler(self, event)
 
-    def reduce_many(self, events: list[dict]):
-        """Apply multiple events in order."""
+    def reduce_many(self, events):
         for e in events:
             self.reduce(e)
 
-    def rebuild(self, from_seq: int = 0):
-        """Rebuild the entire belief store from the event log (§7.3)."""
-        # Truncate belief tables
-        with self.store.transaction() as conn:
-            for table in ["facts", "episodes", "notes", "refs", "relationships",
-                          "procedures", "entities", "user_knowledge", "justifications",
-                          "corrections", "nogoods"]:
-                conn.execute(f"DELETE FROM {table}")
-            conn.execute("DELETE FROM observed_fts")
-            conn.execute("DELETE FROM observed_vectors")
-            conn.execute("DELETE FROM session_index")
-            conn.execute("DELETE FROM memory_vectors")
-
-        # Replay events
-        events = self.store.get_events_since(from_seq)
-        for e in events:
-            self.reduce(e)
-
-        # Set projection seq
-        if events:
-            max_seq = max(e["seq"] for e in events)
-            self.store.set_projection_seq(max_seq)
-
-        logger.info(f"Rebuilt belief store from {len(events)} events (seq > {from_seq})")
-
-    # -- Event handlers -----------------------------------------------------
-
-    def _on_observed(self, event: dict):
-        """Persist raw + index it. No belief created."""
-        payload = self._parse_payload(event)
-        excerpt = payload.get("excerpt", "")
-
-        # Index in FTS
-        if excerpt:
-            self.store.fts_index(event["event_id"], excerpt)
-
-        # Enqueue extraction
-        self.store.enqueue_curation("extract", {
-            "event_id": event["event_id"],
-            "excerpt": excerpt,
-            "session_id": event.get("session_id"),
-        })
-
-    def _on_asserted(self, event: dict):
-        """Upsert belief from extraction."""
-        payload = self._parse_payload(event)
-        kind = payload.get("kind", "fact")
-        key = payload.get("key", {})
-        body = payload.get("body", "")
-        confidence = payload.get("confidence", 0.8)
-        source_event = payload.get("source_event", event["event_id"])
-        extractor_version = payload.get("extractor_version", "")
-
-        # Trust ceiling check
-        trust = event.get("trust_level", 2)
-        ceiling = TRUST_CEILING.get(trust, 0.75)
-        confidence = min(confidence, ceiling)
-
-        # Compute belief_id
-        b_id = compute_belief_id(kind, key, [source_event])
-
-        # Check for existing belief with same key
-        existing = self._find_existing(kind, key, event.get("owner", "default"),
-                                        event.get("domain", "general"))
-
-        if existing:
-            # Fact conflict policy (§8.5)
-            existing_val = existing.get("value", existing.get("body", ""))
-            if existing_val == body:
-                # Equal: confirm
-                self._confirm_belief(existing, event)
-            else:
-                # Differ: apply domain policy
-                domain = event.get("domain", "general")
-                policy = DOMAIN_DECAY.get(domain, DOMAIN_DECAY["general"])
-                if policy["contradiction"] == "newer_wins":
-                    self._supersede_belief(existing, b_id, event)
-                elif policy["contradiction"] == "flag_for_review":
-                    # New belief as draft, open contradiction
-                    self._insert_belief(kind, b_id, key, body, confidence, event,
-                                        status="draft")
-                    self._open_contradiction(existing["belief_id"], b_id, event)
-                else:
-                    self._insert_belief(kind, b_id, key, body, confidence, event)
+    def rebuild(self, from_seq: int = 0, as_of_recorded: Optional[str] = None):
+        """Truncate the projection and replay the log in order (§7.3, I3)."""
+        self.store.truncate_projection()
+        if as_of_recorded:
+            events = [e for e in self.store.get_events_as_of(as_of_recorded) if e["seq"] > from_seq]
         else:
-            self._insert_belief(kind, b_id, key, body, confidence, event)
+            events = self.store.get_events_since(from_seq)
+        for e in events:
+            self.reduce(e)
+        if events:
+            self.store.set_projection_seq(max(e["seq"] for e in events))
+        logger.info("Rebuilt projection from %d events", len(events))
 
-        # Add justification
+    # -- handlers ----------------------------------------------------------
+
+    def _on_observed(self, event):
+        p = _payload(event)
+        excerpt = p.get("excerpt", "")
+        eid = event["event_id"]
+        if excerpt:
+            self.store.fts_index_observed(eid, excerpt)
+            if self.embedder is not None:
+                from .embeddings import pack
+                self.store.add_observed_vector(
+                    eid, pack(self.embedder.embed(excerpt)), self.embedder.model,
+                    event.get("owner", "default"))
+        # Skip extraction for branch-abandoned spans (I16).
+        if event.get("branch_id") == "__abandoned__":
+            return
+        self.store.enqueue_curation("extract", {"event_id": eid, "session_id": event.get("session_id")})
+
+    def _on_asserted(self, event):
+        p = _payload(event)
+        kind = p.get("kind", "fact")
+        key = p.get("key", {})
+        body = p.get("body", "")
+        source_event = p.get("source_event", event["event_id"])
+        owner = event.get("owner", "default")
+        domain = event.get("domain") or p.get("domain", "general")
+        event["domain"] = domain  # carry resolved domain to _insert_belief/_apply_fact_conflict
+        trust = event.get("trust_level", 2)
+        source_type = p.get("source_type") or _provenance_source(event)
+
+        raw = p.get("confidence", base_confidence(source_type))
+        confidence = clamp_to_ceiling(raw, trust)
+
+        b_id = compute_belief_id(kind, key, [source_event])
+        existing = self._find_existing(kind, key, owner, domain)
+
+        if kind == "fact" and existing:
+            self._apply_fact_conflict(existing, kind, key, body, confidence, event, source_event)
+            return
+        if kind != "fact" and existing:
+            self._confirm(existing["belief_id"], _table_for(kind), source_event, event)
+            self.store.add_justification(existing["belief_id"], source_event, "event", "extraction")
+            return
+
+        status = p.get("status", "active")
+        self._insert_belief(kind, b_id, key, body, confidence, event, status=status,
+                            source_type=source_type, extras=p.get("extras", {}))
         self.store.add_justification(b_id, source_event, "event", "extraction")
 
-    def _on_confirmed(self, event: dict):
-        """Increment confirm_count, recompute confidence."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        source_event = payload.get("source_event")
+    def _on_confirmed(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
+        if not b_id:
+            return
+        found = self.store.find_belief(b_id)
+        if found:
+            src = p.get("source_event", event["event_id"])
+            self._confirm(b_id, found[0], src, event)
+            self.store.add_justification(b_id, src, "event", "confirmation")
+
+    def _on_contradicted(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
+        if not b_id:
+            return
+        found = self.store.find_belief(b_id)
+        if not found:
+            return
+        table, row = found
+        if "contradiction_count" in row:
+            self.store.update_belief(table, b_id,
+                                     contradiction_count=(row.get("contradiction_count") or 0) + 1)
+        self._recompute_confidence(table, b_id)
+        self.store.open_contradiction(b_id, p.get("conflicting_event", ""), p.get("detail", ""))
+
+    def _on_corrected(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
+        if not b_id:
+            return
+        if p.get("new_body"):
+            found = self.store.find_belief(b_id)
+            if found:
+                self.store.update_belief(found[0], b_id, status="superseded",
+                                         valid_until=event.get("recorded_at"))
+        else:
+            self._retract(b_id)
+        self._cascade(b_id)
+        self.store.record_correction(b_id, p.get("reason", "corrected"), p.get("source_ref", ""), [])
+
+    def _on_retracted(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
         if b_id:
-            self._confirm_belief_by_id(b_id, source_event, event)
+            self._retract(b_id)
+            self._cascade(b_id)
 
-    def _on_contradicted(self, event: dict):
-        """Open a contradiction record."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        if b_id:
-            logger.info(f"Contradiction opened for belief {b_id}")
+    def _on_forbidden(self, event):
+        p = _payload(event)
+        ch = p.get("content_hash", "")
+        if not ch:
+            return
+        self.store.add_tombstone(ch, p.get("scope", "*"))
+        for ev in self.store.get_events_by_type("observed"):
+            if hash_str(_payload(ev).get("excerpt", "")) == ch:
+                self.store.fts_delete_observed(ev["event_id"])
+        for bid in self._beliefs_matching_hash(ch):
+            self._retract(bid)
 
-    def _on_corrected(self, event: dict):
-        """Supersede or retract + cascade."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        new_body = payload.get("new_body")
-        if b_id and new_body:
-            self._supersede_belief_by_id(b_id, event)
-            # Cascade (§9.3)
-            self._cascade_revision(b_id)
-
-    def _on_retracted(self, event: dict):
-        """Retract + cascade."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        if b_id:
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes", "refs", "relationships", "procedures"]:
-                    conn.execute(f"UPDATE {table} SET status='retracted' WHERE belief_id=?", (b_id,))
-            self._cascade_revision(b_id)
-
-    def _on_forbidden(self, event: dict):
-        """Tombstone content."""
-        payload = self._parse_payload(event)
-        content_hash = payload.get("content_hash", "")
-        scope = payload.get("scope", "*")
-        if content_hash:
-            self.store.add_tombstone(content_hash, scope)
-
-    def _on_derived(self, event: dict):
-        """Insert derived belief."""
-        payload = self._parse_payload(event)
-        kind = payload.get("kind", "fact")
-        key = payload.get("key", {})
-        body = payload.get("body", "")
-        rule_id = payload.get("rule_id", "")
-        premises = payload.get("premises", [])
-        confidence = payload.get("confidence", 0.6)
-
-        # Clamp to inference ceiling
-        confidence = min(confidence, TRUST_CEILING[2])
-
-        b_id = compute_belief_id(kind, key, premises + [rule_id])
-        self._insert_belief(kind, b_id, key, body, confidence, event,
-                            source_type="inference")
-
-        # Justifications = premises + rule_id
-        for p in premises:
-            self.store.add_justification(b_id, p, "belief", rule_id)
+    def _on_derived(self, event):
+        p = _payload(event)
+        kind = p.get("kind", "fact")
+        key = p.get("key", {})
+        body = p.get("body", "")
+        rule_id = p.get("rule_id", "")
+        premises = p.get("premises", [])
+        confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2)  # C(inference)=0.75
+        status = p.get("status", "draft")
+        event["domain"] = p.get("domain", "general")
+        b_id = compute_belief_id(kind, key, sorted(premises) + [rule_id])
+        self._insert_belief(kind, b_id, key, body, confidence, event, status=status,
+                            source_type="inference",
+                            extras={"rule_id": rule_id, "premises": json.dumps(premises)})
+        for prem in premises:
+            self.store.add_justification(b_id, prem, "belief", rule_id)
         self.store.add_justification(b_id, rule_id, "assumption", rule_id)
 
-    def _on_informed(self, event: dict):
-        """Upsert user_knowledge."""
-        payload = self._parse_payload(event)
-        proposition = payload.get("proposition", "")
-        import hashlib
-        prop_hash = hashlib.blake2b(proposition.encode(), digest_size=16).hexdigest()
-        b_id = f"b_{prop_hash}"
+    def _on_informed(self, event):
+        p = _payload(event)
+        proposition = p.get("proposition", "")
+        if not proposition:
+            return
+        b_id = "uk_" + hash_str(proposition + event.get("owner", "default"))[:32]
+        now = event.get("recorded_at") or now_iso()
+        existing = self.store.query_user_knowledge("belief_id=?", (b_id,), limit=1)
+        times = (existing[0]["times_communicated"] + 1) if existing else 1
+        self.store.upsert_user_knowledge({
+            "belief_id": b_id, "proposition": proposition, "about_belief": p.get("about_belief", ""),
+            "state": "told", "last_communicated": now, "times_communicated": times,
+            "importance": p.get("importance", 0.5), "owner": event.get("owner", "default"),
+            "read_acl": access.DEFAULT_ACL, "domain": event.get("domain", "user"), "created_at": now})
 
-        now = event.get("recorded_at", "")
-        uk = {
-            "belief_id": b_id,
-            "proposition": proposition,
-            "about_belief": payload.get("about_belief", ""),
-            "state": "told",
-            "last_communicated": now,
-            "times_communicated": 1,
-            "owner": event.get("owner", "default"),
-            "read_acl": "user_agents",
-            "domain": event.get("domain", "user"),
-            "created_at": now,
-        }
-        self.store.upsert_belief("user_knowledge", uk)
-
-    def _on_grant(self, event: dict):
-        """Update read_acl to grant access."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        principal = payload.get("principal")
+    def _on_grant(self, event):
+        p = _payload(event)
+        b_id, principal = p.get("belief_id"), p.get("principal")
         if b_id and principal:
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes", "refs", "relationships", "procedures"]:
-                    conn.execute(
-                        f"UPDATE {table} SET read_acl=read_acl||? WHERE belief_id=?",
-                        (f",{principal}", b_id)
-                    )
+            found = self.store.find_belief(b_id)
+            if found:
+                self.store.update_belief(found[0], b_id,
+                                         read_acl=access.grant(found[1].get("read_acl"), principal))
 
-    def _on_revoke(self, event: dict):
-        """Update read_acl to revoke access."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        principal = payload.get("principal")
+    def _on_revoke(self, event):
+        p = _payload(event)
+        b_id, principal = p.get("belief_id"), p.get("principal")
         if b_id and principal:
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes", "refs", "relationships", "procedures"]:
-                    conn.execute(
-                        f"UPDATE {table} SET read_acl=REPLACE(read_acl,?,?) WHERE belief_id=?",
-                        (f",{principal}", "", b_id)
-                    )
+            found = self.store.find_belief(b_id)
+            if found:
+                self.store.update_belief(found[0], b_id,
+                                         read_acl=access.revoke(found[1].get("read_acl"), principal))
 
-    def _on_decayed(self, event: dict):
-        """Fidelity transition."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        to_fidelity = payload.get("to_fidelity", "gist")
+    def _on_decayed(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
         if b_id:
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes"]:
-                    conn.execute(f"UPDATE {table} SET fidelity=? WHERE belief_id=?",
-                                 (to_fidelity, b_id))
+            self.store.update_belief_all_tables(b_id, fidelity=p.get("to_fidelity", "gist"))
 
-    def _on_rehearsed(self, event: dict):
-        """Update last_seen_at."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        now = event.get("recorded_at", "")
+    def _on_rehearsed(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
         if b_id:
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes", "refs", "relationships", "procedures"]:
-                    conn.execute(f"UPDATE {table} SET last_seen_at=? WHERE belief_id=?",
-                                 (now, b_id))
+            self.store.update_belief_all_tables(b_id, last_seen_at=event.get("recorded_at"))
 
-    def _on_verified(self, event: dict):
-        """Update verification status."""
-        payload = self._parse_payload(event)
-        b_id = payload.get("belief_id")
-        status = payload.get("status", "verified")
-        method = payload.get("method", "manual")
-        now = event.get("recorded_at", "")
-        if b_id:
-            ver = json.dumps({"status": status, "method": method, "at": now})
-            with self.store.transaction() as conn:
-                for table in ["facts", "episodes", "notes"]:
-                    conn.execute(f"UPDATE {table} SET verification=? WHERE belief_id=?",
-                                 (ver, b_id))
+    def _on_verified(self, event):
+        p = _payload(event)
+        b_id = p.get("belief_id")
+        if not b_id:
+            return
+        ver = json.dumps({"status": p.get("status", "verified"), "method": p.get("method", "manual"),
+                          "at": event.get("recorded_at")})
+        found = self.store.find_belief(b_id)
+        if found and "verification" in found[1]:
+            self.store.update_belief(found[0], b_id, verification=ver)
 
-    def _on_merged(self, event: dict):
-        """Entity merge."""
-        payload = self._parse_payload(event)
-        from_entity = payload.get("from_entity")
-        into_entity = payload.get("into_entity")
-        if from_entity and into_entity:
-            with self.store.transaction() as conn:
-                conn.execute("UPDATE entities SET merged_into=? WHERE belief_id=?",
-                             (into_entity, from_entity))
+    def _on_merged(self, event):
+        p = _payload(event)
+        frm, into = p.get("from_entity"), p.get("into_entity")
+        if frm and into:
+            self.store.update_belief("entities", frm, merged_into=into)
 
-    def _on_unmerged(self, event: dict):
-        """Entity unmerge."""
-        payload = self._parse_payload(event)
-        from_entity = payload.get("from_entity")
-        if from_entity:
-            with self.store.transaction() as conn:
-                conn.execute("UPDATE entities SET merged_into=NULL WHERE belief_id=?",
-                             (from_entity,))
+    def _on_unmerged(self, event):
+        p = _payload(event)
+        frm = p.get("from_entity")
+        if frm:
+            self.store.update_belief("entities", frm, merged_into=None)
 
-    def _on_compressed(self, event: dict):
-        """Audit only — beliefs already durable."""
-        pass
+    def _on_compressed(self, event):
+        pass  # audit only — beliefs already durable (§13)
 
-    def _on_signal(self, event: dict):
-        """Route learning signal."""
-        payload = self._parse_payload(event)
-        signal_type = payload.get("signal_type", "")
-        logger.info(f"Learning signal: {signal_type}")
+    def _on_signal(self, event):
+        logger.debug("signal: %s", _payload(event).get("signal_type"))
 
-    def _on_distilled(self, event: dict):
-        """Deferred — gated."""
-        pass
-
-    # -- Helpers ------------------------------------------------------------
+    def _on_distilled(self, event):
+        pass  # deferred (§20.4)
 
     _HANDLERS = {
-        "observed": _on_observed,
-        "asserted": _on_asserted,
-        "confirmed": _on_confirmed,
-        "contradicted": _on_contradicted,
-        "corrected": _on_corrected,
-        "retracted": _on_retracted,
-        "forbidden": _on_forbidden,
-        "derived": _on_derived,
-        "informed": _on_informed,
-        "grant": _on_grant,
-        "revoke": _on_revoke,
-        "decayed": _on_decayed,
-        "rehearsed": _on_rehearsed,
-        "verified": _on_verified,
-        "merged": _on_merged,
-        "unmerged": _on_unmerged,
-        "compressed": _on_compressed,
-        "signal": _on_signal,
+        "observed": _on_observed, "asserted": _on_asserted, "confirmed": _on_confirmed,
+        "contradicted": _on_contradicted, "corrected": _on_corrected, "retracted": _on_retracted,
+        "forbidden": _on_forbidden, "derived": _on_derived, "informed": _on_informed,
+        "grant": _on_grant, "revoke": _on_revoke, "decayed": _on_decayed,
+        "rehearsed": _on_rehearsed, "verified": _on_verified, "merged": _on_merged,
+        "unmerged": _on_unmerged, "compressed": _on_compressed, "signal": _on_signal,
         "distilled": _on_distilled,
     }
 
-    def _parse_payload(self, event: dict) -> dict:
-        p = event.get("payload", "{}")
-        if isinstance(p, str):
-            return json.loads(p)
-        return p
+    # -- fact conflict policy (§8.5) --------------------------------------
 
-    def _find_existing(self, kind: str, key: dict, owner: str,
-                       domain: str) -> Optional[dict]:
-        """Find an existing active belief matching the natural key."""
-        table_map = {
-            "fact": "facts", "episode": "episodes", "note": "notes",
-            "reference": "refs", "relationship": "relationships",
-            "entity": "entities", "user_knowledge": "user_knowledge",
-            "procedure": "procedures",
-        }
-        table = table_map.get(kind)
+    def _apply_fact_conflict(self, existing, kind, key, body, confidence, event, source_event):
+        old_val = existing.get("value", "")
+        domain = event.get("domain") or "general"
+        b_id_new = compute_belief_id(kind, key, [source_event])
+        now = event.get("recorded_at") or now_iso()
+        if old_val == body:
+            self._confirm(existing["belief_id"], "facts", source_event, event)
+            self.store.add_justification(existing["belief_id"], source_event, "event", "extraction")
+            return
+        policy = DOMAIN_POLICY.get(domain, DOMAIN_POLICY["general"])["contradiction"]
+        old_conf = existing.get("confidence", 0.8)
+        if policy == "newer_wins":
+            self.store.update_belief("facts", existing["belief_id"], status="superseded",
+                                     valid_until=now, superseded_by=b_id_new)
+            self._insert_belief(kind, b_id_new, key, body, confidence, event, status="active",
+                                source_type=_provenance_source(event))
+            self.store.add_justification(b_id_new, source_event, "event", "extraction")
+        elif policy == "flag_for_review":
+            if confidence >= old_conf:
+                self.store.update_belief("facts", existing["belief_id"], status="superseded",
+                                         valid_until=now, superseded_by=b_id_new)
+                self._insert_belief(kind, b_id_new, key, body, confidence, event, status="active",
+                                    source_type=_provenance_source(event))
+            else:
+                self._insert_belief(kind, b_id_new, key, body, confidence, event, status="draft",
+                                    source_type=_provenance_source(event))
+            self.store.add_justification(b_id_new, source_event, "event", "extraction")
+            self.store.open_contradiction(existing["belief_id"], b_id_new, "value conflict")
+            self.store.update_belief("facts", existing["belief_id"],
+                                     contradiction_count=(existing.get("contradiction_count") or 0) + 1)
+            self._recompute_confidence("facts", existing["belief_id"])
+        else:  # general → refresh, not a conflicting fact
+            self.store.update_belief("facts", existing["belief_id"], last_seen_at=now)
+
+    # -- helpers -----------------------------------------------------------
+
+    def _find_existing(self, kind, key, owner, domain):
+        table = _table_for(kind)
         if table is None:
             return None
-
         if kind == "fact":
-            entity_id = key.get("entity_id", "")
-            pred = key.get("predicate_canonical", "")
-            qh = key.get("qualifiers_hash", "")
             rows = self.store.query_beliefs(
-                table,
-                "entity_id=? AND predicate_canonical=? AND qualifiers_hash=? AND owner=? AND domain=? AND status='active'",
-                (entity_id, pred, qh, owner, domain)
-            )
+                "facts",
+                "entity_id=? AND predicate_canonical=? AND qualifiers_hash=? AND owner=? AND domain=? "
+                "AND status='active'",
+                (key.get("entity_id", ""), key.get("predicate_canonical", ""),
+                 key.get("qualifiers_hash", ""), owner, domain), limit=1)
             return rows[0] if rows else None
-
+        if kind == "note":
+            bh = hash_str(key["body"]) if "body" in key else key.get("body_hash", "")
+            rows = self.store.query_beliefs(
+                "notes", "note_type=? AND subject=? AND body_hash=? AND owner=? AND domain=? "
+                "AND status='active'",
+                (key.get("note_type", "belief"), key.get("subject", ""), bh, owner, domain), limit=1)
+            return rows[0] if rows else None
+        if kind == "entity":
+            rows = self.store.query_beliefs(
+                "entities", "normalized_name=? AND type=? AND owner=? AND domain=?",
+                (key.get("normalized_name", key.get("name", "").lower()),
+                 key.get("entity_type", key.get("type", "")), owner, domain), limit=1)
+            return rows[0] if rows else None
         return None
 
-    def _insert_belief(self, kind: str, b_id: str, key: dict, body: str,
-                       confidence: float, event: dict, status: str = "active",
-                       source_type: str = "extraction"):
-        """Insert a belief into the appropriate table."""
-        now = event.get("recorded_at", "")
+    def _ensure_entity(self, entity_id, name, owner, domain, event):
+        if not entity_id:
+            return
+        ent = self.store.get_belief("entities", entity_id)
+        if ent:
+            self.store.update_belief("entities", entity_id, fact_count=(ent.get("fact_count", 0) + 1))
+            return
+        now = event.get("recorded_at") or now_iso()
+        self.store.upsert_belief("entities", {
+            "belief_id": entity_id, "type": "", "name": name or entity_id,
+            "normalized_name": (name or entity_id).lower(), "aliases": "[]", "domain": domain,
+            "owner": owner, "read_acl": access.DEFAULT_ACL, "fact_count": 1, "relationship_count": 0,
+            "created_at": now, "last_seen_at": now})
+
+    def _insert_belief(self, kind, b_id, key, body, confidence, event, status="active",
+                       source_type="extraction", extras=None):
+        now = event.get("recorded_at") or now_iso()
         owner = event.get("owner", "default")
-        domain = event.get("domain", "general")
+        domain = event.get("domain") or "general"
         trust = event.get("trust_level", 2)
-        provenance = json.dumps({
-            "source_type": source_type,
-            "source_event": event.get("event_id", ""),
-            "extracted_by": "chronicle-v5",
-            "extracted_at": now,
-        })
+        extras = extras or {}
+        p = _payload(event)
+        provenance = json.dumps({"source_type": source_type, "source_event": event.get("event_id", ""),
+                                 "extracted_by": "chronicle-v5", "extracted_at": now})
+        crit, crit_reason = classify_criticality(body, kind, key.get("note_type", ""))
+        salience = event.get("salience") or key.get("salience", "normal")
 
         if kind == "fact":
-            belief = {
-                "belief_id": b_id,
-                "entity_id": key.get("entity_id", ""),
-                "attribute": key.get("attribute", ""),
-                "predicate_canonical": key.get("predicate_canonical", ""),
-                "value": body,
-                "value_type": "string",
+            self._ensure_entity(key.get("entity_id", ""), key.get("entity_name"), owner, domain, event)
+            vnum, vts = _typed_value(body)
+            self.store.upsert_belief("facts", {
+                "belief_id": b_id, "entity_id": key.get("entity_id", ""),
+                "attribute": key.get("attribute", key.get("predicate_canonical", "")),
+                "predicate_canonical": key.get("predicate_canonical", ""), "value": body,
+                "value_type": "number" if vnum is not None else "string", "value_num": vnum, "value_ts": vts,
                 "qualifiers": json.dumps(key.get("qualifiers", {})),
                 "qualifiers_hash": key.get("qualifiers_hash", ""),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "salience": "normal",
-                "criticality": "normal", "confidence": confidence,
-                "trust_level": trust, "valid_from": now,
-                "created_at": now, "last_seen_at": now,
+                "extractor_version": p.get("extractor_version", ""), "domain": domain, "owner": owner,
+                "read_acl": access.DEFAULT_ACL, "status": status, "salience": salience, "criticality": crit,
+                "criticality_reason": crit_reason, "confidence": confidence, "trust_level": trust,
+                "valid_from": p.get("valid_from", now), "created_at": now, "last_seen_at": now,
                 "fidelity": "verbatim", "utility": 0,
-                "purpose_scope": '["*"]', "provenance": provenance,
-                "verification": '{"status":"unverified"}',
-            }
-            self.store.upsert_belief("facts", belief)
+                "purpose_scope": json.dumps(p.get("purpose_scope", ["*"])), "provenance": provenance,
+                "verification": '{"status":"unverified"}', "rule_id": extras.get("rule_id"),
+                "premises": extras.get("premises")})
         elif kind == "episode":
-            belief = {
-                "belief_id": b_id, "title": key.get("title", ""),
-                "summary": body, "occurred_at": key.get("occurred_at", now),
-                "session_ref": key.get("session_ref", ""),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "salience": "normal",
-                "criticality": "normal", "confidence": confidence,
-                "trust_level": trust, "valid_from": now,
-                "created_at": now, "last_seen_at": now,
-                "fidelity": "verbatim", "utility": 0,
-                "purpose_scope": '["*"]', "provenance": provenance,
-            }
-            self.store.upsert_belief("episodes", belief)
+            self.store.upsert_belief("episodes", {
+                "belief_id": b_id, "title": key.get("title", body[:60]), "summary": body,
+                "participants": json.dumps(key.get("participants", [])),
+                "occurred_at": key.get("occurred_at", now), "session_ref": key.get("session_ref", ""),
+                "domain": domain, "owner": owner, "read_acl": access.DEFAULT_ACL, "status": status,
+                "salience": salience, "criticality": crit, "criticality_reason": crit_reason,
+                "confidence": confidence, "trust_level": trust, "valid_from": now, "created_at": now,
+                "last_seen_at": now, "fidelity": "verbatim", "utility": 0, "purpose_scope": '["*"]',
+                "provenance": provenance})
         elif kind == "note":
-            import hashlib
-            body_hash = hashlib.blake2b(body.encode(), digest_size=16).hexdigest()
-            belief = {
-                "belief_id": b_id,
-                "note_type": key.get("note_type", "belief"),
-                "subject": key.get("subject", ""),
-                "body": body, "body_hash": body_hash,
-                "imperative": key.get("imperative", 0),
-                "always_inject": key.get("always_inject", 0),
-                "risk_tier": key.get("risk_tier", "low"),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "salience": "normal",
-                "criticality": "normal", "confidence": confidence,
-                "trust_level": trust, "valid_from": now,
-                "created_at": now, "last_seen_at": now,
-                "fidelity": "verbatim", "utility": 0,
-                "purpose_scope": '["*"]', "provenance": provenance,
-            }
-            self.store.upsert_belief("notes", belief)
+            note_type = key.get("note_type", "belief")
+            always = 1 if (note_type == "norm" or key.get("always_inject")) else 0
+            self.store.upsert_belief("notes", {
+                "belief_id": b_id, "note_type": note_type, "subject": key.get("subject", ""),
+                "body": body, "body_hash": hash_str(body),
+                "imperative": 1 if note_type == "norm" else key.get("imperative", 0),
+                "always_inject": always, "risk_tier": key.get("risk_tier", "low"), "domain": domain,
+                "owner": owner, "read_acl": access.DEFAULT_ACL, "status": status,
+                "salience": "pinned" if always else salience,
+                "criticality": "high" if always and crit == "normal" else crit,
+                "criticality_reason": crit_reason or ("directive" if always else ""),
+                "confidence": confidence, "trust_level": trust, "valid_from": now, "created_at": now,
+                "last_seen_at": now, "fidelity": "verbatim", "utility": 0, "purpose_scope": '["*"]',
+                "provenance": provenance})
         elif kind == "entity":
-            belief = {
-                "belief_id": b_id,
-                "type": key.get("entity_type", ""),
-                "name": key.get("name", ""),
-                "normalized_name": key.get("normalized_name", key.get("name", "").lower()),
-                "aliases": json.dumps(key.get("aliases", [])),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "fact_count": 0, "relationship_count": 0,
-                "created_at": now, "last_seen_at": now,
-            }
-            self.store.upsert_belief("entities", belief)
+            self.store.upsert_belief("entities", {
+                "belief_id": b_id, "type": key.get("entity_type", key.get("type", "")),
+                "name": key.get("name", body),
+                "normalized_name": key.get("normalized_name", key.get("name", body).lower()),
+                "aliases": json.dumps(key.get("aliases", [])), "domain": domain, "owner": owner,
+                "read_acl": access.DEFAULT_ACL, "external_ref": key.get("external_ref"),
+                "external_provider": key.get("external_provider"), "fact_count": 0,
+                "relationship_count": 0, "created_at": now, "last_seen_at": now})
         elif kind == "relationship":
-            belief = {
-                "belief_id": b_id,
-                "source_id": key.get("source_id", ""),
-                "predicate": key.get("predicate", ""),
-                "target_id": key.get("target_id", ""),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "confidence": confidence,
-                "trust_level": trust, "valid_from": now,
-                "created_at": now, "provenance": provenance,
-            }
-            self.store.upsert_belief("relationships", belief)
+            self.store.upsert_belief("relationships", {
+                "belief_id": b_id, "source_id": key.get("source_id", ""),
+                "predicate": key.get("predicate", ""), "target_id": key.get("target_id", ""),
+                "external_ref": key.get("external_ref"), "domain": domain, "owner": owner,
+                "read_acl": access.DEFAULT_ACL, "status": status, "salience": salience,
+                "confidence": confidence, "trust_level": trust, "valid_from": now, "created_at": now,
+                "last_seen_at": now, "purpose_scope": '["*"]', "provenance": provenance,
+                "rule_id": extras.get("rule_id"), "premises": extras.get("premises")})
         elif kind == "procedure":
-            belief = {
-                "belief_id": b_id,
-                "name": key.get("name", ""),
-                "params": json.dumps(key.get("params", [])),
+            self.store.upsert_belief("procedures", {
+                "belief_id": b_id, "name": key.get("name", ""), "params": json.dumps(key.get("params", [])),
                 "steps": json.dumps(key.get("steps", [])),
-                "success_criteria": json.dumps(key.get("success_criteria", [])),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "confidence": confidence,
-                "trust_level": trust, "created_at": now, "last_seen_at": now,
-                "purpose_scope": '["*"]', "provenance": provenance,
-            }
-            self.store.upsert_belief("procedures", belief)
+                "success_criteria": json.dumps(key.get("success_criteria", [])), "domain": domain,
+                "owner": owner, "read_acl": access.DEFAULT_ACL, "status": status, "salience": salience,
+                "confidence": confidence, "trust_level": trust, "valid_from": now, "created_at": now,
+                "last_seen_at": now, "purpose_scope": '["*"]', "provenance": provenance})
         elif kind == "reference":
-            belief = {
-                "belief_id": b_id,
-                "topic": key.get("topic", ""),
-                "domain": domain, "owner": owner, "read_acl": "user_agents",
-                "status": status, "trust_level": trust,
-                "created_at": now, "purpose_scope": '["*"]',
-                "provenance": provenance,
-            }
-            self.store.upsert_belief("refs", belief)
+            self.store.upsert_belief("refs", {
+                "belief_id": b_id, "topic": key.get("topic", ""), "cached_summary": body,
+                "ttl_days": key.get("ttl_days", 30), "domain": domain, "owner": owner,
+                "read_acl": access.DEFAULT_ACL, "status": status, "confidence": confidence,
+                "trust_level": trust, "valid_from": now, "created_at": now, "last_seen_at": now,
+                "purpose_scope": '["*"]', "provenance": provenance})
 
-    def _confirm_belief(self, existing: dict, event: dict):
-        """Increment confirm_count and raise confidence."""
-        b_id = existing["belief_id"]
-        new_count = existing.get("confirm_count", 0) + 1
-        old_conf = existing.get("confidence", 0.8)
-        # raw = base + 0.05 * min(confirm_count, 5)
-        new_conf = min(old_conf + 0.05 * min(new_count, 5), 1.0)
-        now = event.get("recorded_at", "")
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE facts SET confirm_count=?, confidence=?, last_confirmed_at=? WHERE belief_id=?",
-                (new_count, new_conf, now, b_id)
-            )
+        if self.embedder is not None and kind in ("fact", "episode", "note", "reference", "procedure"):
+            from .embeddings import pack
+            text = body or key.get("name", "") or key.get("topic", "")
+            self.store.add_memory_vector(b_id, kind, pack(self.embedder.embed(text)), self.embedder.model)
 
-    def _confirm_belief_by_id(self, b_id: str, source_event: str, event: dict):
-        row = self.store.get_belief("facts", b_id)
-        if row:
-            self._confirm_belief(row, event)
+    def _confirm(self, b_id, table, source_event, event):
+        row = self.store.get_belief(table, b_id)
+        if not row:
+            return
+        if "confirm_count" in row:
+            self.store.update_belief(table, b_id, confirm_count=(row.get("confirm_count") or 0) + 1,
+                                     last_confirmed_at=event.get("recorded_at"))
+        self._recompute_confidence(table, b_id)
 
-    def _supersede_belief(self, existing: dict, new_b_id: str, event: dict):
-        """Supersede old belief with new."""
-        old_id = existing["belief_id"]
-        now = event.get("recorded_at", "")
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE facts SET status='superseded', valid_until=?, superseded_by=? WHERE belief_id=?",
-                (now, new_b_id, old_id)
-            )
+    def _recompute_confidence(self, table, b_id):
+        row = self.store.get_belief(table, b_id)
+        if not row or "confidence" not in row:
+            return
+        st = json.loads(row.get("provenance") or "{}").get("source_type", "session_transcript")
+        corroborated = (row.get("confirm_count") or 0) >= 1
+        raw = raw_confidence(st, row.get("confirm_count") or 0, row.get("contradiction_count") or 0)
+        conf = clamp_to_ceiling(raw, row.get("trust_level") or 2, corroborated)
+        self.store.update_belief(table, b_id, confidence=conf)
 
-    def _supersede_belief_by_id(self, b_id: str, event: dict):
-        now = event.get("recorded_at", "")
-        with self.store.transaction() as conn:
-            conn.execute(
-                "UPDATE facts SET status='superseded', valid_until=? WHERE belief_id=?",
-                (now, b_id)
-            )
+    def _retract(self, b_id):
+        found = self.store.find_belief(b_id)
+        if found and found[0] in BELIEF_TABLES:
+            self.store.update_belief(found[0], b_id, status="retracted")
+        else:
+            self.store.update_belief_all_tables(b_id, status="retracted")
+        self.store.delete_justifications(b_id)
 
-    def _open_contradiction(self, existing_id: str, new_id: str, event: dict):
-        """Open a contradiction record."""
-        logger.info(f"Contradiction: existing={existing_id} vs new={new_id}")
+    def _cascade(self, b_id):
+        """Revision cascade (§9.3, I5, I24d): retract dependents that lose support.
 
-    def _cascade_revision(self, b_id: str):
-        """Retraction cascade (§9.3): retract all beliefs depending on b_id."""
-        dependents = self.store.get_dependents(b_id)
-        for dep in dependents:
-            dep_b_id = dep["belief_id"]
-            # Check if remaining supports still satisfy the rule
-            remaining = self.store.get_justifications(dep_b_id)
-            remaining_supports = [r for r in remaining if r["support"] != b_id]
-            if not remaining_supports:
-                # Retract
-                with self.store.transaction() as conn:
-                    for table in ["facts", "episodes", "notes", "refs", "relationships", "procedures"]:
-                        conn.execute(f"UPDATE {table} SET status='retracted' WHERE belief_id=?",
-                                     (dep_b_id,))
-                # Record correction
-                import datetime, uuid
-                now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-                with self.store.transaction() as conn:
-                    conn.execute(
-                        "INSERT INTO corrections(id, belief_id, reason, correction_ref, propagated, created_at) "
-                        "VALUES(?,?,?,?,?,?)",
-                        (str(uuid.uuid4()), dep_b_id, "cascade_from_retraction", b_id,
-                         json.dumps([b_id]), now)
-                    )
-                # Recurse
-                self._cascade_revision(dep_b_id)
+        A rule-derived belief is a conjunction of its premises, so losing ANY one
+        premise retracts it. An ordinary belief with several independent supports
+        survives while ≥1 real support remains."""
+        for dep in self.store.get_dependents(b_id):
+            dep_id = dep["belief_id"]
+            if dep_id == b_id:
+                continue
+            rule = dep.get("rule") or ""
+            derived_dep = rule not in ("", "extraction", "confirmation")
+            if derived_dep:
+                self._retract(dep_id)
+                self.store.record_correction(dep_id, "cascade_premise_retracted", b_id, [b_id])
+                self._cascade(dep_id)
+                continue
+            remaining = [j for j in self.store.get_justifications(dep_id) if j["support"] != b_id]
+            real = [j for j in remaining if j["support_kind"] != "assumption"]
+            if not real:
+                self._retract(dep_id)
+                self.store.record_correction(dep_id, "cascade_from_retraction", b_id, [b_id])
+                self._cascade(dep_id)
+
+    def _beliefs_matching_hash(self, content_hash):
+        out = [r["belief_id"] for r in self.store.query_beliefs("notes", "body_hash=?", (content_hash,), limit=1000)]
+        for row in self.store.query_beliefs("facts", "1=1", (), limit=5000):
+            if hash_str(row.get("value", "")) == content_hash:
+                out.append(row["belief_id"])
+        return out
+
+
+# -- module helpers -------------------------------------------------------
+
+def _payload(event) -> dict:
+    p = event.get("payload", "{}")
+    if isinstance(p, str):
+        try:
+            return json.loads(p)
+        except Exception:
+            return {}
+    return p or {}
+
+
+def _provenance_source(event) -> str:
+    p = _payload(event)
+    if p.get("source_type"):
+        return p["source_type"]
+    actor = event.get("actor", "agent")
+    return {"user": "user_direct", "agent": "session_transcript",
+            "curator": "inference", "system": "session_transcript"}.get(actor, "session_transcript")
+
+
+def _table_for(kind):
+    return KIND_TABLE.get(kind)
+
+
+def _typed_value(body):
+    s = (body or "").strip()
+    try:
+        if s and s.replace(".", "", 1).replace("-", "", 1).isdigit():
+            return (float(s), None)
+    except Exception:
+        pass
+    return (None, None)
+
+
+from .config import TRUST_CEILING  # noqa: E402,F401  (back-compat for tests)

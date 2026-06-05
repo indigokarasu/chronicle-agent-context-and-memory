@@ -7,11 +7,14 @@ name = "chronicle-plugin"
 version = "5.0.0"
 description = "Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# BLAKE3-256 is the spec's content-addressing hash (§5.2). Without it the build
+# falls back to BLAKE2b-256 (set CHRONICLE_REQUIRE_BLAKE3=1 to require BLAKE3).
+hash = ["blake3>=0.4"]
+dev = ["pytest>=8.0", "blake3>=0.4"]
 
 [tool.setuptools.packages.find]
 include = ["engine*", "plugins*"]
