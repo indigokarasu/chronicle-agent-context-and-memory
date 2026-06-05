@@ -37,7 +37,13 @@ logger = logging.getLogger("chronicle.core")
 
 class ChronicleCore:
     _instances = {}
+    _active = None        # most-recently-created core (for slash-command handlers)
     _lock = threading.Lock()
+
+    @classmethod
+    def active(cls):
+        """The live core for the current process (typically the only one)."""
+        return cls._active or (next(iter(cls._instances.values())) if cls._instances else None)
 
     def __init__(self, hermes_home: str, config: Optional[dict] = None):
         self.hermes_home = hermes_home
@@ -77,6 +83,7 @@ class ChronicleCore:
                              reap_threshold=self.cfg.get("reaper.reap_threshold", "45m"))
 
         self._seed()
+        ChronicleCore._active = self
         logger.info("ChronicleCore initialized at %s (hash=%s)", db_path, _hash_name())
 
     def _seed(self):
