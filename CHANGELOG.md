@@ -3,6 +3,18 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.3.3
+
+- Fix: context engine not loading ("Context engine 'chronicle' loaded but no
+  engine instance found" → fell back to the built-in compressor). The
+  context-engine loader's subclass-fallback path scans the module for a
+  ContextEngine subclass, but the classes were only imported lazily inside
+  register(). Now ChronicleContextEngine / ChronicleMemoryProvider are exposed at
+  package top level so that path finds them.
+- Hardened register(ctx): each slot (memory / context / command) is registered
+  independently, so a loader collector that rejects command registration can no
+  longer discard an already-registered context engine.
+
 ## 5.3.2
 
 - Added a user-facing **`/chronicle`** slash command (registered via the general
