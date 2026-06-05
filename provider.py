@@ -1,9 +1,14 @@
 """
 Chronicle — Memory Provider plugin (Hermes memory-provider slot).
 
-Long-term memory: capture + recall. Methods map 1:1 to the §12.3 hook table and
-delegate to the shared `ChronicleCore`. `sync_turn` is the durability anchor
-(I12); `on_pre_compress` yields to the Context Engine when it is active (§13.4).
+Long-term memory: capture + recall. Subclasses `agent.memory_provider.MemoryProvider`
+and delegates to the shared `ChronicleCore`. `sync_turn` is the non-blocking
+durability anchor; `on_pre_compress` yields to the Context Engine when it is
+active. Registered via `register(ctx)` in this package's `__init__.py`.
+
+Imports are dual-mode: relative when loaded as a plugin package (the Hermes
+loader registers a synthetic parent package), absolute when imported top-level
+for local development and tests.
 """
 
 from __future__ import annotations
@@ -13,12 +18,23 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-try:  # real Hermes base when present, else a local stand-in
+try:  # real Hermes base when present …
     from agent.memory_provider import MemoryProvider  # type: ignore
-except Exception:  # pragma: no cover
-    from ._base import MemoryProvider
+except Exception:  # … else a local stand-in (plugin-package or top-level)
+    try:
+        from ._base import MemoryProvider
+    except Exception:  # pragma: no cover
+        from _base import MemoryProvider
 
 logger = logging.getLogger("chronicle.provider")
+
+
+def _load_core():
+    try:
+        from .engine.core import ChronicleCore  # plugin-package context
+    except Exception:
+        from engine.core import ChronicleCore   # top-level (dev/tests)
+    return ChronicleCore
 
 
 class ChronicleMemoryProvider(MemoryProvider):
@@ -30,11 +46,13 @@ class ChronicleMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._principal_id = "default"
 
+    # -- lifecycle ---------------------------------------------------------
+
     def is_available(self) -> bool:
-        return self.core.local_ok() if self.core else True
+        return self.core.local_ok() if self.core else True  # no network
 
     def initialize(self, session_id, *, hermes_home=None, principal_id="default", config=None, **kw):
-        from engine.core import ChronicleCore
+        ChronicleCore = _load_core()
         hermes_home = hermes_home or str(Path.home() / ".hermes")
         self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
@@ -43,9 +61,32 @@ class ChronicleMemoryProvider(MemoryProvider):
         self.scope = self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
         logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
-    # capture (§12.3)
-    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+    def shutdown(self):
         if self.core:
+            self.core.capture.flush_best_effort()
+            self.core.flush_git()
+
+    # -- config (setup wizard) --------------------------------------------
+
+    def get_config_schema(self):
+        return [
+            {"key": "db_path", "description": "SQLite database location",
+             "default": "~/.hermes/commons/db/chronicle/chronicle.db", "secret": False, "required": False},
+            {"key": "git_repo", "description": "Git mirror directory for the event log",
+             "default": "~/.hermes/commons/db/chronicle/git", "secret": False, "required": False},
+            {"key": "embeddings_model", "description": "Embedding model (offline hashing default if unset)",
+             "default": "embeddinggemma-300m", "secret": False, "required": False},
+        ]
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        cfg_path = Path(hermes_home) / "chronicle.json"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(values, indent=2))
+
+    # -- capture -----------------------------------------------------------
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+        if self.core:  # MUST be non-blocking — one local append, no network
             self.core.capture.observe(user_content, assistant_content,
                                       session_id=session_id or self._session_id, messages=messages)
 
@@ -53,7 +94,7 @@ class ChronicleMemoryProvider(MemoryProvider):
         if not self.core:
             return ""
         if self.core.has_context_engine:
-            return ""  # the Context Engine owns compression (§13.4)
+            return ""  # the Context Engine owns compression when active
         _, summary = self.core.capture.rescue(messages, session_id=self._session_id)
         return summary
 
@@ -81,7 +122,8 @@ class ChronicleMemoryProvider(MemoryProvider):
                                                 self._principal_id)
             self._session_id = new_session_id
 
-    # recall (§12.3)
+    # -- recall ------------------------------------------------------------
+
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
             return ""
@@ -102,8 +144,3 @@ class ChronicleMemoryProvider(MemoryProvider):
         if not self.core:
             return json.dumps({"error": "Chronicle not initialized"})
         return self.core.tools.dispatch(self._principal_id, tool_name, args)
-
-    def shutdown(self):
-        if self.core:
-            self.core.capture.flush_best_effort()
-            self.core.flush_git()

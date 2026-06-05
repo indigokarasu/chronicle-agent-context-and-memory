@@ -8,7 +8,7 @@ Replaces: ocas-elephas skill. Version: 5.0.0.
 
 ## 🤖 If you are an agent: how to install & set up
 
-> Read this first if you're an AI agent installing or wiring up Chronicle. It is self-contained and matches the actual code in `engine/` and `plugins/`.
+> Read this first if you're an AI agent installing or wiring up Chronicle. It is self-contained and matches the actual code — the `engine/` core plus the root `provider.py` / `context.py` adapters and the `register(ctx)` in `__init__.py`.
 
 **What you're installing.** Two Hermes plugins over one shared in-process core (`ChronicleCore`): a **memory provider** (long-term memory) and a **context engine** (working memory). Either runs without the other. Pure Python standard library — no required dependencies, no network, no model server.
 
@@ -26,18 +26,23 @@ pip install -e .            # add ".[dev]" for pytest, ".[hash]" for spec-exact 
 
 Requires **Python ≥ 3.9**. Without the optional `blake3` package, content addressing falls back to BLAKE2b-256 (set `CHRONICLE_REQUIRE_BLAKE3=1` to require BLAKE3).
 
-**2. Register both slots.** `plugin.yaml` already declares them:
+**2. Both slots register automatically.** `__init__.py` exposes a `register(ctx)`
+that the Hermes loader calls; it registers **both** slots from the one shared core:
 
-```yaml
-memory_provider: plugins.memory_provider:ChronicleMemoryProvider
-context_engine:  plugins.context_engine:ChronicleContextEngine
+```python
+def register(ctx):
+    if hasattr(ctx, "register_memory_provider"):
+        ctx.register_memory_provider(ChronicleMemoryProvider())
+    if hasattr(ctx, "register_context_engine"):
+        ctx.register_context_engine(ChronicleContextEngine())
 ```
 
-In `~/.hermes/config.yaml`, the minimal config is just:
+Then activate them in `~/.hermes/config.yaml` (each slot is single-select):
 
 ```yaml
 memory:  { provider: chronicle }   # everything else has safe defaults (engine/config.py)
 context: { engine: chronicle }     # optional — enables memory-aware compression
+plugins: { enabled: [chronicle] }  # if not auto-enabled on install
 ```
 
 **3. First run is zero-setup.** On the first `initialize(...)` the SQLite database and full schema are created automatically at `~/.hermes/commons/db/chronicle/chronicle.db`. There is no migration or `createdb` step. Startup recovery + the reaper finalize any sessions left by a crash.
@@ -185,11 +190,14 @@ Tests run against an in-memory SQLite database. No external services needed.
 ## Project structure
 
 ```
-chronicle-plugin/
-  __init__.py          # Package init, version
-  pyproject.toml       # Package metadata
-  plugin.yaml          # Hermes plugin manifest (both slots)
-  engine/              # Core modules (shared by both plugins)
+chronicle/             # installs to ~/.hermes/plugins/chronicle/
+  __init__.py          # plugin entry: register(ctx) registers both slots + __version__
+  provider.py          # ChronicleMemoryProvider (memory-provider slot)
+  context.py           # ChronicleContextEngine (context-engine slot, I17)
+  _base.py             # minimal ABCs so the adapters import offline (dev/tests)
+  plugin.yaml          # Hermes plugin manifest (name/version/description/hooks)
+  pyproject.toml       # dev/test metadata
+  engine/              # shared core (relative-imported by both slots)
     core.py            # ChronicleCore singleton + Scope, wires every subsystem (§11)
     config.py          # Configuration reference + defaults (§27)
     serialize.py       # CJSON + content addressing, BLAKE3/BLAKE2b (§5)
@@ -212,10 +220,6 @@ chronicle-plugin/
     embeddings.py      # Pluggable embedder + offline default (§24.4)
     tools.py           # Full agent tool surface (§23)
     errors.py          # Error codes (§32)
-  plugins/             # Hermes plugin adapters
-    memory_provider.py # ChronicleMemoryProvider (memory-provider slot)
-    context_engine.py  # ChronicleContextEngine (context-engine slot, I17)
-    _base.py           # Minimal ABCs for offline import/testing
   tests/
     test_build.py      # Unit + property tests P1–P21 + worked examples B.1–B.6
 ```

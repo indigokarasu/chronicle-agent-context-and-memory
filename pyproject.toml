@@ -16,5 +16,11 @@ dependencies = []
 hash = ["blake3>=0.4"]
 dev = ["pytest>=8.0", "blake3>=0.4"]
 
+# Chronicle installs as a Hermes plugin via `hermes plugins install
+# indigokarasu/chronicle-agent-context-and-memory` (cloned to ~/.hermes/plugins/);
+# this metadata is for local dev installs (`pip install -e .`) and tooling.
+[tool.setuptools]
+py-modules = ["provider", "context", "_base"]
+
 [tool.setuptools.packages.find]
-include = ["engine*", "plugins*"]
+include = ["engine*"]
