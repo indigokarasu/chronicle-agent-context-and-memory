@@ -59,31 +59,83 @@ class HashingEmbedder:
         return vec
 
 
-def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None) -> "Embedder":
+# Local embedding servers probed when no explicit base_url is configured.
+# OpenAI-compatible /v1/embeddings (LM Studio, Ollama ≥0.1.39, llama.cpp, …).
+_DEFAULT_ENDPOINTS = [
+    "http://localhost:1234/v1",    # LM Studio
+    "http://localhost:11434/v1",   # Ollama (OpenAI-compatible)
+    "http://127.0.0.1:8080/v1",    # llama.cpp server
+]
+
+
+class OpenAICompatEmbedder:
+    """Calls a local OpenAI-compatible ``/v1/embeddings`` endpoint (stdlib only)."""
+
+    def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = ""):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.dimensions = dimensions
+        self.api_key = api_key or ""
+
+    def embed(self, text: str) -> List[float]:
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"model": self.model, "input": text or ""}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.base_url + "/embeddings", data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        vec = data["data"][0]["embedding"]
+        if not isinstance(vec, list) or not vec:
+            raise ValueError("empty embedding")
+        return [float(x) for x in vec]
+
+    def healthcheck(self) -> bool:
+        v = self.embed("ok")
+        if self.dimensions != len(v):
+            self.dimensions = len(v)  # trust the server's real dimensionality
+        return True
+
+
+def _candidate_urls(base_url: Optional[str]) -> List[str]:
+    import os
+    if base_url:
+        return [base_url]
+    env = os.environ.get("CHRONICLE_EMBED_BASE_URL")
+    if env:
+        return [env]
+    return list(_DEFAULT_ENDPOINTS)
+
+
+def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
+                 base_url: Optional[str] = None, api_key: Optional[str] = None) -> "Embedder":
     """Return the active embedder.
 
-    The offline HashingEmbedder is the default and the always-available fallback
-    (no model, no network). A real model is used only if its runtime actually
-    loads; otherwise we log and fall back to hashing — so configuring a model
-    name never silently breaks retrieval.
+    Default assumption is a **local model** (e.g. embeddinggemma-300m) served over
+    an OpenAI-compatible ``/v1/embeddings`` endpoint. We auto-detect a running
+    local server (configured base_url / $CHRONICLE_EMBED_BASE_URL, else common
+    LM Studio / Ollama / llama.cpp ports). If none is reachable we fall back to
+    the built-in offline HashingEmbedder with a warning — so retrieval (FTS +
+    vectors) never hard-breaks and the box still works without a model running.
     """
-    dims = int(dimensions) if dimensions else 256
-    name = (model or "hashing").strip().lower()
+    dims = int(dimensions) if dimensions else 768
+    name = (model or "").strip().lower()
     if name in _HASHING_NAMES:
-        return HashingEmbedder(dimensions=dims)
-    try:
-        return _load_model_embedder(model, dims)
-    except Exception as e:
-        logger.warning("embedding model %r unavailable (%s); using offline hashing embedder", model, e)
-        return HashingEmbedder(dimensions=dims)
-
-
-def _load_model_embedder(model: str, dims: int) -> "Embedder":
-    """Pluggable hook for a real local embedder (sentence-transformers, an Ollama
-    endpoint, etc.). Not bundled — raises so callers fall back to hashing. Wire a
-    real loader here to enable model-based embeddings without touching the rest
-    of the pipeline (§24.4)."""
-    raise RuntimeError("no local embedding runtime configured")
+        return HashingEmbedder(dimensions=int(dimensions) if dimensions else 256)
+    for url in _candidate_urls(base_url):
+        try:
+            emb = OpenAICompatEmbedder(url, model, dims, api_key or "")
+            if emb.healthcheck():
+                logger.info("Chronicle embeddings: local model %r via %s (dim %d)", model, url, emb.dimensions)
+                return emb
+        except Exception:
+            continue  # connection refused / model not loaded → try next / fall back
+    logger.warning("Chronicle embeddings: local model %r unreachable on %s; "
+                   "using offline hashing embedder (set embeddings.base_url or start the server)",
+                   model, ", ".join(_candidate_urls(base_url)))
+    return HashingEmbedder(dimensions=dims)
 
 
 def _stable_hash(s: str) -> int:

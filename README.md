@@ -4,13 +4,13 @@ Two plugins, one core. A local-first memory system for Hermes Agent.
 
 **ChronicleMemoryProvider** persists conversation history, facts, and agent knowledge across sessions using an event-sourced SQLite store. **ChronicleContextEngine** replaces the default context compressor with memory-aware compaction that evicts only durable spans and re-injects relevant long-term memory.
 
-Version: 5.1.1.
+Version: 5.2.0.
 
 ## 🤖 If you are an agent: how to install & set up
 
 > Read this first if you're an AI agent installing or wiring up Chronicle. It is self-contained and matches the actual code — the `engine/` core plus the root `provider.py` / `context.py` adapters and the `register(ctx)` in `__init__.py`.
 
-**What you're installing.** Two Hermes plugins over one shared in-process core (`ChronicleCore`): a **memory provider** (long-term memory) and a **context engine** (working memory). Either runs without the other. Pure Python standard library — no required dependencies, no network, no model server.
+**What you're installing.** Two Hermes plugins over one shared in-process core (`ChronicleCore`): a **memory provider** (long-term memory) and a **context engine** (working memory). Either runs without the other. Pure Python standard library — no required pip dependencies. Embeddings default to a **local model** (`embeddinggemma-300m` over an auto-detected OpenAI-compatible endpoint — LM Studio :1234 / Ollama :11434 / llama.cpp :8080) and **fall back to an offline hashing embedder** if no server is reachable, so it works with or without a model running.
 
 **1. Install**
 

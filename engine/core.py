@@ -53,7 +53,9 @@ class ChronicleCore:
 
         self.store = MemoryStore(db_path)
         self.embedder = get_embedder(self.cfg.get("embeddings.model"),
-                                     self.cfg.get("embeddings.dimensions"))
+                                     self.cfg.get("embeddings.dimensions"),
+                                     self.cfg.get("embeddings.base_url"),
+                                     self.cfg.get("embeddings.api_key"))
         self.reducer = Reducer(self.store, self.embedder)
         self.store.reducer = self.reducer                       # inline reduce on append (I7)
         self.capture = CaptureEngine(self.store, self.reducer,

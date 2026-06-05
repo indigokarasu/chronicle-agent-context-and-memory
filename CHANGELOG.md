@@ -3,6 +3,21 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.2.0
+
+- **Local embedding model is now the default.** Embeddings use a real local
+  model (`embeddinggemma-300m`) over an OpenAI-compatible `/v1/embeddings`
+  endpoint, auto-detected across common local servers (LM Studio :1234, Ollama
+  :11434, llama.cpp :8080) or a configured `embeddings.base_url` /
+  `$CHRONICLE_EMBED_BASE_URL`. New `OpenAICompatEmbedder` (stdlib `urllib`, no
+  new deps).
+- If no local server is reachable, Chronicle **falls back to the offline hashing
+  embedder** with a warning — retrieval (FTS + vectors) never hard-breaks, and
+  the box still works with no model running. Set `embeddings.model: hashing` to
+  force offline.
+- Setup wizard adds an `embeddings_base_url` field; `embeddings_model` now
+  defaults to the local model.
+
 ## 5.1.1
 
 - Embeddings are honest about the default: the built-in **offline hashing**

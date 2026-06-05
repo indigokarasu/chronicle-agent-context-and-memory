@@ -25,8 +25,10 @@ from engine.core import ChronicleCore
 
 
 def make_core():
+    # Force the offline hashing embedder so tests are deterministic and never
+    # probe localhost embedding servers.
     home = tempfile.mkdtemp()
-    return ChronicleCore(home), home
+    return ChronicleCore(home, {"embeddings": {"model": "hashing"}}), home
 
 
 # --------------------------------------------------------------------------
@@ -71,6 +73,15 @@ class TestSerialization(unittest.TestCase):
         v = HashingEmbedder().embed("vet in denver")
         self.assertAlmostEqual(cosine(v, v), 1.0, places=5)
         self.assertEqual(len(unpack(pack(v))), len(v))
+
+    def test_embedder_local_default_falls_back_offline(self):
+        # Local model is the default, but an unreachable endpoint must fall back
+        # to the offline hashing embedder (never hard-break retrieval).
+        from engine.embeddings import get_embedder, HashingEmbedder
+        e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
+        self.assertIsInstance(e, HashingEmbedder)
+        self.assertEqual(e.dimensions, 768)
+        self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
 
 
 # --------------------------------------------------------------------------
