@@ -74,26 +74,27 @@ class TestSerialization(unittest.TestCase):
         self.assertAlmostEqual(cosine(v, v), 1.0, places=5)
         self.assertEqual(len(unpack(pack(v))), len(v))
 
-    def test_embedder_local_default_falls_back_offline(self):
-        # Local model is the default, but an unreachable endpoint must fall back
-        # to the offline hashing embedder (never hard-break retrieval).
-        from engine.embeddings import get_embedder, HashingEmbedder
+    def test_embedder_explicit_defers_to_runtime_retry(self):
+        # An explicit model + endpoint is trusted: an unreachable endpoint at init
+        # does NOT fall back to hashing. It returns the retrying client, which
+        # waits+retries at runtime and raises on exhaustion (never hash vectors).
+        from engine.embeddings import get_embedder, HashingEmbedder, OpenAICompatEmbedder
         e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
-        self.assertIsInstance(e, HashingEmbedder)
+        self.assertIsInstance(e, OpenAICompatEmbedder)
         self.assertEqual(e.dimensions, 768)
-        # 'auto' with no reachable server also falls back to hashing
+        # 'auto' with no reachable server (nothing to trust) still falls back to hashing
         self.assertIsInstance(get_embedder("auto", 768, base_url="http://127.0.0.1:9"), HashingEmbedder)
         self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
 
-    def test_openai_embedder_runtime_resilient(self):
-        # A reachable-at-init-but-then-failing endpoint must not raise from embed()
-        # — it trips to offline hashing (same dim) instead.
+    def test_openai_embedder_retries_then_raises(self):
+        # A failing endpoint must NOT silently emit hash vectors. embed() waits +
+        # retries (bounded) and then RAISES; callers catch it and skip the vector
+        # for this item (FTS/structured retrieval continue).
         from engine.embeddings import OpenAICompatEmbedder
-        emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768)
-        v = emb.embed("hello")          # endpoint dead → must NOT raise
-        self.assertEqual(len(v), 768)
-        self.assertEqual(len(emb.embed("again")), 768)
-
+        emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768,
+                                   max_attempts=2, backoff_base=0.0, backoff_cap=0.0)
+        with self.assertRaises(Exception):
+            emb.embed("hello")
 
 # --------------------------------------------------------------------------
 # §6/§24 Event log & store

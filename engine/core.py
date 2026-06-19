@@ -96,8 +96,29 @@ class ChronicleCore:
     def get(cls, hermes_home: str, config=None) -> "ChronicleCore":
         with cls._lock:
             if hermes_home not in cls._instances:
+                if config is None:
+                    config = cls._load_memory_config(hermes_home)
                 cls._instances[hermes_home] = cls(hermes_home, config)
             return cls._instances[hermes_home]
+
+    @staticmethod
+    def _load_memory_config(hermes_home: str) -> dict:
+        """The host's initialize_all() does not hand Chronicle a config dict, so
+        load the ``memory:`` section from ``<hermes_home>/config.yaml`` ourselves.
+        This is what makes embeddings/retrieval settings (e.g. a hosted embeddings
+        endpoint) actually take effect at runtime, matching embedding_check.py."""
+        try:
+            import yaml
+            p = Path(hermes_home) / "config.yaml"
+            if p.exists():
+                raw = yaml.safe_load(p.read_text()) or {}
+                mem = raw.get("memory")
+                if isinstance(mem, dict):
+                    return mem
+        except Exception as e:
+            logger.warning("Chronicle: could not load memory config from %s/config.yaml: %s",
+                           hermes_home, e)
+        return {}
 
     # -- lifecycle ---------------------------------------------------------
 

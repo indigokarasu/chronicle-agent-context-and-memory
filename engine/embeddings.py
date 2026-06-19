@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import re
 import struct
+import time
 from typing import List, Optional, Protocol
 
 logger = logging.getLogger("chronicle.embeddings")
@@ -72,24 +74,32 @@ _DEFAULT_ENDPOINTS = [
 
 
 class OpenAICompatEmbedder:
-    """Calls a local OpenAI-compatible ``/v1/embeddings`` endpoint (stdlib only).
+    """Calls an OpenAI-compatible ``/v1/embeddings`` endpoint (stdlib only).
 
     `healthcheck()` is strict (raises) so init can decide real-model vs hashing.
-    `embed()` is resilient: it NEVER raises at runtime — on the first failure
-    (server died, timeout, a model that doesn't actually support embeddings, a
-    rejected input) it trips permanently to an offline hashing embedder (same
-    dimensionality) for the rest of the session and logs once. Callers — including
-    the durable capture path — therefore can't be broken by the embedding backend;
-    FTS retrieval continues regardless.
+
+    `embed()` is resilient WITHOUT degrading quality: on a transient failure
+    (rate-limit 429, timeout, 5xx, a server blip) it WAITS with exponential
+    backoff + jitter and RETRIES the same endpoint, up to `max_attempts`. It does
+    NOT fall back to offline hashing — hash vectors live in a different, incomparable
+    geometry and silently poison the store. If every attempt in the budget fails it
+    RAISES; every caller already catches that and simply skips the vector for this
+    item (FTS + structured retrieval continue), and the embed is retried fresh on
+    the next operation, so a transient outage never pins the whole session to a
+    degraded embedder. Auth failures (401/403) are terminal and raised immediately
+    (waiting will not fix a bad key).
     """
 
-    def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0):
+    def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0,
+                 max_attempts: int = 5, backoff_base: float = 1.0, backoff_cap: float = 8.0):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.dimensions = dimensions
         self.api_key = api_key or ""
         self.timeout = timeout
-        self._fallback: Optional["HashingEmbedder"] = None
+        self.max_attempts = max(1, int(max_attempts))
+        self.backoff_base = float(backoff_base)
+        self.backoff_cap = float(backoff_cap)
 
     def _embed_raw(self, text: str, timeout: float) -> List[float]:
         import json as _json
@@ -111,17 +121,33 @@ class OpenAICompatEmbedder:
         self.dimensions = len(v)  # trust the server's real dimensionality
         return True
 
+    @staticmethod
+    def _is_terminal(exc: Exception) -> bool:
+        # Auth/credential errors will not fix themselves by waiting; do not retry.
+        return getattr(exc, "code", None) in (401, 403)
+
     def embed(self, text: str) -> List[float]:
-        if self._fallback is not None:
-            return self._fallback.embed(text)
-        try:
-            return self._embed_raw(text, timeout=self.timeout)
-        except Exception as e:
-            logger.warning("Chronicle embeddings: endpoint %s failed at runtime (%s); "
-                           "switching to offline hashing for this session (FTS retrieval continues)",
-                           self.base_url, e)
-            self._fallback = HashingEmbedder(dimensions=self.dimensions)
-            return self._fallback.embed(text)
+        attempt = 0
+        while True:
+            try:
+                return self._embed_raw(text, timeout=self.timeout)
+            except Exception as e:
+                attempt += 1
+                if self._is_terminal(e):
+                    logger.error("Chronicle embeddings: %s auth error (%s) -- terminal, not retrying",
+                                 self.base_url, e)
+                    raise
+                if attempt >= self.max_attempts:
+                    logger.error("Chronicle embeddings: %s failed after %d attempts (%s); raising -- "
+                                 "no hash fallback; vector skipped this round, FTS retrieval continues, "
+                                 "embed retried on the next operation", self.base_url, attempt, e)
+                    raise
+                wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
+                wait = wait * (0.5 + random.random() * 0.5)  # 50-100% jitter
+                logger.warning("Chronicle embeddings: %s embed failed (attempt %d/%d: %s); "
+                               "waiting %.1fs then retrying", self.base_url, attempt, self.max_attempts, e, wait)
+                if wait > 0:
+                    time.sleep(wait)
 
 
 def _candidate_urls(base_url: Optional[str]) -> List[str]:
@@ -161,12 +187,30 @@ def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
     reachable (or only chat models are loaded), fall back to the built-in offline
     HashingEmbedder with a warning — retrieval (FTS + vectors) never hard-breaks.
     Set model to 'hashing' to force offline.
+
+    Exception: an EXPLICIT model + explicit base_url is trusted even when it is
+    unreachable at init — it returns the retrying OpenAICompatEmbedder (which
+    waits+retries at runtime) rather than pinning the whole session to hashing on
+    a transient startup rate-limit/outage.
     """
     dims = int(dimensions) if dimensions else 768
     name = (model or "auto").strip().lower()
     if name in _HASHING_NAMES:
         return HashingEmbedder(dimensions=int(dimensions) if dimensions else 256)
     auto = name in _AUTO_NAMES
+    if not auto and base_url:
+        # Trust the configured model + endpoint: defer transient failures to the
+        # runtime wait-and-retry in embed() instead of falling back to hashing.
+        emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "")
+        try:
+            emb.healthcheck()  # best-effort: confirm reachable + adopt the real dim
+            logger.info("Chronicle embeddings: using model %r via %s (dim %d)",
+                        model, base_url, emb.dimensions)
+        except Exception as e:
+            logger.warning("Chronicle embeddings: %r @ %s unreachable at init (%s); "
+                           "deferring to runtime retry (will NOT fall back to hashing)",
+                           model, base_url, e)
+        return emb
     for url in _candidate_urls(base_url):
         try:
             candidates = _discover_embedding_models(url, api_key or "") if auto else [model]
