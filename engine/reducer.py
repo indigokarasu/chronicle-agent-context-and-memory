@@ -28,6 +28,14 @@ DOMAIN_POLICY = {
     "general": {"contradiction": "refetch"},
 }
 
+# Core identity predicates about the user — always-known, elevated so they enter the
+# injected/static block regardless of their value text (a phone number or city name
+# matches no criticality keyword on its own).
+_IDENTITY_PREDICATES = {
+    "name", "phone", "email", "lives_in", "address", "home_address",
+    "works_at", "works_in", "birthday", "located_in", "owns_property",
+}
+
 
 class Reducer:
     def __init__(self, store, embedder=None):
@@ -75,6 +83,12 @@ class Reducer:
                                                    event.get("owner", "default"))
         # Skip extraction for branch-abandoned spans (I16).
         if event.get("branch_id") == "__abandoned__":
+            return
+        # Do NOT promote operational exhaust into durable memory. The assistant's own
+        # autonomous turns (no user content) and tool-output / run-log content are
+        # raw-indexed above for recall, but must not become facts/notes/episodes:
+        # memory is about the user and their world, not the assistant running itself.
+        if _is_operational(event, p, excerpt):
             return
         self.store.enqueue_curation("extract", {"event_id": eid, "session_id": event.get("session_id")})
 
@@ -364,6 +378,13 @@ class Reducer:
         provenance = json.dumps({"source_type": source_type, "source_event": event.get("event_id", ""),
                                  "extracted_by": "chronicle-v5", "extracted_at": now})
         crit, crit_reason = classify_criticality(body, kind, key.get("note_type", ""))
+        # Core identity facts about the user are always-known: elevate so they enter
+        # the injected/static block (their value text alone — a phone number, a city —
+        # matches no criticality keyword).
+        if kind == "fact" and domain == "user" \
+                and key.get("predicate_canonical", "") in _IDENTITY_PREDICATES \
+                and crit == "normal":
+            crit, crit_reason = "high", "identity"
         salience = event.get("salience") or key.get("salience", "normal")
 
         if kind == "fact":
@@ -539,6 +560,32 @@ def _provenance_source(event) -> str:
     actor = event.get("actor", "agent")
     return {"user": "user_direct", "agent": "session_transcript",
             "curator": "inference", "system": "session_transcript"}.get(actor, "session_transcript")
+
+
+# Markers of operational exhaust (run-logs / tool output) that must never be promoted
+# into durable memory. Conservative: anything not matched still flows through normally.
+_OP_MARKERS = ("mentor-light", "dispatch.draft", "dispatch_triage", "light-scan",
+               '"run_id"', '"run_type"', '"schema":')
+
+
+def _is_operational(event, p, excerpt) -> bool:
+    """True when an observed event is the assistant operating itself rather than the
+    user/world. Such events stay raw-indexed (FTS + vector) for recall but are NOT
+    promoted into facts/notes/episodes."""
+    src = p.get("source_type", "")
+    if src == "agent_memory_write":
+        return False  # an explicit, intentional save — keep it
+    # An autonomous agent turn: a session transcript with no user content
+    # (capture.observe tags actor='agent' exactly when user_content is empty).
+    if src == "session_transcript" and event.get("actor") == "agent":
+        return True
+    head = (excerpt or "")[:400]
+    low = head.lstrip().lower()
+    if low.startswith("tool:") or low.startswith("assistant: tool:"):
+        return True
+    if any(m in head for m in _OP_MARKERS):
+        return True
+    return False
 
 
 def _table_for(kind):
