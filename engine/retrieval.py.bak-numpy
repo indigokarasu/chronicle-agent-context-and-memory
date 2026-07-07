@@ -19,7 +19,7 @@ import re
 from typing import Dict, List
 
 from . import access
-from .embeddings import unpack, cosine, batch_cosine
+from .embeddings import unpack, cosine
 from .trust import Calibrator, confidence_summary
 from .store import now_iso, KIND_TABLE
 
@@ -115,17 +115,15 @@ class RetrievalEngine:
                 scored.setdefault(r["event_id"], {"excerpt": r["excerpt"], "score": 0.0,
                                                   "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
         if q["embedding"] is not None:
-            ov = self.store.iter_observed_vectors()
-            osims = batch_cosine(q["embedding"], [v["embedding"] for v in ov])
-            for i, v in enumerate(ov):
-                if osims[i] <= 0.1:
-                    continue
+            for v in self.store.iter_observed_vectors():
                 if not access.can_read(access.DEFAULT_ACL, v.get("owner"), principal):
                     continue
-                ev = self.store.get_event(v["event_id"])
-                p = json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str) else (ev or {}).get("payload", {})
-                scored.setdefault(v["event_id"], {"excerpt": p.get("excerpt", ""), "score": 0.0,
-                                                  "owner": v.get("owner")})["score"] += self._vec_w * osims[i]
+                sim = cosine(q["embedding"], unpack(v["embedding"]))
+                if sim > 0.1:
+                    ev = self.store.get_event(v["event_id"])
+                    p = json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str) else (ev or {}).get("payload", {})
+                    scored.setdefault(v["event_id"], {"excerpt": p.get("excerpt", ""), "score": 0.0,
+                                                      "owner": v.get("owner")})["score"] += self._vec_w * sim
         for s in self.store.iter_session_vectors():
             if q["embedding"] is not None and s.get("embedding"):
                 sim = cosine(q["embedding"], unpack(s["embedding"]))
@@ -307,12 +305,10 @@ class RetrievalEngine:
         return chain
 
     def as_of(self, world=None, knowledge=None) -> List[dict]:
-        """Bitemporal query (§7.4): as-known-at `knowledge`, as-true-at `world`.
-
-        Uses iter_events_since for memory-safe streaming (no 100k cap)."""
-        stream = self.store.iter_events_since(0) if not knowledge else self.store.get_events_as_of(knowledge)
+        """Bitemporal query (§7.4): as-known-at `knowledge`, as-true-at `world`."""
+        events = self.store.get_events_as_of(knowledge) if knowledge else self.store.get_events_since(0)
         facts = {}
-        for ev in stream:
+        for ev in events:
             if ev["type"] != "asserted":
                 continue
             p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
@@ -342,10 +338,11 @@ class RetrievalEngine:
         return bool(t1) and t1[0]["score"] >= (self._fts_w + self._vec_w) / (self._rrf_k + 1) * 0.9
 
     def _vector_beliefs(self, query_emb, limit):
-        rows = self.store.iter_memory_vectors()
-        sims = batch_cosine(query_emb, [v["embedding"] for v in rows])
-        scored = [(rows[i]["belief_id"], rows[i]["kind"], sims[i])
-                  for i in range(len(rows)) if sims[i] > 0.1]
+        scored = []
+        for v in self.store.iter_memory_vectors():
+            sim = cosine(query_emb, unpack(v["embedding"]))
+            if sim > 0.1:
+                scored.append((v["belief_id"], v["kind"], sim))
         scored.sort(key=lambda x: x[2], reverse=True)
         return scored[:limit]
 

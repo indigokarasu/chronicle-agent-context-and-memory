@@ -23,8 +23,6 @@ logger = logging.getLogger("chronicle.store")
 
 # Belief tables that carry the common envelope (§8.1).
 BELIEF_TABLES = ["facts", "episodes", "notes", "refs", "relationships", "procedures"]
-# Statuses that take a belief out of search; its embedding becomes dead weight.
-_INACTIVE_STATUSES = {"retracted", "superseded", "inactive", "expired"}
 KIND_TABLE = {
     "fact": "facts", "episode": "episodes", "note": "notes", "reference": "refs",
     "relationship": "relationships", "entity": "entities", "procedure": "procedures",
@@ -138,34 +136,10 @@ class MemoryStore:
         row = self._conn().execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_events_since(self, seq: int, limit: Optional[int] = None) -> List[dict]:
-        """Events with seq > `seq`, ascending. Pass limit=None (default) for
-        unbounded full-scan; pass an explicit N for paginated reads."""
-        q = "SELECT * FROM events WHERE seq > ? ORDER BY seq"
-        params: list = [seq]
-        if limit is not None:
-            q += " LIMIT ?"
-            params.append(limit)
-        rows = self._conn().execute(q, params).fetchall()
+    def get_events_since(self, seq: int, limit: int = 100000) -> List[dict]:
+        rows = self._conn().execute(
+            "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?", (seq, limit)).fetchall()
         return [dict(r) for r in rows]
-
-    def iter_events_since(self, seq: int, batch_size: int = 50000):
-        """Stream events with seq > `seq` in batches of `batch_size`, ascending
-        by seq. Memory-safe for multi-hundred-k event stores: never holds more
-        than one batch in memory at a time."""
-        cur_seq = seq
-        while True:
-            rows = self._conn().execute(
-                "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?",
-                (cur_seq, batch_size)).fetchall()
-            if not rows:
-                break
-            for r in rows:
-                yield dict(r)
-            new_seq = rows[-1]["seq"]
-            if new_seq == cur_seq:
-                break
-            cur_seq = new_seq
 
     def get_events_as_of(self, recorded_at: str) -> List[dict]:
         rows = self._conn().execute(
@@ -250,14 +224,6 @@ class MemoryStore:
             conn.execute("INSERT OR REPLACE INTO memory_vectors(belief_id,kind,embedding,model,created_at) "
                          "VALUES(?,?,?,?,?)", (belief_id, kind, embedding, model, now_iso()))
 
-    def delete_memory_vector(self, belief_id: str):
-        """Drop a belief's embedding once it is no longer searchable. Without
-        this, retracted/superseded beliefs leak vectors that bloat the brute-
-        force scan forever (their facts stay out of results, but the vectors
-        are still scanned on every query)."""
-        with self.transaction() as conn:
-            conn.execute("DELETE FROM memory_vectors WHERE belief_id=?", (belief_id,))
-
     def add_session_vector(self, session_id: str, summary: str, embedding: bytes, owner: str, occurred_at: str):
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO session_index(session_id,summary,embedding,owner,occurred_at) "
@@ -298,8 +264,6 @@ class MemoryStore:
             sets = ",".join(f"{k}=?" for k in fields)
             conn.execute(f"UPDATE {table} SET {sets} WHERE belief_id=?",
                          [*fields.values(), belief_id])
-        if fields.get("status") in _INACTIVE_STATUSES:
-            self.delete_memory_vector(belief_id)
 
     def update_belief_all_tables(self, belief_id: str, **fields):
         sets = ",".join(f"{k}=?" for k in fields)
@@ -308,8 +272,6 @@ class MemoryStore:
                 if all(_has_col(conn, t, k) for k in fields):
                     conn.execute(f"UPDATE {t} SET {sets} WHERE belief_id=?",
                                  [*fields.values(), belief_id])
-        if fields.get("status") in _INACTIVE_STATUSES:
-            self.delete_memory_vector(belief_id)
 
     def get_belief(self, table: str, belief_id: str) -> Optional[dict]:
         row = self._conn().execute(f"SELECT * FROM {table} WHERE belief_id=?", (belief_id,)).fetchone()

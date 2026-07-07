@@ -1,0 +1,9 @@
+# Hermes plugin manifest (https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins).
+# Chronicle registers TWO single-select slots — a memory provider and a context
+# engine — from one shared core, via register(ctx) in __init__.py. Activate them in
+# ~/.hermes/config.yaml:  memory.provider: chronicle  /  context.engine: chronicle
+name: chronicle
+version: 5.3.3
+description: "Event-sourced long-term memory + memory-aware context compression for Hermes. Captures every turn durably, extracts beliefs with provenance, answers from memory (raw-tier fallback + abstention), derives scoped conclusions, and compresses the window losslessly."
+hooks:
+  - on_session_end
