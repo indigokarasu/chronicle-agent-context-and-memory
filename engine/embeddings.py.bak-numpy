@@ -257,33 +257,3 @@ def cosine(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     # Vectors are pre-normalized; dot ≈ cosine. Clamp for safety.
     return max(-1.0, min(1.0, dot))
-
-def batch_cosine(query, blobs):
-    """Vectorized cosine of `query` (pre-normalized) against many packed,
-    pre-normalized embeddings. Returns list[float] aligned to `blobs`.
-    Embeddings whose byte length doesn't match the query dimensionality
-    (e.g. incomparable hash vectors) score 0.0. Falls back to scalar
-    `cosine` if numpy is unavailable."""
-    n = len(blobs)
-    if n == 0:
-        return []
-    try:
-        import numpy as np
-    except Exception:
-        return [cosine(query, unpack(b)) for b in blobs]
-    q = np.asarray(query, dtype=np.float32)
-    d = int(q.shape[0]) if q.ndim else 0
-    out = [0.0] * n
-    if not d:
-        return out
-    idx, mats = [], []
-    for i, b in enumerate(blobs):
-        if b and len(b) == d * 4:
-            idx.append(i)
-            mats.append(b)
-    if idx:
-        M = np.frombuffer(b"".join(mats), dtype=np.float32).reshape(len(idx), d)
-        sims = np.clip(M @ q, -1.0, 1.0)
-        for j, i in enumerate(idx):
-            out[i] = float(sims[j])
-    return out
