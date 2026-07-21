@@ -1,7 +1,7 @@
 # chronicle-agent-context-and-memory
 
 <p align="center">
-<img src="./assets/readme/hero.svg" width="100%" alt="Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas.">
+<img src="./assets/readme/hero.jpg" width="100%" alt="Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas.">
 </p>
 
 chronicle-agent-context-and-memory — Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas.
