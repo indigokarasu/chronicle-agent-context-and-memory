@@ -1,14 +1,12 @@
 # chronicle-agent-context-and-memory
 
 <p align="center">
-<img src="./assets/readme/hero.jpg" width="100%" alt="Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas.">
+  <img src="./assets/readme/hero.jpg" width="100%" alt="Chronicle: event-sourced memory provider and context engine for Hermes Agent">
 </p>
 
-chronicle-agent-context-and-memory — Chronicle Plugins — event-sourced memory provider + memory-aware context engine for Hermes Agent. Replaces ocas-elephas.
+Chronicle is the event-sourced memory provider and context engine for Hermes Agent. It stores facts, episodes, and references with provenance. Supports memory, recall, and context expansion across sessions.
 
-
-> One clear job, done well.
-
----
-
-*chronicle-agent-context-and-memory is part of the [OCAS Agent Suite](https://github.com/indigokarasu).*
+**Capabilities:**
+- Dual-tier store: facts + raw events
+- Context pinning and focus
+- Entity disambiguation and ACL
