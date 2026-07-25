@@ -164,9 +164,9 @@ class TestReducer(unittest.TestCase):
                                occurred_at=kw.get("occurred_at"))
 
     def test_asserted_projects_and_justifies(self):  # I5
-        self._fact("name", "Jared")
+        self._fact("name", "the operator")
         f = self.store.query_beliefs("facts", "predicate_canonical='name'")[0]
-        self.assertEqual(f["value"], "Jared")
+        self.assertEqual(f["value"], "the operator")
         self.assertGreaterEqual(len(self.store.get_justifications(f["belief_id"])), 1)
 
     def test_trust_ceiling(self):  # P6 / I6
@@ -175,11 +175,11 @@ class TestReducer(unittest.TestCase):
         self.assertLessEqual(f["confidence"], TRUST_CEILING[0])
 
     def test_conflict_supersede_user_domain(self):  # §8.5
-        self._fact("name", "Jared")
-        self._fact("name", "Jared M", conf=0.95)
+        self._fact("name", "the operator")
+        self._fact("name", "the operator M", conf=0.95)
         active = self.store.query_beliefs("facts", "predicate_canonical='name' AND status='active'")
         self.assertEqual(len(active), 1)
-        self.assertEqual(active[0]["value"], "Jared M")
+        self.assertEqual(active[0]["value"], "the operator M")
 
     def test_conflict_equal_confirms(self):  # §8.5 — corroboration from a distinct source
         self._fact("city", "Denver", src="ev_a", occurred_at="2026-01-01T00:00:00.000Z")
@@ -188,14 +188,14 @@ class TestReducer(unittest.TestCase):
         self.assertGreaterEqual(f["confirm_count"], 1)
 
     def test_rebuild_identical(self):  # P3 / I3
-        self._fact("name", "Jared")
+        self._fact("name", "the operator")
         self._fact("city", "Denver")
         before = self._snapshot()
         self.reducer.rebuild()
         self.assertEqual(before, self._snapshot())
 
     def test_reducer_deterministic(self):  # P4
-        self._fact("name", "Jared")
+        self._fact("name", "the operator")
         s1 = self._snapshot()
         self.reducer.rebuild()
         self.reducer.rebuild()
@@ -237,7 +237,7 @@ class TestCapture(unittest.TestCase):
         self.assertGreaterEqual(len(self.store.query_beliefs("notes", "status='draft'")), 1)
 
     def test_finalize_reextracts(self):  # part of I13
-        self.cap.observe("My name is Jared", "ok", session_id="s1")
+        self.cap.observe("My name is the operator", "ok", session_id="s1")
         while self.store.claim_curation_job():
             pass
         for j in self.store.query_beliefs("curation_jobs", "status='running'"):
@@ -260,25 +260,25 @@ class TestInvariants(unittest.TestCase):
     def test_P8_durable_enqueue(self):  # I7
         before_git = self.core.store.count_rows("git_queue")
         before_jobs = self.core.store.pending_curation_count()
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.assertEqual(self.core.store.count_rows("git_queue"), before_git + 1)
         self.assertEqual(self.core.store.pending_curation_count(), before_jobs + 1)
 
     def test_P12_trigger_independence(self):  # I13
-        self.core.capture.observe("My name is Jared and I live in Denver", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator and I live in Denver", "ok", session_id="s1")
         self.core.store.upsert_session({"session_id": "s1", "status": "active"})
         self.core.reaper.startup_recovery()
         self.core.process_pending()
         facts = self.core.store.query_beliefs("facts", "status='active'")
-        self.assertTrue(any(f["value"] == "Jared" for f in facts))
+        self.assertTrue(any(f["value"] == "the operator" for f in facts))
 
     def test_P16_source_independence(self):  # I18
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.process_pending()
         self.assertGreaterEqual(self.core.store.count_rows("facts", "status='active'"), 1)
 
     def test_P19_access_control(self):  # I22
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.process_pending()
         f = self.core.store.query_beliefs("facts", "predicate_canonical='name'")[0]
         self.assertTrue(access.can_read(f["read_acl"], f["owner"], "research"))
@@ -350,10 +350,10 @@ class TestInvariants(unittest.TestCase):
         self.core.embedder = boom
         self.core.reducer.embedder = boom
         self.core.retrieval.embedder = boom
-        eid = self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        eid = self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.assertIsNotNone(self.core.store.get_event(eid))   # durable capture survived
         self.core.process_pending()
-        self.assertTrue(any(f["value"] == "Jared"
+        self.assertTrue(any(f["value"] == "the operator"
                             for f in self.core.store.query_beliefs("facts", "status='active'")))
         ans = self.core.retrieval.answer("what is my name")    # query path survives too
         self.assertIn("tier", ans)
@@ -363,7 +363,7 @@ class TestInvariants(unittest.TestCase):
         self.assertIsNotNone(self.core.store.get_event(eid))
 
     def test_B5_multiagent_privacy(self):
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.process_pending()
         f = self.core.store.query_beliefs("facts", "predicate_canonical='name'")[0]
         self.assertTrue(access.can_read(f["read_acl"], f["owner"], "research"))
@@ -374,7 +374,7 @@ class TestInvariants(unittest.TestCase):
         self.assertTrue(access.can_read(f2["read_acl"], f2["owner"], "assistant"))
 
     def test_I16_branch_isolation(self):
-        e1 = self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        e1 = self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.capture.observe("Actually call me Bob on this branch", "ok", session_id="s1")
         bp = self.core.store.get_event(e1)["seq"]
         self.core.abandon_after("s1", bp)        # abandon everything after e1
@@ -400,7 +400,7 @@ class TestCurationHealth(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def test_extract_idempotent(self):  # I9
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.process_pending()
         n1 = self.core.store.count_rows("facts")
         ev = self.core.store.get_events_by_type("observed")[0]
@@ -409,7 +409,7 @@ class TestCurationHealth(unittest.TestCase):
         self.assertEqual(self.core.store.count_rows("facts"), n1)
 
     def test_health_no_unjustified(self):  # I5
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         self.core.process_pending()
         self.assertEqual(self.core.health.run()["unjustified"], [])
 
@@ -435,7 +435,7 @@ class TestCurationHealth(unittest.TestCase):
         self.assertIn("mode", t)
 
     def test_git_mirror_flush(self):  # §26
-        self.core.capture.observe("My name is Jared", "ok", session_id="s1")
+        self.core.capture.observe("My name is the operator", "ok", session_id="s1")
         flushed = self.core.gitmirror.flush()
         self.assertGreaterEqual(flushed, 1)
         self.assertEqual(self.core.store.git_lag(), 0)

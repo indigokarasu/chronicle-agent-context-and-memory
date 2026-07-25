@@ -123,7 +123,7 @@ class HeuristicExtractor(Extractor):
         m = re.search(r"\b(?:my name is|i'?m|i am|call me)\s+([a-z][\w'-]+(?:\s+[a-z][\w'-]+)?)", low)
         if m:
             cand = line[m.start(1):m.end(1)].strip()
-            # Keep only the leading run of capitalized words ("Jared and" → "Jared").
+            # Keep only the leading run of capitalized words ("the operator and" → "the operator").
             kept = []
             for w in cand.split():
                 if w[:1].isupper():
