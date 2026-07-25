@@ -261,7 +261,7 @@ class TestTools(unittest.TestCase):
 
     def test_search(self):
         self.tools.dispatch("assistant", "chronicle_remember", {
-            "kind": "fact", "content": "Jared lives in Denver", "entity": "user", "attribute": "city"
+            "kind": "fact", "content": "the operator lives in Denver", "entity": "user", "attribute": "city"
         })
         self.core.process_pending()
         result = json.loads(self.tools.dispatch("assistant", "chronicle_search", {
@@ -271,7 +271,7 @@ class TestTools(unittest.TestCase):
 
     def test_answer(self):
         self.tools.dispatch("assistant", "chronicle_remember", {
-            "kind": "fact", "content": "My name is Jared", "entity": "user", "attribute": "name"
+            "kind": "fact", "content": "My name is the operator", "entity": "user", "attribute": "name"
         })
         self.core.process_pending()
         result = json.loads(self.tools.dispatch("assistant", "chronicle_answer", {
