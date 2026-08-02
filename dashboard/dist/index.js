@@ -223,7 +223,7 @@
                   ? h("span", { className: "chr-cov-v" }, r.pct + "%")
                   : h("span", { className: "chr-cov-v", style: { color: "var(--color-warning,#f0b54e)" } }, fmt(r.pct) + "%")
               );
-            }).concat(hasEntities ? [h("p", { key: "footnote", className: "text-xs text-muted-foreground mt-2" }, "Entities are not embedded — N/A.")] : []))
+            }))
       )
     );
   }
