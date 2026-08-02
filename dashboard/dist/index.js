@@ -326,14 +326,25 @@
     );
 
     var pending = store.pending_jobs || 0;
-    var queueCard = pending > 0
+    // the card exists to offer the enqueue action; with everything embedded
+    // there is nothing to trigger, and the pending count is already a KPI
+    var embedWork = ["event", "note", "episode", "fact", "document"].some(function (k) {
+      var e = emb[k] || {};
+      return (e.total || 0) > (e.embedded || 0);
+    });
+    var queueCard = pending > 0 && embedWork
       ? h(Card, null,
           h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Curation queue · " + fmt(pending) + " items")),
           h(CardContent, null,
             h("div", { className: "flex items-center justify-between gap-3 flex-wrap" },
-              h("span", { className: "text-xs text-muted-foreground" }, "Background curation work waiting for the next pass — extraction and canonicalization. Embedding state is shown in coverage above."),
-              h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: process },
-                busy ? "Queueing…" : "Queue up to 500 extractions")
+              // nothing to trigger while every kind is fully embedded
+              ["event", "note", "episode", "fact", "document"].some(function (k) {
+                var e = emb[k] || {};
+                return (e.total || 0) > (e.embedded || 0);
+              })
+                ? h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: process },
+                    busy ? "Queueing…" : "Queue up to 500 extractions")
+                : null
             )
           )
         )
