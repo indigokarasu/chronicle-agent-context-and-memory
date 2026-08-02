@@ -50,11 +50,13 @@
       ".chr-kpi-v{font-size:1.6rem;font-weight:300;line-height:1;margin-top:.35rem}",
       ".chr-kpi-u{font-size:.8rem;font-weight:400;color:var(--color-muted-foreground);margin-left:.15rem}",
       ".chr-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:stretch}.chr-grid>*{height:100%}",
-      ".chr-comp{display:flex;align-items:center;gap:1.25rem;flex-wrap:nowrap}",
+      ".chr-comp{display:flex;align-items:flex-start;gap:1.25rem;flex-wrap:nowrap}",
       ".chr-donut{position:relative;width:140px;height:140px;flex:none}",
       ".chr-donut::before{content:\"\";position:absolute;inset:0;border-radius:50%;background:var(--g);-webkit-mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px));mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px))}",
       ".chr-donut .ctr{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}",
       ".chr-legend{display:flex;flex-direction:column;gap:.4rem;flex:1 1 auto;min-width:0}",
+      // same rhythm as .chr-legend so rows line up across the two cards
+      ".chr-covlist{display:flex;flex-direction:column;gap:.4rem}",
       ".chr-leg-row{display:flex;align-items:center;gap:.6rem;font-size:.8rem;padding:.18rem 0}",
       ".chr-sw{width:.6rem;height:.6rem;border-radius:2px;flex:0 0 auto}",
       ".chr-leg-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
@@ -201,7 +203,7 @@
       h(CardContent, null,
         rows.length === 0
           ? h("span", { className: "text-xs text-muted-foreground" }, "No embeddable items yet.")
-          : h("div", { className: "flex flex-col" }, rows.map(function (r, i) {
+          : h("div", { className: "chr-covlist" }, rows.map(function (r, i) {
               if (r.isEntity) {
                 // Entities are not embedded — show N/A bar per Braun spec
                 return h("div", { key: i, className: "chr-cov" },
@@ -326,12 +328,12 @@
     var pending = store.pending_jobs || 0;
     var queueCard = pending > 0
       ? h(Card, null,
-          h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Embedding queue · " + fmt(pending) + " items")),
+          h(CardHeader, { className: "pb-2" }, h(CardTitle, { className: "text-sm" }, "Curation queue · " + fmt(pending) + " items")),
           h(CardContent, null,
             h("div", { className: "flex items-center justify-between gap-3 flex-wrap" },
-              h("span", { className: "text-xs text-muted-foreground" }, "Unembedded items waiting for the next curation pass."),
+              h("span", { className: "text-xs text-muted-foreground" }, "Background curation work waiting for the next pass — extraction and canonicalization. Embedding state is shown in coverage above."),
               h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: process },
-                busy ? "Queueing…" : "Queue up to 500 more")
+                busy ? "Queueing…" : "Queue up to 500 extractions")
             )
           )
         )
