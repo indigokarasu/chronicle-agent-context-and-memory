@@ -14,10 +14,9 @@ import datetime
 import logging
 import re
 import uuid
-from typing import List, Optional, Tuple
 
-from .serialize import event_id, hash_str
 from .criticality import classify as classify_criticality
+from .serialize import event_id, hash_str
 from .store import now_iso
 
 logger = logging.getLogger("chronicle.capture")
@@ -33,7 +32,7 @@ _MSG_START = re.compile(r"\n(?=[^\s:][^:\n]{0,32}: )")   # next "role: …" mess
 _SENTENCE_END = re.compile(r"[.!?]\s|\n")
 
 
-def _split_excerpt(text: str, cap: int) -> List[str]:
+def _split_excerpt(text: str, cap: int) -> list[str]:
     """Chunk `text` into pieces of at most `cap` chars — §12.1, no silent truncation.
 
     Boundary preference: start of the next message ("role: …") > last sentence
@@ -86,9 +85,9 @@ class CaptureEngine:
     # -- the single append path -------------------------------------------
 
     def append(self, type_: str, payload: dict, *, parents=None, actor="agent",
-               owner: Optional[str] = None, trust_level: int = 2,
-               session_id: Optional[str] = None, branch_id: Optional[str] = None,
-               occurred_at: Optional[str] = None) -> str:
+               owner: str | None = None, trust_level: int = 2,
+               session_id: str | None = None, branch_id: str | None = None,
+               occurred_at: str | None = None) -> str:
         now = self._now()
         owner = owner or self.owner
         occurred_at = occurred_at or now
@@ -101,7 +100,7 @@ class CaptureEngine:
             "occurred_at": occurred_at, "recorded_at": now,
             "prev_head": self.store.get_head_event_id(), "sig": None})
 
-    def append_many(self, events: List[dict], *, window: int = 64) -> List[str]:
+    def append_many(self, events: list[dict], *, window: int = 64) -> list[str]:
         """Append a KNOWN run of events, embedding each window's text in one round trip.
 
         `events` is a list of dicts shaped like append()'s arguments —
@@ -118,7 +117,7 @@ class CaptureEngine:
         there is nothing to batch and nothing here to use — this is for backfills
         and transcript imports, where the whole run is in hand up front.
         """
-        out: List[str] = []
+        out: list[str] = []
         window = max(1, int(window or 1))
         try:
             for i in range(0, len(events), window):
@@ -134,8 +133,8 @@ class CaptureEngine:
     # -- hooks → events ----------------------------------------------------
 
     def observe(self, user_content: str, assistant_content: str, *, session_id: str = "",
-                messages: Optional[List[dict]] = None, trust_level: int = 2,
-                occurred_at: Optional[str] = None) -> str:
+                messages: list[dict] | None = None, trust_level: int = 2,
+                occurred_at: str | None = None) -> str:
         """sync_turn: durable observed event(s) (§12.1, I12).
 
         A long turn is chunked, never truncated: one `observed` event per chunk,
@@ -171,7 +170,7 @@ class CaptureEngine:
         return first
 
     def agent_explicit(self, action: str, target: str, content: str, metadata=None,
-                       *, occurred_at: Optional[str] = None) -> str:
+                       *, occurred_at: str | None = None) -> str:
         """on_memory_write: highest-precision signal, no confidence discount (§12.3)."""
         return self.append("observed",
                            {"source_type": "agent_memory_write", "excerpt": content[:4000],
@@ -180,13 +179,13 @@ class CaptureEngine:
                            actor="agent", trust_level=3, occurred_at=occurred_at)
 
     def delegation(self, task: str, result: str, *, child_session_id: str = "",
-                   occurred_at: Optional[str] = None) -> str:
+                   occurred_at: str | None = None) -> str:
         return self.append("observed",
                            {"source_type": "delegation", "excerpt": f"Task: {task}\nResult: {result}",
                             "task": task, "result": result, "child_session_id": child_session_id},
                            actor="agent", occurred_at=occurred_at)
 
-    def rescue(self, messages: List[dict], *, session_id: str = "") -> Tuple[List[str], str]:
+    def rescue(self, messages: list[dict], *, session_id: str = "") -> tuple[list[str], str]:
         """Two-speed rescue (§12.6, I14): durably persist + fast-extract high-salience spans
         to `asserted(draft, salience=high)` so nothing critical is lost on eviction."""
         belief_events, summaries = [], []

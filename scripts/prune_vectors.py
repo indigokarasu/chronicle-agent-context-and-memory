@@ -29,18 +29,17 @@ import argparse
 import sqlite3
 import sys
 from pathlib import Path
-from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.vector_index import delete_matching  # noqa: E402
+from engine.vector_index import delete_matching
 
 # Rows to prune: observed_vectors joined to events by event_id, session prefix match.
 # vec0 carries the same event_id column, so this predicate applies unchanged there.
 _MATCH = "event_id IN (SELECT event_id FROM events WHERE session_id LIKE ? || '%')"
 
 
-def prune_vectors(db_path: str, prefixes: List[str], dry_run: bool = False) -> int:
+def prune_vectors(db_path: str, prefixes: list[str], dry_run: bool = False) -> int:
     """Delete (or with dry_run only count) observed_vectors for each prefix.
 
     Returns the total reported. A real run deletes each row once; a dry run

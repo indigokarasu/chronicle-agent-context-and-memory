@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 try:  # real Hermes base when present …
     from agent.context_engine import ContextEngine  # type: ignore
@@ -83,7 +83,7 @@ class ChronicleContextEngine(ContextEngine):
         return pt > self.threshold_tokens
 
     # compression (§13.2)
-    def compress(self, messages, current_tokens=None, focus_topic=None, force=False, **kwargs) -> List[Dict[str, Any]]:
+    def compress(self, messages, current_tokens=None, focus_topic=None, force=False, **kwargs) -> list[dict[str, Any]]:
         focus_topic = focus_topic or self.focus_topic
         if not self.core:
             return self._heuristic(messages)

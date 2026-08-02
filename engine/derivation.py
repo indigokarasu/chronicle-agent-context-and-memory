@@ -20,7 +20,6 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-from typing import Dict, List, Optional
 
 from . import access
 from .config import INFERENCE_TRUST
@@ -28,7 +27,7 @@ from .config import INFERENCE_TRUST
 logger = logging.getLogger("chronicle.derivation")
 
 
-def _parse_ts(ts: Optional[str]):
+def _parse_ts(ts: str | None):
     if not ts:
         return None
     try:
@@ -43,9 +42,7 @@ def temporal_overlap(a: dict, b: dict) -> bool:
     bf, bu = _parse_ts(b.get("valid_from")), _parse_ts(b.get("valid_until"))
     if au is not None and bf is not None and au <= bf:
         return False
-    if bu is not None and af is not None and bu <= af:
-        return False
-    return True
+    return not (bu is not None and af is not None and bu <= af)
 
 
 class Rule:
@@ -53,10 +50,10 @@ class Rule:
     name = ""
     materialize = "high_value"
 
-    def antecedent_predicates(self) -> List[str]:
+    def antecedent_predicates(self) -> list[str]:
         return []
 
-    def derive(self, subject: str, store, principal: str, cfg) -> List[dict]:
+    def derive(self, subject: str, store, principal: str, cfg) -> list[dict]:
         return []
 
 
@@ -123,7 +120,7 @@ class DerivationEngine:
         self.store = store
         self.cfg = cfg
         self.append = append_fn        # capture.append, to emit `derived` events
-        self.rules: Dict[str, Rule] = {r.rule_id: r for r in _STARTER_RULES}
+        self.rules: dict[str, Rule] = {r.rule_id: r for r in _STARTER_RULES}
 
     def seed_rules(self):
         for r in self.rules.values():
@@ -133,7 +130,7 @@ class DerivationEngine:
                     "pattern": json.dumps(r.antecedent_predicates()), "guards": "entity,cardinality,temporal,acl",
                     "conclusion": "scoped", "scope": "reified", "materialize": r.materialize})
 
-    def enabled_rules(self) -> List[Rule]:
+    def enabled_rules(self) -> list[Rule]:
         rows = {row["rule_id"]: row for row in self.store.get_derivation_rules(enabled_only=False)}
         out = []
         for rid, rule in self.rules.items():
@@ -142,7 +139,7 @@ class DerivationEngine:
                 out.append(rule)
         return out
 
-    def derive_for_subject(self, subject: str, principal: str = "default", *, materialize: bool = True) -> List[dict]:
+    def derive_for_subject(self, subject: str, principal: str = "default", *, materialize: bool = True) -> list[dict]:
         """Run all enabled rules for one subject. Returns derived payloads;
         materializes them as `derived` events when materialize=True (I24c)."""
         derived = []
@@ -207,7 +204,7 @@ class DerivationEngine:
         found = self.store.find_belief(belief_id)
         if not found:
             return {"error": "not_found"}
-        table, row = found
+        _table, row = found
         justs = self.store.get_justifications(belief_id)
         return {
             "belief_id": belief_id, "body": row.get("value") or row.get("body"),
@@ -217,7 +214,7 @@ class DerivationEngine:
             "confidence": row.get("confidence"), "status": row.get("status")}
 
 
-def _active_facts(store, subject, predicate, principal) -> List[dict]:
+def _active_facts(store, subject, predicate, principal) -> list[dict]:
     rows = store.query_beliefs(
         "facts", "entity_id=? AND predicate_canonical=? AND status='active'",
         (subject, predicate), limit=20)

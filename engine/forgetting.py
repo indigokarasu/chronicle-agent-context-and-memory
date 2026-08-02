@@ -25,7 +25,7 @@ class ForgettingEngine:
         self.cfg = cfg
         self.append = append_fn
 
-    def decay_sweep(self, *, now: datetime.datetime = None):
+    def decay_sweep(self, *, now: datetime.datetime | None = None):
         now = now or datetime.datetime.now(datetime.timezone.utc)
         mults = self.cfg.get("salience.decay_multipliers",
                              {"pinned": 0, "high": 0.25, "normal": 1.0, "incidental": 4.0})

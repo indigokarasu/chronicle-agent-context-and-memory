@@ -6,7 +6,6 @@ of a different model; run health check; assert mismatch count > 0 and embed
 jobs enqueued; running twice does not double-enqueue.
 """
 
-import os
 import shutil
 import sys
 import tempfile
@@ -15,7 +14,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from engine.core import ChronicleCore
-from engine.embeddings import Embedder
 
 
 class FakeEmbedder:
@@ -84,7 +82,7 @@ def test_embedder_mismatch_self_heal():
         requeued = mismatch_data["requeued"]
         print(f"Mismatched: {mismatched}, Requeued: {requeued}")
 
-        total_expected = len(obs_vecs_1) + len(mem_vecs_1)
+        len(obs_vecs_1) + len(mem_vecs_1)
         assert mismatched > 0, f"Expected mismatched > 0, got {mismatched}"
         assert requeued > 0, f"Expected requeued > 0, got {requeued}"
         assert requeued <= mismatched, f"Requeued {requeued} > mismatched {mismatched}"

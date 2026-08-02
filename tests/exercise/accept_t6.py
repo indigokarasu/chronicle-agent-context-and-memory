@@ -17,8 +17,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from engine.capture import _split_excerpt          # noqa: E402
-from engine.core import ChronicleCore              # noqa: E402
+from engine.capture import _split_excerpt
+from engine.core import ChronicleCore
 
 _HOMES = []
 
@@ -65,7 +65,7 @@ def test_exact_reconstruction():
     core = make_core()
     core.initialize("s1")
     body = build_turn()
-    expected = "User: %s\nAssistant: %s" % ("t6 acceptance", body)
+    expected = "User: {}\nAssistant: {}".format("t6 acceptance", body)
     chunks = _split_excerpt(expected, core.capture._excerpt_cap())
     print("input %d chars -> %d chunks (cap %d)" % (len(expected), len(chunks),
                                                     core.capture._excerpt_cap()))
@@ -123,7 +123,7 @@ def test_identical_siblings_survive():
     core = make_core({"capture": {"max_excerpt_chars": 500}})
     core.initialize("s3")
     body = "abc def. " * 229                       # splits into repeating identical chunks
-    expected = "User: %s\nAssistant: %s" % ("u", body)
+    expected = "User: {}\nAssistant: {}".format("u", body)
     chunks = _split_excerpt(expected, 500)
     dupes = len(chunks) - len(set(chunks))
     if dupes < 1:
@@ -193,7 +193,7 @@ if __name__ == "__main__":
         try:
             results.append(bool(t()))
         except Exception as exc:                    # a crash is a failure, not a stack trace
-            print("FAIL %s: %s: %s" % (t.__name__, type(exc).__name__, exc))
+            print(f"FAIL {t.__name__}: {type(exc).__name__}: {exc}")
             results.append(False)
     for home in _HOMES:
         shutil.rmtree(home, ignore_errors=True)

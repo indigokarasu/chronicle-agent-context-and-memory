@@ -12,7 +12,6 @@ same interface; the curation worker, routing, and idempotency are unchanged.
 from __future__ import annotations
 
 import re
-from typing import List
 
 from .serialize import qualifiers_hash
 
@@ -35,11 +34,11 @@ PREDICATE_MAP = {
 }
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_FIRST_PERSON = re.compile(r"\b(i|my|i'm|im|me)\b", re.I)
+_FIRST_PERSON = re.compile(r"\b(i|my|i'm|im|me)\b", re.IGNORECASE)
 
 
 class ExtractionResult:
-    def __init__(self, items: List[dict], ambiguous: bool = False, route: str = "promote"):
+    def __init__(self, items: list[dict], ambiguous: bool = False, route: str = "promote"):
         self.items = items
         self.ambiguous = ambiguous
         self.route = route
@@ -72,7 +71,7 @@ class HeuristicExtractor(Extractor):
     version = "extractor-v1"
 
     def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id=""):
-        items: List[dict] = []
+        items: list[dict] = []
         ambiguous = False
         text = _strip_roles(excerpt)
         for line in re.split(r"[\n.!?]+", text):
@@ -193,12 +192,12 @@ def _note_item(body, note_type, owner, domain, source_event, risk="low"):
 
 
 def _strip_roles(excerpt: str) -> str:
-    return re.sub(r"^(User|Assistant|system|user|assistant):\s*", "", excerpt or "", flags=re.M)
+    return re.sub(r"^(User|Assistant|system|user|assistant):\s*", "", excerpt or "", flags=re.MULTILINE)
 
 
 def _clean_value(s: str) -> str:
     s = s.strip().strip(".,;:!?").strip()
-    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.IGNORECASE)
     return s[:200]
 
 
@@ -254,9 +253,9 @@ class LLMExtractor(Extractor):
         try:
             import json as _json
             reply = self._chat(_LLM_PROMPT + (excerpt or "")[:4000])
-            m = re.search(r"\{.*\}", reply, re.S)      # tolerate fenced/prefixed replies
+            m = re.search(r"\{.*\}", reply, re.DOTALL)      # tolerate fenced/prefixed replies
             parsed = _json.loads(m.group(0) if m else reply)
-            items: List[dict] = []
+            items: list[dict] = []
             for f in (parsed.get("facts") or [])[:20]:
                 subj = str(f.get("subject") or "").strip()
                 attr = re.sub(r"[^a-z0-9_]", "_", str(f.get("attribute") or "").strip().lower())[:60]

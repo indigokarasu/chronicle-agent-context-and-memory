@@ -31,8 +31,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from engine.core import ChronicleCore
 from engine import access
+from engine.core import ChronicleCore
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("test_manual")

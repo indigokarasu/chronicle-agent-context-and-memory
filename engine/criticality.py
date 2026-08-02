@@ -8,8 +8,6 @@ security content is never lost to passive decay (I10). Learned refinement may
 
 from __future__ import annotations
 
-from typing import Tuple
-
 # (criticality, category, keywords)
 _RULES = [
     ("critical", "safety", ["allerg", "anaphyla", "epipen", "do not resuscitate", "suicid", "overdose"]),
@@ -22,7 +20,7 @@ _RULES = [
 ]
 
 
-def classify(text: str, kind: str = "fact", note_type: str = "") -> Tuple[str, str]:
+def classify(text: str, kind: str = "fact", note_type: str = "") -> tuple[str, str]:
     """Return (criticality, reason). Directives/norms start at high (never-evict)."""
     t = (text or "").lower()
     best = ("normal", "")

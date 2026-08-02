@@ -9,14 +9,29 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine.config import (
-    Config, DEFAULTS, TRUST_CEILING, CONFIDENCE_BASE, ABSTAIN_GATES,
-    check_abstain_gate, _deep_merge,
+    ABSTAIN_GATES,
+    CONFIDENCE_BASE,
+    DEFAULTS,
+    TRUST_CEILING,
+    Config,
+    _deep_merge,
+    check_abstain_gate,
 )
 from engine.errors import (
-    ChronicleError, E_SCHEMA, E_NOT_FOUND, E_FORBIDDEN_CONTENT,
-    E_TRUST_CEILING, E_CONFLICT, E_BUDGET, E_EVICT_UNSAFE,
-    E_RISK_REVIEW, E_LEARN_BOUND, E_AUTHORITY_UNAVAILABLE,
-    E_ACCESS_DENIED, E_READ_BUDGET, E_DERIVATION_GUARD,
+    E_ACCESS_DENIED,
+    E_AUTHORITY_UNAVAILABLE,
+    E_BUDGET,
+    E_CONFLICT,
+    E_DERIVATION_GUARD,
+    E_EVICT_UNSAFE,
+    E_FORBIDDEN_CONTENT,
+    E_LEARN_BOUND,
+    E_NOT_FOUND,
+    E_READ_BUDGET,
+    E_RISK_REVIEW,
+    E_SCHEMA,
+    E_TRUST_CEILING,
+    ChronicleError,
 )
 
 
@@ -125,7 +140,7 @@ class TestConfig(unittest.TestCase):
         cfg = Config()
         self.assertIn(cfg.get("retrieval.abstain_gate"), ABSTAIN_GATES)
         for k in ("score_threshold", "focus_coverage", "overlap_min_tokens"):
-            self.assertIsNotNone(cfg.get("retrieval." + k), "retrieval.%s unregistered" % k)
+            self.assertIsNotNone(cfg.get("retrieval." + k), f"retrieval.{k} unregistered")
 
     def test_config_abstain_gate_unknown_raises(self):  # §18.4
         # A typo here would silently disable abstention — the one failure the

@@ -99,7 +99,7 @@ class ExerciseRetrievalLog(_Base):
         self.assertGreater(misses, logged)
         self.assertGreater(gap, 1.0)
         finding("1a", "retrieval_log IS read  — health._recall_gap (health.py:54); "
-                      "recall_gap=%s (>1: not a rate)" % gap)
+                      f"recall_gap={gap} (>1: not a rate)")
 
     def test_health_run_has_no_production_trigger(self):
         """The reader exists; its trigger does not. Nothing enqueues a `health` job."""
@@ -143,8 +143,7 @@ class ExerciseCreditAssignment(_Base):
             for row in self.store.query_beliefs(table, "1=1", (), limit=200):
                 seen.add(row.get("utility"))
         self.assertEqual(sorted(seen), [0.0])
-        finding("1b", "utility never written — distinct utility over a real corpus: %s"
-                % sorted(seen))
+        finding("1b", f"utility never written — distinct utility over a real corpus: {sorted(seen)}")
 
     def test_record_outcome_ewma_is_correct_when_called_directly(self):
         """The arithmetic works; nothing calls it. utility = 0.8*prev + 0.2*signal."""
@@ -264,8 +263,8 @@ class ExerciseCalibration(_Base):
             self.assertEqual(before_cal, 0.75)          # identity below min_obs
             self.assertLess(after_cal, before_cal)      # …and a real remap above it
             self.assertLess(after_ans, before_ans)
-            finding("2", "calibration IS live  — calibrate(0.75): %s -> %s; answer confidence "
-                         "%s -> %s" % (before_cal, after_cal, before_ans, after_ans))
+            finding("2", f"calibration IS live  — calibrate(0.75): {before_cal} -> {after_cal}; answer confidence "
+                         f"{before_ans} -> {after_ans}")
         finally:
             shutil.rmtree(home, ignore_errors=True)
 
@@ -331,7 +330,7 @@ class ExerciseRulePrecision(_Base):
             for i, line in enumerate(text.splitlines(), 1):
                 if "auto_disable_low_precision_rules" in line and "def " not in line:
                     hits.append("%s:%d" % (path.name, i))
-        self.assertEqual(hits, [], "unexpected caller(s): %s" % hits)
+        self.assertEqual(hits, [], f"unexpected caller(s): {hits}")
 
 
 # =============================================================================
