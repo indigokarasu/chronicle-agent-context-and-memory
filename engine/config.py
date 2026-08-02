@@ -10,7 +10,42 @@ default so the system is fully functional on Hermes hooks alone (I18).
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict
+import logging
+import os
+from typing import Any, Callable, Dict, List, Tuple
+
+# Env override for the embedding model (§27 embeddings.model). Deliberately wins
+# over file config: eval/CI must be able to pin the deterministic offline embedder
+# on a host whose config says `auto`, without editing anyone's config.yaml.
+EMBED_MODEL_ENV = "CHRONICLE_EMBED_MODEL"
+
+# Support gates selectable via retrieval.abstain_gate — §18.4
+ABSTAIN_GATES = ("score", "overlap", "focus")
+
+# Dormant flags: declared in DEFAULTS but never read by engine code. Boot warns
+# once per process when a flag is actually "live" — see is_enabled below. This is
+# NOT a default-value diff: two of these (hyde, expand_synonyms, decompose) are
+# *already* True in DEFAULTS, so a stock boot will warn for them exactly once —
+# that is the honest report, since the shipped config claims those features run
+# and nothing implements them (§u1 audit). Each entry:
+#   (config path, is_enabled(current_val) -> bool, reason comment)
+DORMANT: List[Tuple[str, Callable[[Any], bool], str]] = [
+    ("retrieval.query_understanding.hyde", lambda v: bool(v),
+     "Hypothetical Document Embeddings — rewrite loop not yet implemented"),
+    ("retrieval.query_understanding.expand_synonyms", lambda v: bool(v),
+     "Query synonym expansion — synonym detection not yet wired"),
+    ("retrieval.query_understanding.decompose", lambda v: bool(v),
+     "Query decomposition — multi-clause strategy not yet implemented"),
+    ("retrieval.reranker_version", lambda v: v != "identity",
+     "Reranker version string — only 'identity' passthrough exists"),
+]
+
+# Flags already warned about in this process. Config() boots repeatedly (every
+# LME query, every ChronicleCore() call) — without this, the loop below would
+# re-log the same warning on every single boot. Module-level (not per-Config)
+# so it survives across the many short-lived Config instances in one run.
+# Tests may `.clear()` this to re-arm warnings for a fresh assertion.
+_DORMANT_WARNED: set = set()
 
 # Trust ceiling C(level) — §10.3
 TRUST_CEILING = {0: 0.40, 1: 0.60, 2: 0.75, 3: 0.90, 4: 1.00}
@@ -38,9 +73,16 @@ DEFAULTS: Dict[str, Any] = {
     # Default = auto: detect a running local OpenAI-compatible server (base_url
     # null → LM Studio :1234, Ollama :11434, llama.cpp :8080, or
     # $CHRONICLE_EMBED_BASE_URL) and use whatever embedding model IT serves — no
-    # model id is hardcoded. Falls back to the offline hashing embedder if none is
-    # reachable. Set model: hashing to force offline, or a specific id to pin one.
-    "embeddings": {"model": "auto", "dimensions": 768, "base_url": None, "api_key": None},
+    # model id is hardcoded. If none is reachable the engine runs DEGRADED (no
+    # vectors written, embeds queued for retry, §24.4) — it never silently hashes.
+    # Canonical recommendation (locked 2026-07-31): nomic-embed-text, served
+    # locally — Ollama (:11434) or llama.cpp --embedding (:8080, ~350MB RSS, runs
+    # on 1-2 vCPU self-hosted boxes). No remote-API tier: memory excerpts never
+    # leave the host. Hosts too weak for nomic run DEGRADED (FTS + queued embeds).
+    # Set model: hashing to force the offline embedder (eval/CI only), or a
+    # specific id to pin one. $CHRONICLE_EMBED_MODEL overrides this value.
+    "embeddings": {"model": "auto", "dimensions": 768, "base_url": None, "api_key": None,
+                   "exclude_session_prefixes": []},
     "vector_index": {"backend": "bruteforce", "bruteforce_ceiling": 100000},
 
     "principals": {
@@ -62,11 +104,18 @@ DEFAULTS: Dict[str, Any] = {
         "cache_ttl": "24h",
         "pins": {},
         "provider_trust": {"default": 2},
+        "local_dbs": [],
     },
     "outputs": {"ocas_signal_emit": {"enabled": "auto", "sink": "~/.hermes/commons/signals/"}},
 
     "extraction": {
         "version": "extractor-v1",
+        # backend: heuristic (default — deterministic, offline, replayable) | llm.
+        # llm calls an OpenAI-compatible chat endpoint per excerpt and falls back
+        # to the heuristic on ANY failure, so capture never depends on a model.
+        # The write path stays LLM-free unless explicitly opted in (I9, §16).
+        "backend": "heuristic",
+        "llm": {"base_url": None, "model": None, "api_key": None, "timeout": 30},
         "multi_hypothesis_threshold": 0.6,
         "signal_confidence_min": 0.7,
         "granularities": ["atomic", "entity", "session_summary"],
@@ -86,6 +135,20 @@ DEFAULTS: Dict[str, Any] = {
     "retrieval": {
         "fts_weight": 0.4, "vector_weight": 0.6, "rrf_k": 60, "overfetch": 4,
         "default_limit": 10, "max_limit": 50, "miss_threshold": 0.15,
+        # Support gate for abstention (I8, §18.4). Only the threshold belonging to
+        # the active gate is read. The dial (scripts/sweep_abstain.py, LongMemEval
+        # _abs set): 0.78 → 21/30 abstained but 57/100 answerable REFUSED; 0.5 →
+        # 3/30 abstained, 8/100 refused. No lexical signal separates "unanswerable"
+        # from "answerable" (the _abs haystacks are on-topic, they just omit the
+        # asked fact). Default is PERMISSIVE: in production the reading agent gets
+        # a second abstention chance over get_context, so a refusal loop costs more
+        # than a checkable wrong answer. Raise toward 0.78 where fabrication is
+        # the greater harm.
+        "abstain_gate": "focus", "score_threshold": 0.0148,
+        "focus_coverage": 0.5, "overlap_min_tokens": 1,
+        # Temporal channel (§18.6): rerank raw-tier survivors when the query names
+        # an absolute date/month/year. 0 disables; clamped to [0, 2] in code.
+        "temporal_boost": 0.5, "graph_weight": 0.25,
         "reranker_version": "identity", "prefetch_budget": 1200,
         "predictive_prefetch": True,
         "raw_tier": {"enabled": True, "span_index": True, "session_index": True},
@@ -95,8 +158,12 @@ DEFAULTS: Dict[str, Any] = {
         "query_understanding": {"decompose": True, "expand_synonyms": True, "hyde": True},
     },
     "context": {"default_token_budget": 1500,
+                "session_window": True,
+                "session_window_max_sessions": 5,
+                "session_window_max_events": 60,
                 "weights": {"relevance": 0.4, "recency": 0.25, "salience": 0.25, "pinned": 0.1}},
-    "capture": {"sync_turn": {"mode": "observe_only"},
+    "capture": {"max_excerpt_chars": 4000,          # per-chunk cap, clamped [500, 16000] (§12.1)
+                "sync_turn": {"mode": "observe_only"},
                 "precompress": {"budget_ms": 400},
                 "agent_memory_write": {"salience": "high", "confidence_discount": 0}},
     "reaper": {"enabled": True, "schedule": "*/5 * * * *", "idle_threshold": "20m",
@@ -144,6 +211,18 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 
+def check_abstain_gate(name: str) -> str:
+    """Reject an unknown retrieval.abstain_gate loudly (§18.4).
+
+    A typo here would silently disable abstention, which is the one failure the
+    gate exists to prevent — so it is a hard error, not a fallback.
+    """
+    if name not in ABSTAIN_GATES:
+        raise ValueError("retrieval.abstain_gate must be one of %s (got %r)"
+                         % (", ".join(ABSTAIN_GATES), name))
+    return name
+
+
 def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (over or {}).items():
@@ -159,6 +238,29 @@ class Config:
 
     def __init__(self, overrides: Dict[str, Any] = None):
         self._d = _deep_merge(DEFAULTS, overrides or {})
+        env_model = (os.environ.get(EMBED_MODEL_ENV) or "").strip()
+        if env_model:
+            if not isinstance(self._d.get("embeddings"), dict):
+                self._d["embeddings"] = {}
+            self._d["embeddings"]["model"] = env_model
+        check_abstain_gate(self._d["retrieval"].get("abstain_gate"))
+        self._check_dormant_flags()
+
+    def _check_dormant_flags(self):
+        """Warn once per process for each DORMANT flag that is currently live.
+
+        `is_enabled` decides liveness directly from the value, not from a diff
+        against some remembered default — that was the sonnet-1 bug: comparing
+        against a stored default_val of True made `hyde=False` trip `!= True`
+        and warn "is enabled" anyway (§u1 review triage).
+        """
+        log = logging.getLogger("chronicle.config")
+        for path, is_enabled, reason in DORMANT:
+            if path in _DORMANT_WARNED:
+                continue
+            if is_enabled(self.get(path)):
+                log.warning("dormant config flag %s is enabled: %s", path, reason)
+                _DORMANT_WARNED.add(path)
 
     def get(self, path: str, default: Any = None) -> Any:
         cur: Any = self._d

@@ -3,8 +3,8 @@ Chronicle — Embeddings (§24.4, §27 embeddings:).
 
 A pluggable Embedder interface plus a deterministic, dependency-free default
 (feature hashing) so the vector retrieval tier is exercisable offline and in CI
-without a model or network. A real deployment swaps in `embeddinggemma-300m`
-behind the same interface; nothing else changes.
+without a model or network. A real deployment runs `nomic-embed-text`
+locally (Ollama or llama.cpp) behind the same interface; nothing else changes.
 
 Vectors serialize to a compact little-endian float32 blob (no numpy needed).
 """
@@ -26,6 +26,16 @@ _HASHING_NAMES = {"hashing", "hashing-v1", "offline", "none"}
 _AUTO_NAMES = {"", "auto", "auto-detect", "autodetect", "local", "default"}
 # Model ids that look like embedding models (used to auto-pick from /v1/models).
 _EMBED_RE = re.compile(r"embed|bge|gte|nomic|e5|minilm|mxbai|arctic|stella|gemma|qwen.*embed", re.I)
+
+
+class EmbeddingsUnavailable(RuntimeError):
+    """No embedding backend is reachable, so NOTHING is written (§24.4).
+
+    Not the same as a transient embed failure: the caller re-queues the work as an
+    `embed` curation job (§17.3) instead of silently substituting a hash vector.
+    Hash vectors live in an incomparable geometry — mixing them into the store is
+    invisible at write time and permanently poisons vector retrieval.
+    """
 
 
 class Embedder(Protocol):
@@ -149,6 +159,53 @@ class OpenAICompatEmbedder:
                 if wait > 0:
                     time.sleep(wait)
 
+    def _embed_raw_batch(self, texts: List[str], timeout: float) -> List[List[float]]:
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"model": self.model, "input": [t or "" for t in texts]}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = urllib.request.Request(self.base_url + "/embeddings", data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        rows = data.get("data") or []
+        if len(rows) != len(texts):
+            raise ValueError("batch response had %d embeddings for %d inputs" % (len(rows), len(texts)))
+        # The API contract orders rows by index; sort defensively anyway.
+        rows.sort(key=lambda r: r.get("index", 0))
+        out = []
+        for r in rows:
+            vec = r.get("embedding")
+            if not isinstance(vec, list) or not vec:
+                raise ValueError("batch response row had no embedding")
+            out.append([float(x) for x in vec])
+        return out
+
+    def embed_batch(self, texts: List[str], chunk: int = 64) -> List[List[float]]:
+        """Batch embed with the same retry/no-hash-fallback contract as embed().
+
+        One HTTP round-trip per `chunk` texts instead of one per text — the
+        difference between minutes and hours on a backfill (requeue script,
+        re-embed after an outage). A longer timeout per call, scaled by chunk
+        size, because a batch legitimately takes longer than a single.
+        """
+        out: List[List[float]] = []
+        for i in range(0, len(texts), chunk):
+            part = texts[i:i + chunk]
+            attempt = 0
+            while True:
+                try:
+                    out.extend(self._embed_raw_batch(part, timeout=max(self.timeout, 2.0 + 0.25 * len(part))))
+                    break
+                except Exception as e:
+                    attempt += 1
+                    if self._is_terminal(e) or attempt >= self.max_attempts:
+                        raise
+                    wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
+                    time.sleep(wait * (0.5 + random.random() * 0.5))
+        return out
+
 
 def _candidate_urls(base_url: Optional[str]) -> List[str]:
     import os
@@ -176,41 +233,14 @@ def _discover_embedding_models(base_url: str, api_key: str) -> List[str]:
     return [i for i in ids if _EMBED_RE.search(i)] or ids
 
 
-def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
-                 base_url: Optional[str] = None, api_key: Optional[str] = None) -> "Embedder":
-    """Return the active embedder.
+def _probe_endpoints(model: Optional[str], dims: int, base_url: Optional[str],
+                     api_key: Optional[str]) -> Optional["Embedder"]:
+    """First reachable OpenAI-compatible endpoint that really embeds, else None.
 
-    Default is ``auto``: find a running local OpenAI-compatible server (configured
-    base_url / $CHRONICLE_EMBED_BASE_URL, else common LM Studio / Ollama /
-    llama.cpp ports) and use whatever embedding model it actually serves — no
-    model id is hardcoded. An explicit model name is used as-is. If nothing is
-    reachable (or only chat models are loaded), fall back to the built-in offline
-    HashingEmbedder with a warning — retrieval (FTS + vectors) never hard-breaks.
-    Set model to 'hashing' to force offline.
-
-    Exception: an EXPLICIT model + explicit base_url is trusted even when it is
-    unreachable at init — it returns the retrying OpenAICompatEmbedder (which
-    waits+retries at runtime) rather than pinning the whole session to hashing on
-    a transient startup rate-limit/outage.
-    """
-    dims = int(dimensions) if dimensions else 768
-    name = (model or "auto").strip().lower()
-    if name in _HASHING_NAMES:
-        return HashingEmbedder(dimensions=int(dimensions) if dimensions else 256)
-    auto = name in _AUTO_NAMES
-    if not auto and base_url:
-        # Trust the configured model + endpoint: defer transient failures to the
-        # runtime wait-and-retry in embed() instead of falling back to hashing.
-        emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "")
-        try:
-            emb.healthcheck()  # best-effort: confirm reachable + adopt the real dim
-            logger.info("Chronicle embeddings: using model %r via %s (dim %d)",
-                        model, base_url, emb.dimensions)
-        except Exception as e:
-            logger.warning("Chronicle embeddings: %r @ %s unreachable at init (%s); "
-                           "deferring to runtime retry (will NOT fall back to hashing)",
-                           model, base_url, e)
-        return emb
+    `model` auto/empty → ask each endpoint's /v1/models what it serves and try
+    those; otherwise try exactly that id. Shared by init (get_embedder) and the
+    later re-probe (DegradedEmbedder.recheck) so both decide identically."""
+    auto = (model or "auto").strip().lower() in _AUTO_NAMES
     for url in _candidate_urls(base_url):
         try:
             candidates = _discover_embedding_models(url, api_key or "") if auto else [model]
@@ -220,15 +250,133 @@ def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
             try:
                 emb = OpenAICompatEmbedder(url, mid, dims, api_key or "")
                 if emb.healthcheck():
-                    logger.info("Chronicle embeddings: using local model %r via %s (dim %d)",
-                                mid, url, emb.dimensions)
                     return emb
             except Exception:
                 continue  # not an embedding model / rejected → try next candidate
-    logger.warning("Chronicle embeddings: no local embedding model reachable (%s on %s); "
-                   "using offline hashing embedder",
-                   "auto-detect" if auto else repr(model), ", ".join(_candidate_urls(base_url)))
-    return HashingEmbedder(dimensions=dims)
+    return None
+
+
+class DegradedEmbedder:
+    """No embedding backend is reachable: write NOTHING, queue the work (§24.4).
+
+    `embed()` raises EmbeddingsUnavailable; the caller enqueues an `embed` curation
+    job that is deferred and retried with backoff (§17.3). This replaces the old
+    silent fall-back to hashing, which produced vectors in an incomparable geometry
+    that nothing downstream could tell apart from real ones.
+
+    Keeps its resolution inputs so `recheck()` can adopt a server that comes up
+    later. It upgrades IN PLACE because reducer/retrieval/curation each hold this
+    same object — swapping `core.embedder` would leave stale references behind.
+    Only the deferred embed job calls recheck(): read paths must never pay probe
+    latency against a dead endpoint.
+    """
+
+    def __init__(self, model: str = "auto", dimensions: int = 768, base_url: Optional[str] = None,
+                 api_key: Optional[str] = None, recheck_seconds: float = 60.0):
+        self.requested_model = model or "auto"
+        self.base_url = base_url
+        self.api_key = api_key
+        self.recheck_seconds = float(recheck_seconds)
+        self._dimensions = int(dimensions or 768)
+        self._live = None                                  # adopted backend, once one appears
+        self._next_probe = time.time() + self.recheck_seconds
+
+    @property
+    def live(self):
+        return self._live
+
+    @property
+    def model(self) -> str:
+        # Only ever stamped onto a row when a vector exists, i.e. when _live is set.
+        return self._live.model if self._live is not None else "degraded"
+
+    @property
+    def dimensions(self) -> int:
+        return self._live.dimensions if self._live is not None else self._dimensions
+
+    def recheck(self, force: bool = False) -> bool:
+        """Re-probe for a backend, at most once per `recheck_seconds`. True once live."""
+        if self._live is not None:
+            return True
+        now = time.time()
+        if not force and now < self._next_probe:
+            return False
+        self._next_probe = now + self.recheck_seconds
+        emb = _probe_endpoints(self.requested_model, self._dimensions, self.base_url, self.api_key)
+        if emb is None:
+            return False
+        logger.warning("Chronicle embeddings: RECOVERED — %r via %s (dim %d); queued embeds resume",
+                       emb.model, emb.base_url, emb.dimensions)
+        self._live = emb
+        return True
+
+    def embed(self, text: str) -> List[float]:
+        if self._live is not None:
+            return self._live.embed(text)
+        raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
+
+    def embed_batch(self, texts: List[str], chunk: int = 64) -> List[List[float]]:
+        # Present so an adopted backend keeps its batch path once recheck() has
+        # upgraded us in place; still raises while nothing is reachable, exactly
+        # like embed(), so callers need no separate degraded branch.
+        if self._live is not None:
+            return self._live.embed_batch(texts, chunk=chunk)
+        raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
+
+
+def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
+                 base_url: Optional[str] = None, api_key: Optional[str] = None) -> "Embedder":
+    """Return the active embedder, logging exactly ONE line: which mode, and why.
+
+    Default is ``auto``: find a running local OpenAI-compatible server (configured
+    base_url / $CHRONICLE_EMBED_BASE_URL, else common LM Studio / Ollama /
+    llama.cpp ports) and use whatever embedding model it actually serves — no
+    model id is hardcoded. An explicit model name is used as-is.
+
+    If nothing is reachable (or only chat models are loaded) the result is a
+    DegradedEmbedder, NOT a hashing fallback: no vectors are written and each
+    embed becomes a deferred curation job (§24.4). Retrieval still works on FTS.
+    Set model to 'hashing' (or $CHRONICLE_EMBED_MODEL=hashing) to deliberately
+    choose the offline/CI embedder — that path is unchanged.
+
+    Exception: an EXPLICIT model + explicit base_url is trusted even when it is
+    unreachable at init — it returns the retrying OpenAICompatEmbedder (which
+    waits+retries at runtime) rather than pinning the whole session on a transient
+    startup rate-limit/outage.
+    """
+    dims = int(dimensions) if dimensions else 768
+    name = (model or "auto").strip().lower()
+    if name in _HASHING_NAMES:
+        dim = int(dimensions) if dimensions else 256
+        logger.info("Chronicle embeddings: HASHING mode — %r requested explicitly; deterministic "
+                    "offline vectors (dim %d), no server contacted", name, dim)
+        return HashingEmbedder(dimensions=dim)
+    auto = name in _AUTO_NAMES
+    if not auto and base_url:
+        # Trust the configured model + endpoint: defer transient failures to the
+        # runtime wait-and-retry in embed() instead of downgrading the session.
+        emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "")
+        try:
+            emb.healthcheck()  # best-effort: confirm reachable + adopt the real dim
+            logger.info("Chronicle embeddings: MODEL mode — %r via %s (dim %d)",
+                        model, base_url, emb.dimensions)
+        except Exception as e:
+            logger.warning("Chronicle embeddings: MODEL mode — %r @ %s unreachable at init (%s); "
+                           "keeping it and deferring to the runtime retry (never hashing)",
+                           model, base_url, e)
+        return emb
+    emb = _probe_endpoints(model, dims, base_url, api_key)
+    if emb is not None:
+        logger.info("Chronicle embeddings: MODEL mode — local %r via %s (dim %d)",
+                    emb.model, emb.base_url, emb.dimensions)
+        return emb
+    logger.warning("Chronicle embeddings: DEGRADED mode — %s on %s. NO vectors are written; every "
+                   "embed is queued as a curation job and retried with backoff until a server "
+                   "appears. Set embeddings.model (or $CHRONICLE_EMBED_MODEL) to 'hashing' for "
+                   "deterministic offline vectors instead",
+                   "no embedding model reachable" if auto else "model %r not reachable" % model,
+                   ", ".join(_candidate_urls(base_url)))
+    return DegradedEmbedder(model=name, dimensions=dims, base_url=base_url, api_key=api_key)
 
 
 def _stable_hash(s: str) -> int:

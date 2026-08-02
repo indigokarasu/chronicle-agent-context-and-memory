@@ -8,7 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.config import Config, DEFAULTS, TRUST_CEILING, CONFIDENCE_BASE, _deep_merge
+from engine.config import (
+    Config, DEFAULTS, TRUST_CEILING, CONFIDENCE_BASE, ABSTAIN_GATES,
+    check_abstain_gate, _deep_merge,
+)
 from engine.errors import (
     ChronicleError, E_SCHEMA, E_NOT_FOUND, E_FORBIDDEN_CONTENT,
     E_TRUST_CEILING, E_CONFLICT, E_BUDGET, E_EVICT_UNSAFE,
@@ -117,6 +120,24 @@ class TestConfig(unittest.TestCase):
         cfg = Config()
         self.assertTrue(cfg.get("reaper.enabled"))
         self.assertTrue(cfg.get("reaper.startup_recovery"))
+
+    def test_config_abstain_gate_defaults(self):  # §18.4 support gate
+        cfg = Config()
+        self.assertIn(cfg.get("retrieval.abstain_gate"), ABSTAIN_GATES)
+        for k in ("score_threshold", "focus_coverage", "overlap_min_tokens"):
+            self.assertIsNotNone(cfg.get("retrieval." + k), "retrieval.%s unregistered" % k)
+
+    def test_config_abstain_gate_unknown_raises(self):  # §18.4
+        # A typo here would silently disable abstention — the one failure the
+        # gate exists to prevent — so it must be loud, not a fallback.
+        with self.assertRaises(ValueError):
+            Config({"retrieval": {"abstain_gate": "overlp"}})
+        with self.assertRaises(ValueError):
+            check_abstain_gate(None)
+
+    def test_config_abstain_gate_each_known_accepted(self):  # §18.4
+        for g in ABSTAIN_GATES:
+            self.assertEqual(Config({"retrieval": {"abstain_gate": g}}).get("retrieval.abstain_gate"), g)
 
 
 class TestErrors(unittest.TestCase):

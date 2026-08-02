@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Optional
 
 from . import access
+from .embeddings import EmbeddingsUnavailable, pack
 from .serialize import belief_id as compute_belief_id, hash_str
 from .criticality import classify as classify_criticality
 from .trust import raw_confidence, clamp_to_ceiling, base_confidence
@@ -36,11 +38,88 @@ _IDENTITY_PREDICATES = {
     "works_at", "works_in", "birthday", "located_in", "owns_property",
 }
 
+# Belief kinds that get a memory vector on assert (§24.4). Named once so
+# vector_text() and _on_asserted cannot disagree about what gets embedded.
+_VECTORED_KINDS = ("fact", "episode", "note", "reference", "procedure")
+
+
+def _normalize_value(s):
+    """§8.5: Normalize fact values for NOOP-dedup (mem0-style update).
+
+    casefold, collapse whitespace, strip punctuation + leading articles."""
+    if not s:
+        return ""
+    # Lowercase + collapse whitespace
+    norm = " ".join(s.casefold().split())
+    # Strip leading articles (a, an, the)
+    norm = re.sub(r'^\b(a|an|the)\s+', '', norm)
+    # Strip punctuation
+    norm = re.sub(r'[^\w\s]', '', norm)
+    return norm.strip()
+
 
 class Reducer:
-    def __init__(self, store, embedder=None):
+    def __init__(self, store, embedder=None, cfg=None):
         self.store = store
         self.embedder = embedder
+        self.cfg = cfg
+        self._vec_cache = {}      # one-shot prefetch window; see prefetch_vectors
+
+    # -- batched embedding (pure optimisation) -----------------------------
+
+    def vector_text(self, event_type, payload) -> str:
+        """The exact text this reducer embeds for an event, or '' if none.
+
+        One definition, so a prefetch can never embed something subtly different
+        from what the handler then looks up (a cache keyed on text is only useful
+        if both sides derive the key the same way)."""
+        if event_type == "observed":
+            return payload.get("excerpt", "") or ""
+        if event_type == "asserted" and payload.get("kind", "fact") in _VECTORED_KINDS:
+            key = payload.get("key") or {}
+            return payload.get("body", "") or key.get("name", "") or key.get("topic", "") or ""
+        return ""
+
+    def prefetch_vectors(self, events) -> int:
+        """Embed a known run of events' texts in ONE round trip, into a one-shot cache.
+
+        No semantic effect whatsoever: _safe_vec still decides what gets written
+        and writes the same bytes for the same text — this only changes how many
+        times the process blocks on the network to get them. That matters because
+        a networked embedder answers a single embed in ~50ms regardless of size,
+        so a bulk ingest spends essentially all of its wall clock waiting one
+        item at a time; `embeddings.embed_batch` was written for exactly this and
+        had no caller.
+
+        The cache is REPLACED on every call, so it never holds more than one
+        window, and a hit is correct by construction (same embedder, same text).
+        A backend with no batch API — the offline hashing embedder, where there
+        is no round trip to amortise — leaves it empty and every embed takes the
+        ordinary path. Failures are swallowed for the same reason _safe_vec
+        swallows them: an optimisation must not be able to fail a capture (I12).
+        Returns how many vectors were cached.
+        """
+        self._vec_cache = {}
+        batch = getattr(self.embedder, "embed_batch", None)
+        if batch is None:
+            return 0
+        texts, seen = [], set()
+        for ev in events:
+            text = self.vector_text(ev.get("type"), _payload(ev))
+            if text and text not in seen:
+                seen.add(text)
+                texts.append(text)
+        if len(texts) < 2:
+            return 0                      # nothing to amortise
+        try:
+            vecs = batch(texts)
+        except Exception as e:            # incl. EmbeddingsUnavailable (degraded)
+            logger.debug("embedding prefetch skipped (%s)", e)
+            return 0
+        if len(vecs) != len(texts):
+            return 0
+        self._vec_cache = dict(zip(texts, vecs))
+        return len(self._vec_cache)
 
     # -- dispatch ----------------------------------------------------------
 
@@ -83,10 +162,14 @@ class Reducer:
         p = _payload(event)
         excerpt = p.get("excerpt", "")
         eid = event["event_id"]
+        # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
+        excluded = (self.cfg.get("embeddings.exclude_session_prefixes", []) if self.cfg else [])
+        sid = event.get("session_id") or ""  # observed events may carry no session_id at all
+        skip_vec = any(sid.startswith(prefix) for prefix in excluded)
         if excerpt:
             self.store.fts_index_observed(eid, excerpt)
-            if self.embedder is not None:
-                blob = self._safe_vec(excerpt)
+            if self.embedder is not None and not skip_vec:
+                blob = self._safe_vec(excerpt, target_id=eid, kind="observed")
                 if blob is not None:
                     self.store.add_observed_vector(eid, blob, self.embedder.model,
                                                    event.get("owner", "default"))
@@ -163,11 +246,46 @@ class Reducer:
         b_id = p.get("belief_id")
         if not b_id:
             return
-        if p.get("new_body"):
+        new_body = p.get("new_body")
+        if new_body:
             found = self.store.find_belief(b_id)
             if found:
-                self.store.update_belief(found[0], b_id, status="superseded",
+                table, row = found
+                # Mark the old belief as superseded.
+                self.store.update_belief(table, b_id, status="superseded",
                                          valid_until=event.get("recorded_at"))
+                # Extract kind from table name; reconstruct key from existing belief.
+                kind_map = {"facts": "fact", "episodes": "episode", "notes": "note",
+                            "refs": "reference", "relationships": "relationship", "procedures": "procedure"}
+                kind = kind_map.get(table)
+                if kind:
+                    # Rebuild key from the existing belief row.
+                    if kind == "fact":
+                        key = {"entity_id": row.get("entity_id", ""),
+                               "predicate_canonical": row.get("predicate_canonical", ""),
+                               "attribute": row.get("attribute", ""),
+                               "qualifiers_hash": row.get("qualifiers_hash", ""),
+                               "qualifiers": json.loads(row.get("qualifiers", "{}")),
+                               "owner": row.get("owner", ""), "domain": row.get("domain", "")}
+                    elif kind == "note":
+                        key = {"note_type": row.get("note_type", "belief"),
+                               "subject": row.get("subject", "")}
+                    elif kind == "episode":
+                        participants = json.loads(row.get("participants", "[]")) if row.get("participants") else []
+                        key = {"title": new_body[:60], "participants": participants,
+                               "occurred_at": row.get("occurred_at", ""),
+                               "session_ref": row.get("session_ref", "")}
+                    else:
+                        # For other kinds, use a minimal key.
+                        key = {}
+                    # Compute new belief_id and insert the corrected belief.
+                    correction_event_id = event.get("event_id", "")
+                    b_id_new = compute_belief_id(kind, key, [correction_event_id])
+                    # Insert the replacement belief as active, sourced from user_direct correction.
+                    self._insert_belief(kind, b_id_new, key, new_body, row.get("confidence", 0.8), event,
+                                       status="active", source_type="user_direct")
+                    # Record the correction event as justification for the new belief.
+                    self.store.add_justification(b_id_new, correction_event_id, "event", "correction")
         else:
             self._retract(b_id)
         self._cascade(b_id)
@@ -189,6 +307,7 @@ class Reducer:
         for ev in self.store.get_events_by_type("observed"):
             if hash_str(_payload(ev).get("excerpt", "")) == ch:
                 self.store.fts_delete_observed(ev["event_id"])
+                self.store.delete_observed_vector(ev["event_id"])
         for bid in self._beliefs_matching_hash(ch):
             self._retract(bid)
 
@@ -307,6 +426,12 @@ class Reducer:
         if old_val == body:
             self._confirm(existing["belief_id"], "facts", source_event, event)
             self.store.add_justification(existing["belief_id"], source_event, "event", "extraction")
+            return
+        # §8.5: NOOP-dedup on normalized values (mem0-style update).
+        if _normalize_value(old_val) == _normalize_value(body):
+            self._confirm(existing["belief_id"], "facts", source_event, event)
+            self.store.add_justification(existing["belief_id"], source_event, "event", "extraction")
+            self.store.update_belief("facts", existing["belief_id"], last_seen_at=now)
             return
         policy = DOMAIN_POLICY.get(domain, DOMAIN_POLICY["general"])["contradiction"]
         old_conf = existing.get("confidence", 0.8)
@@ -473,20 +598,34 @@ class Reducer:
                 "trust_level": trust, "valid_from": now, "created_at": now, "last_seen_at": now,
                 "purpose_scope": '["*"]', "provenance": provenance})
 
-        if self.embedder is not None and kind in ("fact", "episode", "note", "reference", "procedure"):
-            text = body or key.get("name", "") or key.get("topic", "")
-            blob = self._safe_vec(text)
+        if self.embedder is not None and kind in _VECTORED_KINDS:
+            text = self.vector_text("asserted", p)
+            blob = self._safe_vec(text, target_id=b_id, kind=kind)
             if blob is not None:
                 self.store.add_memory_vector(b_id, kind, blob, self.embedder.model)
 
-    def _safe_vec(self, text):
+    def _safe_vec(self, text, target_id=None, kind=None):
         """Pack an embedding, or return None on ANY failure — so the embedding
-        backend can never roll back a durable capture (I12). The embedder itself
-        also degrades to hashing, but this is the belt-and-suspenders guard on the
-        transactional write path."""
+        backend can never roll back a durable capture (I12).
+
+        When the backend is DEGRADED (unreachable, §24.4) the vector is not merely
+        skipped: an `embed` job is queued in this same transaction so the write is
+        replayed once a model appears (§17.3). It is queued, never hashed — a hash
+        vector is indistinguishable from a real one downstream and would poison
+        retrieval silently.
+
+        A prefetch window (prefetch_vectors) is consulted first. A miss costs only
+        the ordinary single embed, so no caller depends on the cache being warm."""
         try:
-            from .embeddings import pack
-            return pack(self.embedder.embed(text))
+            cached = self._vec_cache.get(text)
+            return pack(cached if cached is not None else self.embedder.embed(text))
+        except EmbeddingsUnavailable:
+            try:
+                if target_id and kind and text:
+                    self.store.enqueue_embed_job(target_id, kind, text)
+            except Exception as e:  # I12 again: not even the queue may roll back a capture
+                logger.warning("deferred embed not queued for %s (%s)", target_id, e)
+            return None
         except Exception as e:
             logger.debug("embedding skipped (%s)", e)
             return None

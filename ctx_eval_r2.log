@@ -1,0 +1,14 @@
+dormant config flag retrieval.query_understanding.hyde is enabled: Hypothetical Document Embeddings — rewrite loop not yet implemented
+dormant config flag retrieval.query_understanding.expand_synonyms is enabled: Query synonym expansion — synonym detection not yet wired
+dormant config flag retrieval.query_understanding.decompose is enabled: Query decomposition — multi-clause strategy not yet implemented
+  ...10/60
+  ...20/60
+  ...30/60
+  ...40/60
+  ...50/60
+  ...60/60
+
+Context Retrieval Recall (60 instances)
+
+  token_budget=1500:  43/58  (  74.1%)
+  token_budget=4000:  49/58  (  84.5%)

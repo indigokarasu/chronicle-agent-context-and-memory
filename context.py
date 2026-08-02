@@ -83,7 +83,7 @@ class ChronicleContextEngine(ContextEngine):
         return pt > self.threshold_tokens
 
     # compression (§13.2)
-    def compress(self, messages, current_tokens=None, focus_topic=None) -> List[Dict[str, Any]]:
+    def compress(self, messages, current_tokens=None, focus_topic=None, force=False, **kwargs) -> List[Dict[str, Any]]:
         focus_topic = focus_topic or self.focus_topic
         if not self.core:
             return self._heuristic(messages)
@@ -152,9 +152,13 @@ class ChronicleContextEngine(ContextEngine):
         content = m.get("content") or ""
         if len(content) < 1:
             return
+        # Normalize chat-role to a valid Chronicle actor (CHECK constraint allows
+        # only 'user','agent','curator','system'). "assistant" is not a valid actor.
+        role = m.get("role", "system")
+        actor = role if role in ("user", "agent", "curator", "system") else "agent"
         self.core.capture.append("observed", {"source_type": "context_eviction",
                                               "excerpt": content[:4000], "source_ref": self._session_id},
-                                 actor=m.get("role", "system") if m.get("role") in ("user", "assistant") else "system",
+                                 actor=actor,
                                  session_id=self._session_id)
 
     def _heuristic(self, messages):

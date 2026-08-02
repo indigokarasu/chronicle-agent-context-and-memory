@@ -21,10 +21,12 @@ from .embeddings import get_embedder
 from .reducer import Reducer
 from .capture import CaptureEngine, Reaper
 from .retrieval import RetrievalEngine
-from .extraction import HeuristicExtractor, PREDICATE_MAP
+from .vector_index import VectorIndex
+from .extraction import HeuristicExtractor, make_extractor, PREDICATE_MAP
 from .derivation import DerivationEngine
 from .curation import CurationWorker
 from .federation import CapabilityRegistry
+from .localdb import register_local_dbs
 from .forgetting import ForgettingEngine
 from .health import HealthEngine
 from .learning import LearningLoop
@@ -62,14 +64,23 @@ class ChronicleCore:
                                      self.cfg.get("embeddings.dimensions"),
                                      self.cfg.get("embeddings.base_url"),
                                      self.cfg.get("embeddings.api_key"))
-        self.reducer = Reducer(self.store, self.embedder)
+        # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
+        # the store (add/delete/prune on write) and retrieval (KNN on read); see
+        # vector_index.py and RetrievalEngine.__init__ for why sharing matters.
+        # Dimensions come from the ACTIVE embedder, not a separate config knob,
+        # so the vec0 column always matches what's actually being written.
+        self.vector_index = VectorIndex(self.store, self.cfg, embedder=self.embedder)
+        self.store.vector_index = self.vector_index
+        self.reducer = Reducer(self.store, self.embedder, self.cfg)
         self.store.reducer = self.reducer                       # inline reduce on append (I7)
         self.capture = CaptureEngine(self.store, self.reducer,
-                                     extractor_version=self.cfg.get("extraction.version", "extractor-v1"))
-        self.extractor = HeuristicExtractor()
+                                     extractor_version=self.cfg.get("extraction.version", "extractor-v1"),
+                                     cfg=self.cfg)
+        self.extractor = make_extractor(self.cfg)
         self.derivation = DerivationEngine(self.store, self.cfg, self.capture.append)
         self.federation = CapabilityRegistry(self.store, self.cfg)
-        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation)
+        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation,
+                                         vector_index=self.vector_index)
         self.forgetting = ForgettingEngine(self.store, self.cfg, self.capture.append)
         self.health = HealthEngine(self)
         self.learning = LearningLoop(self)
@@ -176,6 +187,7 @@ class ChronicleCore:
 
     def bind_capabilities(self):
         self.federation.bind()
+        register_local_dbs(self.federation, self.cfg)
 
     def abandon_after(self, session_id, branch_point_seq):
         """Mark a session's post-rewind observed events as abandoned (I16)."""
@@ -198,26 +210,37 @@ class ChronicleCore:
         return self.gitmirror.flush()
 
     def embedding_status(self) -> dict:
-        """Report whether the active embedder is a real local model (and whether it
-        currently embeds) or the offline hashing fallback. Does a strict live test
-        embed against the endpoint."""
-        from .embeddings import OpenAICompatEmbedder, HashingEmbedder
+        """Report which embedding mode is live: a real local model (and whether it
+        currently embeds), the deliberate offline hashing embedder, or DEGRADED —
+        no backend, nothing vectored, embeds queued (§24.4). Does a strict live test
+        embed against the endpoint; the two backend-less embedders have none to
+        probe, so every endpoint field is read through getattr."""
+        from .embeddings import HashingEmbedder, DegradedEmbedder
         e = self.embedder
         info = {"embedder": type(e).__name__, "model": getattr(e, "model", None),
                 "endpoint": getattr(e, "base_url", None), "dimensions": getattr(e, "dimensions", None)}
         if isinstance(e, HashingEmbedder):
             info.update(mode="offline_hashing", supports_embeddings=False,
-                        detail="No local embedding model selected (server unreachable or model can't "
-                               "embed). FTS retrieval still works; vector search is lexical.")
+                        detail="Offline hashing embedder selected explicitly (embeddings.model / "
+                               "$CHRONICLE_EMBED_MODEL). Vectors are lexical, not semantic.")
             return info
+        if isinstance(e, DegradedEmbedder) and e.live is None:
+            info.update(mode="degraded", supports_embeddings=False,
+                        pending_embeds=self.store.count_rows("curation_jobs",
+                                                             "task='embed' AND status='pending'"),
+                        detail=f"No embedding backend reachable for {e.requested_model!r}. NO vectors "
+                               "are being written; each one is queued as an embed job and retried with "
+                               "backoff. FTS retrieval still works.")
+            return info
+        e = getattr(e, "live", None) or e                 # a recovered DegradedEmbedder proxies one
         try:
             v = e._embed_raw("chronicle embedding self-test", timeout=getattr(e, "timeout", 10))
             info.update(mode="local_model", supports_embeddings=True, dimensions=len(v),
                         detail=f"Live test embed OK ({len(v)}-dim) from {e.base_url} model {e.model!r}.")
         except Exception as ex:
             info.update(mode="local_model_failing", supports_embeddings=False,
-                        detail=f"Selected endpoint {e.base_url} failed a live embed: {ex}. "
-                               "Runtime will degrade to offline hashing.")
+                        detail=f"Selected endpoint {getattr(e, 'base_url', None)} failed a live embed: "
+                               f"{ex}. Vectors for this round are queued, never hashed.")
         return info
 
 

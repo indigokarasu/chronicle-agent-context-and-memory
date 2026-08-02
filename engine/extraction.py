@@ -123,7 +123,7 @@ class HeuristicExtractor(Extractor):
         m = re.search(r"\b(?:my name is|i'?m|i am|call me)\s+([a-z][\w'-]+(?:\s+[a-z][\w'-]+)?)", low)
         if m:
             cand = line[m.start(1):m.end(1)].strip()
-            # Keep only the leading run of capitalized words ("the operator and" → "the operator").
+            # Keep only the leading run of capitalized words ("Pat and" → "Pat").
             kept = []
             for w in cand.split():
                 if w[:1].isupper():
@@ -200,3 +200,99 @@ def _clean_value(s: str) -> str:
     s = s.strip().strip(".,;:!?").strip()
     s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I)
     return s[:200]
+
+
+_LLM_PROMPT = """Extract durable memory items from this conversation excerpt. Reply with ONLY a JSON object, no prose:
+{"facts": [{"subject": "user"|"<Entity Name>", "attribute": "<snake_case_predicate>", "value": "<value>"}],
+ "entities": [{"name": "<Name>", "type": "<person|org|place|thing>"}],
+ "directives": ["<standing instruction the user gave, verbatim-ish>"],
+ "episode": "<one-sentence summary of what happened>"|null}
+Rules: only durable facts (identity, relationships, preferences, dates, places, work) — no small talk; attribute names snake_case; omit anything uncertain; empty lists are fine.
+
+EXCERPT:
+"""
+
+
+class LLMExtractor(Extractor):
+    """Model-backed extraction behind the same interface (§16's intended swap).
+
+    Calls an OpenAI-compatible /chat/completions per excerpt and maps the JSON
+    reply onto the exact item shapes the heuristic emits, so the curation worker,
+    routing, and idempotency are untouched. On ANY failure — endpoint down, bad
+    JSON, timeout — it answers with the heuristic's result instead: capture must
+    never depend on a model being up (I18), and the raw tier still floors recall
+    either way. Opt-in via extraction.backend: llm; the write path stays
+    LLM-free unless explicitly chosen.
+    """
+
+    version = "extractor-v2-llm"
+
+    def __init__(self, base_url, model, api_key="", timeout=30, fallback=None):
+        self.base_url = (base_url or "").rstrip("/")
+        self.model = model or ""
+        self.api_key = api_key or ""
+        self.timeout = float(timeout or 30)
+        self.fallback = fallback or HeuristicExtractor()
+
+    def _chat(self, prompt):
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"model": self.model, "temperature": 0,
+                            "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        req = urllib.request.Request(self.base_url + "/chat/completions", data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+
+    def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id=""):
+        if not (self.base_url and self.model):
+            return self.fallback.extract(excerpt, source_event=source_event, owner=owner,
+                                         domain=domain, session_id=session_id)
+        try:
+            import json as _json
+            reply = self._chat(_LLM_PROMPT + (excerpt or "")[:4000])
+            m = re.search(r"\{.*\}", reply, re.S)      # tolerate fenced/prefixed replies
+            parsed = _json.loads(m.group(0) if m else reply)
+            items: List[dict] = []
+            for f in (parsed.get("facts") or [])[:20]:
+                subj = str(f.get("subject") or "").strip()
+                attr = re.sub(r"[^a-z0-9_]", "_", str(f.get("attribute") or "").strip().lower())[:60]
+                val = _clean_value(str(f.get("value") or ""))
+                if not (subj and attr and val):
+                    continue
+                canon, _card = canonical_predicate(attr.replace("_", " "))
+                if subj.lower() in ("user", "the user", "i", "me"):
+                    items.append(_fact_item("user", canon, val, owner, domain, source_event, "user_direct"))
+                else:
+                    items.append(_fact_item(entity_token(subj), canon, val, owner, domain,
+                                            source_event, "session_transcript", entity_name=subj))
+            for e in (parsed.get("entities") or [])[:10]:
+                name, etype = str(e.get("name") or "").strip(), str(e.get("type") or "thing").strip()
+                if name:
+                    items.append(_entity_item(name, etype, owner, domain, source_event))
+            for d in (parsed.get("directives") or [])[:5]:
+                if str(d).strip():
+                    items.append(_note_item(str(d).strip()[:400], "norm", owner, domain, source_event))
+            ep = parsed.get("episode")
+            if ep and str(ep).strip():
+                items.append({"type": "asserted", "kind": "episode",
+                              "key": {"title": str(ep)[:48], "session_ref": session_id},
+                              "body": str(ep)[:400], "confidence": 0.6, "source_event": source_event,
+                              "source_type": "session_transcript", "route": "promote"})
+            return ExtractionResult(items, False, "promote" if items else "skip")
+        except Exception:
+            return self.fallback.extract(excerpt, source_event=source_event, owner=owner,
+                                         domain=domain, session_id=session_id)
+
+
+def make_extractor(cfg):
+    """extraction.backend selector: heuristic (default) or llm-with-fallback."""
+    if cfg and cfg.get("extraction.backend", "heuristic") == "llm":
+        return LLMExtractor(cfg.get("extraction.llm.base_url"),
+                            cfg.get("extraction.llm.model"),
+                            cfg.get("extraction.llm.api_key") or "",
+                            cfg.get("extraction.llm.timeout", 30))
+    return HeuristicExtractor()
