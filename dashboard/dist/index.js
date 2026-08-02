@@ -49,13 +49,13 @@
       ".chr-kpi-l{font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;color:var(--color-muted-foreground);min-height:2.4em;line-height:1.3}",
       ".chr-kpi-v{font-size:1.6rem;font-weight:300;line-height:1;margin-top:.35rem}",
       ".chr-kpi-u{font-size:.8rem;font-weight:400;color:var(--color-muted-foreground);margin-left:.15rem}",
-      ".chr-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start}",
+      ".chr-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:stretch}.chr-grid>*{height:100%}",
       ".chr-comp{display:flex;align-items:center;gap:1.25rem;flex-wrap:nowrap}",
       ".chr-donut{position:relative;width:140px;height:140px;flex:none}",
       ".chr-donut::before{content:\"\";position:absolute;inset:0;border-radius:50%;background:var(--g);-webkit-mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px));mask:radial-gradient(circle farthest-side,#0000 calc(100% - 20px),#000 calc(100% - 20px))}",
       ".chr-donut .ctr{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}",
       ".chr-legend{display:flex;flex-direction:column;gap:.4rem;flex:1 1 auto;min-width:0}",
-      ".chr-leg-row{display:flex;align-items:center;gap:.5rem;font-size:.8rem}",
+      ".chr-leg-row{display:flex;align-items:center;gap:.6rem;font-size:.8rem;padding:.18rem 0}",
       ".chr-sw{width:.6rem;height:.6rem;border-radius:2px;flex:0 0 auto}",
       ".chr-leg-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
       ".chr-leg-ct{font-variant-numeric:tabular-nums}",
@@ -64,7 +64,7 @@
       ".chr-cov-l{flex:0 0 5.5rem}",
       ".chr-track{flex:1 1 auto;height:6px;border-radius:9999px;background:var(--color-border);overflow:hidden}",
       ".chr-fill{display:block;height:100%;border-radius:9999px}",
-      ".chr-cov-v{flex:0 0 auto;width:3.2em;text-align:right;font-variant-numeric:tabular-nums}",
+      ".chr-cov-v{flex:0 0 auto;width:3.2em;text-align:right;font-variant-numeric:tabular-nums;color:var(--color-muted-foreground)}",
       ".chr-act{display:flex;align-items:center;gap:.5rem;font-size:.78rem;padding:.18rem 0}",
       ".chr-mark{width:.5rem;height:.5rem;border-radius:9999px;flex:0 0 auto;background:var(--color-muted-foreground)}",
       ".chr-act-sum{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
@@ -131,6 +131,7 @@
       { name: "Documents", kind: "document", count: store.documents || 0 },
       { name: "Entities", kind: "entity", count: store.entities || 0 },
     ].map(function (s) { s.color = KIND_COLORS[s.kind]; return s; })
+     .filter(function (s) { return s.count > 0; })
      .sort(function (a, b) { return b.count - a.count; });
 
     var total = segs.reduce(function (a, s) { return a + s.count; }, 0);
@@ -191,7 +192,7 @@
     var hasEntities = false;
     var rows = order
       .map(function (k) { var e = emb[k] || {}; var isEntity = (k === "entity"); if (isEntity) hasEntities = true; return { kind: k, total: e.total || 0, embedded: e.embedded || 0, pct: e.pct || 0, isEntity: isEntity }; })
-      .filter(function (r) { return r.total > 0 || r.isEntity; })
+      .filter(function (r) { return r.total > 0 && !r.isEntity; })
       // rank by the composition counts so both lists read in the same order
       .sort(function (a, b) { return (rank[b.kind] || 0) - (rank[a.kind] || 0); });
 
@@ -204,7 +205,7 @@
               if (r.isEntity) {
                 // Entities are not embedded — show N/A bar per Braun spec
                 return h("div", { key: i, className: "chr-cov" },
-                  h("span", { className: "chr-cov-l text-muted-foreground" }, labels[r.kind] || r.kind),
+                  h("span", { className: "chr-cov-l" }, labels[r.kind] || r.kind),
                   h("span", { className: "chr-track" },
                     h("span", { className: "chr-fill", style: { width: "0%", background: kindColors.entity, opacity: 0.5 } })
                   ),
@@ -215,7 +216,7 @@
               var deficit = r.total - r.embedded;
               var fillColor = kindColors[r.kind] || SEG_COLORS[0];
               return h("div", { key: i, className: "chr-cov" },
-                h("span", { className: "chr-cov-l text-muted-foreground" }, labels[r.kind] || r.kind),
+                h("span", { className: "chr-cov-l" }, labels[r.kind] || r.kind),
                 h("span", { className: "chr-track" },
                   h("span", { className: "chr-fill", style: { width: Math.max(0, Math.min(100, r.pct)) + "%", background: fillColor } })
                 ),
