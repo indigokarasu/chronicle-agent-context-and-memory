@@ -71,7 +71,9 @@ def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='fact'"),
             ("event",
              "SELECT COUNT(*) FROM events WHERE type='observed'",
-             "SELECT COUNT(DISTINCT event_id) FROM observed_vectors"),
+             "SELECT COUNT(DISTINCT ov.event_id) FROM observed_vectors ov "
+             "JOIN events e ON e.event_id = ov.event_id "
+             "WHERE e.type='observed'"),
         ]
         for kind, total_q, emb_q in queries:
             total = conn.execute(total_q).fetchone()[0]
@@ -79,11 +81,17 @@ def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
                 stats[kind] = {"total": 0, "embedded": 0, "pct": 0}
                 continue
             embedded = conn.execute(emb_q).fetchone()[0]
-            embedded = min(embedded, total)  # can't embed more items than exist
+            if embedded > total:
+                # Numerator/denominator disagree on population: a query bug, not
+                # saturation. Clamping alone once reported a false 100%.
+                log.warning("coverage[%s]: embedded %d > total %d; check queries",
+                            kind, embedded, total)
+            embedded = min(embedded, total)
             pct = min(100, round((embedded / total) * 100))
             stats[kind] = {"total": total, "embedded": embedded, "pct": pct}
         # Entities are not embedded by the current pipeline.
-        stats["entity"] = {"total": 0, "embedded": 0, "pct": 0}
+        _ent = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        stats["entity"] = {"total": _ent, "embedded": 0, "pct": 0}
         conn.close()
     except Exception as e:
         log.warning("embedding stats failed: %s", e)
