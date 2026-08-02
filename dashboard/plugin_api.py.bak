@@ -99,29 +99,18 @@ _VERB = {
     "embedded": "Embedded",
     "updated": "Updated",
     "corrected": "Corrected",
-    "signal": "Signalled",
 }
 
 
 def _summarize_event(kind: str, payload) -> str:
-    """Build a short human-readable summary of what an event recorded.
-
-    Extracts content from the payload fields that various event types use:
-      - asserted/signal events store their primary text in ``body``
-      - observed events use ``excerpt``
-      - other historical tables use ``text`` / ``value`` / ``summary`` / ``content`` / ``note``
-    When no direct text is found, falls back to structured fields to say WHAT
-    happened: kind for asserted, signal_type for signals, action+target for observed.
-    """
+    """Build a short human-readable summary of what an event recorded."""
     if not isinstance(payload, dict):
         try:
             payload = json.loads(payload) if isinstance(payload, str) else {}
         except Exception:
             payload = {}
-    # Direct text — body first since it's the primary field for asserted/signal
     text = (
-        payload.get("body")
-        or payload.get("excerpt")
+        payload.get("excerpt")
         or payload.get("text")
         or payload.get("value")
         or payload.get("summary")
@@ -131,29 +120,6 @@ def _summarize_event(kind: str, payload) -> str:
     if text:
         s = str(text).replace("\n", " ").strip()
         return s[:120] + ("…" if len(s) > 120 else "")
-    # Structured fallback — say WHAT happened even when there's no free-text body
-    if kind == "asserted":
-        sub_kind = payload.get("kind", "item")
-        key = payload.get("key", {})
-        if isinstance(key, dict):
-            title = key.get("title") or key.get("subject") or key.get("note_type") or ""
-        elif isinstance(key, str):
-            title = key
-        else:
-            title = ""
-        if title:
-            return f"Asserted {sub_kind} · {str(title)[:100]}"
-        return f"Asserted {sub_kind}"
-    if kind == "signal":
-        sig_type = payload.get("signal_type", "directive")
-        return f"Signal · {sig_type}"
-    if kind == "observed":
-        action = payload.get("action", "")
-        target = payload.get("target", "")
-        if action and target:
-            return f"{action} {target}"
-        if action:
-            return action
     if payload.get("attribute") and payload.get("value"):
         return f"{payload['attribute']}: {payload['value']}"
     if payload.get("belief_id"):
@@ -247,11 +213,6 @@ def get_recent(limit: int = Query(20, ge=1, le=100)):
             kind = d.get("kind") or "event"
             d["summary"] = _summarize_event(kind, pl)
             d["verb"] = _VERB.get(kind, kind.capitalize())
-            # Surface domain + confidence from payload for frontend chips
-            d["domain"] = pl.get("domain")
-            d["confidence"] = pl.get("confidence")
-            # For signal events, include signal_type for richer display
-            d["signal_type"] = pl.get("signal_type") if kind == "signal" else None
             events.append(d)
         return {"events": events, "count": len(events)}
     except Exception:

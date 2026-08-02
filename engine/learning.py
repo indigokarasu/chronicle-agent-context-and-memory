@@ -66,8 +66,12 @@ class LearningLoop:
             raise E_LEARN_BOUND("max active deltas exceeded", cap=self.max_active)
         if not beats_champion:
             raise E_LEARN_BOUND("challenger did not beat champion")
-        self.store.upsert_policy({"version": version, "kind": "", "params": "{}",
-                                  "parent_version": "", "active": 1})
+        challenger = self.store.get_policy(version)
+        if not challenger:
+            raise E_LEARN_BOUND("no such challenger version", version=version)
+        self.store.upsert_policy({"version": version, "kind": challenger["kind"],
+                                  "params": challenger["params"],
+                                  "parent_version": challenger["parent_version"], "active": 1})
 
     def _check_bounds(self, kind, params):
         if kind not in self.mutable:

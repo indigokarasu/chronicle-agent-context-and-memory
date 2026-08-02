@@ -7,8 +7,9 @@ Reads the embedding config (defaults + $HERMES_HOME/config.yaml `memory.embeddin
 if present), shows which local servers/models are visible, resolves the embedder
 exactly as Chronicle does at runtime, then runs a STRICT live test embed.
 
-Exit codes:  0 = real local model embeds OK   2 = offline hashing fallback in use
+Exit codes:  0 = real local model embeds OK   2 = offline hashing selected explicitly
              3 = a model is selected but failed a live embed   1 = diagnostic error
+             4 = DEGRADED: no backend reachable (no vectors written, embeds queued)
 
 Usage:  python3 scripts/embedding_check.py
         (installed:  python3 ~/.hermes/plugins/chronicle/scripts/embedding_check.py)
@@ -27,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.config import Config
 from engine.embeddings import (
-    get_embedder, OpenAICompatEmbedder, HashingEmbedder,
+    get_embedder, OpenAICompatEmbedder, HashingEmbedder, DegradedEmbedder,
     _candidate_urls, _discover_embedding_models,
 )
 
@@ -76,10 +77,17 @@ def main() -> int:
 
     if isinstance(emb, HashingEmbedder):
         print(f"RESULT: OFFLINE HASHING in use (dim {emb.dimensions}).")
-        print("        No local embedding model was selected — either no server is")
-        print("        reachable, or the configured/served model can't embed.")
+        print("        Selected deliberately via embeddings.model / $CHRONICLE_EMBED_MODEL.")
         print("        FTS retrieval works; vector search is lexical, not semantic.")
         return 2
+
+    if isinstance(emb, DegradedEmbedder):
+        print(f"RESULT: DEGRADED — no embedding backend reachable (dim {emb.dimensions}).")
+        print("        NO vectors are written; every embed is queued as a curation job")
+        print("        and retried with backoff until a server appears. FTS retrieval works.")
+        print("        Set embeddings.model / $CHRONICLE_EMBED_MODEL to 'hashing' if you want")
+        print("        deterministic offline vectors instead of waiting.")
+        return 4
 
     # A local model was selected (it already passed Chronicle's healthcheck).
     # Re-confirm with a strict live embed (bypasses the resilient fallback).

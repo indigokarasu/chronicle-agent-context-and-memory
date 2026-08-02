@@ -1,7 +1,44 @@
+## 5.4.0
+Abstention support gate; chunked capture; degraded-mode embeddings with retry queue and self-heal; paged vector scan + optional sqlite-vec; session-grouped dated context with session windows; temporal channel (absolute + relative w/ now=); graph read channel; entity digests; standing user profile; NOOP-dedup; corrected chronicle_correct/chronicle_remember; generic local-DB federation provider + projection embeddings + SELECT-only db_query tool; config honesty audit. Canonical embedder: nomic-embed-text (local only).
+
 # Changelog
 
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
+
+## Unreleased
+
+- **`vector_index.backend: sqlite-vec` is real.** It was configuration fiction —
+  the setting existed, and every query brute-forced anyway. It now maintains a
+  `vec0` virtual table mirroring `observed_vectors` (created lazily, written on
+  add, cleaned on delete/prune/truncate) and serves `retrieve_raw`'s vector scan
+  by KNN `MATCH`. Strictly optional, guarded like the numpy path in
+  `embeddings.batch_cosine`: the library missing, a sqlite3 built without
+  loadable extensions (Apple's macOS system Python), or a `vec0` left at a
+  different embedding width all fall back to the paged scan, permanently and
+  quietly. `bruteforce` stays the default and is untouched. Results are the same
+  either way — the paged scan credits every FTS hit's vector contribution as a
+  side effect of scanning past it, so the fast path fetches those vectors by id
+  rather than letting a bounded window drop them, and widens the window when ACL
+  filtering prunes its top. 5,000 vectors, 50 queries: 37.5ms → 6.4ms per query.
+
+- **No more silent hash fallback.** `model: auto` with no reachable embedding
+  server used to quietly switch to the offline hashing embedder — hash vectors are
+  indistinguishable from model vectors downstream and permanently skew retrieval.
+  It now runs **degraded**: no vectors are written, each one becomes an `embed`
+  curation job that is deferred and retried with backoff (30s → 30m) until a
+  server appears, at which point the worker adopts it and drains the backlog. One
+  loud log line at init says which mode is live and why. `model: hashing` is
+  unchanged — that is the deliberate offline/CI setting.
+- `$CHRONICLE_EMBED_MODEL` overrides `embeddings.model`, so eval/CI can pin the
+  deterministic offline embedder without editing config.
+- Schema v2 + migration: `curation_jobs.run_after` (deferred retry) and task
+  `'embed'`. Existing stores are migrated in place on open — `CREATE TABLE IF NOT
+  EXISTS` never touches an existing table, so without this an old store would fail
+  the task CHECK *inside* the durable-capture transaction and fail every claim on
+  the missing column. `meta.schema_version` records the level.
+- `scripts/requeue_hash_vectors.py <db> [--dry-run]`: delete vectors written by
+  the hashing embedder and requeue the real embeds. Idempotent.
 
 ## 5.3.3
 

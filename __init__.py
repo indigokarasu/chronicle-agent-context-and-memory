@@ -59,7 +59,10 @@ def chronicle_status_command(raw_args: str = "") -> str:
     lines = ["Chronicle v" + __version__]
     try:
         st = core.embedding_status()
-        mark = "✅ local model" if st.get("supports_embeddings") else "⚠️ offline hashing"
+        mark = {"local_model": "✅ local model",
+                "offline_hashing": "⚙️ offline hashing (chosen explicitly)",
+                "degraded": "⚠️ no embedding server — vectors queued, none written",
+                }.get(st.get("mode"), "⚠️ " + str(st.get("mode")))
         lines.append("Embeddings: " + mark + " — " + str(st.get("detail", "")))
         lines.append("  embedder={} model={} endpoint={} dim={}".format(
             st.get("embedder"), st.get("model"), st.get("endpoint"), st.get("dimensions")))

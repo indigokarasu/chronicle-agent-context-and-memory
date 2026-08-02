@@ -5,8 +5,8 @@ Compositional inference via a small set of *guarded join rules* — never eager
 transitive closure (I24e). A rule fires for a binding only if all guards hold:
 (1) entity-grounded premises, (2) cardinality (required predicates single-valued),
 (3) temporal overlap, (4) shared readable ACL/domain. The conclusion is bound to
-a reified scope node (so it states "the user's Innovaccer office is downtown,"
-never "Innovaccer is downtown," I24b), carries source_type=inference with
+a reified scope node (so it states "the user's Acme office is downtown,"
+never "Acme is downtown," I24b), carries source_type=inference with
 confidence ≤ C(inference)=0.75, is hedged, and is justified by its premises + the
 rule so the TMS retracts it when any premise is (I24d).
 

@@ -198,6 +198,16 @@ class TestLearningLoop(unittest.TestCase):
         with self.assertRaises(E_LEARN_BOUND):
             self.learning.activate_policy(version, beats_champion=False)
 
+    def test_activate_policy_preserves_challenger_fields(self):
+        # Regression: activate_policy used to overwrite kind/params/parent_version
+        # with hardcoded blanks instead of the challenger's real values.
+        version = self.learning.propose_policy("rrf_weights", {"fts": 0.1}, parent_version="p0")
+        self.learning.activate_policy(version, beats_champion=True)
+        row = self.core.store.get_policy(version)
+        self.assertEqual(row["active"], 1)
+        self.assertEqual(row["kind"], "rrf_weights")
+        self.assertEqual(row["parent_version"], "p0")
+
     def test_record_outcome_no_belief_silent(self):
         # Should not raise for nonexistent belief_id
         self.learning.record_outcome("nonexistent", used=True)
@@ -261,7 +271,7 @@ class TestTools(unittest.TestCase):
 
     def test_search(self):
         self.tools.dispatch("assistant", "chronicle_remember", {
-            "kind": "fact", "content": "the operator lives in Denver", "entity": "user", "attribute": "city"
+            "kind": "fact", "content": "Pat lives in Denver", "entity": "user", "attribute": "city"
         })
         self.core.process_pending()
         result = json.loads(self.tools.dispatch("assistant", "chronicle_search", {
@@ -271,7 +281,7 @@ class TestTools(unittest.TestCase):
 
     def test_answer(self):
         self.tools.dispatch("assistant", "chronicle_remember", {
-            "kind": "fact", "content": "My name is the operator", "entity": "user", "attribute": "name"
+            "kind": "fact", "content": "My name is Pat", "entity": "user", "attribute": "name"
         })
         self.core.process_pending()
         result = json.loads(self.tools.dispatch("assistant", "chronicle_answer", {

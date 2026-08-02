@@ -41,6 +41,8 @@ class HealthEngine:
                 self.core.capture.append("retracted", {"belief_id": bid, "reason": "unjustified_orphan"},
                                          actor="curator", owner="default")
         self.consistency_sweep()
+        # Self-heal Tier-1: requeue vectors written by mismatched embedder.
+        results.update(self._embedder_mismatch_heal())
         self.store.record_health_run(results)
         return results
 
@@ -90,3 +92,51 @@ class HealthEngine:
     def rebuild_fts(self):
         """Tier-1 auto-repair: rebuild FTS from the projection (non-destructive)."""
         self.core.reducer.rebuild()
+
+    def _embedder_mismatch_heal(self) -> dict:
+        """Tier-1 auto-repair: requeue vectors whose embedder model ≠ active model.
+
+        Skip if embedder is None or has no model attribute. Returns {mismatched: N, requeued: N}."""
+        embedder = self.core.embedder
+        if embedder is None or not hasattr(embedder, "model"):
+            return {"embedder_mismatch": {"mismatched": 0, "requeued": 0}}
+
+        active_model = embedder.model
+        mismatched = 0
+        requeued = 0
+
+        # Scan observed_vectors for mismatched model.
+        for row in self.store._conn().execute(
+            "SELECT event_id, model FROM observed_vectors WHERE model != ?", (active_model,)).fetchall():
+            mismatched += 1
+            event_id, model = row[0], row[1]
+            # Extract text from the event payload (same logic as requeue_hash_vectors).
+            ev = self.store._conn().execute("SELECT payload FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if ev:
+                payload = json.loads(ev[0]) if isinstance(ev[0], str) else (ev[0] if ev[0] else {})
+                text = (payload or {}).get("excerpt", "")
+                if text and self.store.enqueue_embed_job(event_id, "observed", text) is not None:
+                    requeued += 1
+                    self._fingerprint("embedder_mismatch", "tier1", "requeue_embed", auto=1)
+
+        # Scan memory_vectors for mismatched model.
+        for row in self.store._conn().execute(
+            "SELECT belief_id, kind, model FROM memory_vectors WHERE model != ?", (active_model,)).fetchall():
+            mismatched += 1
+            belief_id, kind, model = row[0], row[1], row[2]
+            # Extract text from the belief (same logic as requeue_hash_vectors).
+            _BELIEF_TEXT = {
+                "fact": ("facts", "value"), "episode": ("episodes", "summary"),
+                "note": ("notes", "body"), "reference": ("refs", "cached_summary"),
+                "procedure": ("procedures", "name")}
+            table, col = _BELIEF_TEXT.get(kind, (None, None))
+            text = ""
+            if table:
+                b = self.store._conn().execute(f"SELECT {col} FROM {table} WHERE belief_id=?",
+                                               (belief_id,)).fetchone()
+                text = (b[0] or "") if b else ""
+            if text and self.store.enqueue_embed_job(belief_id, kind, text) is not None:
+                requeued += 1
+                self._fingerprint("embedder_mismatch", "tier1", "requeue_embed", auto=1)
+
+        return {"embedder_mismatch": {"mismatched": mismatched, "requeued": requeued}}

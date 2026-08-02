@@ -17,9 +17,14 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("chronicle.store")
+
+# Bumped whenever _SCHEMA changes shape; recorded in meta.schema_version by
+# _migrate. 2 = curation_jobs.run_after + task 'embed' (deferred embeds, §24.4).
+# 3 = task 'digest' (entity consolidation digests, §u2).
+SCHEMA_VERSION = 3
 
 # Belief tables that carry the common envelope (§8.1).
 BELIEF_TABLES = ["facts", "episodes", "notes", "refs", "relationships", "procedures"]
@@ -37,12 +42,21 @@ def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
 
 
+def _iso_in(seconds: float) -> str:
+    """now_iso() shifted forward — identical fixed-width format, so a stored
+    timestamp and a live one compare with plain string ordering (job run_after)."""
+    t = (datetime.datetime.now(datetime.timezone.utc)
+         + datetime.timedelta(seconds=max(0.0, float(seconds))))
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
+
+
 class MemoryStore:
     def __init__(self, db_path):
         self.db_path = str(db_path)
         self._local = threading.local()
         self._write_lock = threading.RLock()
         self.reducer = None  # set by ChronicleCore; enables inline reduce on append (I7)
+        self.vector_index = None  # set by ChronicleCore; optional ANN index for fast KNN
         self._lock_waits = 0
         self._lock_acqs = 0
         self._init_db()
@@ -90,9 +104,73 @@ class MemoryStore:
     def _init_db(self):
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        self._migrate(conn)
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('projection_seq','0')")
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('head_event_id','')")
+        # Seed the monotonic event_seq counter (used by append_event's atomic
+        # UPDATE...RETURNING). Omitting this left fresh DBs with no event_seq row,
+        # so the first append_event crashed with "NoneType is not subscriptable".
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('event_seq', "
+                     "(SELECT COALESCE(MAX(seq),0) FROM events))")
         conn.commit()
+
+    def _migrate(self, conn):
+        """Bring an EXISTING db up to _SCHEMA, idempotently (I2 in spirit).
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so
+        every _SCHEMA edit is invisible to older stores unless it is migrated here.
+        Skipping this is not cosmetic: an old curation_jobs makes append_event's
+        enqueue fail the task CHECK *inside* the durable-capture transaction (I12),
+        and makes every claim fail on the missing run_after column.
+
+        Each step probes the live schema first, so re-running costs two catalog
+        reads and changes nothing."""
+        if not _has_col(conn, "curation_jobs", "run_after"):
+            logger.info("schema migration: curation_jobs + run_after (deferred retry)")
+            conn.execute("ALTER TABLE curation_jobs ADD COLUMN run_after TEXT")
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                           ("curation_jobs",)).fetchone()
+        # Each new task value needs its OWN membership check: a DB migrated for
+        # 'embed' (schema_version 2) already has 'embed' in the CHECK, so testing
+        # only that string misses 'digest' (schema_version 3) entirely and every
+        # v2 DB enqueues a 'digest' job that fails the CHECK inside append_event's
+        # txn (I12), aborting the enclosing extract job. One rebuild covers both.
+        missing = [t for t in ("embed", "digest") if row and f"'{t}'" not in (row[0] or "")]
+        if missing:
+            logger.info("schema migration: curation_jobs task CHECK += %s", ", ".join(missing))
+            self._rebuild_curation_jobs(conn)
+        conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
+
+    def _rebuild_curation_jobs(self, conn):
+        """Recreate curation_jobs so its task CHECK admits 'embed' (SQLite cannot
+        ALTER a CHECK): create → copy → drop → rename → reindex, all in ONE explicit
+        transaction, per SQLite's documented table-rebuild procedure.
+
+        foreign_keys is toggled OUTSIDE the transaction (the pragma is a silent
+        no-op inside one) because curation_jobs.depends_on references the very
+        table being dropped. executescript() is avoided for the same reason — it
+        commits before running."""
+        conn.commit()                                   # no implicit txn open, so the pragma bites
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.execute("BEGIN")
+            conn.execute(_CURATION_JOBS_DDL % "curation_jobs_new")
+            conn.execute(f"INSERT INTO curation_jobs_new({_JOB_COLS}) "
+                         f"SELECT {_JOB_COLS} FROM curation_jobs")
+            conn.execute("DROP TABLE curation_jobs")
+            conn.execute("ALTER TABLE curation_jobs_new RENAME TO curation_jobs")
+            for ddl in _JOBS_INDEX_DDLS:
+                conn.execute(ddl)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")     # must not mask the real failure
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     # -- meta --------------------------------------------------------------
 
@@ -113,7 +191,18 @@ class MemoryStore:
         with self.transaction() as conn:
             if conn.execute("SELECT 1 FROM events WHERE event_id=?", (eid,)).fetchone():
                 return eid  # idempotent hit: no reduce, no git, no curation
-            seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM events").fetchone()[0]
+            # Monotonic seq from a single authoritative counter (meta.event_seq),
+            # updated atomically inside this transaction. Replaces the racy
+            # "SELECT MAX(seq)+1" which caused UNIQUE(seq) collisions under
+            # concurrent writers (chronicle_event_seq_unique_constraint defect).
+            # Self-heal: ensure the event_seq counter row exists even on a DB
+            # opened before _init_db() ran (e.g. existing DBs missing the seed).
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('event_seq', "
+                         "(SELECT COALESCE(MAX(seq),0) FROM events))")
+            seq = conn.execute(
+                "UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='event_seq' "
+                "RETURNING CAST(value AS INTEGER)"
+            ).fetchone()[0]
             conn.execute(
                 """INSERT INTO events(event_id,seq,order_key,type,payload,parents,actor,owner,
                    trust_level,session_id,branch_id,occurred_at,recorded_at,prev_head,sig)
@@ -172,10 +261,29 @@ class MemoryStore:
             "SELECT * FROM events WHERE recorded_at <= ? ORDER BY seq", (recorded_at,)).fetchall()
         return [dict(r) for r in rows]
 
-    def get_events_by_session(self, session_id: str, since_seq: int = 0) -> List[dict]:
-        rows = self._conn().execute(
-            "SELECT * FROM events WHERE session_id=? AND seq > ? ORDER BY seq",
-            (session_id, since_seq)).fetchall()
+    def get_events_by_session(self, session_id: str, since_seq: int = 0,
+                              types: Optional[Sequence[str]] = None,
+                              limit: Optional[int] = None) -> List[dict]:
+        """Events of one session, ascending by seq.
+
+        `types` and `limit` exist so a caller that wants "the first N observed
+        turns" can say so IN SQL. A session has no natural size bound — a
+        long-running assistant session accumulates thousands of events — and
+        filtering/slicing in Python still pays to read every row, build a dict
+        for each, and (for retrieval) json-decode each payload. idx_events_session
+        is (session_id, seq), which serves both the WHERE and the ORDER BY, so
+        LIMIT stops the scan early rather than sorting the session first.
+        """
+        q = "SELECT * FROM events WHERE session_id=? AND seq > ?"
+        params: list = [session_id, since_seq]
+        if types:
+            q += " AND type IN (%s)" % ",".join(["?"] * len(types))
+            params.extend(types)
+        q += " ORDER BY seq"
+        if limit is not None:
+            q += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn().execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
     def get_events_by_type(self, type_: str, since_seq: int = 0) -> List[dict]:
@@ -244,11 +352,41 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO observed_vectors(event_id,embedding,model,owner,created_at) "
                          "VALUES(?,?,?,?,?)", (event_id, embedding, model, owner, now_iso()))
+            # Mirror into the optional ANN index (§27 vector_index, u5), on the
+            # SAME connection/transaction -- this can be nested arbitrarily deep
+            # inside append_event's single re-entrant transaction (I7), so it
+            # must never commit independently (see vector_index.py docstring).
+            if self.vector_index:
+                try:
+                    self.vector_index.add_observed_vector(conn, event_id, embedding)
+                except Exception as e:
+                    logger.warning("Failed to update vector_index for %s: %s", event_id, e)
+
+    def delete_observed_vector(self, event_id: str):
+        """Drop a single observed event's vector (both the brute-force row and
+        its ANN mirror). Used where a raw event stops being retrievable outright
+        -- e.g. §20.5 unlearn/forbidden content -- as opposed to
+        prune_observed_vectors's bulk keep-list rebuild."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM observed_vectors WHERE event_id=?", (event_id,))
+            if self.vector_index:
+                try:
+                    self.vector_index.delete_observed_vector(conn, event_id)
+                except Exception as e:
+                    logger.warning("Failed to delete vector_index entry for %s: %s", event_id, e)
 
     def add_memory_vector(self, belief_id: str, kind: str, embedding: bytes, model: str):
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO memory_vectors(belief_id,kind,embedding,model,created_at) "
                          "VALUES(?,?,?,?,?)", (belief_id, kind, embedding, model, now_iso()))
+
+    def has_observed_vector(self, event_id: str) -> bool:
+        return self._conn().execute("SELECT 1 FROM observed_vectors WHERE event_id=?",
+                                    (event_id,)).fetchone() is not None
+
+    def has_memory_vector(self, belief_id: str, kind: str) -> bool:
+        return self._conn().execute("SELECT 1 FROM memory_vectors WHERE belief_id=? AND kind=?",
+                                    (belief_id, kind)).fetchone() is not None
 
     def delete_memory_vector(self, belief_id: str):
         """Drop a belief's embedding once it is no longer searchable. Without
@@ -269,8 +407,130 @@ class MemoryStore:
     def iter_observed_vectors(self) -> List[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM observed_vectors").fetchall()]
 
+    def iter_observed_vectors_paged(self, batch_size: int = 1000):
+        """Yield batches of observed_vectors, paged by rowid (streaming, O(batch) memory)."""
+        conn = self._conn()
+        min_rowid = 0
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, * FROM observed_vectors WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (min_rowid, batch_size)).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
+
+    def get_observed_vectors_by_ids(self, event_ids) -> Dict[str, dict]:
+        """Stored vectors for specific events, keyed by event_id (§24.4, u5).
+
+        Random access is what the paged scan never needs and the ANN fast path
+        cannot do without: `iter_observed_vectors_paged` visits EVERY row, so
+        retrieve_raw's paged branch credits every already-scored FTS hit as a
+        side effect of scanning past it, while a bounded KNN window reaches
+        only its own top-k. Without a by-id lookup an FTS hit outside that
+        window silently loses its whole vector contribution. Chunked to stay
+        under SQLITE_MAX_VARIABLE_NUMBER; ids with no vector are simply absent.
+        """
+        out: Dict[str, dict] = {}
+        ids = [e for e in dict.fromkeys(event_ids) if e]
+        if not ids:
+            return out
+        conn = self._conn()
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            ph = ",".join("?" * len(part))
+            for r in conn.execute(
+                    "SELECT event_id, embedding, owner FROM observed_vectors "
+                    f"WHERE event_id IN ({ph})", part).fetchall():
+                out[r["event_id"]] = dict(r)
+        return out
+
+    def add_projection_vector(self, provider: str, external_id: str, embedding: bytes, model: str,
+                              owner: str):
+        """Store or update a projection vector from an external data source.
+
+        `owner` is a REAL principal-shaped owner (e.g. the principal that
+        triggered the sweep/enqueue, same convention as observed/session
+        vectors) — never a placeholder — so the retrieve_raw scan can run the
+        same access.can_read check it runs for every other vector channel."""
+        with self.transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO projection_vectors"
+                         "(provider,external_id,embedding,model,owner,created_at) "
+                         "VALUES(?,?,?,?,?,?)", (provider, external_id, embedding, model, owner, now_iso()))
+
+    def has_projection_vector(self, provider: str, external_id: str) -> bool:
+        return self._conn().execute(
+            "SELECT 1 FROM projection_vectors WHERE provider=? AND external_id=?",
+            (provider, external_id)).fetchone() is not None
+
+    def get_projection_vectors_by_ids(self, proj_ids: List[Tuple[str, str]]) -> Dict[str, dict]:
+        """Stored projection vectors for specific (provider, external_id) pairs.
+
+        Returns dict keyed by "proj:<provider>:<external_id>" namespace id, mirroring
+        the retrieval.retrieve_raw session id namespacing "session:<session_id>".
+        Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER.
+        """
+        out: Dict[str, dict] = {}
+        if not proj_ids:
+            return out
+        conn = self._conn()
+        chunk = 250  # half of 500 event chunk due to 2 params per id
+        for i in range(0, len(proj_ids), chunk):
+            part = proj_ids[i:i + chunk]
+            params = []
+            conditions = []
+            for provider, external_id in part:
+                conditions.append("(provider=? AND external_id=?)")
+                params.extend([provider, external_id])
+            where_clause = " OR ".join(conditions)
+            for r in conn.execute(
+                    f"SELECT provider, external_id, embedding, owner FROM projection_vectors "
+                    f"WHERE {where_clause}", params).fetchall():
+                key = f"proj:{r['provider']}:{r['external_id']}"
+                out[key] = {"embedding": r["embedding"], "provider": r["provider"],
+                            "external_id": r["external_id"], "owner": r["owner"]}
+        return out
+
+    def iter_projection_vectors_paged(self, batch_size: int = 1000):
+        """Yield batches of projection_vectors, paged by rowid (streaming, O(batch) memory)."""
+        conn = self._conn()
+        min_rowid = 0
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, * FROM projection_vectors WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (min_rowid, batch_size)).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
+
+    def delete_projection_vectors(self, provider: str):
+        """Delete all projection vectors from a specific provider."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM projection_vectors WHERE provider=?", (provider,))
+
     def iter_session_vectors(self) -> List[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM session_index").fetchall()]
+
+    def iter_session_vectors_paged(self, batch_size: int = 1000):
+        """Yield batches of session_index, paged by rowid (streaming, O(batch) memory)."""
+        conn = self._conn()
+        min_rowid = 0
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, * FROM session_index WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (min_rowid, batch_size)).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
 
     def vector_count(self) -> int:
         return self.count_rows("memory_vectors") + self.count_rows("observed_vectors")
@@ -409,19 +669,87 @@ class MemoryStore:
 
     # -- curation jobs (§17) ----------------------------------------------
 
-    def enqueue_curation(self, task: str, payload: dict, depends_on: Optional[int] = None) -> int:
+    def enqueue_curation(self, task: str, payload: dict, depends_on: Optional[int] = None) -> Optional[int]:
+        """Queue a curation job, collapsing an identical (task, payload) pair that
+        is already pending or running — the same guard enqueue_embed_job applies
+        below, on the same canonical-json key and served by the same partial index.
+
+        Callers that enqueue unconditionally are the reason. _task_extract ends
+        with `enqueue_curation("digest", {"entity_id": s})` for every subject it
+        touched (§u2 deliberately puts the >=3-fact threshold in the handler, not
+        the enqueue) and one `canonicalize` job per extract — including the very
+        common `{"subjects": []}`. Draining N byte-identical jobs recomputes one
+        answer N times. It is safe to collapse them precisely because they are
+        byte-identical: each handler reads current state when it runs, so the one
+        surviving job — which stays pending behind the extract jobs that queued
+        it, since claim is by ascending id — sees everything the collapsed ones
+        would have, and the end state is the same.
+
+        depends_on is left out of the key on purpose: two jobs with the same
+        (task, payload) are the same unit of work whoever is waiting on them.
+        Returns the job id, or None when it deduped."""
+        canon = json.dumps(payload, sort_keys=True)
         with self.transaction() as conn:
+            dup = conn.execute(
+                "SELECT id FROM curation_jobs WHERE task=? AND status IN ('pending','running') "
+                "AND payload=?", (task, canon)).fetchone()
+            if dup is not None:
+                return None
             cur = conn.execute(
                 "INSERT INTO curation_jobs(task,payload,depends_on,created_at) VALUES(?,?,?,?)",
-                (task, json.dumps(payload), depends_on, now_iso()))
+                (task, canon, depends_on, now_iso()))
             return cur.lastrowid
 
+    def enqueue_embed_job(self, target_id: str, kind: str, text: str, *,
+                         owner: Optional[str] = None, provider: Optional[str] = None,
+                         external_id: Optional[str] = None) -> Optional[int]:
+        """Queue a deferred vector write (§24.4), unless the same one is already
+        queued. Degraded mode can re-touch one belief many times (every update
+        re-enters the reduce), and the queue must not grow without bound; the
+        payload is canonical json, so an identical (target, kind, text, ...)
+        dedupes. Returns the job id, or None when deduped.
+
+        `owner`/`provider`/`external_id` are optional extras carried through to
+        the handler for kinds that need them (kind='projection', §g5) — the
+        'observed'/belief-kind callers omit them and see no change in the
+        dedup key, so this is additive, not a behavior change for them."""
+        payload_dict = {"target_id": target_id, "kind": kind, "text": (text or "")[:8000]}
+        if owner is not None:
+            payload_dict["owner"] = owner
+        if provider is not None:
+            payload_dict["provider"] = provider
+        if external_id is not None:
+            payload_dict["external_id"] = external_id
+        payload = json.dumps(payload_dict, sort_keys=True)
+        with self.transaction() as conn:
+            dup = conn.execute("SELECT id FROM curation_jobs WHERE task='embed' AND "
+                               "status IN ('pending','running') AND payload=?", (payload,)).fetchone()
+            if dup is not None:
+                return None
+            cur = conn.execute("INSERT INTO curation_jobs(task,payload,created_at) "
+                               "VALUES('embed',?,?)", (payload, now_iso()))
+            return cur.lastrowid
+
+    def enqueue_projection_embed(self, provider: str, external_id: str, text: str,
+                                 owner: Optional[str] = None) -> Optional[int]:
+        """Queue a projection's rendered text for embedding via the SAME deferred
+        embed-job path every other vector channel uses — never inline at sweep
+        time (§g5a). The target id is namespaced "proj:<provider>:<external_id>",
+        mirroring the id retrieve_raw's projection scan produces, so a queued
+        job and its eventual vector agree on identity by construction."""
+        target_id = f"proj:{provider}:{external_id}"
+        return self.enqueue_embed_job(target_id, "projection", text, owner=owner,
+                                      provider=provider, external_id=external_id)
+
     def claim_curation_job(self) -> Optional[dict]:
+        """Lowest-id ready job. Ready = pending, dependencies done, and NOT deferred:
+        a job whose run_after is still in the future stays invisible (§17.3)."""
         with self.transaction() as conn:
             row = conn.execute(
                 "SELECT * FROM curation_jobs WHERE status='pending' AND "
+                "(run_after IS NULL OR run_after <= ?) AND "
                 "(depends_on IS NULL OR depends_on IN (SELECT id FROM curation_jobs WHERE status='done')) "
-                "ORDER BY id LIMIT 1").fetchone()
+                "ORDER BY id LIMIT 1", (now_iso(),)).fetchone()
             if row is None:
                 return None
             conn.execute("UPDATE curation_jobs SET status='running', started_at=?, attempts=attempts+1 "
@@ -433,8 +761,28 @@ class MemoryStore:
             conn.execute("UPDATE curation_jobs SET status=?, finished_at=?, error=? WHERE id=?",
                          ("failed" if error else "done", now_iso(), error, job_id))
 
+    def defer_curation_job(self, job_id: int, delay_seconds: int, error: Optional[str] = None):
+        """Put a claimed job back as pending, invisible until `delay_seconds` from now.
+
+        run_after is written in the same now_iso() format as every other timestamp
+        column so claim's `run_after <= ?` comparison is a plain lexicographic one
+        on fixed-width RFC3339 (a SQLite-computed 'YYYY-MM-DD HH:MM:SS' would sort
+        BELOW every 'T'-separated value and fire instantly). The reason is parked in
+        `error` so the queue explains itself; status stays 'pending', so it reads as
+        waiting, not failed."""
+        run_after = _iso_in(delay_seconds)
+        with self.transaction() as conn:
+            conn.execute("UPDATE curation_jobs SET status='pending', run_after=?, started_at=NULL, "
+                         "error=? WHERE id=?", (run_after, error, job_id))
+        return run_after
+
     def pending_curation_count(self) -> int:
         return self.count_rows("curation_jobs", "status='pending'")
+
+    def get_curation_jobs(self, where: str = "1=1", limit: int = 100) -> List[dict]:
+        """Job rows for diagnostics/tests (same trusted-where contract as count_rows)."""
+        return [dict(r) for r in self._conn().execute(
+            f"SELECT * FROM curation_jobs WHERE {where} ORDER BY id LIMIT ?", (int(limit),)).fetchall()]
 
     # -- extractions (§16) -------------------------------------------------
 
@@ -678,6 +1026,10 @@ class MemoryStore:
                                    (kind,)).fetchone()
         return dict(row) if row else None
 
+    def get_policy(self, version: str) -> Optional[dict]:
+        row = self._conn().execute("SELECT * FROM policies WHERE version=?", (version,)).fetchone()
+        return dict(row) if row else None
+
     def count_active_policies(self) -> int:
         return self.count_rows("policies", "active=1")
 
@@ -718,10 +1070,15 @@ class MemoryStore:
         with self.transaction() as conn:
             for t in (BELIEF_TABLES + ["entities", "user_knowledge", "justifications",
                                        "corrections", "nogoods", "contradictions",
-                                       "observed_vectors", "session_index", "memory_vectors"]):
+                                       "observed_vectors", "session_index", "memory_vectors", "projection_vectors"]):
                 conn.execute(f"DELETE FROM {t}")
             conn.execute("DELETE FROM observed_fts")
             conn.execute("DELETE FROM belief_fts")
+            if self.vector_index:
+                try:
+                    self.vector_index.prune_observed_vectors(conn, set())  # keep nothing -- full rebuild
+                except Exception as e:
+                    logger.warning("Failed to clear vector_index on truncate: %s", e)
 
 
 # -- helpers --------------------------------------------------------------
@@ -762,6 +1119,34 @@ def _fts_query(query: str) -> str:
         return ""
     return " OR ".join(f'"{t}"' for t in terms)
 
+
+# curation_jobs is spliced into _SCHEMA from these, so the migration rebuild
+# (_rebuild_curation_jobs) recreates the EXACT table+index and can never drift
+# from the fresh-install schema. `run_after` = deferred retry (§17.3, §24.4).
+_CURATION_JOBS_DDL = """CREATE TABLE IF NOT EXISTS %s (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task TEXT CHECK(task IN ('extract','route','criticality','canonicalize','consolidate',
+        'contradiction','identity','derive','verify','decay','consistency','health','reextract',
+        'journal_ingest','session_summarize','embed','digest')),
+    payload TEXT, depends_on INTEGER REFERENCES curation_jobs(id),
+    status TEXT CHECK(status IN ('pending','running','done','failed')) DEFAULT 'pending',
+    attempts INTEGER DEFAULT 0, created_at TEXT, started_at TEXT, finished_at TEXT, error TEXT,
+    run_after TEXT);"""
+_JOBS_INDEX_DDLS = (
+    "CREATE INDEX IF NOT EXISTS idx_jobs_ready ON curation_jobs(status, id) "
+    "WHERE status='pending';",
+    # Serves the enqueue_curation / enqueue_embed_job dedup probe. Without it
+    # every enqueue scans curation_jobs, which grows as the drain proceeds, so
+    # the guard that exists to REMOVE work costs O(queue) per call and eats most
+    # of what it saves.
+    "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON curation_jobs(task, payload) "
+    "WHERE status IN ('pending','running');",
+)
+# One string for the _SCHEMA splice (executescript takes many statements);
+# the rebuild path executes them one at a time (conn.execute takes exactly one).
+_JOBS_INDEX_DDL = "\n".join(_JOBS_INDEX_DDLS)
+_JOB_COLS = ("id,task,payload,depends_on,status,attempts,created_at,started_at,finished_at,"
+             "error,run_after")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -900,15 +1285,7 @@ CREATE TABLE IF NOT EXISTS derivation_rules (
     guards TEXT NOT NULL, conclusion TEXT NOT NULL, scope TEXT NOT NULL,
     materialize TEXT DEFAULT 'high_value', precision_n INTEGER DEFAULT 0, precision_correct INTEGER DEFAULT 0);
 
-CREATE TABLE IF NOT EXISTS curation_jobs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task TEXT CHECK(task IN ('extract','route','criticality','canonicalize','consolidate',
-        'contradiction','identity','derive','verify','decay','consistency','health','reextract',
-        'journal_ingest','session_summarize')),
-    payload TEXT, depends_on INTEGER REFERENCES curation_jobs(id),
-    status TEXT CHECK(status IN ('pending','running','done','failed')) DEFAULT 'pending',
-    attempts INTEGER DEFAULT 0, created_at TEXT, started_at TEXT, finished_at TEXT, error TEXT);
-CREATE INDEX IF NOT EXISTS idx_jobs_ready ON curation_jobs(status, id) WHERE status='pending';
+""" + (_CURATION_JOBS_DDL % "curation_jobs") + "\n" + _JOBS_INDEX_DDL + """
 
 CREATE TABLE IF NOT EXISTS extractions (
     id TEXT PRIMARY KEY, observed_event TEXT, extractor_version TEXT, produced TEXT,
@@ -924,6 +1301,11 @@ CREATE TABLE IF NOT EXISTS session_index (
     session_id TEXT PRIMARY KEY, summary TEXT, embedding BLOB, owner TEXT, occurred_at TEXT);
 CREATE TABLE IF NOT EXISTS memory_vectors (
     belief_id TEXT, kind TEXT, embedding BLOB, model TEXT, created_at TEXT, PRIMARY KEY(belief_id, kind));
+
+CREATE TABLE IF NOT EXISTS projection_vectors (
+    provider TEXT NOT NULL, external_id TEXT NOT NULL, embedding BLOB, model TEXT,
+    owner TEXT, created_at TEXT, PRIMARY KEY(provider, external_id));
+CREATE INDEX IF NOT EXISTS idx_proj_vectors_provider ON projection_vectors(provider);
 
 CREATE TABLE IF NOT EXISTS sources (
     source_id TEXT PRIMARY KEY, source_type TEXT, trust_level INTEGER, info_label TEXT);
