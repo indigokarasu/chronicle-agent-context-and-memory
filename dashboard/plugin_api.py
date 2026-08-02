@@ -11,7 +11,7 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query
 
@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _get_db_path() -> Path | None:
+def _get_db_path() -> Optional[Path]:
     """Locate the Chronicle SQLite database."""
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     for rel in ["commons/db/chronicle/chronicle.db", "commons/db/chronicle.db", "chronicle.db"]:
@@ -40,7 +40,7 @@ def _count(db_path: Path, table: str, where: str = "") -> int:
         return 0
 
 
-def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
+def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
     """Return embedding coverage for every content table.
 
     Mirrors the actual embedding pipeline (see scripts/enrich_embeddings.py and
@@ -52,7 +52,7 @@ def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
       - entities: not part of the embedding pipeline
     Percentages are capped at 100 (some events accrue >1 vector over time).
     """
-    stats: dict[str, Any] = {}
+    stats: Dict[str, Any] = {}
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         # (key, total_query, embedded_query)
@@ -87,7 +87,7 @@ def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
                 log.warning("coverage[%s]: embedded %d > total %d; check queries",
                             kind, embedded, total)
             embedded = min(embedded, total)
-            pct = min(100, round((embedded / total) * 100))
+            pct = min(100, int(round((embedded / total) * 100)))
             stats[kind] = {"total": total, "embedded": embedded, "pct": pct}
         # Entities are not embedded by the current pipeline.
         _ent = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
@@ -188,6 +188,10 @@ def get_status():
         "entities": _count(db_path, "entities"),
         "documents": _count(db_path, "documents"),
         "pending_jobs": _count(db_path, "curation_jobs", "status='pending'"),
+        # what the enqueue button would actually find; 0 means it is a no-op
+        "enqueue_candidates": _count(
+            db_path, "events e LEFT JOIN extractions ext ON ext.observed_event = e.event_id",
+            "ext.observed_event IS NULL"),
     }
     return {
         "plugin": "chronicle",
@@ -269,7 +273,7 @@ def get_recent(limit: int = Query(20, ge=1, le=100)):
 @router.get("/facts")
 def get_facts(
     limit: int = Query(20, ge=1, le=100),
-    status: str | None = Query(None),
+    status: Optional[str] = Query(None),
 ):
     db_path = _get_db_path()
     if not db_path:
