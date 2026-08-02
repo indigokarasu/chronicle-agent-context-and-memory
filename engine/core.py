@@ -13,26 +13,25 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Optional
 
-from .config import Config
-from .store import MemoryStore, now_iso
-from .embeddings import get_embedder
-from .reducer import Reducer
 from .capture import CaptureEngine, Reaper
-from .retrieval import RetrievalEngine
-from .vector_index import VectorIndex
-from .extraction import HeuristicExtractor, make_extractor, PREDICATE_MAP
-from .derivation import DerivationEngine
+from .config import Config
 from .curation import CurationWorker
+from .derivation import DerivationEngine
+from .embeddings import get_embedder
+from .extraction import PREDICATE_MAP, make_extractor
 from .federation import CapabilityRegistry
-from .localdb import register_local_dbs
 from .forgetting import ForgettingEngine
+from .gitmirror import GitMirror
 from .health import HealthEngine
 from .learning import LearningLoop
-from .reasoning import ReasoningLayer, EpistemicModel
-from .gitmirror import GitMirror
+from .localdb import register_local_dbs
+from .reasoning import EpistemicModel, ReasoningLayer
+from .reducer import Reducer
+from .retrieval import RetrievalEngine
+from .store import MemoryStore, now_iso
 from .tools import Tools
+from .vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.core")
 
@@ -47,7 +46,7 @@ class ChronicleCore:
         """The live core for the current process (typically the only one)."""
         return cls._active or (next(iter(cls._instances.values())) if cls._instances else None)
 
-    def __init__(self, hermes_home: str, config: Optional[dict] = None):
+    def __init__(self, hermes_home: str, config: dict | None = None):
         self.hermes_home = hermes_home
         self.cfg = Config(config or {})
         self.has_memory_provider = False
@@ -104,7 +103,7 @@ class ChronicleCore:
         self.derivation.seed_rules()
 
     @classmethod
-    def get(cls, hermes_home: str, config=None) -> "ChronicleCore":
+    def get(cls, hermes_home: str, config=None) -> ChronicleCore:
         with cls._lock:
             if hermes_home not in cls._instances:
                 if config is None:
@@ -215,7 +214,7 @@ class ChronicleCore:
         no backend, nothing vectored, embeds queued (§24.4). Does a strict live test
         embed against the endpoint; the two backend-less embedders have none to
         probe, so every endpoint field is read through getattr."""
-        from .embeddings import HashingEmbedder, DegradedEmbedder
+        from .embeddings import DegradedEmbedder, HashingEmbedder
         e = self.embedder
         info = {"embedder": type(e).__name__, "model": getattr(e, "model", None),
                 "endpoint": getattr(e, "base_url", None), "dimensions": getattr(e, "dimensions", None)}

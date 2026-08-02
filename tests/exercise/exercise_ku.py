@@ -75,7 +75,7 @@ def ingest_instance(core, inst) -> int:
             if turn.get("role") == "user":
                 pend = content
                 continue
-            excerpt = ("User: %s\nAssistant: %s" % (pend or "", content))[:4000]
+            excerpt = ("User: {}\nAssistant: {}".format(pend or "", content))[:4000]
             eid = core.capture.append(
                 "observed", {"source_type": "session_transcript", "excerpt": excerpt, "source_ref": sid},
                 actor="user", session_id=sid, occurred_at=when, trust_level=2)
@@ -84,7 +84,7 @@ def ingest_instance(core, inst) -> int:
             pend = None
         if pend is not None:  # trailing user turn with no assistant reply
             eid = core.capture.append(
-                "observed", {"source_type": "session_transcript", "excerpt": ("User: %s" % pend)[:4000],
+                "observed", {"source_type": "session_transcript", "excerpt": (f"User: {pend}")[:4000],
                              "source_ref": sid},
                 actor="user", session_id=sid, occurred_at=when, trust_level=2)
             if eid:

@@ -3,22 +3,21 @@ Chronicle — tests for forgetting.py, gitmirror.py, and federation.py (§14, §
 """
 
 import datetime
-import json
 import os
-import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.forgetting import ForgettingEngine, _age_days, _LADDER
 from engine.federation import (
-    CapabilityProvider, CapabilityRegistry,
-    PREDICATE_CAPABILITY, E_AUTHORITY_UNAVAILABLE,
+    E_AUTHORITY_UNAVAILABLE,
+    PREDICATE_CAPABILITY,
+    CapabilityProvider,
+    CapabilityRegistry,
 )
+from engine.forgetting import _LADDER, ForgettingEngine, _age_days
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +59,8 @@ class TestForgettingLadder(unittest.TestCase):
 
 class TestForgettingEngine(unittest.TestCase):
     def setUp(self):
-        from engine.store import MemoryStore
         from engine.config import Config
+        from engine.store import MemoryStore
 
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()
@@ -176,8 +175,8 @@ class TestCapabilityProvider(unittest.TestCase):
 
 class TestCapabilityRegistry(unittest.TestCase):
     def setUp(self):
-        from engine.store import MemoryStore
         from engine.config import Config
+        from engine.store import MemoryStore
 
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.tmp.close()

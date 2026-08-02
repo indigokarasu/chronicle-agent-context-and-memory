@@ -43,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.environ.get("CHRONICLE_DIR") or str(Path(__file__).resolve().parent.parent))
 
-from engine.core import ChronicleCore  # noqa: E402
+from engine.core import ChronicleCore
 
 # (gate, attr, value) — attr is the RetrievalEngine field the gate reads, so a
 # trial applies straight onto a fresh engine without rebuilding the config.
@@ -74,7 +74,7 @@ def ingest(core, inst):
             if turn.get("role") == "user":
                 pend = content
                 continue
-            excerpt = ("User: %s\nAssistant: %s" % (pend or "", content))[:4000]
+            excerpt = ("User: {}\nAssistant: {}".format(pend or "", content))[:4000]
             core.capture.append("observed",
                                 {"source_type": "session_transcript", "excerpt": excerpt,
                                  "source_ref": sid},
@@ -83,7 +83,7 @@ def ingest(core, inst):
         if pend is not None:  # trailing user turn with no assistant reply
             core.capture.append("observed",
                                 {"source_type": "session_transcript",
-                                 "excerpt": ("User: %s" % pend)[:4000], "source_ref": sid},
+                                 "excerpt": (f"User: {pend}")[:4000], "source_ref": sid},
                                 actor="user", session_id=sid, occurred_at=when)
 
 
@@ -120,7 +120,7 @@ def main() -> int:
         fa = sum(abstains(i, gate, attr, value) for i in answerable)
         rows.append((gate, attr, value, ab, fa))
         print("  %-8s %-18s abstained %2d/%d   false-abstain %3d/%d"
-              % (gate, "%s=%s" % (attr.lstrip("_"), value), ab, len(unanswerable), fa,
+              % (gate, "{}={}".format(attr.lstrip("_"), value), ab, len(unanswerable), fa,
                  len(answerable)), flush=True)
 
     n_abs, n_a = len(unanswerable), len(answerable)
@@ -129,7 +129,7 @@ def main() -> int:
     print("-" * 62)
     for gate, attr, value, ab, fa in rows:
         print("%-8s %-20s %-14s %-18s"
-              % (gate, "%s=%s" % (attr.lstrip("_"), value), "%d/%d" % (ab, n_abs),
+              % (gate, "{}={}".format(attr.lstrip("_"), value), "%d/%d" % (ab, n_abs),
                  "%d/%d" % (fa, n_a)))
     print("\n(%.1fs)" % (time.time() - t0))
 
@@ -149,7 +149,7 @@ def main() -> int:
 
     print("\nSELECTED: abstain_gate=%s %s=%s  (abstained %d/%d, false-abstain %d/%d)"
           % (pick[0], pick[1].lstrip("_"), pick[2], pick[3], n_abs, pick[4], n_a))
-    print("  %s" % note)
+    print(f"  {note}")
     if pick[4] > 8:
         print("  COST: %d/%d answerable questions are refused at this setting. The lexical"
               % (pick[4], n_a))

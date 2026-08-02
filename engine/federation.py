@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List, Optional
 
 from .errors import E_AUTHORITY_UNAVAILABLE
 
@@ -38,7 +37,7 @@ class CapabilityProvider:
     def resolve(self, ref):
         raise NotImplementedError
 
-    def query(self, params) -> List[dict]:
+    def query(self, params) -> list[dict]:
         return []
 
 
@@ -46,7 +45,7 @@ class CapabilityRegistry:
     def __init__(self, store, cfg):
         self.store = store
         self.cfg = cfg
-        self.providers: Dict[str, CapabilityProvider] = {}
+        self.providers: dict[str, CapabilityProvider] = {}
 
     # -- discovery / lifecycle --------------------------------------------
 
@@ -77,7 +76,7 @@ class CapabilityRegistry:
 
     # -- routing ----------------------------------------------------------
 
-    def capability_for_predicate(self, predicate: str) -> Optional[str]:
+    def capability_for_predicate(self, predicate: str) -> str | None:
         cap = PREDICATE_CAPABILITY.get(predicate)
         if not cap:
             return None
@@ -112,5 +111,5 @@ class CapabilityRegistry:
             return json.loads(ptr["cached_projection"])
         raise E_AUTHORITY_UNAVAILABLE(f"no active provider for {capability}", capability=capability)
 
-    def list_capabilities(self) -> List[dict]:
+    def list_capabilities(self) -> list[dict]:
         return self.store.get_capability_providers()

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import List
 
 from .store import now_iso
 
@@ -31,7 +30,7 @@ class EpistemicModel:
             append_fn("informed", {"proposition": proposition, "about_belief": about_belief,
                                    "importance": importance}, actor="agent", owner=owner)
 
-    def what_user_knows(self, topic: str) -> List[dict]:
+    def what_user_knows(self, topic: str) -> list[dict]:
         rows = self.store.query_user_knowledge("proposition LIKE ?", (f"%{topic}%",), limit=20)
         return [{"proposition": r["proposition"], "state": r["state"],
                  "last_communicated": r["last_communicated"],
@@ -69,7 +68,7 @@ class ReasoningLayer:
         return self.store.get_active_goals()
 
     # procedures
-    def get_procedure(self, name: str, params: dict = None):
+    def get_procedure(self, name: str, params: dict | None = None):
         rows = self.store.query_beliefs("procedures", "name=? AND status='active'", (name,), 1)
         if not rows:
             sims = self.store.fts_search_beliefs(name, limit=3)

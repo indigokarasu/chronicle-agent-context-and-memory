@@ -28,8 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.config import Config
 from engine.embeddings import (
-    get_embedder, OpenAICompatEmbedder, HashingEmbedder, DegradedEmbedder,
-    _candidate_urls, _discover_embedding_models,
+    DegradedEmbedder,
+    HashingEmbedder,
+    _candidate_urls,
+    _discover_embedding_models,
+    get_embedder,
 )
 
 
@@ -93,7 +96,7 @@ def main() -> int:
     # Re-confirm with a strict live embed (bypasses the resilient fallback).
     try:
         v = emb._embed_raw("chronicle embedding self-test", timeout=getattr(emb, "timeout", 10))
-        print(f"RESULT: LOCAL MODEL supports embeddings ✓")
+        print("RESULT: LOCAL MODEL supports embeddings ✓")
         print(f"        model={emb.model!r}  endpoint={emb.base_url}  dim={len(v)}")
         return 0
     except Exception as e:

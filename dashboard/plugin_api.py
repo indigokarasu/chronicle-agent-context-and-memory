@@ -11,7 +11,7 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import APIRouter, Query
 
@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _get_db_path() -> Optional[Path]:
+def _get_db_path() -> Path | None:
     """Locate the Chronicle SQLite database."""
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
     for rel in ["commons/db/chronicle/chronicle.db", "commons/db/chronicle.db", "chronicle.db"]:
@@ -40,7 +40,7 @@ def _count(db_path: Path, table: str, where: str = "") -> int:
         return 0
 
 
-def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
+def _get_embedding_stats(db_path: Path) -> dict[str, Any]:
     """Return embedding coverage for every content table.
 
     Mirrors the actual embedding pipeline (see scripts/enrich_embeddings.py and
@@ -52,7 +52,7 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
       - entities: not part of the embedding pipeline
     Percentages are capped at 100 (some events accrue >1 vector over time).
     """
-    stats: Dict[str, Any] = {}
+    stats: dict[str, Any] = {}
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         # (key, total_query, embedded_query)
@@ -80,7 +80,7 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
                 continue
             embedded = conn.execute(emb_q).fetchone()[0]
             embedded = min(embedded, total)  # can't embed more items than exist
-            pct = min(100, int(round((embedded / total) * 100)))
+            pct = min(100, round((embedded / total) * 100))
             stats[kind] = {"total": total, "embedded": embedded, "pct": pct}
         # Entities are not embedded by the current pipeline.
         stats["entity"] = {"total": 0, "embedded": 0, "pct": 0}
@@ -261,7 +261,7 @@ def get_recent(limit: int = Query(20, ge=1, le=100)):
 @router.get("/facts")
 def get_facts(
     limit: int = Query(20, ge=1, le=100),
-    status: Optional[str] = Query(None),
+    status: str | None = Query(None),
 ):
     db_path = _get_db_path()
     if not db_path:

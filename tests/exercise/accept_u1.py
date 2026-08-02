@@ -26,8 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from engine.core import ChronicleCore
 from engine import config as config_mod
+from engine.core import ChronicleCore
 
 
 def _fail(check, msg):
@@ -139,8 +139,7 @@ def check2_audit_script():
     try:
         result = subprocess.run(
             [sys.executable, str(script)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=30
         )
     except subprocess.TimeoutExpired:

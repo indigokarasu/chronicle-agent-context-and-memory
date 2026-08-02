@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List
 
 logger = logging.getLogger("chronicle.health")
 
@@ -46,7 +45,7 @@ class HealthEngine:
         self.store.record_health_run(results)
         return results
 
-    def _ghost_facts(self, gf) -> List[str]:
+    def _ghost_facts(self, gf) -> list[str]:
         rows = self.store.query_beliefs(
             "facts", "status='active' AND confirm_count=0 AND confidence>=?",
             (gf.get("confidence_min", 0.8),), limit=5000)
@@ -67,7 +66,7 @@ class HealthEngine:
         """CSP (§21): single-cardinality predicate with >1 active value → contradiction;
         unsound derivations → nogoods + rule penalty."""
         rows = self.store.query_beliefs("facts", "status='active'", (), limit=5000)
-        groups: Dict[tuple, list] = {}
+        groups: dict[tuple, list] = {}
         for r in rows:
             groups.setdefault((r["entity_id"], r["predicate_canonical"], r["qualifiers_hash"],
                                r["owner"], r["domain"]), []).append(r)
@@ -109,7 +108,7 @@ class HealthEngine:
         for row in self.store._conn().execute(
             "SELECT event_id, model FROM observed_vectors WHERE model != ?", (active_model,)).fetchall():
             mismatched += 1
-            event_id, model = row[0], row[1]
+            event_id, _model = row[0], row[1]
             # Extract text from the event payload (same logic as requeue_hash_vectors).
             ev = self.store._conn().execute("SELECT payload FROM events WHERE event_id=?", (event_id,)).fetchone()
             if ev:
@@ -123,7 +122,7 @@ class HealthEngine:
         for row in self.store._conn().execute(
             "SELECT belief_id, kind, model FROM memory_vectors WHERE model != ?", (active_model,)).fetchall():
             mismatched += 1
-            belief_id, kind, model = row[0], row[1], row[2]
+            belief_id, kind, _model = row[0], row[1], row[2]
             # Extract text from the belief (same logic as requeue_hash_vectors).
             _BELIEF_TEXT = {
                 "fact": ("facts", "value"), "episode": ("episodes", "summary"),

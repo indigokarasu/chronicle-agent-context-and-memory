@@ -16,7 +16,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.environ.get("CHRONICLE_DIR")
                 or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from engine.core import ChronicleCore  # noqa: E402
+from engine.core import ChronicleCore
 
 BUDGETS = (1500, 4000)
 
@@ -52,7 +52,7 @@ def ingest(core, inst):
             if turn.get("role") == "user":
                 pend = content
                 continue
-            excerpt = ("User: %s\nAssistant: %s" % (pend or "", content))[:4000]
+            excerpt = ("User: {}\nAssistant: {}".format(pend or "", content))[:4000]
             events.append({
                 "type": "observed",
                 "payload": {"source_type": "session_transcript", "excerpt": excerpt,
@@ -63,7 +63,7 @@ def ingest(core, inst):
             events.append({
                 "type": "observed",
                 "payload": {"source_type": "session_transcript",
-                            "excerpt": ("User: %s" % pend)[:4000], "source_ref": sid},
+                            "excerpt": (f"User: {pend}")[:4000], "source_ref": sid},
                 "actor": "user", "session_id": sid, "occurred_at": when})
     core.capture.append_many(events)
 

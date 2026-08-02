@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable
 
 # Env override for the embedding model (§27 embeddings.model). Deliberately wins
 # over file config: eval/CI must be able to pin the deterministic offline embedder
@@ -29,7 +29,7 @@ ABSTAIN_GATES = ("score", "overlap", "focus")
 # that is the honest report, since the shipped config claims those features run
 # and nothing implements them (§u1 audit). Each entry:
 #   (config path, is_enabled(current_val) -> bool, reason comment)
-DORMANT: List[Tuple[str, Callable[[Any], bool], str]] = [
+DORMANT: list[tuple[str, Callable[[Any], bool], str]] = [
     ("retrieval.query_understanding.hyde", lambda v: bool(v),
      "Hypothetical Document Embeddings — rewrite loop not yet implemented"),
     ("retrieval.query_understanding.expand_synonyms", lambda v: bool(v),
@@ -64,7 +64,7 @@ CONFIDENCE_BASE = {
     "delegation": 0.60,
 }
 
-DEFAULTS: Dict[str, Any] = {
+DEFAULTS: dict[str, Any] = {
     "provider": "chronicle",
     "store": "sqlite",
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
@@ -218,12 +218,11 @@ def check_abstain_gate(name: str) -> str:
     gate exists to prevent — so it is a hard error, not a fallback.
     """
     if name not in ABSTAIN_GATES:
-        raise ValueError("retrieval.abstain_gate must be one of %s (got %r)"
-                         % (", ".join(ABSTAIN_GATES), name))
+        raise ValueError("retrieval.abstain_gate must be one of {} (got {!r})".format(", ".join(ABSTAIN_GATES), name))
     return name
 
 
-def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (over or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -236,7 +235,7 @@ def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
 class Config:
     """Thin dotted-path accessor over a merged config dict."""
 
-    def __init__(self, overrides: Dict[str, Any] = None):
+    def __init__(self, overrides: dict[str, Any] | None = None):
         self._d = _deep_merge(DEFAULTS, overrides or {})
         env_model = (os.environ.get(EMBED_MODEL_ENV) or "").strip()
         if env_model:
@@ -275,5 +274,5 @@ class Config:
         return self._d[key]
 
     @property
-    def raw(self) -> Dict[str, Any]:
+    def raw(self) -> dict[str, Any]:
         return self._d

@@ -24,7 +24,7 @@ chronicle_dir = os.environ.get("CHRONICLE_DIR") or os.path.join(
 sys.path.insert(0, chronicle_dir)
 
 from engine.core import ChronicleCore
-from engine.embeddings import pack, HashingEmbedder
+from engine.embeddings import HashingEmbedder, pack
 from engine.retrieval import RetrievalEngine
 from engine.store import MemoryStore
 
