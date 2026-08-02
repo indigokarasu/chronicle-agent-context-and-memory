@@ -15,13 +15,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.serialize import cjson_dumps, content_hash, event_id, decimalize, HASH_NAME
-from engine.store import MemoryStore, SCHEMA_VERSION
-from engine.reducer import Reducer, TRUST_CEILING
-from engine.capture import CaptureEngine
-from engine.embeddings import HashingEmbedder, pack, unpack, cosine
 from engine import access
+from engine.capture import CaptureEngine
 from engine.core import ChronicleCore
+from engine.embeddings import HashingEmbedder, cosine, pack, unpack
+from engine.reducer import TRUST_CEILING, Reducer
+from engine.serialize import HASH_NAME, cjson_dumps, content_hash, decimalize, event_id
+from engine.store import SCHEMA_VERSION, MemoryStore
 
 
 def make_core():
@@ -78,8 +78,13 @@ class TestSerialization(unittest.TestCase):
         # An explicit model + endpoint is trusted: an unreachable endpoint at init
         # does NOT fall back to hashing. It returns the retrying client, which
         # waits+retries at runtime and raises on exhaustion (never hash vectors).
-        from engine.embeddings import (get_embedder, DegradedEmbedder, EmbeddingsUnavailable,
-                                       HashingEmbedder, OpenAICompatEmbedder)
+        from engine.embeddings import (
+            DegradedEmbedder,
+            EmbeddingsUnavailable,
+            HashingEmbedder,
+            OpenAICompatEmbedder,
+            get_embedder,
+        )
         e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
         self.assertIsInstance(e, OpenAICompatEmbedder)
         self.assertEqual(e.dimensions, 768)
@@ -98,7 +103,7 @@ class TestSerialization(unittest.TestCase):
         from engine.embeddings import OpenAICompatEmbedder
         emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768,
                                    max_attempts=2, backoff_base=0.0, backoff_cap=0.0)
-        with self.assertRaises(Exception):
+        with self.assertRaises(OSError):
             emb.embed("hello")
 
 # --------------------------------------------------------------------------
@@ -366,7 +371,7 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(ans["tier"], 2)
 
     def test_P20_support_gate_config_bounds(self):  # I8, §18.4
-        from engine.config import Config, DEFAULTS
+        from engine.config import DEFAULTS, Config
         d = DEFAULTS["retrieval"]
         self.assertEqual(self.core.retrieval._abstain_gate, d["abstain_gate"])
         self.assertEqual(self.core.retrieval._focus_coverage, d["focus_coverage"])
@@ -768,12 +773,12 @@ class TestTopicGatedStandingNotes(unittest.TestCase):
         """
         self._seed_past_cap()
         ctx = self.core.retrieval.get_context("what is the capital of France", token_budget=2000)
-        self.assertNotIn("[DIRECTIVE] %s" % self.SEAT, ctx)
-        self.assertNotIn("[NOTE] %s" % self.SEAT, ctx)
+        self.assertNotIn(f"[DIRECTIVE] {self.SEAT}", ctx)
+        self.assertNotIn(f"[NOTE] {self.SEAT}", ctx)
         # The gate is what kept it out — not an empty context, and not a session
         # window that stopped delivering the turn it came from.
         self.assertIn("[DIRECTIVE] ", ctx)
-        self.assertIn("User: %s" % self.SEAT, ctx,
+        self.assertIn(f"User: {self.SEAT}", ctx,
                       "raw evidence for the seat turn must still be delivered")
 
     def test_unconditional_delivery_is_untouched(self):
@@ -784,9 +789,9 @@ class TestTopicGatedStandingNotes(unittest.TestCase):
             "notes", "always_inject=1 AND status='active'", (), 20)]
         ctx = self.core.retrieval.get_context("what seat should I book", token_budget=2000)
         lines = ctx.split("\n")
-        self.assertEqual(lines[:20], ["[DIRECTIVE] %s" % b for b in first20])
+        self.assertEqual(lines[:20], [f"[DIRECTIVE] {b}" for b in first20])
         for body in first20 + [self.SEAT]:
-            self.assertEqual(lines.count("[DIRECTIVE] %s" % body), 1, body)
+            self.assertEqual(lines.count(f"[DIRECTIVE] {body}"), 1, body)
 
     def test_include_directives_false_still_suppresses_notes(self):
         """A caller that opted out of standing notes must not get them back
@@ -906,7 +911,7 @@ class TestSessionWindowBounds(unittest.TestCase):
         self.core.retrieval.get_context("migration planning", token_budget=4000)
         self.assertTrue(calls, "session-window expansion never ran")
         self.assertEqual(len(calls), len({c["sid"] for c in calls}),
-                         "one query per session, not one per turn: %r" % (calls,))
+                         f"one query per session, not one per turn: {calls!r}")
         for c in calls:
             self.assertEqual(c["types"], ("observed",))
             self.assertEqual(c["limit"], 60, "default context.session_window_max_events")
@@ -931,7 +936,7 @@ class TestSessionWindowBounds(unittest.TestCase):
 
             core.store.get_events_by_session = spy
             core.retrieval.get_context("migration planning", token_budget=8000)
-            self.assertLessEqual(len(calls), 2, "expanded more sessions than the cap: %r" % (calls,))
+            self.assertLessEqual(len(calls), 2, f"expanded more sessions than the cap: {calls!r}")
         finally:
             shutil.rmtree(self.home + "-cap", ignore_errors=True)
 

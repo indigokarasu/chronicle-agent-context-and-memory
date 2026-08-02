@@ -17,7 +17,6 @@ Different normalized values keep today's behavior exactly.
 Run:  python3 tests/exercise/accept_u3.py
 """
 
-import json
 import shutil
 import sys
 import tempfile

@@ -168,7 +168,7 @@ def test_fts_hits_fall_outside_the_knn_window():
         for query in _STATE["queries"]:
             emb = retr.query_understanding(query)["embedding"]
             fts_ids = [r["event_id"] for r in store.fts_search_observed(query, limit=k)]
-            knn_ids = set(eid for eid, _s in vi.retrieve_knn(pack(emb), k * 2))
+            knn_ids = {eid for eid, _s in vi.retrieve_knn(pack(emb), k * 2)}
             outside = [e for e in fts_ids if e not in knn_ids]
             vrows = store.get_observed_vectors_by_ids(outside)
             sims = batch_cosine(emb, [vrows[e]["embedding"] for e in outside if e in vrows])
@@ -213,15 +213,15 @@ def _compare_topk(bf, knn, k, query):
     if not bf:
         return worst, 0
     cut = bf[-1]["score"]
-    strict_bf = set(r["event_id"] for r in bf if r["score"] > cut + SCORE_TOL)
-    strict_knn = set(r["event_id"] for r in knn if r["score"] > cut + SCORE_TOL)
+    strict_bf = {r["event_id"] for r in bf if r["score"] > cut + SCORE_TOL}
+    strict_knn = {r["event_id"] for r in knn if r["score"] > cut + SCORE_TOL}
     assert strict_bf == strict_knn, (
         f"K={k}: ids scoring strictly above the rank-{k} cut differ for {query!r} "
         f"(missing from KNN: {sorted(strict_bf - strict_knn)}; "
         f"extra in KNN: {sorted(strict_knn - strict_bf)})")
-    scores = dict((r["event_id"], r["score"]) for r in bf)
+    scores = {r["event_id"]: r["score"] for r in bf}
     scores.update((r["event_id"], r["score"]) for r in knn)
-    diff = set(r["event_id"] for r in bf) ^ set(r["event_id"] for r in knn)
+    diff = {r["event_id"] for r in bf} ^ {r["event_id"] for r in knn}
     for eid in diff:
         assert abs(scores[eid] - cut) < SCORE_TOL, (
             f"K={k}: {eid} appears in only one path for {query!r} at score "

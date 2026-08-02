@@ -30,9 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from engine.core import ChronicleCore                                    # noqa: E402
-from engine.embeddings import DegradedEmbedder, HashingEmbedder          # noqa: E402
-from engine.store import now_iso, SCHEMA_VERSION                         # noqa: E402
+from engine.core import ChronicleCore
+from engine.embeddings import DegradedEmbedder, HashingEmbedder
+from engine.store import SCHEMA_VERSION, now_iso
 
 DEAD_ENDPOINT = "http://127.0.0.1:9"        # discard port: refuses instantly, never serves
 HARNESS = os.environ.get("CHRONICLE_LME_HARNESS", "/private/tmp/claude-501/"
@@ -146,7 +146,7 @@ def check3_harness():
         return True
     env = dict(os.environ, CHRONICLE_DIR=str(ROOT), CHRONICLE_EMBED_MODEL="hashing")
     p = subprocess.run([sys.executable, HARNESS, ORACLE], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+                       capture_output=True, timeout=1800)
     out = p.stdout.decode("utf-8", "replace")
     if p.returncode != 0:
         print(out[-2000:])

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 try:  # real Hermes base when present …
     from agent.memory_provider import MemoryProvider  # type: ignore
@@ -33,7 +33,7 @@ def _load_core():
     try:
         from .engine.core import ChronicleCore  # plugin-package context
     except Exception:
-        from engine.core import ChronicleCore   # top-level (dev/tests)
+        from engine.core import ChronicleCore  # top-level (dev/tests)
     return ChronicleCore
 
 
@@ -87,7 +87,7 @@ class ChronicleMemoryProvider(MemoryProvider):
              "default": "", "secret": False, "required": False},
         ]
 
-    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+    def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         cfg_path = Path(hermes_home) / "chronicle.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(values, indent=2))
@@ -146,7 +146,7 @@ class ChronicleMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return self.core.retrieval.static_block(self._principal_id) if self.core else ""
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return self.core.tools.schemas() if self.core else []
 
     def handle_tool_call(self, tool_name, args, **kw) -> str:

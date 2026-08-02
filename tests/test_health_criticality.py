@@ -2,8 +2,6 @@
 Chronicle — tests for health.py and criticality.py (§20.1, §21).
 """
 
-import json
-import os
 import shutil
 import sys
 import tempfile
@@ -12,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.criticality import classify, _RULES
+from engine.criticality import _RULES, classify
 from engine.health import HealthEngine
 
 
@@ -21,7 +19,7 @@ from engine.health import HealthEngine
 # ---------------------------------------------------------------------------
 class TestCriticality(unittest.TestCase):
     def test_fact_returns_normal_for_benign(self):
-        crit, reason = classify("enjoys hiking on weekends")
+        crit, _reason = classify("enjoys hiking on weekends")
         self.assertEqual(crit, "normal")
 
     def test_medical_keyword(self):
@@ -30,7 +28,7 @@ class TestCriticality(unittest.TestCase):
         self.assertIn(reason, ("safety", "medical"))  # "allerg" matches safety rule first
 
     def test_safety_keyword(self):
-        crit, reason = classify("carries an epipen")
+        crit, _reason = classify("carries an epipen")
         self.assertEqual(crit, "critical")
 
     def test_legal_keyword(self):
@@ -39,20 +37,20 @@ class TestCriticality(unittest.TestCase):
         self.assertEqual(reason, "legal")
 
     def test_financial_keyword(self):
-        crit, reason, _ = classify("bank account number"), None, None
-        crit, reason = classify("bank account routing number")
+        crit, _reason, _ = classify("bank account number"), None, None
+        crit, _reason = classify("bank account routing number")
         self.assertEqual(crit, "high")
 
     def test_boundary_keyword(self):
-        crit, reason = classify("never share my password with anyone")
+        crit, _reason = classify("never share my password with anyone")
         self.assertEqual(crit, "high")
 
     def test_identity_keyword(self):
-        crit, reason = classify("legal name is John Smith")
+        crit, _reason = classify("legal name is John Smith")
         self.assertEqual(crit, "high")
 
     def test_security_keyword(self):
-        crit, reason = classify("API key for production")
+        crit, _reason = classify("API key for production")
         self.assertEqual(crit, "high")
 
     def test_norm_type_starts_at_high(self):
@@ -61,11 +59,11 @@ class TestCriticality(unittest.TestCase):
         self.assertEqual(reason, "directive")
 
     def test_norm_type_with_medical_stays_critical(self):
-        crit, reason = classify("insulin dosage is 10mg", note_type="norm")
+        crit, _reason = classify("insulin dosage is 10mg", note_type="norm")
         self.assertEqual(crit, "critical")
 
     def test_empty_input(self):
-        crit, reason = classify("")
+        crit, _reason = classify("")
         self.assertEqual(crit, "normal")
 
     def test_rules_list_non_empty(self):
@@ -86,10 +84,6 @@ class TestCriticality(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestHealthEngine(unittest.TestCase):
     def setUp(self):
-        from engine.store import MemoryStore
-        from engine.config import Config
-        from engine.reducer import Reducer
-        from engine.capture import CaptureEngine
         from engine.core import ChronicleCore
 
         self.home = tempfile.mkdtemp()

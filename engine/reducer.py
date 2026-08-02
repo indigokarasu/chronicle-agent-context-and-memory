@@ -13,14 +13,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional
 
 from . import access
-from .embeddings import EmbeddingsUnavailable, pack
-from .serialize import belief_id as compute_belief_id, hash_str
 from .criticality import classify as classify_criticality
-from .trust import raw_confidence, clamp_to_ceiling, base_confidence
-from .store import now_iso, KIND_TABLE, BELIEF_TABLES
+from .embeddings import EmbeddingsUnavailable, pack
+from .serialize import belief_id as compute_belief_id
+from .serialize import hash_str
+from .store import BELIEF_TABLES, KIND_TABLE, now_iso
+from .trust import base_confidence, clamp_to_ceiling, raw_confidence
 
 logger = logging.getLogger("chronicle.reducer")
 
@@ -134,7 +134,7 @@ class Reducer:
         for e in events:
             self.reduce(e)
 
-    def rebuild(self, from_seq: int = 0, as_of_recorded: Optional[str] = None):
+    def rebuild(self, from_seq: int = 0, as_of_recorded: str | None = None):
         """Truncate the projection and replay the log in order (§7.3, I3).
 
         Uses iter_events_since for memory-safe batched streaming — never holds
@@ -150,8 +150,7 @@ class Reducer:
         for e in stream:
             self.reduce(e)
             count += 1
-            if e["seq"] > max_seq:
-                max_seq = e["seq"]
+            max_seq = max(max_seq, e["seq"])
         if count:
             self.store.set_projection_seq(max_seq)
         logger.info("Rebuilt projection from %d events", count)
@@ -729,11 +728,9 @@ def _is_operational(event, p, excerpt) -> bool:
         return True
     head = (excerpt or "")[:400]
     low = head.lstrip().lower()
-    if low.startswith("tool:") or low.startswith("assistant: tool:"):
+    if low.startswith(("tool:", "assistant: tool:")):
         return True
-    if any(m in head for m in _OP_MARKERS):
-        return True
-    return False
+    return bool(any(m in head for m in _OP_MARKERS))
 
 
 def _table_for(kind):
@@ -750,4 +747,4 @@ def _typed_value(body):
     return (None, None)
 
 
-from .config import TRUST_CEILING  # noqa: E402,F401  (back-compat for tests)
+from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)

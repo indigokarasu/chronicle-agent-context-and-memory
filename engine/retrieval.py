@@ -17,14 +17,14 @@ import heapq
 import json
 import logging
 import re
-from typing import Dict, List
 
 from . import access
 from .config import DEFAULTS, check_abstain_gate
-from .embeddings import unpack, cosine, batch_cosine, pack
+from .embeddings import batch_cosine, cosine, pack, unpack
+from .store import KIND_TABLE, now_iso
 from .trust import Calibrator, confidence_summary
-from .store import now_iso, KIND_TABLE
-from .vector_index import VectorIndex, MAX_K as KNN_MAX_K
+from .vector_index import MAX_K as KNN_MAX_K
+from .vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.retrieval")
 
@@ -37,10 +37,10 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
      "august", "september", "october", "november", "december"])}
 _MONTH_RX = "(" + "|".join(m[:3] + r"[a-z]*" for m in _MONTHS) + ")"
 _RX_ISO = re.compile(r"\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b")
-_RX_MDY = re.compile(r"\b" + _MONTH_RX + r"\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b", re.I)
-_RX_DMY = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTH_RX + r"\.?,?\s+(20\d{2})\b", re.I)
-_RX_MY = re.compile(r"\b" + _MONTH_RX + r"\.?,?\s+(20\d{2})\b", re.I)
-_RX_Y = re.compile(r"\b(?:in|during|of)\s+(20\d{2})\b", re.I)
+_RX_MDY = re.compile(r"\b" + _MONTH_RX + r"\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(20\d{2})\b", re.IGNORECASE)
+_RX_DMY = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTH_RX + r"\.?,?\s+(20\d{2})\b", re.IGNORECASE)
+_RX_MY = re.compile(r"\b" + _MONTH_RX + r"\.?,?\s+(20\d{2})\b", re.IGNORECASE)
+_RX_Y = re.compile(r"\b(?:in|during|of)\s+(20\d{2})\b", re.IGNORECASE)
 # Relative time expressions: yesterday, today, last/this week/month/year, N days/weeks/months ago
 # "N" accepts either digits ("3 weeks ago") or word-form number names ("three
 # weeks ago", "a month ago", "an hour ago" is out of scope but "a"/"an" -> 1
@@ -50,17 +50,17 @@ _WORD_NUMS = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
     "twelve": 12,
 }
-_RX_YESTERDAY = re.compile(r"\byesterday\b", re.I)
-_RX_TODAY = re.compile(r"\btoday\b", re.I)
-_RX_LAST_WEEK = re.compile(r"\blast\s+week\b", re.I)
-_RX_LAST_MONTH = re.compile(r"\blast\s+month\b", re.I)
-_RX_LAST_YEAR = re.compile(r"\blast\s+year\b", re.I)
-_RX_THIS_WEEK = re.compile(r"\bthis\s+week\b", re.I)
-_RX_THIS_MONTH = re.compile(r"\bthis\s+month\b", re.I)
+_RX_YESTERDAY = re.compile(r"\byesterday\b", re.IGNORECASE)
+_RX_TODAY = re.compile(r"\btoday\b", re.IGNORECASE)
+_RX_LAST_WEEK = re.compile(r"\blast\s+week\b", re.IGNORECASE)
+_RX_LAST_MONTH = re.compile(r"\blast\s+month\b", re.IGNORECASE)
+_RX_LAST_YEAR = re.compile(r"\blast\s+year\b", re.IGNORECASE)
+_RX_THIS_WEEK = re.compile(r"\bthis\s+week\b", re.IGNORECASE)
+_RX_THIS_MONTH = re.compile(r"\bthis\s+month\b", re.IGNORECASE)
 _NUM_WORD = r"(\d+|" + "|".join(sorted(_WORD_NUMS, key=len, reverse=True)) + r")"
-_RX_N_DAYS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+days?\s+ago\b", re.I)
-_RX_N_WEEKS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+weeks?\s+ago\b", re.I)
-_RX_N_MONTHS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+months?\s+ago\b", re.I)
+_RX_N_DAYS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+days?\s+ago\b", re.IGNORECASE)
+_RX_N_WEEKS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+weeks?\s+ago\b", re.IGNORECASE)
+_RX_N_MONTHS_AGO = re.compile(r"\b" + _NUM_WORD + r"\s+months?\s+ago\b", re.IGNORECASE)
 
 
 def _month_num(name):
@@ -303,7 +303,7 @@ class RetrievalEngine:
 
     # -- query understanding (§18.2) --------------------------------------
 
-    def _tokens(self, query: str) -> List[str]:
+    def _tokens(self, query: str) -> list[str]:
         return [t for t in re.findall(r"[A-Za-z0-9']+", query.lower())
                 if t not in _STOP and len(t) > 1]
 
@@ -326,7 +326,7 @@ class RetrievalEngine:
     def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None):
         principal = principal or self.active_principal
         q = self.query_understanding(query)
-        ranked: Dict[str, dict] = {}
+        ranked: dict[str, dict] = {}
 
         def add(bid, table, rank, channel):
             row = self.store.get_belief(table, bid)
@@ -365,7 +365,7 @@ class RetrievalEngine:
         # channel can. Bounded (≤6 seed nodes, 1 hop, ≤8 facts/node); an empty
         # graph is a no-op.
         nodes = self._graph_seeds(q["tokens"])
-        hop: List[str] = []
+        hop: list[str] = []
         for e in nodes[:3]:
             for r in self.store.query_beliefs(
                     "relationships", "(source_id=? OR target_id=?) AND status='active'", (e, e), 8):
@@ -392,12 +392,12 @@ class RetrievalEngine:
 
     # -- Tier 2 (§18.1) — raw layer (recall floor) ------------------------
 
-    def _graph_seeds(self, tokens, cap=6) -> List[str]:
+    def _graph_seeds(self, tokens, cap=6) -> list[str]:
         """Query tokens → entity nodes (§18.8). Names match entities directly;
         predicates ("wife", "sister") reach entities through relationships.
         Shared with get_context so the digest surface seeds on exactly the same
         entities the graph channel does, rather than a second guess at it."""
-        nodes: List[str] = []
+        nodes: list[str] = []
         for tok in tokens:
             if len(tok) < 3 or len(nodes) >= cap:
                 continue
@@ -430,7 +430,7 @@ class RetrievalEngine:
     def retrieve_raw(self, query, *, limit=20, principal=None, now=None):
         principal = principal or self.active_principal
         q = self.query_understanding(query)
-        scored: Dict[str, dict] = {}
+        scored: dict[str, dict] = {}
         for i, r in enumerate(self.store.fts_search_observed(query, limit=limit)):
             ev = self.store.get_event(r["event_id"])
             if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
@@ -451,7 +451,7 @@ class RetrievalEngine:
             # top-k argument). Memory is therefore O(batch_size + limit), not
             # O(corpus size); the event/payload fetch is skipped entirely for
             # candidates that can't possibly survive, so compute stays cheap too.
-            vec_heap: List[tuple] = []  # (score, seq, event_id, excerpt, owner) — min-heap on score
+            vec_heap: list[tuple] = []  # (score, seq, event_id, excerpt, owner) — min-heap on score
             seq = 0
 
             # Optional ANN fast path (§27 vector_index:, u5). vec0's KNN MATCH
@@ -567,7 +567,7 @@ class RetrievalEngine:
 
             # Paged session-vector streaming, same bounded top-k treatment. Session
             # ids are namespaced "session:" so they never collide with event ids.
-            sess_heap: List[tuple] = []  # (score, seq, session_id, summary, owner)
+            sess_heap: list[tuple] = []  # (score, seq, session_id, summary, owner)
             seq = 0
             for batch in self.store.iter_session_vectors_paged(batch_size=1000):
                 for s in batch:
@@ -588,7 +588,7 @@ class RetrievalEngine:
             # Paged projection-vector streaming (§g5 projections). Similar bounded top-k
             # treatment to observed and session vectors. Projection ids are namespaced
             # "proj:<provider>:<external_id>" so they never collide with event or session ids.
-            proj_heap: List[tuple] = []  # (score, seq, proj_id, excerpt, owner)
+            proj_heap: list[tuple] = []  # (score, seq, proj_id, excerpt, owner)
             seq = 0
             for batch in self.store.iter_projection_vectors_paged(batch_size=1000):
                 psims = batch_cosine(q["embedding"], [v["embedding"] for v in batch])
@@ -710,7 +710,7 @@ class RetrievalEngine:
                 "sources": [c["event_id"] for c in t2[:3]] + [b["belief_id"] for b in t1[:2]],
                 "confidence": round(conf, 4), "promoted": promoted}
 
-    def _promote_from_span(self, span, focus, principal) -> List[str]:
+    def _promote_from_span(self, span, focus, principal) -> list[str]:
         """Write beliefs back from a raw span (§16.7). Returns promoted belief ids."""
         from .extraction import entity_token
         from .serialize import belief_id as bid_fn
@@ -730,7 +730,7 @@ class RetrievalEngine:
     # -- context assembly (§18.5) -----------------------------------------
 
     def _expand_session_window(self, session_id: str, principal: str,
-                               existing_excerpts: set, limit: int = 60) -> List[dict]:
+                               existing_excerpts: set, limit: int = 60) -> list[dict]:
         """Observed turns of one session that context does not already carry.
 
         ONE query per session, capped IN SQL: `type='observed'` and `LIMIT` are
@@ -745,7 +745,7 @@ class RetrievalEngine:
         a defensive bound is for — it bounds the work; the caller's remaining
         char budget bounds the output. Ordered by seq; 'excerpt' and 'date' keys.
         """
-        expanded: List[dict] = []
+        expanded: list[dict] = []
         if limit is not None and limit <= 0:
             return expanded
         events = self.store.get_events_by_session(session_id, since_seq=0,
@@ -765,7 +765,7 @@ class RetrievalEngine:
     def get_context(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
                     principal=None, epistemic=None, now=None) -> str:
         principal = principal or self.active_principal
-        parts: List[str] = []
+        parts: list[str] = []
         if include_directives:
             for d in self.store.query_beliefs("notes", "always_inject=1 AND status='active'", (), 20):
                 if d.get("body"):
@@ -790,8 +790,8 @@ class RetrievalEngine:
         used_chars = len(ctx)
         if used_chars < max_chars:
             remaining_chars = max_chars - used_chars
-            groups: List[dict] = []          # insertion order = relevance order
-            by_sid: Dict[str, dict] = {}
+            groups: list[dict] = []          # insertion order = relevance order
+            by_sid: dict[str, dict] = {}
             seen_excerpts = set()
 
             # Phase 1: Top-ranked excerpts from retrieve_raw
@@ -820,11 +820,11 @@ class RetrievalEngine:
             # header line, and `emitted_headers` is where that fact lives: phase 2
             # reuses this session's header verbatim rather than rebuilding one from
             # whatever timestamp the turn it happens to be expanding carries.
-            emitted_headers: Dict[str, str] = {}
+            emitted_headers: dict[str, str] = {}
             for g in groups:
                 if not g["excerpts"]:
                     continue
-                header = "[SESSION %s%s]" % (g["sid"], " @ " + g["date"] if g["date"] else "")
+                header = "[SESSION {}{}]".format(g["sid"], " @ " + g["date"] if g["date"] else "")
                 block_open = False
                 for excerpt in g["excerpts"]:
                     need = (0 if block_open else len(header) + 1) + len(excerpt) + 1
@@ -888,7 +888,7 @@ class RetrievalEngine:
                     header_present = header is not None
                     if header is None:
                         date = g["date"] or (expanded[0].get("date") or "")
-                        header = "[SESSION %s%s]" % (sid, " @ " + date if date else "")
+                        header = "[SESSION {}{}]".format(sid, " @ " + date if date else "")
                     # Append the expanded excerpts that weren't in the top-ranked list
                     for exp in expanded:
                         if remaining_chars <= 0:
@@ -937,10 +937,10 @@ class RetrievalEngine:
             for e in self._graph_seeds(self._tokens(hint))[:3]:
                 for d in self.store.query_beliefs(
                         "notes", "note_type='belief' AND subject=? AND status='active'",
-                        ("digest:%s" % e,), 1):
+                        (f"digest:{e}",), 1):
                     if not d.get("body") or not self._readable(d, principal, purpose, None):
                         continue
-                    line = "[DIGEST] %s" % d["body"]
+                    line = "[DIGEST] {}".format(d["body"])
                     if len(ctx) + len(line) + 1 >= max_chars:
                         continue
                     parts.append(line)
@@ -967,7 +967,7 @@ class RetrievalEngine:
             # Bodies already on a line of their own. An epistemic annotation is
             # appended to the [NOTE] render, so compare by prefix, not equality.
             emitted = [p.split(" ", 1)[1] for p in parts
-                       if p.startswith("[DIRECTIVE] ") or p.startswith("[NOTE] ")]
+                       if p.startswith(("[DIRECTIVE] ", "[NOTE] "))]
             added = 0
             for d in (self.store.query_beliefs(
                         "notes", "always_inject=1 AND status='active'", (), 200) if focus else []):
@@ -981,7 +981,7 @@ class RetrievalEngine:
                 low = body.lower()
                 if not any(t in low for t in focus):
                     continue
-                line = "[DIRECTIVE] %s" % body
+                line = f"[DIRECTIVE] {body}"
                 if remaining_chars - len(line) - 1 <= 0:
                     break
                 parts.append(line)
@@ -1043,7 +1043,7 @@ class RetrievalEngine:
         # digest summarizes them, it never stands in for them.
         for d in self.store.query_beliefs(
                 "notes", "note_type='belief' AND subject=? AND status='active'",
-                ("digest:%s" % entity_id,), 1):
+                (f"digest:{entity_id}",), 1):
             if self._readable(d, principal, "*", None):
                 out.append({"belief_id": d["belief_id"], "kind": "digest",
                             "digest_line": d.get("body", ""), "confidence": d.get("confidence")})
@@ -1090,7 +1090,7 @@ class RetrievalEngine:
             guard += 1
         return chain
 
-    def as_of(self, world=None, knowledge=None) -> List[dict]:
+    def as_of(self, world=None, knowledge=None) -> list[dict]:
         """Bitemporal query (§7.4): as-known-at `knowledge`, as-true-at `world`.
 
         Uses iter_events_since for memory-safe streaming (no 100k cap)."""
@@ -1112,7 +1112,7 @@ class RetrievalEngine:
             out.append({"entity_id": ent, "predicate": pred, "value": v["value"]})
         return out
 
-    def changes_since(self, ts: str) -> List[dict]:
+    def changes_since(self, ts: str) -> list[dict]:
         rows = self.store.query_beliefs("facts", "created_at > ?", (ts,), 100, order="created_at")
         return [{"belief_id": r["belief_id"], "value": r["value"], "status": r["status"]} for r in rows]
 
@@ -1140,10 +1140,10 @@ class RetrievalEngine:
         if self._abstain_gate == "score":
             return view[0][1] >= self._score_threshold
         if self._abstain_gate == "overlap":
-            qt = set(t for t in q["tokens"] if len(t) > 3)
+            qt = {t for t in q["tokens"] if len(t) > 3}
             return any(len(qt & _content_tokens(txt)) >= self._overlap_min_tokens
                        for txt, _ in view[:3])
-        qt = set(t for t in q["tokens"] if len(t) > 3 and t not in _GENERIC)
+        qt = {t for t in q["tokens"] if len(t) > 3 and t not in _GENERIC}
         if not qt:
             return True  # nothing distinctive to cover → nothing to fail on
         seen = set()
@@ -1178,9 +1178,7 @@ class RetrievalEngine:
                     return False
             except Exception:
                 pass
-        if row.get("info_label") == "secret" and purpose != "secret":
-            return False
-        return True
+        return not (row.get("info_label") == "secret" and purpose != "secret")
 
     def _render(self, b):
         if b["kind"] == "fact":
@@ -1223,8 +1221,8 @@ def _clamp(v, lo=0.0, hi=1.0):
 
 
 def _content_tokens(text):
-    return set(w for w in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
-               if len(w) > 3 and w not in _STOP)
+    return {w for w in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+               if len(w) > 3 and w not in _STOP}
 
 
 def _support_text(item):
@@ -1232,7 +1230,7 @@ def _support_text(item):
     attribute + value (what _render would show a reader)."""
     if item.get("excerpt") is not None:
         return item["excerpt"]
-    return "%s %s" % (item.get("attribute") or "", item.get("value") or "")
+    return "{} {}".format(item.get("attribute") or "", item.get("value") or "")
 
 
 def _table_of_kind(kind):

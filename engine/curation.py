@@ -15,7 +15,7 @@ import os
 
 from .embeddings import EmbeddingsUnavailable, pack
 from .serialize import belief_id as compute_belief_id
-from .store import now_iso, KIND_TABLE
+from .store import KIND_TABLE, now_iso
 
 logger = logging.getLogger("chronicle.curation")
 
@@ -410,7 +410,7 @@ class CurationWorker:
         # renders the same bytes — an unstable order would look like a content
         # change and churn the log. N counts the distinct sessions behind the
         # rendered facts (a session is Chronicle's episode unit, §8.3).
-        attrs = sorted({"%s=%s" % (r.get("attribute") or r.get("predicate_canonical") or "", r["value"])
+        attrs = sorted({"{}={}".format(r.get("attribute") or r.get("predicate_canonical") or "", r["value"])
                         for r in active if (r.get("attribute") or r.get("predicate_canonical"))
                         and r.get("value")})
         if not attrs:
@@ -421,7 +421,7 @@ class CurationWorker:
         line = "%s: %s (episodes: %d)" % (entity.get("name") or entity_id,
                                           "; ".join(shown), len(sessions))
 
-        subject = "digest:%s" % entity_id
+        subject = f"digest:{entity_id}"
         key = {"note_type": "belief", "subject": subject}
         b_id = compute_belief_id("note", key, [anchor])
         owner = entity.get("owner", "default")

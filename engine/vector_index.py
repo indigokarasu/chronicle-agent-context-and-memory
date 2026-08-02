@@ -125,7 +125,7 @@ def _declared_dims(conn):
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec0'").fetchone()
     if not row or not row[0]:
         return None
-    m = re.search(r"FLOAT\s*\[\s*(\d+)\s*\]", row[0], re.I)
+    m = re.search(r"FLOAT\s*\[\s*(\d+)\s*\]", row[0], re.IGNORECASE)
     return int(m.group(1)) if m else None
 
 

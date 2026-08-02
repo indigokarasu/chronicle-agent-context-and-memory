@@ -14,7 +14,6 @@ read_acl encodings:
 from __future__ import annotations
 
 import json
-from typing import Dict, Set
 
 DEFAULT_ACL = "user_agents"
 
@@ -25,7 +24,7 @@ def user_of(principal: str) -> str:
     return principal.split(":", 1)[0] if ":" in principal else "_user"
 
 
-def parse_acl(read_acl) -> Dict:
+def parse_acl(read_acl) -> dict:
     if not read_acl or read_acl == DEFAULT_ACL:
         return {"mode": "user_agents", "allow": set(), "deny": set()}
     if read_acl == "owner_only":
@@ -40,7 +39,7 @@ def parse_acl(read_acl) -> Dict:
     return {"mode": "user_agents", "allow": set(), "deny": set()}
 
 
-def dump_acl(mode: str, allow: Set[str], deny: Set[str]) -> str:
+def dump_acl(mode: str, allow: set[str], deny: set[str]) -> str:
     if mode == "user_agents" and not allow and not deny:
         return DEFAULT_ACL
     if mode == "owner_only" and not allow and not deny:

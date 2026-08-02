@@ -12,12 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from engine.trust import (
-    ceiling, base_confidence, raw_confidence,
-    clamp_to_ceiling, bucket_of, Calibrator, confidence_summary,
-)
-from engine.config import TRUST_CEILING, CONFIDENCE_BASE
 from engine.errors import E_LEARN_BOUND
+from engine.trust import (
+    Calibrator,
+    base_confidence,
+    bucket_of,
+    ceiling,
+    clamp_to_ceiling,
+    confidence_summary,
+    raw_confidence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +161,6 @@ class TestConfidenceSummary(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestLearningLoop(unittest.TestCase):
     def setUp(self):
-        from engine.store import MemoryStore
-        from engine.config import Config
-        from engine.reducer import Reducer
-        from engine.capture import CaptureEngine
         from engine.core import ChronicleCore
 
         self.home = tempfile.mkdtemp()

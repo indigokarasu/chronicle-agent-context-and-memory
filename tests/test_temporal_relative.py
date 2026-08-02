@@ -341,29 +341,33 @@ class TestRetrievalEngineSignatures(unittest.TestCase):
 
     def test_search_signature_has_now(self):
         """Verify search() method accepts now keyword argument."""
-        from engine.retrieval import RetrievalEngine
         import inspect
+
+        from engine.retrieval import RetrievalEngine
         sig = inspect.signature(RetrievalEngine.search)
         self.assertIn("now", sig.parameters)
 
     def test_retrieve_raw_signature_has_now(self):
         """Verify retrieve_raw() method accepts now keyword argument."""
-        from engine.retrieval import RetrievalEngine
         import inspect
+
+        from engine.retrieval import RetrievalEngine
         sig = inspect.signature(RetrievalEngine.retrieve_raw)
         self.assertIn("now", sig.parameters)
 
     def test_answer_signature_has_now(self):
         """Verify answer() method accepts now keyword argument."""
-        from engine.retrieval import RetrievalEngine
         import inspect
+
+        from engine.retrieval import RetrievalEngine
         sig = inspect.signature(RetrievalEngine.answer)
         self.assertIn("now", sig.parameters)
 
     def test_get_context_signature_has_now(self):
         """Verify get_context() method accepts now keyword argument."""
-        from engine.retrieval import RetrievalEngine
         import inspect
+
+        from engine.retrieval import RetrievalEngine
         sig = inspect.signature(RetrievalEngine.get_context)
         self.assertIn("now", sig.parameters)
 

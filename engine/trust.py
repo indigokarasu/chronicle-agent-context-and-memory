@@ -9,7 +9,7 @@ falls back to identity until `min_obs` samples exist.
 
 from __future__ import annotations
 
-from .config import TRUST_CEILING, CONFIDENCE_BASE
+from .config import CONFIDENCE_BASE, TRUST_CEILING
 
 
 def ceiling(trust_level: int) -> float:

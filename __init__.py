@@ -30,12 +30,12 @@ logger = logging.getLogger("chronicle.plugin")
 # Dual-mode import: relative under the loader's synthetic package, absolute for
 # local dev/tests.
 try:
-    from .provider import ChronicleMemoryProvider
     from .context import ChronicleContextEngine
+    from .provider import ChronicleMemoryProvider
 except Exception:  # pragma: no cover
     try:
-        from provider import ChronicleMemoryProvider
         from context import ChronicleContextEngine
+        from provider import ChronicleMemoryProvider
     except Exception:
         ChronicleMemoryProvider = None
         ChronicleContextEngine = None
@@ -67,13 +67,13 @@ def chronicle_status_command(raw_args: str = "") -> str:
         lines.append("  embedder={} model={} endpoint={} dim={}".format(
             st.get("embedder"), st.get("model"), st.get("endpoint"), st.get("dimensions")))
     except Exception as e:
-        lines.append("Embeddings: status unavailable (%s)" % e)
+        lines.append(f"Embeddings: status unavailable ({e})")
     try:
         s = core.store
         ev = s.count_rows("events")
         fa = s.count_rows("facts", "status='active'")
         pj = s.count_rows("curation_jobs", "status='pending'")
-        lines.append("Store: {} events · {} active facts · {} pending jobs".format(ev, fa, pj))
+        lines.append(f"Store: {ev} events · {fa} active facts · {pj} pending jobs")
     except Exception:
         pass
     return "\n".join(lines)
@@ -92,12 +92,12 @@ def register(ctx) -> None:
     mp_cls, ce_cls = ChronicleMemoryProvider, ChronicleContextEngine
     if mp_cls is None or ce_cls is None:  # top-level import was deferred — retry now
         try:
-            from .provider import ChronicleMemoryProvider as mp_cls  # type: ignore
             from .context import ChronicleContextEngine as ce_cls  # type: ignore
+            from .provider import ChronicleMemoryProvider as mp_cls  # type: ignore
         except Exception:
             try:
-                from provider import ChronicleMemoryProvider as mp_cls  # type: ignore
                 from context import ChronicleContextEngine as ce_cls  # type: ignore
+                from provider import ChronicleMemoryProvider as mp_cls  # type: ignore
             except Exception:
                 pass
 

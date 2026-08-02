@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict
+from typing import Any
 
 from . import access
 from .reducer import _normalize_value as _norm_fact_value
@@ -69,8 +69,8 @@ class Tools:
 
     # -- dispatch ----------------------------------------------------------
 
-    def dispatch(self, principal: str, name: str, args: Dict[str, Any]) -> str:
-        name = name[len("chronicle_"):] if name.startswith("chronicle_") else name
+    def dispatch(self, principal: str, name: str, args: dict[str, Any]) -> str:
+        name = name.removeprefix("chronicle_")
         fn = getattr(self, f"_t_{name}", None)
         if fn is None:
             return json.dumps({"error": f"unknown tool: {name}"})
@@ -343,9 +343,9 @@ class Tools:
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            return {"error": f"query failed: {str(e)}"}
+            return {"error": f"query failed: {e!s}"}
         except Exception as e:
-            return {"error": f"unexpected error: {str(e)}"}
+            return {"error": f"unexpected error: {e!s}"}
 
     def _t_plan_context(self, principal, a):
         return self.core.reasoning.plan_context(a["goal"])

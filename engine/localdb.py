@@ -19,14 +19,12 @@ Pointers use external_id = "table:pk_value", capability = "declared_name".
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-from .federation import CapabilityProvider
 from .access import can_read
+from .federation import CapabilityProvider
 
 logger = logging.getLogger("chronicle.localdb")
 
@@ -50,7 +48,7 @@ class LocalDBProvider(CapabilityProvider):
         except Exception:
             return False
 
-    def _get_conn(self) -> Optional[sqlite3.Connection]:
+    def _get_conn(self) -> sqlite3.Connection | None:
         """Lazy connection in read-only URI mode. Returns None if unavailable."""
         if not self.is_available():
             return None
@@ -64,7 +62,7 @@ class LocalDBProvider(CapabilityProvider):
                 return None
         return self._conn
 
-    def manifest(self) -> Dict:
+    def manifest(self) -> dict:
         """Return schema manifest: {tables: {name, columns: [name, type, pk], pk, rowcount}}."""
         if self._manifest is not None:
             return self._manifest
@@ -113,7 +111,7 @@ class LocalDBProvider(CapabilityProvider):
         limit: int = 1000,
         owner: str = "_user",
         principal: str = "_user",
-    ) -> List[Dict]:
+    ) -> list[dict]:
         """Iterate rows from a table, optionally filtered by ACL.
 
         Returns a list of dicts (one per row). External attributes are not copied
@@ -145,7 +143,7 @@ class LocalDBProvider(CapabilityProvider):
 
     def get_row(
         self, table: str, pk_value, owner: str = "_user", principal: str = "_user"
-    ) -> Optional[Dict]:
+    ) -> dict | None:
         """Get a single row by primary key.
 
         Returns a dict or None if not found. ACL checked (via can_read).
@@ -182,7 +180,7 @@ class LocalDBProvider(CapabilityProvider):
             )
             return None
 
-    def render_projection(self, table: str, row: Dict) -> str:
+    def render_projection(self, table: str, row: dict) -> str:
         """Render a row as a short text projection (~400 chars, skipping binary/null).
 
         Format: "table: col=val; col=val; ..." Capped to keep cached_projection compact.
@@ -234,7 +232,7 @@ class LocalDBProvider(CapabilityProvider):
 
     # -- federation interface (§14) ------------------------------------------
 
-    def resolve(self, ref) -> Dict:
+    def resolve(self, ref) -> dict:
         """Resolve an external_id pointer (for federation.resolve).
 
         external_id format: "table:pk_value"
@@ -279,7 +277,7 @@ class LocalDBProvider(CapabilityProvider):
             "columns": {k: v for k, v in row.items()},
         }
 
-    def query(self, params) -> List[dict]:
+    def query(self, params) -> list[dict]:
         """Generic query interface (for future federation.query calls).
 
         Not yet implemented; returns empty list.

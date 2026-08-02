@@ -20,7 +20,6 @@ import os
 import sqlite3
 import sys
 import tempfile
-from pathlib import Path
 
 chronicle_dir = os.environ.get("CHRONICLE_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", ".."
@@ -171,7 +170,7 @@ def test_pointer_resolution():
     resolved_missing = provider.resolve("people:99999")
     assert not resolved_missing, "resolve() should return empty for non-existent row"
 
-    print(f"  PASS: pointer resolution correct")
+    print("  PASS: pointer resolution correct")
 
 
 def test_missing_file_degradation():
@@ -199,7 +198,7 @@ def test_missing_file_degradation():
     resolved = provider.resolve("anything:1")
     assert resolved == {}, "resolve should return {} for unavailable provider"
 
-    print(f"  PASS: missing file degrades gracefully without crashing")
+    print("  PASS: missing file degrades gracefully without crashing")
 
 
 def test_acl_enforcement():
@@ -220,7 +219,7 @@ def test_acl_enforcement():
     rows = provider.iter_rows("people", owner="alice:agent", principal="bob:agent")
     assert rows == [], "cross-user iter_rows should return []"
 
-    print(f"  PASS: ACL enforcement blocks cross-user reads")
+    print("  PASS: ACL enforcement blocks cross-user reads")
 
 
 def test_provider_in_federation_registry():

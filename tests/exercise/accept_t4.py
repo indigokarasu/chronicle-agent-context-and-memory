@@ -7,7 +7,6 @@ Fresh temp home, ingest ~6 observe() turns, process_pending(), then verify:
 """
 
 import json
-import os
 import shutil
 import sys
 import tempfile

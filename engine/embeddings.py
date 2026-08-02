@@ -17,7 +17,7 @@ import random
 import re
 import struct
 import time
-from typing import List, Optional, Protocol
+from typing import Protocol
 
 logger = logging.getLogger("chronicle.embeddings")
 
@@ -25,7 +25,7 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 _HASHING_NAMES = {"hashing", "hashing-v1", "offline", "none"}
 _AUTO_NAMES = {"", "auto", "auto-detect", "autodetect", "local", "default"}
 # Model ids that look like embedding models (used to auto-pick from /v1/models).
-_EMBED_RE = re.compile(r"embed|bge|gte|nomic|e5|minilm|mxbai|arctic|stella|gemma|qwen.*embed", re.I)
+_EMBED_RE = re.compile(r"embed|bge|gte|nomic|e5|minilm|mxbai|arctic|stella|gemma|qwen.*embed", re.IGNORECASE)
 
 
 class EmbeddingsUnavailable(RuntimeError):
@@ -42,7 +42,7 @@ class Embedder(Protocol):
     model: str
     dimensions: int
 
-    def embed(self, text: str) -> List[float]: ...
+    def embed(self, text: str) -> list[float]: ...
 
 
 class HashingEmbedder:
@@ -58,7 +58,7 @@ class HashingEmbedder:
         self.dimensions = dimensions
         self.model = model
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str) -> list[float]:
         vec = [0.0] * self.dimensions
         toks = _TOKEN.findall((text or "").lower())
         for tok in toks:
@@ -111,7 +111,7 @@ class OpenAICompatEmbedder:
         self.backoff_base = float(backoff_base)
         self.backoff_cap = float(backoff_cap)
 
-    def _embed_raw(self, text: str, timeout: float) -> List[float]:
+    def _embed_raw(self, text: str, timeout: float) -> list[float]:
         import json as _json
         import urllib.request
         body = _json.dumps({"model": self.model, "input": text or ""}).encode("utf-8")
@@ -136,7 +136,7 @@ class OpenAICompatEmbedder:
         # Auth/credential errors will not fix themselves by waiting; do not retry.
         return getattr(exc, "code", None) in (401, 403)
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str) -> list[float]:
         attempt = 0
         while True:
             try:
@@ -159,7 +159,7 @@ class OpenAICompatEmbedder:
                 if wait > 0:
                     time.sleep(wait)
 
-    def _embed_raw_batch(self, texts: List[str], timeout: float) -> List[List[float]]:
+    def _embed_raw_batch(self, texts: list[str], timeout: float) -> list[list[float]]:
         import json as _json
         import urllib.request
         body = _json.dumps({"model": self.model, "input": [t or "" for t in texts]}).encode("utf-8")
@@ -182,7 +182,7 @@ class OpenAICompatEmbedder:
             out.append([float(x) for x in vec])
         return out
 
-    def embed_batch(self, texts: List[str], chunk: int = 64) -> List[List[float]]:
+    def embed_batch(self, texts: list[str], chunk: int = 64) -> list[list[float]]:
         """Batch embed with the same retry/no-hash-fallback contract as embed().
 
         One HTTP round-trip per `chunk` texts instead of one per text — the
@@ -190,7 +190,7 @@ class OpenAICompatEmbedder:
         re-embed after an outage). A longer timeout per call, scaled by chunk
         size, because a batch legitimately takes longer than a single.
         """
-        out: List[List[float]] = []
+        out: list[list[float]] = []
         for i in range(0, len(texts), chunk):
             part = texts[i:i + chunk]
             attempt = 0
@@ -207,7 +207,7 @@ class OpenAICompatEmbedder:
         return out
 
 
-def _candidate_urls(base_url: Optional[str]) -> List[str]:
+def _candidate_urls(base_url: str | None) -> list[str]:
     import os
     if base_url:
         return [base_url]
@@ -217,7 +217,7 @@ def _candidate_urls(base_url: Optional[str]) -> List[str]:
     return list(_DEFAULT_ENDPOINTS)
 
 
-def _discover_embedding_models(base_url: str, api_key: str) -> List[str]:
+def _discover_embedding_models(base_url: str, api_key: str) -> list[str]:
     """List candidate embedding model ids from an OpenAI-compatible /v1/models.
 
     Prefers ids that look like embedding models; if none match the heuristic,
@@ -233,8 +233,8 @@ def _discover_embedding_models(base_url: str, api_key: str) -> List[str]:
     return [i for i in ids if _EMBED_RE.search(i)] or ids
 
 
-def _probe_endpoints(model: Optional[str], dims: int, base_url: Optional[str],
-                     api_key: Optional[str]) -> Optional["Embedder"]:
+def _probe_endpoints(model: str | None, dims: int, base_url: str | None,
+                     api_key: str | None) -> Embedder | None:
     """First reachable OpenAI-compatible endpoint that really embeds, else None.
 
     `model` auto/empty → ask each endpoint's /v1/models what it serves and try
@@ -271,8 +271,8 @@ class DegradedEmbedder:
     latency against a dead endpoint.
     """
 
-    def __init__(self, model: str = "auto", dimensions: int = 768, base_url: Optional[str] = None,
-                 api_key: Optional[str] = None, recheck_seconds: float = 60.0):
+    def __init__(self, model: str = "auto", dimensions: int = 768, base_url: str | None = None,
+                 api_key: str | None = None, recheck_seconds: float = 60.0):
         self.requested_model = model or "auto"
         self.base_url = base_url
         self.api_key = api_key
@@ -310,12 +310,12 @@ class DegradedEmbedder:
         self._live = emb
         return True
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str) -> list[float]:
         if self._live is not None:
             return self._live.embed(text)
         raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
 
-    def embed_batch(self, texts: List[str], chunk: int = 64) -> List[List[float]]:
+    def embed_batch(self, texts: list[str], chunk: int = 64) -> list[list[float]]:
         # Present so an adopted backend keeps its batch path once recheck() has
         # upgraded us in place; still raises while nothing is reachable, exactly
         # like embed(), so callers need no separate degraded branch.
@@ -324,8 +324,8 @@ class DegradedEmbedder:
         raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
 
 
-def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
-                 base_url: Optional[str] = None, api_key: Optional[str] = None) -> "Embedder":
+def get_embedder(model: str | None = None, dimensions: int | None = None,
+                 base_url: str | None = None, api_key: str | None = None) -> Embedder:
     """Return the active embedder, logging exactly ONE line: which mode, and why.
 
     Default is ``auto``: find a running local OpenAI-compatible server (configured
@@ -374,7 +374,7 @@ def get_embedder(model: Optional[str] = None, dimensions: Optional[int] = None,
                    "embed is queued as a curation job and retried with backoff until a server "
                    "appears. Set embeddings.model (or $CHRONICLE_EMBED_MODEL) to 'hashing' for "
                    "deterministic offline vectors instead",
-                   "no embedding model reachable" if auto else "model %r not reachable" % model,
+                   "no embedding model reachable" if auto else f"model {model!r} not reachable",
                    ", ".join(_candidate_urls(base_url)))
     return DegradedEmbedder(model=name, dimensions=dims, base_url=base_url, api_key=api_key)
 
@@ -388,18 +388,18 @@ def _stable_hash(s: str) -> int:
     return h
 
 
-def pack(vec: List[float]) -> bytes:
+def pack(vec: list[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
-def unpack(blob: Optional[bytes]) -> List[float]:
+def unpack(blob: bytes | None) -> list[float]:
     if not blob:
         return []
     n = len(blob) // 4
     return list(struct.unpack(f"<{n}f", blob))
 
 
-def cosine(a: List[float], b: List[float]) -> float:
+def cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))

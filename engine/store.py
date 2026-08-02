@@ -16,8 +16,8 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("chronicle.store")
 
@@ -174,7 +174,7 @@ class MemoryStore:
 
     # -- meta --------------------------------------------------------------
 
-    def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
         row = self._conn().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else default
 
@@ -223,11 +223,11 @@ class MemoryStore:
             conn.execute("UPDATE meta SET value=? WHERE key='projection_seq'", (str(seq),))
         return eid
 
-    def get_event(self, event_id: str) -> Optional[dict]:
+    def get_event(self, event_id: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_events_since(self, seq: int, limit: Optional[int] = None) -> List[dict]:
+    def get_events_since(self, seq: int, limit: int | None = None) -> list[dict]:
         """Events with seq > `seq`, ascending. Pass limit=None (default) for
         unbounded full-scan; pass an explicit N for paginated reads."""
         q = "SELECT * FROM events WHERE seq > ? ORDER BY seq"
@@ -256,14 +256,14 @@ class MemoryStore:
                 break
             cur_seq = new_seq
 
-    def get_events_as_of(self, recorded_at: str) -> List[dict]:
+    def get_events_as_of(self, recorded_at: str) -> list[dict]:
         rows = self._conn().execute(
             "SELECT * FROM events WHERE recorded_at <= ? ORDER BY seq", (recorded_at,)).fetchall()
         return [dict(r) for r in rows]
 
     def get_events_by_session(self, session_id: str, since_seq: int = 0,
-                              types: Optional[Sequence[str]] = None,
-                              limit: Optional[int] = None) -> List[dict]:
+                              types: Sequence[str] | None = None,
+                              limit: int | None = None) -> list[dict]:
         """Events of one session, ascending by seq.
 
         `types` and `limit` exist so a caller that wants "the first N observed
@@ -277,7 +277,7 @@ class MemoryStore:
         q = "SELECT * FROM events WHERE session_id=? AND seq > ?"
         params: list = [session_id, since_seq]
         if types:
-            q += " AND type IN (%s)" % ",".join(["?"] * len(types))
+            q += " AND type IN ({})".format(",".join(["?"] * len(types)))
             params.extend(types)
         q += " ORDER BY seq"
         if limit is not None:
@@ -286,7 +286,7 @@ class MemoryStore:
         rows = self._conn().execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
-    def get_events_by_type(self, type_: str, since_seq: int = 0) -> List[dict]:
+    def get_events_by_type(self, type_: str, since_seq: int = 0) -> list[dict]:
         rows = self._conn().execute(
             "SELECT * FROM events WHERE type=? AND seq > ? ORDER BY seq", (type_, since_seq)).fetchall()
         return [dict(r) for r in rows]
@@ -310,7 +310,7 @@ class MemoryStore:
             conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
             conn.execute("INSERT INTO observed_fts(event_id, excerpt) VALUES(?,?)", (event_id, excerpt))
 
-    def fts_search_observed(self, query: str, limit: int = 20) -> List[dict]:
+    def fts_search_observed(self, query: str, limit: int = 20) -> list[dict]:
         q = _fts_query(query)
         if not q:
             return []
@@ -328,7 +328,7 @@ class MemoryStore:
 
     # -- belief FTS (Tier-1, §18.1) ---------------------------------------
 
-    def fts_search_beliefs(self, query: str, limit: int = 20) -> List[dict]:
+    def fts_search_beliefs(self, query: str, limit: int = 20) -> list[dict]:
         q = _fts_query(query)
         if not q:
             return []
@@ -401,10 +401,10 @@ class MemoryStore:
             conn.execute("INSERT OR REPLACE INTO session_index(session_id,summary,embedding,owner,occurred_at) "
                          "VALUES(?,?,?,?,?)", (session_id, summary, embedding, owner, occurred_at))
 
-    def iter_memory_vectors(self) -> List[dict]:
+    def iter_memory_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM memory_vectors").fetchall()]
 
-    def iter_observed_vectors(self) -> List[dict]:
+    def iter_observed_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM observed_vectors").fetchall()]
 
     def iter_observed_vectors_paged(self, batch_size: int = 1000):
@@ -422,7 +422,7 @@ class MemoryStore:
                 min_rowid = batch[-1]["rowid"]
             yield batch
 
-    def get_observed_vectors_by_ids(self, event_ids) -> Dict[str, dict]:
+    def get_observed_vectors_by_ids(self, event_ids) -> dict[str, dict]:
         """Stored vectors for specific events, keyed by event_id (§24.4, u5).
 
         Random access is what the paged scan never needs and the ANN fast path
@@ -433,7 +433,7 @@ class MemoryStore:
         window silently loses its whole vector contribution. Chunked to stay
         under SQLITE_MAX_VARIABLE_NUMBER; ids with no vector are simply absent.
         """
-        out: Dict[str, dict] = {}
+        out: dict[str, dict] = {}
         ids = [e for e in dict.fromkeys(event_ids) if e]
         if not ids:
             return out
@@ -466,14 +466,14 @@ class MemoryStore:
             "SELECT 1 FROM projection_vectors WHERE provider=? AND external_id=?",
             (provider, external_id)).fetchone() is not None
 
-    def get_projection_vectors_by_ids(self, proj_ids: List[Tuple[str, str]]) -> Dict[str, dict]:
+    def get_projection_vectors_by_ids(self, proj_ids: list[tuple[str, str]]) -> dict[str, dict]:
         """Stored projection vectors for specific (provider, external_id) pairs.
 
         Returns dict keyed by "proj:<provider>:<external_id>" namespace id, mirroring
         the retrieval.retrieve_raw session id namespacing "session:<session_id>".
         Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER.
         """
-        out: Dict[str, dict] = {}
+        out: dict[str, dict] = {}
         if not proj_ids:
             return out
         conn = self._conn()
@@ -514,7 +514,7 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("DELETE FROM projection_vectors WHERE provider=?", (provider,))
 
-    def iter_session_vectors(self) -> List[dict]:
+    def iter_session_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM session_index").fetchall()]
 
     def iter_session_vectors_paged(self, batch_size: int = 1000):
@@ -571,11 +571,11 @@ class MemoryStore:
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
 
-    def get_belief(self, table: str, belief_id: str) -> Optional[dict]:
+    def get_belief(self, table: str, belief_id: str) -> dict | None:
         row = self._conn().execute(f"SELECT * FROM {table} WHERE belief_id=?", (belief_id,)).fetchone()
         return dict(row) if row else None
 
-    def find_belief(self, belief_id: str) -> Optional[Tuple[str, dict]]:
+    def find_belief(self, belief_id: str) -> tuple[str, dict] | None:
         for t in BELIEF_TABLES + ["entities", "user_knowledge"]:
             row = self._conn().execute(f"SELECT * FROM {t} WHERE belief_id=?", (belief_id,)).fetchone()
             if row:
@@ -583,7 +583,7 @@ class MemoryStore:
         return None
 
     def query_beliefs(self, table: str, where: str = "1=1", params: tuple = (),
-                      limit: int = 50, order: str = "") -> List[dict]:
+                      limit: int = 50, order: str = "") -> list[dict]:
         order_sql = f" ORDER BY {order}" if order else ""
         rows = self._conn().execute(
             f"SELECT * FROM {table} WHERE {where}{order_sql} LIMIT ?", (*params, limit)).fetchall()
@@ -596,11 +596,11 @@ class MemoryStore:
             conn.execute("INSERT OR IGNORE INTO justifications(belief_id,support,support_kind,rule) "
                          "VALUES(?,?,?,?)", (belief_id, support, support_kind, rule))
 
-    def get_justifications(self, belief_id: str) -> List[dict]:
+    def get_justifications(self, belief_id: str) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM justifications WHERE belief_id=?", (belief_id,)).fetchall()]
 
-    def get_dependents(self, support: str) -> List[dict]:
+    def get_dependents(self, support: str) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM justifications WHERE support=?", (support,)).fetchall()]
 
@@ -608,7 +608,7 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("DELETE FROM justifications WHERE belief_id=?", (belief_id,))
 
-    def active_unjustified(self) -> List[str]:
+    def active_unjustified(self) -> list[str]:
         """Active beliefs with zero justifications (I5 health check)."""
         out = []
         conn = self._conn()
@@ -628,7 +628,7 @@ class MemoryStore:
                          "VALUES(?,?,?,?, 'open', ?)",
                          (str(uuid.uuid4()), belief_a, belief_b, detail, now_iso()))
 
-    def get_open_contradictions(self, limit: int = 50) -> List[dict]:
+    def get_open_contradictions(self, limit: int = 50) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM contradictions WHERE status='open' ORDER BY created_at DESC LIMIT ?",
             (limit,)).fetchall()]
@@ -639,7 +639,7 @@ class MemoryStore:
 
     # -- corrections -------------------------------------------------------
 
-    def record_correction(self, belief_id: str, reason: str, correction_ref: str, propagated: List[str]):
+    def record_correction(self, belief_id: str, reason: str, correction_ref: str, propagated: list[str]):
         import uuid
         with self.transaction() as conn:
             conn.execute("INSERT INTO corrections(id,belief_id,reason,correction_ref,propagated,created_at) "
@@ -658,18 +658,18 @@ class MemoryStore:
                          f"ON CONFLICT(session_id) DO UPDATE SET {updates}",
                          [session[c] for c in cols])
 
-    def get_session(self, session_id: str) -> Optional[dict]:
+    def get_session(self, session_id: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_sessions_by_status(self, statuses) -> List[dict]:
+    def get_sessions_by_status(self, statuses) -> list[dict]:
         marks = ",".join("?" * len(statuses))
         return [dict(r) for r in self._conn().execute(
             f"SELECT * FROM sessions WHERE status IN ({marks})", tuple(statuses)).fetchall()]
 
     # -- curation jobs (§17) ----------------------------------------------
 
-    def enqueue_curation(self, task: str, payload: dict, depends_on: Optional[int] = None) -> Optional[int]:
+    def enqueue_curation(self, task: str, payload: dict, depends_on: int | None = None) -> int | None:
         """Queue a curation job, collapsing an identical (task, payload) pair that
         is already pending or running — the same guard enqueue_embed_job applies
         below, on the same canonical-json key and served by the same partial index.
@@ -701,8 +701,8 @@ class MemoryStore:
             return cur.lastrowid
 
     def enqueue_embed_job(self, target_id: str, kind: str, text: str, *,
-                         owner: Optional[str] = None, provider: Optional[str] = None,
-                         external_id: Optional[str] = None) -> Optional[int]:
+                         owner: str | None = None, provider: str | None = None,
+                         external_id: str | None = None) -> int | None:
         """Queue a deferred vector write (§24.4), unless the same one is already
         queued. Degraded mode can re-touch one belief many times (every update
         re-enters the reduce), and the queue must not grow without bound; the
@@ -731,7 +731,7 @@ class MemoryStore:
             return cur.lastrowid
 
     def enqueue_projection_embed(self, provider: str, external_id: str, text: str,
-                                 owner: Optional[str] = None) -> Optional[int]:
+                                 owner: str | None = None) -> int | None:
         """Queue a projection's rendered text for embedding via the SAME deferred
         embed-job path every other vector channel uses — never inline at sweep
         time (§g5a). The target id is namespaced "proj:<provider>:<external_id>",
@@ -741,7 +741,7 @@ class MemoryStore:
         return self.enqueue_embed_job(target_id, "projection", text, owner=owner,
                                       provider=provider, external_id=external_id)
 
-    def claim_curation_job(self) -> Optional[dict]:
+    def claim_curation_job(self) -> dict | None:
         """Lowest-id ready job. Ready = pending, dependencies done, and NOT deferred:
         a job whose run_after is still in the future stays invisible (§17.3)."""
         with self.transaction() as conn:
@@ -756,12 +756,12 @@ class MemoryStore:
                          "WHERE id=?", (now_iso(), row["id"]))
             return dict(row)
 
-    def complete_curation_job(self, job_id: int, error: Optional[str] = None):
+    def complete_curation_job(self, job_id: int, error: str | None = None):
         with self.transaction() as conn:
             conn.execute("UPDATE curation_jobs SET status=?, finished_at=?, error=? WHERE id=?",
                          ("failed" if error else "done", now_iso(), error, job_id))
 
-    def defer_curation_job(self, job_id: int, delay_seconds: int, error: Optional[str] = None):
+    def defer_curation_job(self, job_id: int, delay_seconds: int, error: str | None = None):
         """Put a claimed job back as pending, invisible until `delay_seconds` from now.
 
         run_after is written in the same now_iso() format as every other timestamp
@@ -779,7 +779,7 @@ class MemoryStore:
     def pending_curation_count(self) -> int:
         return self.count_rows("curation_jobs", "status='pending'")
 
-    def get_curation_jobs(self, where: str = "1=1", limit: int = 100) -> List[dict]:
+    def get_curation_jobs(self, where: str = "1=1", limit: int = 100) -> list[dict]:
         """Job rows for diagnostics/tests (same trusted-where contract as count_rows)."""
         return [dict(r) for r in self._conn().execute(
             f"SELECT * FROM curation_jobs WHERE {where} ORDER BY id LIMIT ?", (int(limit),)).fetchall()]
@@ -818,23 +818,23 @@ class MemoryStore:
                          f"ON CONFLICT(principal_id) DO UPDATE SET {updates}",
                          [principal[c] for c in cols])
 
-    def get_principal(self, principal_id: str) -> Optional[dict]:
+    def get_principal(self, principal_id: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM principals WHERE principal_id=?",
                                    (principal_id,)).fetchone()
         return dict(row) if row else None
 
-    def all_principals(self) -> List[dict]:
+    def all_principals(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM principals").fetchall()]
 
     # -- git queue (§26) ---------------------------------------------------
 
-    def get_unflushed_git_events(self, limit: int = 1000) -> List[dict]:
+    def get_unflushed_git_events(self, limit: int = 1000) -> list[dict]:
         rows = self._conn().execute(
             "SELECT gq.id AS gid, e.* FROM git_queue gq JOIN events e ON gq.event_id=e.event_id "
             "WHERE gq.committed=0 ORDER BY gq.id LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
-    def mark_git_flushed(self, gids: List[int], git_commit: str):
+    def mark_git_flushed(self, gids: list[int], git_commit: str):
         with self.transaction() as conn:
             for gid in gids:
                 conn.execute("UPDATE git_queue SET committed=1, committed_at=?, git_commit=? WHERE id=?",
@@ -856,11 +856,11 @@ class MemoryStore:
 
     # -- derivation rules (§9.1) ------------------------------------------
 
-    def get_derivation_rules(self, enabled_only: bool = True) -> List[dict]:
+    def get_derivation_rules(self, enabled_only: bool = True) -> list[dict]:
         q = "SELECT * FROM derivation_rules" + (" WHERE enabled=1" if enabled_only else "")
         return [dict(r) for r in self._conn().execute(q).fetchall()]
 
-    def get_derivation_rule(self, rule_id: str) -> Optional[dict]:
+    def get_derivation_rule(self, rule_id: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM derivation_rules WHERE rule_id=?", (rule_id,)).fetchone()
         return dict(row) if row else None
 
@@ -877,7 +877,7 @@ class MemoryStore:
             conn.execute("UPDATE derivation_rules SET enabled=? WHERE rule_id=?",
                          (1 if enabled else 0, rule_id))
 
-    def add_nogood(self, nogood_id: str, assumptions: List[str]):
+    def add_nogood(self, nogood_id: str, assumptions: list[str]):
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO nogoods(nogood_id,assumptions) VALUES(?,?)",
                          (nogood_id, json.dumps(sorted(assumptions))))
@@ -892,7 +892,7 @@ class MemoryStore:
                          "canonical=excluded.canonical, cardinality=excluded.cardinality",
                          (surface, canonical, cardinality, confidence, now_iso()))
 
-    def get_predicate(self, surface: str) -> Optional[dict]:
+    def get_predicate(self, surface: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM predicates WHERE surface=?", (surface,)).fetchone()
         return dict(row) if row else None
 
@@ -905,7 +905,7 @@ class MemoryStore:
         # Conservative: if any sense is multi, treat as multi (don't over-fire derivations).
         return "multi" if any(r["cardinality"] == "multi" for r in rows) else "single"
 
-    def predicate_synonyms(self, canonical: str) -> List[str]:
+    def predicate_synonyms(self, canonical: str) -> list[str]:
         rows = self._conn().execute("SELECT surface FROM predicates WHERE canonical=?",
                                     (canonical,)).fetchall()
         return [r["surface"] for r in rows]
@@ -921,12 +921,12 @@ class MemoryStore:
                          (cap["capability"], cap["provider"], cap.get("declared_by", ""),
                           cap.get("precedence", 0), cap.get("status", "active")))
 
-    def get_capability_provider(self, capability: str) -> Optional[dict]:
+    def get_capability_provider(self, capability: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM capability_providers WHERE capability=?",
                                    (capability,)).fetchone()
         return dict(row) if row else None
 
-    def get_capability_providers(self) -> List[dict]:
+    def get_capability_providers(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM capability_providers").fetchall()]
 
     def set_capability_status(self, capability: str, status: str):
@@ -946,7 +946,7 @@ class MemoryStore:
                           pointer.get("cache_ttl"), now_iso()))
         return pid
 
-    def get_pointer(self, pointer_id: str) -> Optional[dict]:
+    def get_pointer(self, pointer_id: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM pointers WHERE id=?", (pointer_id,)).fetchone()
         return dict(row) if row else None
 
@@ -960,13 +960,13 @@ class MemoryStore:
             conn.execute(f"INSERT INTO user_knowledge({','.join(cols)}) VALUES({ph}) "
                          f"ON CONFLICT(belief_id) DO UPDATE SET {updates}", [uk[c] for c in cols])
 
-    def query_user_knowledge(self, where: str = "1=1", params: tuple = (), limit: int = 50) -> List[dict]:
+    def query_user_knowledge(self, where: str = "1=1", params: tuple = (), limit: int = 50) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             f"SELECT * FROM user_knowledge WHERE {where} LIMIT ?", (*params, limit)).fetchall()]
 
     # -- calibration (§10.5) ----------------------------------------------
 
-    def get_calibration_obs(self, source_type: str) -> List[dict]:
+    def get_calibration_obs(self, source_type: str) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM calibration_obs WHERE source_type=?", (source_type,)).fetchall()]
 
@@ -989,7 +989,7 @@ class MemoryStore:
             conn.execute("INSERT INTO search_misses(query,domain,top_score,resolved,created_at) "
                          "VALUES(?,?,?,0,?)", (query, domain, top_score, now_iso()))
 
-    def get_unresolved_misses(self, limit: int = 50) -> List[dict]:
+    def get_unresolved_misses(self, limit: int = 50) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM search_misses WHERE resolved=0 ORDER BY id LIMIT ?", (limit,)).fetchall()]
 
@@ -1021,12 +1021,12 @@ class MemoryStore:
             conn.execute(f"INSERT INTO policies({','.join(cols)}) VALUES({ph}) "
                          f"ON CONFLICT(version) DO UPDATE SET {updates}", [policy[c] for c in cols])
 
-    def get_active_policy(self, kind: str) -> Optional[dict]:
+    def get_active_policy(self, kind: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM policies WHERE kind=? AND active=1 LIMIT 1",
                                    (kind,)).fetchone()
         return dict(row) if row else None
 
-    def get_policy(self, version: str) -> Optional[dict]:
+    def get_policy(self, version: str) -> dict | None:
         row = self._conn().execute("SELECT * FROM policies WHERE version=?", (version,)).fetchone()
         return dict(row) if row else None
 
@@ -1043,7 +1043,7 @@ class MemoryStore:
             conn.execute(f"INSERT INTO goals({','.join(cols)}) VALUES({ph}) "
                          f"ON CONFLICT(id) DO UPDATE SET {updates}", [goal[c] for c in cols])
 
-    def get_active_goals(self) -> List[dict]:
+    def get_active_goals(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM goals WHERE status='active' ORDER BY created_at DESC").fetchall()]
 
@@ -1054,7 +1054,7 @@ class MemoryStore:
             conn.execute(f"INSERT OR REPLACE INTO reflections({','.join(cols)}) VALUES({ph})",
                          [reflection[c] for c in cols])
 
-    def search_reflections(self, like: str, limit: int = 5) -> List[dict]:
+    def search_reflections(self, like: str, limit: int = 5) -> list[dict]:
         return [dict(r) for r in self._conn().execute(
             "SELECT * FROM reflections WHERE situation LIKE ? OR lesson LIKE ? LIMIT ?",
             (f"%{like}%", f"%{like}%", limit)).fetchall()]
@@ -1092,7 +1092,7 @@ def _has_col(conn, table: str, col: str) -> bool:
     return any(r["name"] == col for r in rows)
 
 
-def _belief_fts_text(table: str, b: dict) -> Tuple[str, str]:
+def _belief_fts_text(table: str, b: dict) -> tuple[str, str]:
     if table == "facts":
         return "fact", f"{b.get('attribute','')} {b.get('value','')}".strip()
     if table == "episodes":
@@ -1133,14 +1133,14 @@ _CURATION_JOBS_DDL = """CREATE TABLE IF NOT EXISTS %s (
     attempts INTEGER DEFAULT 0, created_at TEXT, started_at TEXT, finished_at TEXT, error TEXT,
     run_after TEXT);"""
 _JOBS_INDEX_DDLS = (
-    "CREATE INDEX IF NOT EXISTS idx_jobs_ready ON curation_jobs(status, id) "
-    "WHERE status='pending';",
+    ("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON curation_jobs(status, id) "
+    "WHERE status='pending';"),
     # Serves the enqueue_curation / enqueue_embed_job dedup probe. Without it
     # every enqueue scans curation_jobs, which grows as the drain proceeds, so
     # the guard that exists to REMOVE work costs O(queue) per call and eats most
     # of what it saves.
-    "CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON curation_jobs(task, payload) "
-    "WHERE status IN ('pending','running');",
+    ("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON curation_jobs(task, payload) "
+    "WHERE status IN ('pending','running');"),
 )
 # One string for the _SCHEMA splice (executescript takes many statements);
 # the rebuild path executes them one at a time (conn.execute takes exactly one).
