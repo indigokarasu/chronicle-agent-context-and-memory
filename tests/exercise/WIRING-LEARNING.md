@@ -224,7 +224,6 @@ ingesting two ordinary sentences: `[('workplace_location', 1, 1)]`.
    `auto_disable_low_precision` across `engine/ provider.py context.py scripts/ dashboard/`:
    only its own definition. Zero production callers.
 
-**THE BUG, and its headline consequence.** `correct` defaults to `True` and the one call site
 never overrides it, so `precision_correct` increments in lockstep with `precision_n`
 (derivation.py:202-203) and the ratio is pinned at `1.0` for every rule forever. Therefore:
 
@@ -269,7 +268,6 @@ activating an `rrf_weights` delta at the magnitude cap leaves `search()` returni
 byte-identical result list, same order, same scores.
 
 **VERDICT: UNWIRED.** The only production-visible effect the `policies` table ever had was the
-corruption bug fixed above — i.e. the sole way activating a policy changed anything was by
 destroying the policy record.
 
 ---
