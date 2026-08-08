@@ -19,8 +19,41 @@ path works). Activate the slots in ``~/.hermes/config.yaml``:
 from __future__ import annotations
 
 import logging
+import os
 
-__version__ = "5.3.3"
+# Last-resort literal, used only when plugin.yaml is missing or unreadable at
+# import time (e.g. the package was vendored without its manifest). plugin.yaml
+# is the single source of truth — do not treat this as a second one.
+_VERSION_FALLBACK = "5.4.1"
+
+
+def _read_version_from_plugin_yaml() -> str:
+    """Read Chronicle's version from the ``version:`` line of plugin.yaml.
+
+    plugin.yaml is the one place the version literal lives; ``__version__`` and
+    every other reporter (the dashboard status API, etc.) derive from it. Parsed
+    with a plain stdlib line scan rather than a YAML library: Chronicle is
+    stdlib-only, and a single top-level scalar does not justify a dependency.
+
+    Only column-0 ``version:`` lines are considered — a top-level YAML key cannot
+    be indented, so this ignores comments and any nested ``version:`` key.
+    """
+    try:
+        yaml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.yaml")
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.startswith("version:"):
+                    continue
+                value = line.split(":", 1)[1].split("#", 1)[0].strip()
+                value = value.strip("\"'").strip()
+                if value:
+                    return value
+    except Exception:  # pragma: no cover - defensive: missing/unreadable manifest
+        pass
+    return _VERSION_FALLBACK
+
+
+__version__ = _read_version_from_plugin_yaml()
 
 logger = logging.getLogger("chronicle.plugin")
 

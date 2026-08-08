@@ -24,7 +24,20 @@ logger = logging.getLogger("chronicle.store")
 # Bumped whenever _SCHEMA changes shape; recorded in meta.schema_version by
 # _migrate. 2 = curation_jobs.run_after + task 'embed' (deferred embeds, §24.4).
 # 3 = task 'digest' (entity consolidation digests, §u2).
-SCHEMA_VERSION = 3
+# 4 = task 'federate_sweep' + federation_watermarks/link_candidates (§14, g4).
+SCHEMA_VERSION = 4
+
+# SQLite busy timeouts, milliseconds.
+#
+# BUSY_TIMEOUT_MS is the steady-state wait and is deliberately long: Chronicle's
+# own writes are short, so out-waiting a concurrent writer beats failing a
+# capture. INIT_BUSY_TIMEOUT_MS bounds the *start-up* path only (schema +
+# migration here, core.initialize() via init_busy_timeout()). Start-up has a
+# caller that can degrade and retry — the context engine falls back to heuristic
+# compression and re-inits later — so blocking it for the full steady-state
+# timeout buys nothing and stalls the host session instead.
+BUSY_TIMEOUT_MS = 30000
+INIT_BUSY_TIMEOUT_MS = 5000
 
 # Belief tables that carry the common envelope (§8.1).
 BELIEF_TABLES = ["facts", "episodes", "notes", "refs", "relationships", "procedures"]
@@ -65,13 +78,41 @@ class MemoryStore:
 
     def _conn(self) -> sqlite3.Connection:
         if getattr(self._local, "conn", None) is None:
-            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return self._local.conn
+
+    @contextmanager
+    def init_busy_timeout(self):
+        """Run a block with the short start-up busy timeout, then restore.
+
+        Scoped rather than global on purpose. Lowering the connect-time timeout
+        would make every steady-state write give up sooner, which is the opposite
+        of what contention needs; what actually has to be bounded is the one
+        caller that can degrade instead of waiting. `ChronicleCore.get()` hands
+        back a WARM singleton without touching SQLite, so a context-engine start
+        typically meets the lock inside `core.initialize()`'s first write — on a
+        connection opened long ago at the steady-state timeout — which is why the
+        bound has to be applicable to an existing connection and not just to a
+        fresh one.
+        """
+        conn = self._conn()
+        # Restore whatever was there rather than assuming the connect-time value,
+        # so nesting (a cold ChronicleCore.get() inside an init block) cannot
+        # hand the outer block back the steady-state timeout half way through.
+        prev = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.execute("PRAGMA busy_timeout=%d" % int(INIT_BUSY_TIMEOUT_MS))
+        try:
+            yield conn
+        finally:
+            try:
+                conn.execute("PRAGMA busy_timeout=%d" % int(prev))
+            except Exception:  # pragma: no cover - a dead conn is the caller's problem
+                logger.debug("could not restore busy_timeout on %s", self.db_path)
 
     @contextmanager
     def transaction(self):
@@ -102,17 +143,21 @@ class MemoryStore:
     # -- schema ------------------------------------------------------------
 
     def _init_db(self):
-        conn = self._conn()
-        conn.executescript(_SCHEMA)
-        self._migrate(conn)
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('projection_seq','0')")
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('head_event_id','')")
-        # Seed the monotonic event_seq counter (used by append_event's atomic
-        # UPDATE...RETURNING). Omitting this left fresh DBs with no event_seq row,
-        # so the first append_event crashed with "NoneType is not subscriptable".
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('event_seq', "
-                     "(SELECT COALESCE(MAX(seq),0) FROM events))")
-        conn.commit()
+        # Bounded by the start-up timeout: a store opened while another process
+        # holds the write lock (the live 2026-08-02 case was a concurrent
+        # migration) must fail in seconds so its caller can degrade and retry,
+        # not block the host for the steady-state timeout.
+        with self.init_busy_timeout() as conn:
+            conn.executescript(_SCHEMA)
+            self._migrate(conn)
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('projection_seq','0')")
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('head_event_id','')")
+            # Seed the monotonic event_seq counter (used by append_event's atomic
+            # UPDATE...RETURNING). Omitting this left fresh DBs with no event_seq row,
+            # so the first append_event crashed with "NoneType is not subscriptable".
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('event_seq', "
+                         "(SELECT COALESCE(MAX(seq),0) FROM events))")
+            conn.commit()
 
     def _migrate(self, conn):
         """Bring an EXISTING db up to _SCHEMA, idempotently (I2 in spirit).
@@ -135,10 +180,19 @@ class MemoryStore:
         # only that string misses 'digest' (schema_version 3) entirely and every
         # v2 DB enqueues a 'digest' job that fails the CHECK inside append_event's
         # txn (I12), aborting the enclosing extract job. One rebuild covers both.
-        missing = [t for t in ("embed", "digest") if row and f"'{t}'" not in (row[0] or "")]
+        missing = [t for t in ("embed", "digest", "federate_sweep")
+                   if row and f"'{t}'" not in (row[0] or "")]
         if missing:
             logger.info("schema migration: curation_jobs task CHECK += %s", ", ".join(missing))
             self._rebuild_curation_jobs(conn)
+        # federation_watermarks predates its second cursor in stores swept by an
+        # earlier build; CREATE TABLE IF NOT EXISTS would leave them one column short.
+        if not _has_col(conn, "federation_watermarks", "rescan_cursor"):
+            logger.info("schema migration: federation_watermarks + rescan_cursor")
+            conn.execute("ALTER TABLE federation_watermarks ADD COLUMN rescan_cursor INTEGER DEFAULT 0")
+        if not _has_col(conn, "link_candidates", "provider"):
+            logger.info("schema migration: link_candidates + provider")
+            conn.execute("ALTER TABLE link_candidates ADD COLUMN provider TEXT")
         conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
 
@@ -384,9 +438,21 @@ class MemoryStore:
         return self._conn().execute("SELECT 1 FROM observed_vectors WHERE event_id=?",
                                     (event_id,)).fetchone() is not None
 
+    def get_observed_vector_model(self, event_id: str) -> Optional[str]:
+        """Get the model name of an existing observed vector, or None if not found."""
+        row = self._conn().execute("SELECT model FROM observed_vectors WHERE event_id=?",
+                                   (event_id,)).fetchone()
+        return row["model"] if row else None
+
     def has_memory_vector(self, belief_id: str, kind: str) -> bool:
         return self._conn().execute("SELECT 1 FROM memory_vectors WHERE belief_id=? AND kind=?",
                                     (belief_id, kind)).fetchone() is not None
+
+    def get_memory_vector_model(self, belief_id: str, kind: str) -> Optional[str]:
+        """Get the model name of an existing memory vector, or None if not found."""
+        row = self._conn().execute("SELECT model FROM memory_vectors WHERE belief_id=? AND kind=?",
+                                   (belief_id, kind)).fetchone()
+        return row["model"] if row else None
 
     def delete_memory_vector(self, belief_id: str):
         """Drop a belief's embedding once it is no longer searchable. Without
@@ -465,6 +531,12 @@ class MemoryStore:
         return self._conn().execute(
             "SELECT 1 FROM projection_vectors WHERE provider=? AND external_id=?",
             (provider, external_id)).fetchone() is not None
+
+    def get_projection_vector_model(self, provider: str, external_id: str) -> str | None:
+        """Get the model name of an existing projection vector, or None if not found."""
+        row = self._conn().execute("SELECT model FROM projection_vectors WHERE provider=? AND external_id=?",
+                                   (provider, external_id)).fetchone()
+        return row["model"] if row else None
 
     def get_projection_vectors_by_ids(self, proj_ids: list[tuple[str, str]]) -> dict[str, dict]:
         """Stored projection vectors for specific (provider, external_id) pairs.
@@ -712,7 +784,16 @@ class MemoryStore:
         `owner`/`provider`/`external_id` are optional extras carried through to
         the handler for kinds that need them (kind='projection', §g5) — the
         'observed'/belief-kind callers omit them and see no change in the
-        dedup key, so this is additive, not a behavior change for them."""
+        dedup key, so this is additive, not a behavior change for them.
+
+        Validates target_id, kind, and text; logs a WARNING and returns None if
+        any are empty or missing. On re-enqueue of a done/failed job, rearms it
+        to pending with attempts=0 and run_after=NULL."""
+        # Validate required fields
+        if not target_id or not kind or not text:
+            logger.warning("enqueue_embed_job: skipping invalid payload (target_id=%r, kind=%r, text=%r)",
+                          target_id, kind, bool(text))
+            return None
         payload_dict = {"target_id": target_id, "kind": kind, "text": (text or "")[:8000]}
         if owner is not None:
             payload_dict["owner"] = owner
@@ -722,10 +803,20 @@ class MemoryStore:
             payload_dict["external_id"] = external_id
         payload = json.dumps(payload_dict, sort_keys=True)
         with self.transaction() as conn:
+            # Check for existing job in pending/running state
             dup = conn.execute("SELECT id FROM curation_jobs WHERE task='embed' AND "
                                "status IN ('pending','running') AND payload=?", (payload,)).fetchone()
             if dup is not None:
                 return None
+            # Check for done/failed job with same payload and re-arm it
+            old_job = conn.execute("SELECT id FROM curation_jobs WHERE task='embed' AND "
+                                   "status IN ('done','failed') AND payload=?", (payload,)).fetchone()
+            if old_job is not None:
+                # Re-arm: reset to pending with attempts=0 and run_after=NULL
+                conn.execute("UPDATE curation_jobs SET status='pending', attempts=0, run_after=NULL, "
+                            "started_at=NULL, finished_at=NULL, error=NULL WHERE id=?", (old_job["id"],))
+                return old_job["id"]
+            # Enqueue new job
             cur = conn.execute("INSERT INTO curation_jobs(task,payload,created_at) "
                                "VALUES('embed',?,?)", (payload, now_iso()))
             return cur.lastrowid
@@ -950,6 +1041,81 @@ class MemoryStore:
         row = self._conn().execute("SELECT * FROM pointers WHERE id=?", (pointer_id,)).fetchone()
         return dict(row) if row else None
 
+    def find_pointer(self, capability: str, provider: str, external_id: str) -> Optional[dict]:
+        """The pointer for one external row, by its natural key.
+
+        upsert_pointer mints a fresh uuid when it is not given an id, and the
+        table's UNIQUE(capability, provider, external_id) turns that into an
+        INSERT OR REPLACE — i.e. refreshing a projection through the naive path
+        silently CHANGES the pointer's id and breaks every belief referencing it.
+        Callers refreshing a known row look it up here first and pass the id back."""
+        row = self._conn().execute(
+            "SELECT * FROM pointers WHERE capability=? AND provider=? AND external_id=?",
+            (capability, provider, external_id)).fetchone()
+        return dict(row) if row else None
+
+    # -- federation sweep bookkeeping (§14) --------------------------------
+
+    def get_federation_state(self, db_name: str) -> dict:
+        """Sweep cursors for one registered provider (see the DDL for why two)."""
+        row = self._conn().execute(
+            "SELECT last_row_id, rescan_cursor, last_sync_at FROM federation_watermarks "
+            "WHERE db_name=?", (db_name,)).fetchone()
+        if not row:
+            return {"last_row_id": 0, "rescan_cursor": 0, "last_sync_at": None}
+        return {"last_row_id": int(row[0] or 0), "rescan_cursor": int(row[1] or 0),
+                "last_sync_at": row[2]}
+
+    def set_federation_state(self, db_name: str, *, last_row_id: Optional[int] = None,
+                             rescan_cursor: Optional[int] = None):
+        """Persist whichever cursor(s) the run advanced; the other is left alone."""
+        cur = self.get_federation_state(db_name)
+        lo = cur["last_row_id"] if last_row_id is None else int(last_row_id)
+        rc = cur["rescan_cursor"] if rescan_cursor is None else int(rescan_cursor)
+        with self.transaction() as conn:
+            conn.execute("INSERT INTO federation_watermarks(db_name, last_row_id, rescan_cursor, "
+                         "last_sync_at) VALUES(?,?,?,?) ON CONFLICT(db_name) DO UPDATE SET "
+                         "last_row_id=excluded.last_row_id, rescan_cursor=excluded.rescan_cursor, "
+                         "last_sync_at=excluded.last_sync_at",
+                         (db_name, lo, rc, now_iso()))
+
+    def enqueue_link_candidate(self, entity_id: str, external_ref: str, reason: str,
+                               score: float, provider: str = "") -> Optional[str]:
+        """Queue a POSSIBLE entity↔external-row link for review (I20, never a link).
+
+        Idempotent on (entity_id, external_ref): a rescan that sees the same
+        collision again keeps the original row — including an operator's decision
+        on it — instead of resurrecting it as new. Returns the new candidate id,
+        or None when the pair was already queued."""
+        import uuid
+        cand_id = str(uuid.uuid4())
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO link_candidates"
+                "(id, entity_id, external_ref, provider, candidate_reason, score, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (cand_id, entity_id, external_ref, provider, reason, score, now_iso()))
+            inserted = cur.rowcount
+        return cand_id if inserted else None
+
+    def get_link_candidates(self, reviewed: bool = False, limit: int = 100) -> List[dict]:
+        """Pending (default) or already-adjudicated link candidates."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM link_candidates WHERE reviewed=? ORDER BY created_at, id LIMIT ?",
+            (1 if reviewed else 0, int(limit))).fetchall()]
+
+    def get_link_candidate(self, candidate_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT * FROM link_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def resolve_link_candidate(self, candidate_id: str, decision: str):
+        """Record an adjudication. The DECISION is stored; acting on it (creating
+        the link) stays outside the sweep — nothing here ever links by itself."""
+        with self.transaction() as conn:
+            conn.execute("UPDATE link_candidates SET reviewed=1, decision=?, reviewed_at=? "
+                         "WHERE id=?", (decision, now_iso(), candidate_id))
+
     # -- user knowledge (§19) ---------------------------------------------
 
     def upsert_user_knowledge(self, uk: dict):
@@ -1127,7 +1293,7 @@ _CURATION_JOBS_DDL = """CREATE TABLE IF NOT EXISTS %s (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task TEXT CHECK(task IN ('extract','route','criticality','canonicalize','consolidate',
         'contradiction','identity','derive','verify','decay','consistency','health','reextract',
-        'journal_ingest','session_summarize','embed','digest')),
+        'journal_ingest','session_summarize','embed','digest','federate_sweep')),
     payload TEXT, depends_on INTEGER REFERENCES curation_jobs(id),
     status TEXT CHECK(status IN ('pending','running','done','failed')) DEFAULT 'pending',
     attempts INTEGER DEFAULT 0, created_at TEXT, started_at TEXT, finished_at TEXT, error TEXT,
@@ -1355,4 +1521,25 @@ CREATE TABLE IF NOT EXISTS reflections (
 CREATE TABLE IF NOT EXISTS capability_providers (
     capability TEXT PRIMARY KEY, provider TEXT, declared_by TEXT, precedence INTEGER,
     status TEXT CHECK(status IN ('active','unavailable')) DEFAULT 'active');
+
+-- Federation sweep bookkeeping (§14, g4). TWO cursors per provider, because the
+-- sweep has two jobs that must not starve each other: last_row_id bounds how far
+-- the ingest of NEW rows has got, rescan_cursor pages back over rows already
+-- ingested to notice edits in place (an external row that changes keeps its id,
+-- so a watermark alone would never look at it again). rescan_cursor wraps to 0
+-- at the end of a lap.
+CREATE TABLE IF NOT EXISTS federation_watermarks (
+    db_name TEXT PRIMARY KEY, last_row_id INTEGER DEFAULT 0,
+    rescan_cursor INTEGER DEFAULT 0, last_sync_at TEXT);
+
+-- Review queue for POSSIBLE identity links (§14.2, I20). Nothing here is a link:
+-- an external row that merely looks like a Chronicle entity lands here and waits
+-- for adjudication. UNIQUE(entity_id, external_ref) makes re-queueing on every
+-- rescan a no-op instead of a pile of duplicates.
+CREATE TABLE IF NOT EXISTS link_candidates (
+    id TEXT PRIMARY KEY, entity_id TEXT, external_ref TEXT, provider TEXT,
+    candidate_reason TEXT, score REAL, reviewed INTEGER DEFAULT 0, decision TEXT,
+    created_at TEXT, reviewed_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_link_candidates_pair
+    ON link_candidates(entity_id, external_ref);
 """

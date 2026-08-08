@@ -56,6 +56,12 @@ class Tools:
             s("list_derivation_rules", "List derivation rules.", {}),
             s("set_rule_enabled", "Enable/disable a derivation rule.", {"rule_id": text, "enabled": {"type": "boolean"}}, ["rule_id", "enabled"]),
             s("list_capabilities", "List federated capability providers.", {}),
+            s("list_link_candidates", "List external rows that look like a known entity and are "
+                                      "waiting for an identity decision.", {"limit": {"type": "integer"}}),
+            s("review_link_candidate", "Adjudicate a link candidate: 'link' binds the entity to the "
+                                       "external row, 'reject' dismisses it.",
+              {"candidate_id": text, "decision": {"type": "string", "enum": ["link", "reject"]}},
+              ["candidate_id", "decision"]),
             s("embedding_status", "Report the active embedder: real local model (with a live test "
                                   "embed) vs offline hashing fallback.", {}),
             s("plan_context", "Bundle facts + procedures + reflections for a goal.", {"goal": text}, ["goal"]),
@@ -235,6 +241,43 @@ class Tools:
 
     def _t_list_contradictions(self, principal, a):
         return {"contradictions": self.core.store.get_open_contradictions(50)}
+
+    def _t_list_link_candidates(self, principal, a):
+        """The federation review queue, filtered to entities this principal may read (§15)."""
+        out = []
+        for c in self.core.store.get_link_candidates(limit=int(a.get("limit") or 50)):
+            ent = self.core.store.get_belief("entities", c.get("entity_id") or "")
+            if not ent or not access.can_read(ent.get("read_acl"), ent.get("owner"), principal):
+                continue
+            out.append({"candidate_id": c["id"], "entity_id": c["entity_id"],
+                        "entity_name": ent.get("name"), "provider": c.get("provider"),
+                        "external_ref": c["external_ref"], "reason": c.get("candidate_reason"),
+                        "score": c.get("score"), "created_at": c.get("created_at")})
+        return {"link_candidates": out}
+
+    def _t_review_link_candidate(self, principal, a):
+        """Adjudicate one candidate — the only way an external row becomes a link.
+
+        The sweep can propose; only this can decide, and the decision goes through
+        the event log like every other write, so it is replayable and auditable."""
+        decision = str(a.get("decision") or "").strip()
+        if decision not in ("link", "reject"):
+            return {"error": "decision must be 'link' or 'reject'"}
+        cid = a.get("candidate_id") or ""
+        cand = self.core.store.get_link_candidate(cid)
+        ent = self.core.store.get_belief("entities", (cand or {}).get("entity_id") or "")
+        if not cand or not ent or not access.can_read(ent.get("read_acl"), ent.get("owner"), principal):
+            return {"error": "unknown link candidate"}
+        event_id = None
+        if decision == "link":
+            event_id = self._emit("federated", {
+                "source_type": "federation", "kind": "link_adjudicated", "decision": "link",
+                "entity_id": cand["entity_id"], "provider": cand.get("provider"),
+                "external_id": cand["external_ref"], "candidate_id": cid,
+                "adjudicated_by": principal}, principal)
+        self.core.store.resolve_link_candidate(cid, decision)
+        return {"candidate_id": cid, "decision": decision, "entity_id": cand["entity_id"],
+                "event_id": event_id}
 
     def _t_list_principals(self, principal, a):
         return {"principals": self.core.store.all_principals()}

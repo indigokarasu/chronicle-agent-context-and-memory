@@ -20,6 +20,43 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _resolve_version() -> str:
+    """Chronicle's version — never a literal in this file.
+
+    Preferred path: the root package's ``__version__`` (itself read from
+    plugin.yaml). That only works when this module is loaded as part of the
+    package; the dashboard plugin host mounts it by file path, in which case
+    there is no parent package to import from. So the fallback reads the same
+    ``version:`` line out of plugin.yaml by path — a pure read, no imports and
+    no ``sys.path`` mutation, which matters here because putting the plugin root
+    on ``sys.path`` would shadow generically named modules (``context``,
+    ``provider``, ``_base``) for the whole dashboard process.
+    """
+    try:
+        from .. import __version__ as package_version
+
+        return package_version
+    except Exception:
+        pass
+    try:
+        yaml_path = Path(__file__).resolve().parent.parent / "plugin.yaml"
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if not line.startswith("version:"):
+                    continue
+                value = line.split(":", 1)[1].split("#", 1)[0].strip()
+                value = value.strip("\"'").strip()
+                if value:
+                    return value
+    except Exception:  # pragma: no cover - defensive: missing/unreadable manifest
+        pass
+    log.warning("chronicle: could not resolve plugin version")
+    return "unknown"
+
+
+_VERSION = _resolve_version()
+
+
 def _get_db_path() -> Optional[Path]:
     """Locate the Chronicle SQLite database."""
     home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
@@ -207,7 +244,7 @@ def get_status():
     }
     return {
         "plugin": "chronicle",
-        "version": "5.3.3",
+        "version": _VERSION,
         "status": "active",
         "store": store,
         "embeddings": _get_embedding_stats(db_path),

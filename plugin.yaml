@@ -4,7 +4,7 @@
 # ~/.hermes/config.yaml:  memory.provider: chronicle  /  context.engine: chronicle
 name: chronicle
 kind: standalone
-version: 5.4.0
+version: 5.4.1
 description: "Event-sourced long-term memory + memory-aware context compression for Hermes. Captures every turn durably, extracts beliefs with provenance, answers from memory (raw-tier fallback + abstention), derives scoped conclusions, and compresses the window losslessly."
 hooks:
   - on_session_end

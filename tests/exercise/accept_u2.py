@@ -206,7 +206,12 @@ def test_migration_from_v2_fixture():
     assert n_jobs > 0, "no curation jobs ran after migration"
 
     version = core2.store.get_meta("schema_version")
-    assert version == "3", f"meta.schema_version is {version!r}, expected '3'"
+    # Compare against the live constant, not a literal: any later schema bump
+    # (e.g. 4 = federate_sweep, §g4) still migrates the v2 fixture through the
+    # same path, and pinning "3" here would fail on every future bump.
+    from engine.store import SCHEMA_VERSION
+    assert version == str(SCHEMA_VERSION), \
+        f"meta.schema_version is {version!r}, expected {str(SCHEMA_VERSION)!r}"
     kept = core2.store.count_rows("curation_jobs", "task='health'")
     assert kept == 1, f"rebuild lost the pre-existing legacy job row (kept={kept})"
     digests = core2.store.query_beliefs(

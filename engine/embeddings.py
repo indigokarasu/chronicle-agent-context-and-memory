@@ -27,6 +27,114 @@ _AUTO_NAMES = {"", "auto", "auto-detect", "autodetect", "local", "default"}
 # Model ids that look like embedding models (used to auto-pick from /v1/models).
 _EMBED_RE = re.compile(r"embed|bge|gte|nomic|e5|minilm|mxbai|arctic|stella|gemma|qwen.*embed", re.IGNORECASE)
 
+# -- token-aware input clamp (§27 embeddings.max_input_tokens / .overflow) ----
+#
+# The production incident this exists for: the deployed llama.cpp/nomic server
+# has a REAL context of 2048 tokens. Excerpts up to 4000 chars overflowed it,
+# the server answered HTTP 500, and the curation job burned all its retry
+# attempts and became permanently poisoned (re-enqueue reuses the same spent
+# row) even after the root cause was fixed. Nothing downstream of this module
+# may ever hand a model more than `max_input_tokens` worth of input again.
+#
+# `_CHARS_PER_TOKEN` is deliberately conservative (an undercount of the real
+# chars/token ratio for ordinary English, which runs ~4): pathological input
+# (URLs, no spaces, unusual scripts) tokenizes far worse than that, so a chars/3
+# ceiling estimate is a safe upper bound on true token count for content we
+# cannot inspect the tokenizer for.
+_CHARS_PER_TOKEN = 3
+_DEFAULT_MAX_INPUT_TOKENS = 2048
+_MIN_MAX_INPUT_TOKENS = 256
+_MAX_MAX_INPUT_TOKENS = 32768
+_OVERFLOW_MODES = ("truncate", "chunk_mean")
+
+# Boundary preference for the local truncate/chunk cut, mirroring
+# capture._split_excerpt (message start > sentence end > hard cut). Duplicated
+# here rather than imported so the embeddings module — the lowest layer, used
+# by reducer/curation/retrieval alike — has no dependency on the capture layer.
+_EMBED_MSG_START = re.compile(r"\n(?=[^\s:][^:\n]{0,32}: )")
+_EMBED_SENTENCE_END = re.compile(r"[.!?]\s|\n")
+
+
+def estimate_tokens(text: str | None) -> int:
+    """Conservative token-count estimate: chars/3, ceiling (§27 embeddings)."""
+    if not text:
+        return 0
+    return -(-len(text) // _CHARS_PER_TOKEN)  # ceil division, stdlib-only
+
+
+def _cap_chars(max_input_tokens: int) -> int:
+    """Character budget that guarantees estimate_tokens(text[:budget]) <= cap.
+
+    Since estimate_tokens is a chars/3 ceiling, capping at max_input_tokens*3
+    chars always estimates at or under max_input_tokens."""
+    return max(_CHARS_PER_TOKEN, int(max_input_tokens) * _CHARS_PER_TOKEN)
+
+
+def clamp_max_input_tokens(value) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = _DEFAULT_MAX_INPUT_TOKENS
+    return max(_MIN_MAX_INPUT_TOKENS, min(_MAX_MAX_INPUT_TOKENS, v))
+
+
+def normalize_overflow(value) -> str:
+    v = (value or "truncate").strip().lower()
+    return v if v in _OVERFLOW_MODES else "truncate"
+
+
+def _split_for_cap(text: str, max_input_tokens: int) -> list[str]:
+    """Boundary-aware split of `text` into chunks each within max_input_tokens.
+
+    Same boundary preference as capture._split_excerpt: prefer the start of the
+    next "role: " message, then a sentence end, then fall back to a hard cut.
+    ``"".join(result) == text`` always holds — lossless, so chunk_mean sees the
+    whole input and truncate's first chunk is a real prefix of it, never a
+    mid-multibyte-character slice landing on an arbitrary boundary."""
+    cap_chars = _cap_chars(max_input_tokens)
+    if len(text) <= cap_chars:
+        return [text]
+    chunks, pos, n = [], 0, len(text)
+    while pos < n:
+        rest = text[pos:]
+        if len(rest) <= cap_chars:
+            chunks.append(rest)
+            break
+        window = rest[:cap_chars]
+        cut = 0
+        for rx in (_EMBED_MSG_START, _EMBED_SENTENCE_END):
+            found = list(rx.finditer(window))
+            if found:
+                cut = found[-1].end()
+                break
+        cut = cut or cap_chars
+        chunks.append(window[:cut])
+        pos += cut
+    return chunks
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0:
+        return [v / norm for v in vec]
+    return list(vec)
+
+
+def _mean_normalize(vecs: list[list[float]]) -> list[float]:
+    """L2-normalize each vector, mean them, then re-normalize to unit length —
+    the chunk_mean overflow strategy (§27 embeddings.overflow)."""
+    if not vecs:
+        return []
+    normed = [_l2_normalize(v) for v in vecs]
+    dims = len(normed[0])
+    mean = [0.0] * dims
+    for v in normed:
+        for i in range(dims):
+            mean[i] += v[i]
+    k = float(len(normed))
+    mean = [x / k for x in mean]
+    return _l2_normalize(mean)
+
 
 class EmbeddingsUnavailable(RuntimeError):
     """No embedding backend is reachable, so NOTHING is written (§24.4).
@@ -54,11 +162,14 @@ class HashingEmbedder:
     fusion, the dual-tier path, and property tests.
     """
 
-    def __init__(self, dimensions: int = 256, model: str = "hashing-v1"):
+    def __init__(self, dimensions: int = 256, model: str = "hashing-v1",
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
         self.dimensions = dimensions
         self.model = model
+        self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
+        self.overflow = normalize_overflow(overflow)
 
-    def embed(self, text: str) -> list[float]:
+    def _embed_one(self, text: str) -> list[float]:
         vec = [0.0] * self.dimensions
         toks = _TOKEN.findall((text or "").lower())
         for tok in toks:
@@ -68,10 +179,20 @@ class HashingEmbedder:
             sign = 1.0 if (h >> 32) & 1 else -1.0
             vec[idx] += sign
             # A light bigram signal sharpens near-duplicate detection.
-        norm = math.sqrt(sum(v * v for v in vec))
-        if norm > 0:
-            vec = [v / norm for v in vec]
-        return vec
+        return _l2_normalize(vec)
+
+    def embed(self, text: str) -> list[float]:
+        """Embed `text`, clamped to max_input_tokens (§27) — NEVER raises for
+        length and NEVER sends over-cap input downstream (there is no real
+        network call here, but the clamp must behave identically to the real
+        backend so tests/CI exercise the same contract as production)."""
+        text = text or ""
+        if estimate_tokens(text) <= self.max_input_tokens:
+            return self._embed_one(text)
+        chunks = _split_for_cap(text, self.max_input_tokens)
+        if self.overflow == "chunk_mean":
+            return _mean_normalize([self._embed_one(c) for c in chunks])
+        return self._embed_one(chunks[0])   # truncate: boundary-aware first chunk only
 
 
 # Local embedding servers probed when no explicit base_url is configured.
@@ -101,7 +222,8 @@ class OpenAICompatEmbedder:
     """
 
     def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0,
-                 max_attempts: int = 5, backoff_base: float = 1.0, backoff_cap: float = 8.0):
+                 max_attempts: int = 5, backoff_base: float = 1.0, backoff_cap: float = 8.0,
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.dimensions = dimensions
@@ -110,6 +232,8 @@ class OpenAICompatEmbedder:
         self.max_attempts = max(1, int(max_attempts))
         self.backoff_base = float(backoff_base)
         self.backoff_cap = float(backoff_cap)
+        self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
+        self.overflow = normalize_overflow(overflow)
 
     def _embed_raw(self, text: str, timeout: float) -> list[float]:
         import json as _json
@@ -136,7 +260,10 @@ class OpenAICompatEmbedder:
         # Auth/credential errors will not fix themselves by waiting; do not retry.
         return getattr(exc, "code", None) in (401, 403)
 
-    def embed(self, text: str) -> list[float]:
+    def _embed_with_retry(self, text: str) -> list[float]:
+        """The original single-call retry loop, now reusable per-chunk so
+        chunk_mean can retry each chunk independently without duplicating the
+        backoff/terminal-error contract."""
         attempt = 0
         while True:
             try:
@@ -158,6 +285,28 @@ class OpenAICompatEmbedder:
                                "waiting %.1fs then retrying", self.base_url, attempt, self.max_attempts, e, wait)
                 if wait > 0:
                     time.sleep(wait)
+
+    def embed(self, text: str) -> list[float]:
+        """Embed `text`, clamped to max_input_tokens before it ever reaches the
+        wire (§27 embeddings.max_input_tokens/.overflow). This is the fix for
+        the nemotron->nomic overflow incident: the model's real context is
+        2048 tokens, so an oversized excerpt must never be sent as-is — that
+        used to 500 and burn the job's entire retry budget.
+
+        truncate (default): one HTTP call, boundary-truncated to the cap.
+        chunk_mean: the input is split into cap-sized, boundary-aware chunks;
+        EACH CHUNK gets its own HTTP call (and its own retry budget), the
+        resulting vectors are L2-normalized and averaged, then the mean is
+        re-normalized to unit length -- a real (if lossy) representation of
+        the whole input, not just its first slice.
+        """
+        text = text or ""
+        if estimate_tokens(text) <= self.max_input_tokens:
+            return self._embed_with_retry(text)
+        chunks = _split_for_cap(text, self.max_input_tokens)
+        if self.overflow == "chunk_mean":
+            return _mean_normalize([self._embed_with_retry(c) for c in chunks])
+        return self._embed_with_retry(chunks[0])   # truncate: one call, first chunk only
 
     def _embed_raw_batch(self, texts: list[str], timeout: float) -> list[list[float]]:
         import json as _json
@@ -182,6 +331,18 @@ class OpenAICompatEmbedder:
             out.append([float(x) for x in vec])
         return out
 
+    def _embed_raw_batch_retrying(self, part: list[str]) -> list[list[float]]:
+        attempt = 0
+        while True:
+            try:
+                return self._embed_raw_batch(part, timeout=max(self.timeout, 2.0 + 0.25 * len(part)))
+            except Exception as e:
+                attempt += 1
+                if self._is_terminal(e) or attempt >= self.max_attempts:
+                    raise
+                wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
+                time.sleep(wait * (0.5 + random.random() * 0.5))
+
     def embed_batch(self, texts: list[str], chunk: int = 64) -> list[list[float]]:
         """Batch embed with the same retry/no-hash-fallback contract as embed().
 
@@ -189,22 +350,31 @@ class OpenAICompatEmbedder:
         difference between minutes and hours on a backfill (requeue script,
         re-embed after an outage). A longer timeout per call, scaled by chunk
         size, because a batch legitimately takes longer than a single.
+
+        Same clamp as embed() (§27 embeddings.max_input_tokens/.overflow): a
+        batch is only ever built from within-cap texts, so an oversized item
+        can never inflate one request past the model's real context and 500
+        the whole batch. Any oversized text is routed through embed() on its
+        own — for `truncate` that is one extra call; for `chunk_mean` it is
+        one call per chunk — and is never mixed into a raw batch payload.
         """
-        out: list[list[float]] = []
-        for i in range(0, len(texts), chunk):
-            part = texts[i:i + chunk]
-            attempt = 0
-            while True:
-                try:
-                    out.extend(self._embed_raw_batch(part, timeout=max(self.timeout, 2.0 + 0.25 * len(part))))
-                    break
-                except Exception as e:
-                    attempt += 1
-                    if self._is_terminal(e) or attempt >= self.max_attempts:
-                        raise
-                    wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
-                    time.sleep(wait * (0.5 + random.random() * 0.5))
-        return out
+        out: list[list[float] | None] = [None] * len(texts)
+        batch_idx: list[int] = []
+        batch_texts: list[str] = []
+        for i, t in enumerate(texts):
+            t = t or ""
+            if estimate_tokens(t) <= self.max_input_tokens:
+                batch_idx.append(i)
+                batch_texts.append(t)
+            else:
+                out[i] = self.embed(t)   # oversized: its own call(s), clamped
+        for i in range(0, len(batch_texts), chunk):
+            part = batch_texts[i:i + chunk]
+            idx_part = batch_idx[i:i + chunk]
+            vecs = self._embed_raw_batch_retrying(part)
+            for j, vec in zip(idx_part, vecs):
+                out[j] = vec
+        return out  # type: ignore[return-value]
 
 
 def _candidate_urls(base_url: str | None) -> list[str]:
@@ -234,7 +404,8 @@ def _discover_embedding_models(base_url: str, api_key: str) -> list[str]:
 
 
 def _probe_endpoints(model: str | None, dims: int, base_url: str | None,
-                     api_key: str | None) -> Embedder | None:
+                     api_key: str | None, max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS,
+                     overflow: str = "truncate") -> Embedder | None:
     """First reachable OpenAI-compatible endpoint that really embeds, else None.
 
     `model` auto/empty → ask each endpoint's /v1/models what it serves and try
@@ -248,7 +419,8 @@ def _probe_endpoints(model: str | None, dims: int, base_url: str | None,
             continue  # /models unreachable on this endpoint → try next
         for mid in candidates:
             try:
-                emb = OpenAICompatEmbedder(url, mid, dims, api_key or "")
+                emb = OpenAICompatEmbedder(url, mid, dims, api_key or "",
+                                           max_input_tokens=max_input_tokens, overflow=overflow)
                 if emb.healthcheck():
                     return emb
             except Exception:
@@ -272,12 +444,15 @@ class DegradedEmbedder:
     """
 
     def __init__(self, model: str = "auto", dimensions: int = 768, base_url: str | None = None,
-                 api_key: str | None = None, recheck_seconds: float = 60.0):
+                 api_key: str | None = None, recheck_seconds: float = 60.0,
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
         self.requested_model = model or "auto"
         self.base_url = base_url
         self.api_key = api_key
         self.recheck_seconds = float(recheck_seconds)
         self._dimensions = int(dimensions or 768)
+        self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
+        self.overflow = normalize_overflow(overflow)
         self._live = None                                  # adopted backend, once one appears
         self._next_probe = time.time() + self.recheck_seconds
 
@@ -302,7 +477,8 @@ class DegradedEmbedder:
         if not force and now < self._next_probe:
             return False
         self._next_probe = now + self.recheck_seconds
-        emb = _probe_endpoints(self.requested_model, self._dimensions, self.base_url, self.api_key)
+        emb = _probe_endpoints(self.requested_model, self._dimensions, self.base_url, self.api_key,
+                              max_input_tokens=self.max_input_tokens, overflow=self.overflow)
         if emb is None:
             return False
         logger.warning("Chronicle embeddings: RECOVERED — %r via %s (dim %d); queued embeds resume",
@@ -325,7 +501,8 @@ class DegradedEmbedder:
 
 
 def get_embedder(model: str | None = None, dimensions: int | None = None,
-                 base_url: str | None = None, api_key: str | None = None) -> Embedder:
+                 base_url: str | None = None, api_key: str | None = None,
+                 max_input_tokens: int | None = None, overflow: str | None = None) -> Embedder:
     """Return the active embedder, logging exactly ONE line: which mode, and why.
 
     Default is ``auto``: find a running local OpenAI-compatible server (configured
@@ -343,19 +520,29 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
     unreachable at init — it returns the retrying OpenAICompatEmbedder (which
     waits+retries at runtime) rather than pinning the whole session on a transient
     startup rate-limit/outage.
+
+    `max_input_tokens` / `overflow` (§27 embeddings.max_input_tokens/.overflow):
+    the token-aware input clamp every returned embedder enforces before any
+    text reaches a real model, so a context-overflowing excerpt 500s never
+    again poison a curation job's retry budget. Defaults: 2048 tokens
+    (clamped [256, 32768]), overflow "truncate".
     """
     dims = int(dimensions) if dimensions else 768
     name = (model or "auto").strip().lower()
+    max_tok = clamp_max_input_tokens(max_input_tokens if max_input_tokens is not None
+                                     else _DEFAULT_MAX_INPUT_TOKENS)
+    ovf = normalize_overflow(overflow)
     if name in _HASHING_NAMES:
         dim = int(dimensions) if dimensions else 256
         logger.info("Chronicle embeddings: HASHING mode — %r requested explicitly; deterministic "
                     "offline vectors (dim %d), no server contacted", name, dim)
-        return HashingEmbedder(dimensions=dim)
+        return HashingEmbedder(dimensions=dim, max_input_tokens=max_tok, overflow=ovf)
     auto = name in _AUTO_NAMES
     if not auto and base_url:
         # Trust the configured model + endpoint: defer transient failures to the
         # runtime wait-and-retry in embed() instead of downgrading the session.
-        emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "")
+        emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "",
+                                   max_input_tokens=max_tok, overflow=ovf)
         try:
             emb.healthcheck()  # best-effort: confirm reachable + adopt the real dim
             logger.info("Chronicle embeddings: MODEL mode — %r via %s (dim %d)",
@@ -365,7 +552,7 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
                            "keeping it and deferring to the runtime retry (never hashing)",
                            model, base_url, e)
         return emb
-    emb = _probe_endpoints(model, dims, base_url, api_key)
+    emb = _probe_endpoints(model, dims, base_url, api_key, max_input_tokens=max_tok, overflow=ovf)
     if emb is not None:
         logger.info("Chronicle embeddings: MODEL mode — local %r via %s (dim %d)",
                     emb.model, emb.base_url, emb.dimensions)
@@ -376,7 +563,8 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
                    "deterministic offline vectors instead",
                    "no embedding model reachable" if auto else f"model {model!r} not reachable",
                    ", ".join(_candidate_urls(base_url)))
-    return DegradedEmbedder(model=name, dimensions=dims, base_url=base_url, api_key=api_key)
+    return DegradedEmbedder(model=name, dimensions=dims, base_url=base_url, api_key=api_key,
+                            max_input_tokens=max_tok, overflow=ovf)
 
 
 def _stable_hash(s: str) -> int:

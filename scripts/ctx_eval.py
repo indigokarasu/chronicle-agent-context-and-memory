@@ -18,7 +18,7 @@ sys.path.insert(0, os.environ.get("CHRONICLE_DIR")
                 or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from engine.core import ChronicleCore
 
-BUDGETS = (1500, 4000)
+BUDGETS = (1500, 4000, 12000)
 
 
 def iso(d):
