@@ -21,6 +21,7 @@ import re
 from . import access
 from .config import DEFAULTS, check_abstain_gate
 from .embeddings import batch_cosine, cosine, pack, unpack
+from .federated import FederatedChannel
 from .store import KIND_TABLE, now_iso
 from .trust import Calibrator, confidence_summary
 from .vector_index import MAX_K as KNN_MAX_K
@@ -300,12 +301,25 @@ class RetrievalEngine:
         self._overlap_min_tokens = int(_clamp(
             cfg.get("retrieval.overlap_min_tokens", d["overlap_min_tokens"]) if cfg
             else d["overlap_min_tokens"], 1, 64))
+        # Federated query channel (§g3): bounded, read-only reads of the SQLite
+        # databases declared in federation.local_dbs. Built once — each provider
+        # caches its introspected schema, so a warm channel costs one statement
+        # per searched table. None unless explicitly enabled, so an unconfigured
+        # Chronicle never opens an external file.
+        self.federated = None
+        if cfg is not None and cfg.get("retrieval.federated_channel", False):
+            self.federated = FederatedChannel(cfg)
 
     # -- query understanding (§18.2) --------------------------------------
 
     def _tokens(self, query: str) -> list[str]:
         return [t for t in re.findall(r"[A-Za-z0-9']+", query.lower())
                 if t not in _STOP and len(t) > 1]
+
+    def _focus_tokens(self, query: str) -> list[str]:
+        """The query's distinctive tokens — the same set the abstention gate
+        calls focus (§18.4): long enough to discriminate, and not generic."""
+        return [t for t in self._tokens(query) if len(t) > 3 and t not in _GENERIC]
 
     def query_understanding(self, query: str) -> dict:
         tokens = self._tokens(query)
@@ -946,6 +960,29 @@ class RetrievalEngine:
                     parts.append(line)
                     ctx = "\n".join(_dedupe(parts))
 
+        # §g3: the federated channel, out of leftover budget only.
+        # Everything above is Chronicle's own evidence — session excerpts carry
+        # turn-level recall — and an external projection is a pointer into
+        # somebody else's record, so it may never displace one (r1 priority
+        # rule). Under a tight budget this loop emits nothing at all, which is
+        # the correct outcome, not a degraded one. Each line carries its
+        # pointer (<table>:<row_id>) so a reader can trace the claim back to a
+        # row; nothing here is written, linked, or promoted to a fact (I20).
+        if self.federated is not None and len(ctx) < max_chars:
+            focus = self._focus_tokens(hint)
+            if focus:
+                remaining_chars = max_chars - len(ctx)
+                added = 0
+                for hit in self.federated.query(focus, principal, self.active_principal):
+                    line = "[FEDERATED %s] %s" % (hit["provider"], hit["block"])
+                    if remaining_chars - len(line) - 1 <= 0:
+                        break
+                    parts.append(line)
+                    remaining_chars -= len(line) + 1
+                    added += 1
+                if added:
+                    ctx = "\n".join(_dedupe(parts))
+
         # §r6: the topic-relevant standing note neither delivery path could carry.
         # The unconditional block above takes the FIRST 20 always_inject rows in
         # store order, not relevance order (real stores reach ~110 active norm
@@ -962,7 +999,7 @@ class RetrievalEngine:
             # Same focus tokens the abstention gate calls distinctive, matched as
             # substrings the way search()'s structured channel matches facts —
             # that is what lets "seat" reach a body that says "seats".
-            focus = [t for t in self._tokens(hint) if len(t) > 3 and t not in _GENERIC]
+            focus = self._focus_tokens(hint)
             remaining_chars = max_chars - len(ctx)
             # Bodies already on a line of their own. An epistemic annotation is
             # appended to the [NOTE] render, so compare by prefix, not equality.

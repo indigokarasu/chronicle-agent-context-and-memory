@@ -405,6 +405,37 @@ class Reducer:
     def _on_distilled(self, event):
         pass  # deferred (§20.4)
 
+    def _on_federated(self, event):
+        """Federation writes (§14, I20). Two kinds, only one of which projects.
+
+        kind="sweep" is AUDIT ONLY: the pointer and its cached projection are a
+        cache, durable in `pointers` (which truncate_projection deliberately does
+        not clear) and rebuildable from the provider at any time. The event
+        carries the content hash so provenance chains — pointer → this event →
+        provider + external_id + hash — without copying external attributes into
+        the permanent log.
+
+        kind="link_adjudicated" is the ONE path that may bind an entity to an
+        external row, and it exists precisely because that decision is made by a
+        person, never inferred from a resemblance. It projects (an entity is a
+        belief, wiped and replayed by rebuild), so the decision survives a
+        rebuild exactly as it was made.
+        """
+        p = _payload(event)
+        if p.get("kind") != "link_adjudicated":
+            return
+        entity_id = p.get("entity_id") or ""
+        if not self.store.get_belief("entities", entity_id):
+            return
+        if p.get("decision") == "link":
+            self.store.update_belief("entities", entity_id,
+                                     external_provider=p.get("provider"),
+                                     external_ref=p.get("external_id"),
+                                     cache_ttl=p.get("cache_ttl"))
+        elif p.get("decision") == "unlink":
+            self.store.update_belief("entities", entity_id,
+                                     external_provider=None, external_ref=None)
+
     _HANDLERS = {
         "observed": _on_observed, "asserted": _on_asserted, "confirmed": _on_confirmed,
         "contradicted": _on_contradicted, "corrected": _on_corrected, "retracted": _on_retracted,
@@ -412,7 +443,7 @@ class Reducer:
         "grant": _on_grant, "revoke": _on_revoke, "decayed": _on_decayed,
         "rehearsed": _on_rehearsed, "verified": _on_verified, "merged": _on_merged,
         "unmerged": _on_unmerged, "compressed": _on_compressed, "signal": _on_signal,
-        "distilled": _on_distilled,
+        "distilled": _on_distilled, "federated": _on_federated,
     }
 
     # -- fact conflict policy (§8.5) --------------------------------------

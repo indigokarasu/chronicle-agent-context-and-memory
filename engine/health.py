@@ -42,6 +42,13 @@ class HealthEngine:
         self.consistency_sweep()
         # Self-heal Tier-1: requeue vectors written by mismatched embedder.
         results.update(self._embedder_mismatch_heal())
+        # Enqueue one bounded federation sweep per health run (§14, g4). The
+        # health sweep is the schedule: enqueue_curation collapses an identical
+        # pending job, so a backlogged queue never stacks sweeps, and each run
+        # picks up where the last one's cursors left off.
+        if self.cfg.get("federation.local_dbs"):
+            results["federate_sweep_queued"] = bool(
+                self.store.enqueue_curation("federate_sweep", {}))
         self.store.record_health_run(results)
         return results
 

@@ -4,7 +4,7 @@ Two plugins, one core. A local-first memory system for Hermes Agent.
 
 **ChronicleMemoryProvider** persists conversation history, facts, and agent knowledge across sessions using an event-sourced SQLite store. **ChronicleContextEngine** replaces the default context compressor with memory-aware compaction that evicts only durable spans and re-injects relevant long-term memory.
 
-Version: 5.3.3.
+Version: 5.4.1.
 
 ## 🤖 If you are an agent: how to install & set up
 

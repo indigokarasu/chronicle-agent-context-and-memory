@@ -62,7 +62,9 @@ class ChronicleCore:
         self.embedder = get_embedder(self.cfg.get("embeddings.model"),
                                      self.cfg.get("embeddings.dimensions"),
                                      self.cfg.get("embeddings.base_url"),
-                                     self.cfg.get("embeddings.api_key"))
+                                     self.cfg.get("embeddings.api_key"),
+                                     self.cfg.get("embeddings.max_input_tokens"),
+                                     self.cfg.get("embeddings.overflow"))
         # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
         # the store (add/delete/prune on write) and retrieval (KNN on read); see
         # vector_index.py and RetrievalEngine.__init__ for why sharing matters.

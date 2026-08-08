@@ -81,8 +81,14 @@ DEFAULTS: dict[str, Any] = {
     # leave the host. Hosts too weak for nomic run DEGRADED (FTS + queued embeds).
     # Set model: hashing to force the offline embedder (eval/CI only), or a
     # specific id to pin one. $CHRONICLE_EMBED_MODEL overrides this value.
+    # max_input_tokens: the model's real context window, in tokens; clamped
+    # [256, 32768]. overflow: "truncate" (default, boundary-aware first slice)
+    # | "chunk_mean" (split into cap-sized chunks, embed each, L2-normalize and
+    # mean, then re-normalize). Both exist so an oversized excerpt is clamped
+    # BEFORE it ever reaches the model — never sent over-cap, never raises for
+    # length (§27; the nemotron->nomic 2048-token overflow incident).
     "embeddings": {"model": "auto", "dimensions": 768, "base_url": None, "api_key": None,
-                   "exclude_session_prefixes": []},
+                   "exclude_session_prefixes": [], "max_input_tokens": 2048, "overflow": "truncate"},
     "vector_index": {"backend": "bruteforce", "bruteforce_ceiling": 100000},
 
     "principals": {
@@ -104,6 +110,19 @@ DEFAULTS: dict[str, Any] = {
         "cache_ttl": "24h",
         "pins": {},
         "provider_trust": {"default": 2},
+        # Local SQLite databases this deployment declares, e.g.
+        #   [{"name": "somedb", "path": "/abs/path.db", "read_only": True}]
+        # Nothing about a particular database is hard-coded anywhere in engine/:
+        # the name is the capability, the path is opened mode=ro, and the schema
+        # is introspected. Optional per-entry "read_acl" (§15) defaults to
+        # user_agents. Empty by default — a Chronicle with no declared DBs has
+        # no federated channel to run (I18).
+        # The federate_sweep job (§14, g4) reads the same declarations; entries
+        # may additionally carry:
+        #   {table, id_column, content_columns: [...], name_column?, capability?}
+        # `name` is the provider id in pointers/watermarks, `content_columns` are
+        # what the cached projection holds, and the optional `name_column` is the
+        # only thing that can propose an identity link — for review, never applied.
         "local_dbs": [],
     },
     "outputs": {"ocas_signal_emit": {"enabled": "auto", "sink": "~/.hermes/commons/signals/"}},
@@ -156,6 +175,9 @@ DEFAULTS: dict[str, Any] = {
                             "read_budget_tokens": 4000, "max_hops": 2,
                             "apply_derivation_rules": True},
         "query_understanding": {"decompose": True, "expand_synonyms": True, "hyde": True},
+        # Federated query channel (§g3, federation.local_dbs). OFF by default:
+        # it reads databases outside Chronicle's own store, so it is opt-in.
+        "federated_channel": False,
     },
     "context": {"default_token_budget": 1500,
                 "session_window": True,
