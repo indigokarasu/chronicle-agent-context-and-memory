@@ -99,7 +99,7 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='document'"),
             ("note",
              "SELECT COUNT(*) FROM notes WHERE status='active'",
-             "SELECT COUNT(*) FROM memory_vectors WHERE kind='note'"),
+             "SELECT COUNT(*) FROM memory_vectors mv JOIN notes n ON n.belief_id=mv.belief_id WHERE mv.kind='note' AND n.status='active'"),
             ("episode",
              "SELECT COUNT(*) FROM episodes WHERE status='active'",
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='episode'"),
@@ -222,6 +222,34 @@ def _summarize_event(kind: str, payload) -> str:
     return ""
 
 
+def _jobs_breakdown(db_path):
+    """Live queue split by status and task -- a to-do list, not a coverage meter."""
+    out = {"pending": 0, "running": 0, "failed": 0, "by_task": {}}
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        for task, status, n in conn.execute(
+                "SELECT task, status, COUNT(*) FROM curation_jobs "
+                "WHERE status != 'done' GROUP BY task, status"):
+            out[status] = out.get(status, 0) + n
+            out["by_task"].setdefault(task, {})[status] = n
+        conn.close()
+    except Exception:
+        pass
+    return out
+
+
+def _outstanding_extractions(db_path):
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        n = conn.execute(
+            "SELECT COUNT(*) FROM events e LEFT JOIN extractions ext "
+            "ON ext.observed_event = e.event_id WHERE ext.observed_event IS NULL").fetchone()[0]
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+
 @router.get("/status")
 def get_status():
     db_path = _get_db_path()
@@ -237,6 +265,8 @@ def get_status():
         "entities": _count(db_path, "entities"), "relationships": _count(db_path, "relationships", "status='active'"),
         "documents": _count(db_path, "documents"),
         "pending_jobs": _count(db_path, "curation_jobs", "status='pending'"),
+        "jobs": _jobs_breakdown(db_path),
+        "extractions_outstanding": _outstanding_extractions(db_path),
         # what the enqueue button would actually find; 0 means it is a no-op
         "enqueue_candidates": _count(
             db_path, "events e LEFT JOIN extractions ext ON ext.observed_event = e.event_id",
