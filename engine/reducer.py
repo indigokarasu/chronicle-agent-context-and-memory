@@ -10,6 +10,7 @@ and replay the log → byte-identical state (I3).
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -399,6 +400,14 @@ class Reducer:
     def _on_compressed(self, event):
         pass  # audit only — beliefs already durable (§13)
 
+    def _on_checkpoint_digest(self, event):
+        pass  # audit only (§R7) — the digest is derived from spans _on_observed already made durable
+
+    def _on_folded(self, event):
+        pass  # audit only (R4) — the durable chunks _ensure_durable wrote are
+        # already indexed via their own `observed` events; this event is only
+        # the span_id/digest -> chunk_ids pointer chronicle_expand resolves.
+
     def _on_signal(self, event):
         logger.debug("signal: %s", _payload(event).get("signal_type"))
 
@@ -443,7 +452,8 @@ class Reducer:
         "grant": _on_grant, "revoke": _on_revoke, "decayed": _on_decayed,
         "rehearsed": _on_rehearsed, "verified": _on_verified, "merged": _on_merged,
         "unmerged": _on_unmerged, "compressed": _on_compressed, "signal": _on_signal,
-        "distilled": _on_distilled, "federated": _on_federated,
+        "distilled": _on_distilled, "federated": _on_federated, "folded": _on_folded,
+        "checkpoint_digest": _on_checkpoint_digest,
     }
 
     # -- fact conflict policy (§8.5) --------------------------------------
@@ -621,10 +631,12 @@ class Reducer:
                 "confidence": confidence, "trust_level": trust, "valid_from": now, "created_at": now,
                 "last_seen_at": now, "purpose_scope": '["*"]', "provenance": provenance})
         elif kind == "reference":
+            ttl_days = key.get("ttl_days", 30)
             self.store.upsert_belief("refs", {
-                "belief_id": b_id, "topic": key.get("topic", ""), "cached_summary": body,
-                "ttl_days": key.get("ttl_days", 30), "domain": domain, "owner": owner,
-                "read_acl": access.DEFAULT_ACL, "status": status, "confidence": confidence,
+                "belief_id": b_id, "topic": key.get("topic", ""), "retrieval_url": key.get("retrieval_url"),
+                "retrieved_at": now, "cached_summary": body,
+                "ttl_days": ttl_days, "stale_after": _add_days_iso(now, ttl_days), "domain": domain,
+                "owner": owner, "read_acl": access.DEFAULT_ACL, "status": status, "confidence": confidence,
                 "trust_level": trust, "valid_from": now, "created_at": now, "last_seen_at": now,
                 "purpose_scope": '["*"]', "provenance": provenance})
 
@@ -762,6 +774,26 @@ def _is_operational(event, p, excerpt) -> bool:
     if low.startswith(("tool:", "assistant: tool:")):
         return True
     return bool(any(m in head for m in _OP_MARKERS))
+
+
+def _add_days_iso(iso_str: str, days) -> str:
+    """`iso_str` (now_iso() format) shifted forward by `days`, same fixed-width
+    format so it string-compares like every other stored timestamp.
+
+    Anchored on the EVENT's own timestamp, never wall-clock now() (§7.2, I3):
+    the reducer is a pure fold over the log, so a derived field computed from
+    the live clock would break byte-identical replay.
+    """
+    try:
+        t = datetime.datetime.fromisoformat((iso_str or "").replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        t = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        delta_days = max(0.0, float(days))
+    except (TypeError, ValueError):
+        delta_days = 30.0
+    t += datetime.timedelta(days=delta_days)
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
 
 
 def _table_for(kind):

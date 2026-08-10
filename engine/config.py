@@ -91,9 +91,21 @@ DEFAULTS: dict[str, Any] = {
                    "exclude_session_prefixes": [], "max_input_tokens": 2048, "overflow": "truncate"},
     "vector_index": {"backend": "bruteforce", "bruteforce_ceiling": 100000},
 
+    # §15.8 (issue #5): the declarative users/agents access topology. can_read's
+    # ceiling comes from here -- per-memory read_acl narrows within it but a
+    # runtime grant() can never widen past it (see engine/access.py Topology).
+    #   users: explicit user roster (optional; agents' user/users also populate it)
+    #   agents: [{id, user|users, reads: [principal_id,...]?, sandbox: bool?}]
+    #     - no `reads` declared -> falls through to default_cross_agent_read for
+    #       same-user peers; cross-user is NEVER implicit regardless
+    #     - `reads` declared -> authoritative ceiling for this agent (narrows
+    #       same-user default; the ONLY way to grant an explicit cross-user edge)
+    #     - sandbox: true -> absolute veto on inbound reads to this agent's data,
+    #       even from same-user siblings under default_cross_agent_read: allow
     "principals": {
         "deployment": "shared_core",          # shared_core | per_agent_isolated
         "default_cross_agent_read": "allow",
+        "users": [],
         "agents": [],
         "encryption": {"restricted_partition_keys": True},
     },
@@ -227,8 +239,22 @@ DEFAULTS: dict[str, Any] = {
                          "criticality": 0.20, "redundancy_vs_store": 0.30},
         "never_evict": "directives",
         "should_compress": {"on_memory_pressure": True, "on_focus_shift": True},
+        # Two-watermark hysteresis (§R2): HIGH is when should_compress() decides
+        # a pass is due (fraction of the model's context window); LOW is the
+        # target fraction compress() evicts DOWN TO. Using two different points
+        # instead of one is the hysteresis -- a single cutoff either re-triggers
+        # a pass on every call sitting right at the edge, or (the previous bug)
+        # doesn't bound the compressed size at all. Both are fractions of
+        # context_length, so the actual token count scales with whatever model
+        # is configured instead of a number picked for no particular window.
+        "high_watermark_percent": 0.75,
+        "low_watermark_percent": 0.55,
         "reinject": {"enabled": True},
         "standalone_fallback": "heuristic",
+        # §R7: cap (tokens) on the rolling, no-model checkpoint digest of
+        # everything compression has folded out this session; oldest lines
+        # drop first once a refresh would push it over this.
+        "checkpoint_digest_max_tokens": 300,
     },
 }
 

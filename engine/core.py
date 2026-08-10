@@ -14,6 +14,7 @@ import logging
 import threading
 from pathlib import Path
 
+from . import access
 from .capture import CaptureEngine, Reaper
 from .config import Config
 from .curation import CurationWorker
@@ -49,6 +50,11 @@ class ChronicleCore:
     def __init__(self, hermes_home: str, config: dict | None = None):
         self.hermes_home = hermes_home
         self.cfg = Config(config or {})
+        # §15.8 (issue #5): install the declarative users/agents ACL topology
+        # from `principals:` config into the access.can_read choke point. One
+        # process-wide default (mirrors ChronicleCore._active) — every existing
+        # access.can_read call site needs no change to be governed by it.
+        access.configure_topology(self.cfg.get("principals"))
         self.has_memory_provider = False
         self.has_context_engine = False
         self.active_principal = "default"

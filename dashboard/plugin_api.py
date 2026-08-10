@@ -86,7 +86,15 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
       - notes/episodes/facts: ONLY status='active' rows are embedded
       - events: type='observed' rows; vectors live in observed_vectors, NOT
         memory_vectors (so the old kind='event' count was always 0)
-      - entities: not part of the embedding pipeline
+      - entities: not part of the embedding pipeline. Entity NAMES carry no
+        semantic content and must never drive identity, so entities are never
+        vector-embedded — this row stays 0%, permanently, by design (§R12).
+      - digest: broken out of the 'note' bucket (same underlying table/kind —
+        note_type='belief', subject LIKE 'digest:%') because it is the ONE
+        semantic surface an entity has: a consolidation note embedded through
+        the ordinary belief-kind path (§u2, §R12). A search that means an
+        entity semantically, without naming it, can only ever land here —
+        never on the (unembedded) entity row above.
     Percentages are capped at 100 (some events accrue >1 vector over time).
     """
     stats: Dict[str, Any] = {}
@@ -98,8 +106,13 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
              "SELECT COUNT(*) FROM documents WHERE abstract IS NOT NULL",
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='document'"),
             ("note",
-             "SELECT COUNT(*) FROM notes WHERE status='active'",
-             "SELECT COUNT(*) FROM memory_vectors mv JOIN notes n ON n.belief_id=mv.belief_id WHERE mv.kind='note' AND n.status='active'"),
+             "SELECT COUNT(*) FROM notes WHERE status='active' AND subject NOT LIKE 'digest:%'",
+             "SELECT COUNT(*) FROM memory_vectors mv JOIN notes n ON n.belief_id=mv.belief_id "
+             "WHERE mv.kind='note' AND n.status='active' AND n.subject NOT LIKE 'digest:%'"),
+            ("digest",
+             "SELECT COUNT(*) FROM notes WHERE status='active' AND subject LIKE 'digest:%'",
+             "SELECT COUNT(*) FROM memory_vectors mv JOIN notes n ON n.belief_id=mv.belief_id "
+             "WHERE mv.kind='note' AND n.status='active' AND n.subject LIKE 'digest:%'"),
             ("episode",
              "SELECT COUNT(*) FROM episodes WHERE status='active'",
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='episode'"),
@@ -138,7 +151,8 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
             embedded = min(embedded, total)
             pct = min(100, int(round((embedded / total) * 100)))
             stats[kind] = {"total": total, "embedded": embedded, "pct": pct}
-        # Entities are not embedded by the current pipeline.
+        # Entities are not embedded by the current pipeline — never will be
+        # (§R12): the 'digest' row above is their semantic surface instead.
         _ent = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
         stats["entity"] = {"total": _ent, "embedded": 0, "pct": 0}
         conn.close()

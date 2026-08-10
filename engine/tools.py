@@ -109,6 +109,15 @@ class Tools:
         else:
             key = {"name": a.get("entity", content[:40])}
 
+        if kind == "fact":
+            # Subject hygiene invariant (§15.8, issue #5): a caller-supplied
+            # entity/attribute is the one runtime path that can smuggle a
+            # composite key straight in -- reject before anything is emitted.
+            try:
+                access.validate_subject_grounding(key["entity_id"], key["attribute"])
+            except ValueError as e:
+                return {"error": str(e)}
+
         # Pre-flight conflict check (facts only, §8.5 domain contradiction policy): look
         # for the active belief this remember is about to collide with, using the exact
         # same lookup + NOOP-dedup normalization the reducer itself uses (_find_existing /
