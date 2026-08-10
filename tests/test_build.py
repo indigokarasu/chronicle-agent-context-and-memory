@@ -716,6 +716,77 @@ class TestDigest(unittest.TestCase):
         self.core.curation.drain(max_jobs=10)
         self.assertEqual(self.core.store.count_rows("events", "1=1"), before)
 
+    def test_digest_note_gets_memory_vector(self):  # §R12(1)
+        """A digest note is note_type='belief', kind='note', which is in
+        _VECTORED_KINDS — VERIFIED here (not assumed) against a real store: it
+        must actually carry a memory_vectors row under kind='note', written by
+        the ordinary belief-kind embed path in Reducer._insert_belief."""
+        d = self._seed()
+        self.assertTrue(self.core.store.has_memory_vector(d["belief_id"], "note"),
+                        "digest note has no memory vector — belief-kind embed path did not reach it")
+        self.assertEqual(self.core.store.get_memory_vector_model(d["belief_id"], "note"),
+                         self.core.embedder.model)
+
+    def test_digest_vector_hit_seeds_entity_as_graph_channel(self):  # §R12(2)
+        """Entities carry no vector of their own, so the ONLY way a purely
+        semantic query (no entity name, no relationship predicate) can reach an
+        entity is through its digest note's embedding. A vector-channel hit on
+        a digest note must route that entity into the graph channel's seed
+        list, surfacing sibling facts the query never lexically or
+        vector-matched on their own — while the digest note itself still never
+        ranks directly (§u2, unchanged by R12)."""
+        d = self._seed()
+        entity_id = d["subject"][len("digest:"):]
+        hint = "Pat Acme profile summary"  # matches the digest's combined text
+        lexical = self.core.retrieval._graph_seeds(self.core.retrieval._tokens(hint))
+        self.assertNotIn(entity_id, lexical,
+                         "fixture assumption broken: the digest's own entity must not be "
+                         "reachable lexically (only 'Acme Fake Co', its own separate entity, "
+                         "may match here) — otherwise this proves nothing about vector routing")
+        q = self.core.retrieval.query_understanding(hint)
+        vec_hits = [bid for bid, kind, _s in self.core.retrieval._vector_beliefs(q["embedding"], 20)]
+        self.assertIn(d["belief_id"], vec_hits,
+                     "fixture assumption broken: hint must produce a raw vector hit on the digest")
+
+        hits = self.core.retrieval.search(hint, limit=20)
+        hit_ids = [h["belief_id"] for h in hits]
+        self.assertNotIn(d["belief_id"], hit_ids, "digest leaked into ranked search() results")
+
+        springfield = [h for h in hits if h.get("value") == "Springfield"]
+        self.assertTrue(springfield, "entity's sibling fact did not reach results via digest-seeded routing")
+        self.assertIn("graph", springfield[0]["channels"])
+
+    def test_embedding_coverage_lists_digest_not_entity(self):  # §R12(3)
+        """Dashboard coverage reporting breaks 'digest' out of the generic
+        'note' bucket (same underlying rows, split for reporting) and keeps
+        'entity' at a permanent, by-design 0% — the semantic surface for an
+        entity is its digest, never the entity row itself."""
+        import importlib.util
+        import types as _types
+        d = self._seed()
+        if "fastapi" not in sys.modules:
+            stub = _types.ModuleType("fastapi")
+            class _APIRouter:
+                def get(self, *a, **k): return lambda fn: fn
+                def post(self, *a, **k): return lambda fn: fn
+            stub.APIRouter = _APIRouter
+            stub.Query = lambda default=None, **k: default
+            sys.modules["fastapi"] = stub
+        plugin_api_path = Path(__file__).parent.parent / "dashboard" / "plugin_api.py"
+        spec = importlib.util.spec_from_file_location("chronicle_plugin_api_r12_unit", str(plugin_api_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        stats = mod._get_embedding_stats(Path(self.core.store.db_path))
+        self.assertIn("digest", stats)
+        self.assertEqual(stats["digest"], {"total": 1, "embedded": 1, "pct": 100})
+        self.assertIn("entity", stats)
+        self.assertEqual(stats["entity"]["embedded"], 0)
+        self.assertEqual(stats["entity"]["pct"], 0)
+        all_active_notes = self.core.store.count_rows("notes", "status='active'")
+        self.assertEqual(stats["note"]["total"] + stats["digest"]["total"], all_active_notes,
+                         "digest double-counted or missing against the 'note' bucket")
+
 
 # --------------------------------------------------------------------------
 # §r6 Topic-relevant standing notes reach the reader

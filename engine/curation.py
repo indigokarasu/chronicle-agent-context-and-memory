@@ -173,6 +173,19 @@ class CurationWorker:
 
     def _emit_item(self, item, ev, owner, domain, source_type, version):
         kind = item.get("kind", "fact")
+        key = item.get("key", {})
+        if kind == "fact":
+            # Subject hygiene invariant (§15.8, issue #5): reject before the
+            # fact ever reaches the durable log -- never in the reducer's
+            # replay fold, which must stay pure over whatever is already
+            # logged (I3). A dropped item just doesn't get logged (I18: never
+            # fails the whole extraction task over one bad item).
+            try:
+                access.validate_subject_grounding(
+                    key.get("entity_id", ""), key.get("attribute", key.get("predicate_canonical", "")))
+            except ValueError as e:
+                logger.warning("chronicle: dropped fact with bad subject grounding: %s", e)
+                return
         risk = item.get("key", {}).get("risk_tier", "low")
         # Risk-tiered application (§16.4): behavior-changing high-risk → draft + review.
         status = item.get("status", "active")
@@ -770,6 +783,20 @@ class CurationWorker:
                                                  "name_collision", score, provider=provider):
                 logger.info("federate_sweep: link candidate %s ↔ %s queued for review",
                             ent["belief_id"], external_id)
+
+    def _task_backfill_sweep(self, payload):
+        """Backfill session_index for ended/reaped sessions lacking an index row
+        (issue #6).
+
+        Deterministic batch job: finds <=200 ended sessions without an index
+        entry, enqueues session_summarize for each, and advances the watermark
+        for idempotent pagination. Stateless: calling again after completion
+        yields 0.
+        """
+        sids = self.store.get_sessions_needing_index_backfill(limit=200)
+        for sid in sids:
+            self.store.enqueue_curation("session_summarize", {"session_id": sid})
+        logger.info("backfill_sweep: enqueued %d sessions for summarization", len(sids))
 
 
 def _quote_ident(name: str) -> str:

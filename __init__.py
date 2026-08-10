@@ -24,7 +24,7 @@ import os
 # Last-resort literal, used only when plugin.yaml is missing or unreadable at
 # import time (e.g. the package was vendored without its manifest). plugin.yaml
 # is the single source of truth — do not treat this as a second one.
-_VERSION_FALLBACK = "5.4.1"
+_VERSION_FALLBACK = "5.5.0"
 
 
 def _read_version_from_plugin_yaml() -> str:

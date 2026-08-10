@@ -8,6 +8,17 @@ All notable changes to the Chronicle Hermes plugin. Versioning follows the
 
 ## Unreleased
 
+- **Context-pressure warning span (Ladder 7 R9).** `compress()` now emits a
+  one-shot system-role advisory the first time `last_prompt_tokens` reaches
+  the HIGH watermark (`context_engine.is_under_pressure()`), so the agent has
+  a chance to `chronicle_pin_context` anything it wants to keep before forced
+  eviction runs; the flag re-arms once `update_from_response` observes the
+  window drop back below the watermark. The warning is fit against the same
+  `_target_budget()`/`used` accounting as the rest of the output (clipped, or
+  skipped and left un-latched if there's no room this call) so it can never
+  push `compress()` over its own R2 budget guarantee, and it is only latched
+  once actually included in what's returned -- so the small-body early-return
+  shortcut can no longer latch the flag without ever delivering the span.
 - **`vector_index.backend: sqlite-vec` is real.** It was configuration fiction —
   the setting existed, and every query brute-forced anyway. It now maintains a
   `vec0` virtual table mirroring `observed_vectors` (created lazily, written on

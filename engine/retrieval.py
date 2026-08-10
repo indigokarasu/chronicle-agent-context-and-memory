@@ -341,6 +341,15 @@ class RetrievalEngine:
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         ranked: dict[str, dict] = {}
+        # R12: entities carry no vector of their own (names are not semantic
+        # content, §R12), so a purely SEMANTIC entity match can only ever surface
+        # through its digest note's embedding. Collected here and merged into the
+        # graph channel's seed list below, so a query that means an entity —
+        # without naming it or any of its relationships — still reaches that
+        # entity's facts. Vector-only: an FTS/structured hit on a digest's text
+        # is a literal string match, which is exactly what the digest choke point
+        # below already excludes (§u2) and must keep excluding.
+        digest_seed_ids: list[str] = []
 
         def add(bid, table, rank, channel):
             row = self.store.get_belief(table, bid)
@@ -351,6 +360,11 @@ class RetrievalEngine:
             # ranking and answer with a summary where a verbatim value exists.
             # One choke point covers every channel (fts, vector, graph).
             if table == "notes" and str(row.get("subject") or "").startswith("digest:"):
+                if channel == "vector":
+                    eid = str(row.get("subject"))[len("digest:"):]
+                    ent = eid and self.store.get_belief("entities", eid)
+                    if ent and not ent.get("merged_into") and eid not in digest_seed_ids:
+                        digest_seed_ids.append(eid)
                 return
             w = {"fts": self._fts_w, "vector": self._vec_w,
                  "graph": self._graph_w()}.get(channel, 0.3)
@@ -378,7 +392,18 @@ class RetrievalEngine:
         # works_at(spouse) through spouse(user, …), which no lexical or vector
         # channel can. Bounded (≤6 seed nodes, 1 hop, ≤8 facts/node); an empty
         # graph is a no-op.
+        #
+        # R12: digest_seed_ids (populated above, vector channel only) are merged
+        # in as additional seeds — the SEMANTIC route to an entity, alongside the
+        # lexical one _graph_seeds already does. Same overall cap, so a query that
+        # both names an entity and semantically matches another's digest still
+        # bounds the fan-out at 6.
         nodes = self._graph_seeds(q["tokens"])
+        for eid in digest_seed_ids:
+            if len(nodes) >= 6:
+                break
+            if eid not in nodes:
+                nodes.append(eid)
         hop: list[str] = []
         for e in nodes[:3]:
             for r in self.store.query_beliefs(

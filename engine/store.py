@@ -25,7 +25,8 @@ logger = logging.getLogger("chronicle.store")
 # _migrate. 2 = curation_jobs.run_after + task 'embed' (deferred embeds, §24.4).
 # 3 = task 'digest' (entity consolidation digests, §u2).
 # 4 = task 'federate_sweep' + federation_watermarks/link_candidates (§14, g4).
-SCHEMA_VERSION = 4
+# 5 = task 'backfill_sweep' (session-index backfill sweep, issue #6).
+SCHEMA_VERSION = 5
 
 # SQLite busy timeouts, milliseconds.
 #
@@ -180,7 +181,12 @@ class MemoryStore:
         # only that string misses 'digest' (schema_version 3) entirely and every
         # v2 DB enqueues a 'digest' job that fails the CHECK inside append_event's
         # txn (I12), aborting the enclosing extract job. One rebuild covers both.
-        missing = [t for t in ("embed", "digest", "federate_sweep")
+        # This list must be kept in lockstep with _CURATION_JOBS_DDL's task CHECK
+        # below — every value added there needs its OWN entry here too, or an
+        # existing store never rebuilds and the first enqueue of the new task
+        # raises IntegrityError inside append_event's txn (already missed twice:
+        # 'digest' at schema_version 3, 'federate_sweep' at schema_version 4).
+        missing = [t for t in ("embed", "digest", "federate_sweep", "backfill_sweep")
                    if row and f"'{t}'" not in (row[0] or "")]
         if missing:
             logger.info("schema migration: curation_jobs task CHECK += %s", ", ".join(missing))
@@ -739,6 +745,26 @@ class MemoryStore:
         return [dict(r) for r in self._conn().execute(
             f"SELECT * FROM sessions WHERE status IN ({marks})", tuple(statuses)).fetchall()]
 
+    def get_sessions_needing_index_backfill(self, limit: int = 200) -> list[str]:
+        """Find ended/reaped sessions lacking a session_index row, ordered by
+        session_id for deterministic pagination. Watermarked: returns only sessions
+        after the recorded watermark, advancing it on success. Idempotent."""
+        watermark = self.get_meta("backfill_sweep_watermark", "")
+        # Sessions that ended/reaped but have no index row, ordered for pagination.
+        rows = self._conn().execute(
+            """SELECT s.session_id FROM sessions s
+               WHERE s.status IN ('ended', 'reaped')
+               AND s.session_id NOT IN (SELECT session_id FROM session_index)
+               AND s.session_id > ?
+               ORDER BY s.session_id
+               LIMIT ?""",
+            (watermark, limit)).fetchall()
+        sids = [dict(r)["session_id"] for r in rows]
+        # Advance watermark to the last processed session for idempotency.
+        if sids:
+            self.set_meta("backfill_sweep_watermark", sids[-1])
+        return sids
+
     # -- curation jobs (§17) ----------------------------------------------
 
     def enqueue_curation(self, task: str, payload: dict, depends_on: int | None = None) -> int | None:
@@ -1293,7 +1319,7 @@ _CURATION_JOBS_DDL = """CREATE TABLE IF NOT EXISTS %s (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task TEXT CHECK(task IN ('extract','route','criticality','canonicalize','consolidate',
         'contradiction','identity','derive','verify','decay','consistency','health','reextract',
-        'journal_ingest','session_summarize','embed','digest','federate_sweep')),
+        'journal_ingest','session_summarize','embed','digest','federate_sweep','backfill_sweep')),
     payload TEXT, depends_on INTEGER REFERENCES curation_jobs(id),
     status TEXT CHECK(status IN ('pending','running','done','failed')) DEFAULT 'pending',
     attempts INTEGER DEFAULT 0, created_at TEXT, started_at TEXT, finished_at TEXT, error TEXT,

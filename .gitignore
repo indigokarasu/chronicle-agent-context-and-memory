@@ -20,3 +20,4 @@ htmlcov/
 *.sqlite3
 .DS_Store
 Thumbs.db
+s_ctx100.json
