@@ -25,6 +25,7 @@ from .federation import CapabilityRegistry
 from .forgetting import ForgettingEngine
 from .gitmirror import GitMirror
 from .health import HealthEngine
+from .hostmodel import HostModelRegistry
 from .learning import LearningLoop
 from .localdb import register_local_dbs
 from .reasoning import EpistemicModel, ReasoningLayer
@@ -70,7 +71,8 @@ class ChronicleCore:
                                      self.cfg.get("embeddings.base_url"),
                                      self.cfg.get("embeddings.api_key"),
                                      self.cfg.get("embeddings.max_input_tokens"),
-                                     self.cfg.get("embeddings.overflow"))
+                                     self.cfg.get("embeddings.overflow"),
+                                     self.cfg.get("embeddings.task_prefixes"))
         # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
         # the store (add/delete/prune on write) and retrieval (KNN on read); see
         # vector_index.py and RetrievalEngine.__init__ for why sharing matters.
@@ -94,6 +96,11 @@ class ChronicleCore:
         self.epistemic = EpistemicModel(self.store, self.cfg)
         self.reasoning = ReasoningLayer(self)
         self.gitmirror = GitMirror(self.store, self.cfg)
+        # Host-model piggyback registry (§H1). Constructing it is free — the
+        # constructor stores two references and touches neither SQLite nor
+        # config — so it is safe on the default path, where host_model.piggyback
+        # is False and not one of its methods is ever called.
+        self.host_model = HostModelRegistry(self.store, self.cfg)
         self.tools = Tools(self)
         self.curation = CurationWorker(self)
         self.reaper = Reaper(self.store, self.capture,
@@ -215,6 +222,39 @@ class ChronicleCore:
 
     def flush_git(self) -> int:
         return self.gitmirror.flush()
+
+    def identity_candidates(self, principal=None, status="pending", kind="", limit=50) -> list:
+        """The identity adjudication queue (§E7), ACL-filtered and named.
+
+        ONE projection shared by every listing surface (the `chronicle_
+        list_identity_candidates` tool and the provider's
+        `list_identity_candidates`), so they cannot disagree about what a
+        principal is allowed to see. A candidate naming an entity the principal
+        cannot read (§15) is dropped, not redacted — its existence is itself a
+        disclosure about that entity.
+
+        Strictly read-only: listing a candidate never applies it. Nothing in
+        Chronicle merges or splits an entity from these rows."""
+        principal = principal or self.active_principal
+        out = []
+        for c in self.store.get_identity_candidates(status=status, kind=kind, limit=int(limit)):
+            ents, names, visible = [c.get("entity_id") or ""], [], True
+            if c.get("other_id"):
+                ents.append(c["other_id"])
+            for eid in ents:
+                ent = self.store.get_belief("entities", eid)
+                if not ent or not access.can_read(ent.get("read_acl"), ent.get("owner"), principal):
+                    visible = False
+                    break
+                names.append(ent.get("name"))
+            if not visible:
+                continue
+            out.append({"candidate_id": c["id"], "kind": c["kind"],
+                        "entity_ids": ents, "entity_names": names,
+                        "mention_ref": c.get("mention_ref") or None,
+                        "similarity": c.get("similarity"), "status": c.get("status"),
+                        "created_at": c.get("created_at")})
+        return out
 
     def embedding_status(self) -> dict:
         """Report which embedding mode is live: a real local model (and whether it

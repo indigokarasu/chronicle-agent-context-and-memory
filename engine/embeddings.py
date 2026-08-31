@@ -83,6 +83,20 @@ def normalize_overflow(value) -> str:
     return v if v in _OVERFLOW_MODES else "truncate"
 
 
+def should_use_task_prefixes(model: str, task_prefixes_config: str | bool | None) -> bool:
+    """Determine whether to prepend task prefixes based on config and model name.
+
+    Config "auto" (default): enabled iff model name contains "nomic".
+    Config True: always enabled.
+    Config False: always disabled.
+    Hashing mode never uses prefixes.
+    """
+    if task_prefixes_config is None or task_prefixes_config == "auto":
+        # Auto-detect: enabled iff model name contains "nomic"
+        return "nomic" in (model or "").lower()
+    return bool(task_prefixes_config)
+
+
 def _split_for_cap(text: str, max_input_tokens: int) -> list[str]:
     """Boundary-aware split of `text` into chunks each within max_input_tokens.
 
@@ -152,6 +166,20 @@ class Embedder(Protocol):
 
     def embed(self, text: str) -> list[float]: ...
 
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query (typically prepended with a task prefix if configured)."""
+        return self.embed(query)
+
+    def embed_document(self, document: str) -> list[float]:
+        """Embed a document (typically prepended with a task prefix if configured)."""
+        return self.embed(document)
+
+    def model_with_prefix_marker(self) -> str:
+        """Return the model name with a prefix marker if task prefixes are used.
+
+        Used for the 'model' field in stored vectors to detect stale bare vectors."""
+        return self.model
+
 
 class HashingEmbedder:
     """Deterministic bag-of-tokens feature-hashing embedder.
@@ -163,11 +191,14 @@ class HashingEmbedder:
     """
 
     def __init__(self, dimensions: int = 256, model: str = "hashing-v1",
-                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate",
+                 task_prefixes: str | bool | None = None):
         self.dimensions = dimensions
         self.model = model
         self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
         self.overflow = normalize_overflow(overflow)
+        # Hashing mode never uses task prefixes (they don't affect the hash meaningfully)
+        self.use_task_prefixes = False
 
     def _embed_one(self, text: str) -> list[float]:
         vec = [0.0] * self.dimensions
@@ -193,6 +224,18 @@ class HashingEmbedder:
         if self.overflow == "chunk_mean":
             return _mean_normalize([self._embed_one(c) for c in chunks])
         return self._embed_one(chunks[0])   # truncate: boundary-aware first chunk only
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query (no task prefix in hashing mode)."""
+        return self.embed(query)
+
+    def embed_document(self, document: str) -> list[float]:
+        """Embed a document (no task prefix in hashing mode)."""
+        return self.embed(document)
+
+    def model_with_prefix_marker(self) -> str:
+        """Hashing mode never uses task prefixes."""
+        return self.model
 
 
 # Local embedding servers probed when no explicit base_url is configured.
@@ -223,7 +266,8 @@ class OpenAICompatEmbedder:
 
     def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0,
                  max_attempts: int = 5, backoff_base: float = 1.0, backoff_cap: float = 8.0,
-                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate",
+                 task_prefixes: str | bool | None = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.dimensions = dimensions
@@ -234,6 +278,8 @@ class OpenAICompatEmbedder:
         self.backoff_cap = float(backoff_cap)
         self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
         self.overflow = normalize_overflow(overflow)
+        # Determine if task prefixes should be used (only for real embedders)
+        self.use_task_prefixes = should_use_task_prefixes(model, task_prefixes)
 
     def _embed_raw(self, text: str, timeout: float) -> list[float]:
         import json as _json
@@ -357,7 +403,16 @@ class OpenAICompatEmbedder:
         the whole batch. Any oversized text is routed through embed() on its
         own — for `truncate` that is one extra call; for `chunk_mean` it is
         one call per chunk — and is never mixed into a raw batch payload.
+
+        The only caller (Reducer.prefetch_vectors) is always document-side, so
+        when task prefixes are enabled each text gets "search_document: "
+        prepended up front, before the size-check split -- otherwise these
+        vectors would go out bare while model_with_prefix_marker() tags them
+        [prefixed], permanently desyncing bulk-ingested vectors from the
+        query-side prefix contract.
         """
+        if self.use_task_prefixes:
+            texts = ["search_document: " + (t or "") for t in texts]
         out: list[list[float] | None] = [None] * len(texts)
         batch_idx: list[int] = []
         batch_texts: list[str] = []
@@ -375,6 +430,24 @@ class OpenAICompatEmbedder:
             for j, vec in zip(idx_part, vecs):
                 out[j] = vec
         return out  # type: ignore[return-value]
+
+    def embed_query(self, query: str) -> list[float]:
+        """Embed a query with optional task prefix."""
+        if self.use_task_prefixes:
+            query = "search_query: " + (query or "")
+        return self.embed(query)
+
+    def embed_document(self, document: str) -> list[float]:
+        """Embed a document with optional task prefix."""
+        if self.use_task_prefixes:
+            document = "search_document: " + (document or "")
+        return self.embed(document)
+
+    def model_with_prefix_marker(self) -> str:
+        """Return model name with [prefixed] marker if task prefixes are used."""
+        if self.use_task_prefixes:
+            return f"{self.model}[prefixed]"
+        return self.model
 
 
 def _candidate_urls(base_url: str | None) -> list[str]:
@@ -405,7 +478,7 @@ def _discover_embedding_models(base_url: str, api_key: str) -> list[str]:
 
 def _probe_endpoints(model: str | None, dims: int, base_url: str | None,
                      api_key: str | None, max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS,
-                     overflow: str = "truncate") -> Embedder | None:
+                     overflow: str = "truncate", task_prefixes: str | bool | None = None) -> Embedder | None:
     """First reachable OpenAI-compatible endpoint that really embeds, else None.
 
     `model` auto/empty → ask each endpoint's /v1/models what it serves and try
@@ -420,7 +493,8 @@ def _probe_endpoints(model: str | None, dims: int, base_url: str | None,
         for mid in candidates:
             try:
                 emb = OpenAICompatEmbedder(url, mid, dims, api_key or "",
-                                           max_input_tokens=max_input_tokens, overflow=overflow)
+                                           max_input_tokens=max_input_tokens, overflow=overflow,
+                                           task_prefixes=task_prefixes)
                 if emb.healthcheck():
                     return emb
             except Exception:
@@ -445,7 +519,8 @@ class DegradedEmbedder:
 
     def __init__(self, model: str = "auto", dimensions: int = 768, base_url: str | None = None,
                  api_key: str | None = None, recheck_seconds: float = 60.0,
-                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate"):
+                 max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate",
+                 task_prefixes: str | bool | None = None):
         self.requested_model = model or "auto"
         self.base_url = base_url
         self.api_key = api_key
@@ -453,6 +528,7 @@ class DegradedEmbedder:
         self._dimensions = int(dimensions or 768)
         self.max_input_tokens = clamp_max_input_tokens(max_input_tokens)
         self.overflow = normalize_overflow(overflow)
+        self._task_prefixes_config = task_prefixes
         self._live = None                                  # adopted backend, once one appears
         self._next_probe = time.time() + self.recheck_seconds
 
@@ -478,7 +554,8 @@ class DegradedEmbedder:
             return False
         self._next_probe = now + self.recheck_seconds
         emb = _probe_endpoints(self.requested_model, self._dimensions, self.base_url, self.api_key,
-                              max_input_tokens=self.max_input_tokens, overflow=self.overflow)
+                              max_input_tokens=self.max_input_tokens, overflow=self.overflow,
+                              task_prefixes=self._task_prefixes_config)
         if emb is None:
             return False
         logger.warning("Chronicle embeddings: RECOVERED — %r via %s (dim %d); queued embeds resume",
@@ -499,10 +576,29 @@ class DegradedEmbedder:
             return self._live.embed_batch(texts, chunk=chunk)
         raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
 
+    def embed_query(self, query: str) -> list[float]:
+        """Delegate to live backend or raise if unavailable."""
+        if self._live is not None:
+            return self._live.embed_query(query)
+        raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
+
+    def embed_document(self, document: str) -> list[float]:
+        """Delegate to live backend or raise if unavailable."""
+        if self._live is not None:
+            return self._live.embed_document(document)
+        raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
+
+    def model_with_prefix_marker(self) -> str:
+        """Delegate to live backend if available."""
+        if self._live is not None:
+            return self._live.model_with_prefix_marker()
+        return self.model
+
 
 def get_embedder(model: str | None = None, dimensions: int | None = None,
                  base_url: str | None = None, api_key: str | None = None,
-                 max_input_tokens: int | None = None, overflow: str | None = None) -> Embedder:
+                 max_input_tokens: int | None = None, overflow: str | None = None,
+                 task_prefixes: str | bool | None = None) -> Embedder:
     """Return the active embedder, logging exactly ONE line: which mode, and why.
 
     Default is ``auto``: find a running local OpenAI-compatible server (configured
@@ -526,6 +622,9 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
     text reaches a real model, so a context-overflowing excerpt 500s never
     again poison a curation job's retry budget. Defaults: 2048 tokens
     (clamped [256, 32768]), overflow "truncate".
+
+    `task_prefixes` (E1): "auto" (default: enabled iff model contains "nomic") |
+    true (always) | false (never). Hashing mode never uses prefixes.
     """
     dims = int(dimensions) if dimensions else 768
     name = (model or "auto").strip().lower()
@@ -536,13 +635,15 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
         dim = int(dimensions) if dimensions else 256
         logger.info("Chronicle embeddings: HASHING mode — %r requested explicitly; deterministic "
                     "offline vectors (dim %d), no server contacted", name, dim)
-        return HashingEmbedder(dimensions=dim, max_input_tokens=max_tok, overflow=ovf)
+        return HashingEmbedder(dimensions=dim, max_input_tokens=max_tok, overflow=ovf,
+                               task_prefixes=task_prefixes)
     auto = name in _AUTO_NAMES
     if not auto and base_url:
         # Trust the configured model + endpoint: defer transient failures to the
         # runtime wait-and-retry in embed() instead of downgrading the session.
         emb = OpenAICompatEmbedder(base_url, model, dims, api_key or "",
-                                   max_input_tokens=max_tok, overflow=ovf)
+                                   max_input_tokens=max_tok, overflow=ovf,
+                                   task_prefixes=task_prefixes)
         try:
             emb.healthcheck()  # best-effort: confirm reachable + adopt the real dim
             logger.info("Chronicle embeddings: MODEL mode — %r via %s (dim %d)",
@@ -552,7 +653,8 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
                            "keeping it and deferring to the runtime retry (never hashing)",
                            model, base_url, e)
         return emb
-    emb = _probe_endpoints(model, dims, base_url, api_key, max_input_tokens=max_tok, overflow=ovf)
+    emb = _probe_endpoints(model, dims, base_url, api_key, max_input_tokens=max_tok, overflow=ovf,
+                          task_prefixes=task_prefixes)
     if emb is not None:
         logger.info("Chronicle embeddings: MODEL mode — local %r via %s (dim %d)",
                     emb.model, emb.base_url, emb.dimensions)
@@ -564,7 +666,7 @@ def get_embedder(model: str | None = None, dimensions: int | None = None,
                    "no embedding model reachable" if auto else f"model {model!r} not reachable",
                    ", ".join(_candidate_urls(base_url)))
     return DegradedEmbedder(model=name, dimensions=dims, base_url=base_url, api_key=api_key,
-                            max_input_tokens=max_tok, overflow=ovf)
+                            max_input_tokens=max_tok, overflow=ovf, task_prefixes=task_prefixes)
 
 
 def _stable_hash(s: str) -> int:
@@ -593,6 +695,42 @@ def cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     # Vectors are pre-normalized; dot ≈ cosine. Clamp for safety.
     return max(-1.0, min(1.0, dot))
+
+def batch_cosine_f64(query, blobs):
+    """`batch_cosine` at full float64 precision, same signature and semantics.
+
+    batch_cosine casts the query to float32 to keep the matmul in the same dtype
+    as the stored blobs, which costs ~1e-8 of accuracy. That is invisible in a
+    ranking — the only thing batch_cosine feeds — but E5's `novelty` is a STORED
+    NUMBER whose contract is exactly `1 − max cosine`, checked to 1e-9 against
+    the scalar `cosine`. Widening the blobs to float64 instead keeps the result
+    within float64 rounding of that scalar (~1e-15) at the cost of a wider
+    temporary, and falls back to the same scalar path when numpy is absent.
+    """
+    n = len(blobs)
+    if n == 0:
+        return []
+    try:
+        import numpy as np
+    except Exception:
+        return [cosine(query, unpack(b)) for b in blobs]
+    q = np.asarray(query, dtype=np.float64)
+    d = int(q.shape[0]) if q.ndim else 0
+    out = [0.0] * n
+    if not d:
+        return out
+    idx, mats = [], []
+    for i, b in enumerate(blobs):
+        if b and len(b) == d * 4:
+            idx.append(i)
+            mats.append(b)
+    if idx:
+        M = np.frombuffer(b"".join(mats), dtype=np.float32).reshape(len(idx), d).astype(np.float64)
+        sims = np.clip(M @ q, -1.0, 1.0)
+        for j, i in enumerate(idx):
+            out[i] = float(sims[j])
+    return out
+
 
 def batch_cosine(query, blobs):
     """Vectorized cosine of `query` (pre-normalized) against many packed,

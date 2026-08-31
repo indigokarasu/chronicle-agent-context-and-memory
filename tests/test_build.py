@@ -466,6 +466,256 @@ class TestInvariants(unittest.TestCase):
         self.assertFalse(any("Bob" in (f["value"] or "") for f in
                              self.core.store.query_beliefs("facts", "status='active'")))
 
+    # E10 geometric abstention -- fixtures below control TWO independent
+    # things directly, rather than hoping a natural-language query lands on
+    # the right side of an unverified distance: (1) t1's top candidate via a
+    # `search` stub (the exact shape test_P20_support_gate_* already uses),
+    # and (2) the query's own embedding via a `query_understanding` wrapper
+    # that keeps real tokenization but substitutes a known vector. The
+    # candidate's OWN embedding is written straight into memory_vectors via
+    # store.add_memory_vector, so the true cosine distance between the two is
+    # known exactly (0.0 for identical vectors, 1.0 for orthogonal ones) --
+    # not merely assumed from wording choices.
+    _E10_VEC_A = [1.0, 0.0, 0.0, 0.0]
+    _E10_VEC_B = [0.0, 1.0, 0.0, 0.0]  # orthogonal to A: cosine 0.0, distance 1.0
+
+    def _E10_wrap_query_understanding(self, r, embedding):
+        real_qu = r.query_understanding
+
+        def fake_qu(query, _real=real_qu, _emb=embedding):
+            out = _real(query)
+            out["embedding"] = _emb
+            return out
+        r.query_understanding = fake_qu
+
+    def test_E10_distance_abstention_off_topic(self):  # E10 calibrated geometric abstention
+        # The top t1 candidate's own stored embedding is orthogonal to the
+        # query embedding -- true cosine distance is exactly 1.0, well past
+        # the 0.5 threshold -- so the gate abstains with the distance-specific
+        # reason, even though a channel still ranked it #1 (score is high;
+        # score is exactly what the FAILED first attempt thresholded instead
+        # of geometry, and this fixture would NOT trip a score-based check).
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
+                                    "retrieval": {"abstain_distance": 0.5}})
+        core.initialize("s1", principal_id="assistant")
+        try:
+            r = core.retrieval
+            core.store.add_memory_vector("b1", "fact", pack(self._E10_VEC_A), "hashing-v1")
+            r.search = lambda *a, **k: [{"belief_id": "b1", "table": "facts", "kind": "fact",
+                                         "score": 1.0, "channels": ["fts"], "value": "Acme Fake Co",
+                                         "entity_id": "user", "attribute": "employer",
+                                         "confidence": 0.9, "status": "active", "source_type": None}]
+            r.retrieve_raw = lambda *a, **k: []
+            self._E10_wrap_query_understanding(r, self._E10_VEC_B)
+
+            self.assertAlmostEqual(1.0 - cosine(self._E10_VEC_B, self._E10_VEC_A), 1.0)
+
+            ans = r.answer("how many kayaking trips did I take in Sacramento")
+            self.assertTrue(ans["abstain"])
+            self.assertEqual(ans["why"], "no sufficiently close memory")
+            self.assertEqual(ans["tier"], 1)
+            self.assertEqual(ans["confidence"], 0.0)
+            self.assertEqual(ans["sources"], [])
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_distance_abstention_on_topic(self):  # E10 calibrated geometric abstention
+        # Same unrelated-employer t1 candidate as
+        # test_P20_support_gate_rejects_unrelated_top_hit (its later, separate
+        # SUPPORT gate rejects it on lexical grounds either way) but now its
+        # own embedding is IDENTICAL to the query's (true distance 0.0, far
+        # under the 0.5 threshold). The distance gate must not fire, so the
+        # pipeline falls through to tier 2, where a supporting raw span (from
+        # test_P20_support_gate_passes_real_support) answers normally.
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
+                                    "retrieval": {"abstain_distance": 0.5}})
+        core.initialize("s1", principal_id="assistant")
+        try:
+            r = core.retrieval
+            core.store.add_memory_vector("b1", "fact", pack(self._E10_VEC_A), "hashing-v1")
+            r.search = lambda *a, **k: [{"belief_id": "b1", "table": "facts", "kind": "fact",
+                                         "score": 1.0, "channels": ["vector"], "value": "Acme Fake Co",
+                                         "entity_id": "user", "attribute": "employer",
+                                         "confidence": 0.9, "status": "active", "source_type": None}]
+            r.retrieve_raw = lambda *a, **k: [
+                {"event_id": "e1", "score": 0.9,
+                 "excerpt": "User: my kayaking trips in Sacramento were in June."}]
+            self._E10_wrap_query_understanding(r, self._E10_VEC_A)
+
+            self.assertAlmostEqual(1.0 - cosine(self._E10_VEC_A, self._E10_VEC_A), 0.0)
+
+            ans = r.answer("when were my kayaking trips in Sacramento")
+            self.assertFalse(ans["abstain"])
+            self.assertNotEqual(ans.get("why"), "no sufficiently close memory")
+            self.assertEqual(ans["tier"], 2)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_distance_abstention_disabled_by_default(self):  # E10 regression test
+        # Byte-identical-behavior proof: reuse the EXACT off-topic fixture
+        # from test_E10_distance_abstention_off_topic -- true distance 1.0,
+        # which demonstrably trips a 0.5 threshold above -- but leave
+        # abstain_distance at its default (None). The geometric gate must be
+        # a complete no-op, leaving the pre-E10 abstention path (the support
+        # gate's "low_support", proven by test_P20_support_gate_rejects_
+        # unrelated_top_hit for this identical t1/query pair) untouched.
+        from engine.config import DEFAULTS
+
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"}})  # defaults
+        core.initialize("s1", principal_id="assistant")
+        try:
+            self.assertIsNone(DEFAULTS["retrieval"]["abstain_distance"])
+            self.assertIsNone(core.cfg.get("retrieval.abstain_distance"))
+
+            r = core.retrieval
+            core.store.add_memory_vector("b1", "fact", pack(self._E10_VEC_A), "hashing-v1")
+            r.search = lambda *a, **k: [{"belief_id": "b1", "table": "facts", "kind": "fact",
+                                         "score": 1.0, "channels": ["fts"], "value": "Acme Fake Co",
+                                         "entity_id": "user", "attribute": "employer",
+                                         "confidence": 0.9, "status": "active", "source_type": None}]
+            r.retrieve_raw = lambda *a, **k: []
+            self._E10_wrap_query_understanding(r, self._E10_VEC_B)
+
+            ans = r.answer("how many kayaking trips did I take in Sacramento")
+            self.assertTrue(ans["abstain"])
+            self.assertEqual(ans["why"], "low_support")             # unchanged pre-E10 reason
+            self.assertNotEqual(ans["why"], "no sufficiently close memory")
+            self.assertEqual(ans["tier"], 0)                        # unchanged pre-E10 tier
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_distance_abstention_inert_without_geometry(self):  # E10 degrade paths
+        # Threshold set near-impossibly tight (0.01) so ANY real computation
+        # would trip it -- yet the gate must stay inert in both cases where
+        # there is no geometry to compute from: no embedder at all, and an
+        # embedder present but the top candidate was never itself embedded
+        # (fts/structured/graph-only hit, or its vector was pruned).
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
+                                    "retrieval": {"abstain_distance": 0.01}})
+        core.initialize("s1", principal_id="assistant")
+        try:
+            r = core.retrieval
+            r.search = lambda *a, **k: [{"belief_id": "b1", "table": "facts", "kind": "fact",
+                                         "score": 1.0, "channels": ["fts"], "value": "Acme Fake Co",
+                                         "entity_id": "user", "attribute": "employer",
+                                         "confidence": 0.9, "status": "active", "source_type": None}]
+            r.retrieve_raw = lambda *a, **k: []
+
+            # (1) No embedder: query_understanding's embedding is None
+            # unconditionally (real code path, not stubbed) -- the gate must
+            # not run regardless of how tight the threshold is. b1 DOES have a
+            # vector here on purpose: without a candidate vector, `if
+            # cand_emb:` alone would already block the gate, leaving the
+            # `q["embedding"]` guard unexercised (cosine(None, vec) == 0.0 ->
+            # distance 1.0 -- a FALSE abstention this guard is the only thing
+            # preventing). Giving b1 a real vector isolates the embedder guard.
+            core.store.add_memory_vector("b1", "fact", pack(self._E10_VEC_A), "hashing-v1")
+            r.embedder = None
+            ans_no_embedder = r.answer("how many kayaking trips did I take in Sacramento")
+            self.assertNotEqual(ans_no_embedder.get("why"), "no sufficiently close memory")
+            self.assertEqual(ans_no_embedder["why"], "low_support")
+
+            # (2) Embedder present, but belief b1 has no memory vector at all
+            # -- get_memory_vector returns None -- the gate must not
+            # fabricate a distance from nothing. Drop the vector added above
+            # so this case tests the OTHER guard in isolation.
+            core.store.delete_memory_vector("b1")
+            r.embedder = HashingEmbedder()
+            self.assertIsNone(core.store.get_memory_vector("b1", "fact"))
+            ans_no_vector = r.answer("how many kayaking trips did I take in Sacramento")
+            self.assertNotEqual(ans_no_vector.get("why"), "no sufficiently close memory")
+            self.assertEqual(ans_no_vector["why"], "low_support")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_get_memory_vector_kind_pinned(self):  # E10 kind pinning
+        # memory_vectors' PRIMARY KEY is (belief_id, kind) -- a vector stored
+        # under one kind must never leak into a lookup for a DIFFERENT kind
+        # sharing the same belief_id (e.g. a "note" and a "fact" minted from
+        # the same source could share an id). A mutant that drops the "AND
+        # kind=?" half of get_memory_vector's WHERE clause would otherwise
+        # survive every other E10 test, since they all use one kind ("fact")
+        # throughout.
+        core, home = make_core()
+        core.initialize("s1", principal_id="assistant")
+        try:
+            core.store.add_memory_vector("b1", "note", pack(self._E10_VEC_A), "hashing-v1")
+            self.assertIsNotNone(core.store.get_memory_vector("b1", "note"))
+            self.assertIsNone(core.store.get_memory_vector("b1", "fact"))
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_abstain_distance_coerces_garbage_to_inert(self):  # E10 config hardening
+        # Mirrors _graph_w / _temporal_boost: a non-numeric config value must
+        # coerce via float() with a safe fallback rather than raising
+        # TypeError out of answer() at query time. abstain_distance's "off"
+        # sentinel is None (not a clamped default), so garbage falls back to
+        # None -- same as never having set it.
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
+                                    "retrieval": {"abstain_distance": "not-a-number"}})
+        core.initialize("s1", principal_id="assistant")
+        try:
+            self.assertIsNone(core.retrieval._abstain_distance())
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_E10_abstain_distance_garbage_survives_answer_end_to_end(self):  # F4b
+        # Ladder-9 review finding: the test above proves _abstain_distance()
+        # coerces garbage in ISOLATION, but nothing in the suite drives that
+        # garbage value through the real answer() entry point -- so a change
+        # that unwires the coerced call (answer() reverting to a raw
+        # `cfg.get("retrieval.abstain_distance")` read) would survive every
+        # other test untouched and only blow up on a live caller's first
+        # non-numeric config value. This closes that gap for real: a real
+        # store, a real captured+extracted fact with a real embedded vector
+        # (no stubbed search()/retrieve_raw -- the E10 tests above stub both
+        # to isolate the gate, which is exactly the isolation this test must
+        # NOT have), and answer() called exactly as a caller would call it.
+        #
+        # Confirmed by hand before writing this test: reverting the
+        # `abstain_dist = self._abstain_distance()` line in answer() back to
+        # a raw `cfg.get` read reproduces this fixture raising
+        # `TypeError: '>' not supported between instances of 'float' and
+        # 'str'` out of answer() (the comparison `distance > abstain_dist`
+        # with abstain_dist still the string "not-a-number") -- restoring the
+        # coerced call makes it pass again.
+        home = tempfile.mkdtemp()
+        core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
+                                    "retrieval": {"abstain_distance": "not-a-number"}})
+        core.initialize("s1", principal_id="assistant")
+        try:
+            core.capture.append("asserted", {
+                "kind": "fact",
+                "key": {"entity_id": "ent_pat_testley", "entity_name": "Pat Testley",
+                        "predicate_canonical": "works_at", "attribute": "works_at",
+                        "qualifiers_hash": "", "qualifiers": {}},
+                "body": "Acme Fake Co", "confidence": 0.9, "source_event": "src-works_at",
+                "source_type": "user_direct", "domain": "user"},
+                actor="user", trust_level=4, session_id="s1")
+            core.process_pending()
+            facts = core.store.query_beliefs("facts", "attribute='works_at'", (), 5)
+            self.assertTrue(facts, "fixture wrote no fact")
+            # The geometric gate is a no-op without a candidate vector to
+            # compare against -- confirm the fixture actually exercises it,
+            # or a pass here would prove nothing (same trap the E10 "inert
+            # without geometry" test above guards against on purpose).
+            self.assertIsNotNone(core.store.get_memory_vector(facts[0]["belief_id"], "fact"),
+                                 "fixture fact has no stored vector -- the E10 gate's "
+                                 "own guard would make this test vacuous")
+
+            ans = core.retrieval.answer("where does Pat Testley work")
+            self.assertFalse(ans["abstain"], "a garbage abstain_distance must degrade "
+                                             "to feature-off, not to an active threshold")
+            self.assertNotEqual(ans.get("why"), "no sufficiently close memory")
+            self.assertEqual(ans["answer"], "Acme Fake Co")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
     def _derived(self):
         return [f for f in self.core.store.query_beliefs("facts", "1=1", (), 50)
                 if json.loads(f.get("provenance") or "{}").get("source_type") == "inference"]
@@ -853,15 +1103,23 @@ class TestTopicGatedStandingNotes(unittest.TestCase):
                       "raw evidence for the seat turn must still be delivered")
 
     def test_unconditional_delivery_is_untouched(self):
-        """Additive only: the 20 rows the unconditional block carries are still
-        all there, in place, and a note it already delivered is never restated."""
+        """Additive only: the rows the unconditional block carries (capped by
+        context.max_directives, default 5 -- §L8, was an unbounded-in-practice
+        20) are still all there, in place, and a note it already delivered is
+        never restated.
+
+        The unconditional block no longer leads `ctx` -- §L8 puts raw evidence
+        first, so these lines land in the bounded noise tail after it -- but
+        that's an ordering change, not a delivery one: every row the cap lets
+        through must appear exactly once, and the r6 addendum must still reach
+        the one topically-relevant note the cap left out."""
         self._seed_past_cap()
-        first20 = [r["body"] for r in self.core.store.query_beliefs(
-            "notes", "always_inject=1 AND status='active'", (), 20)]
+        max_directives = self.core.cfg.get("context.max_directives", 5)
+        first_n = [r["body"] for r in self.core.store.query_beliefs(
+            "notes", "always_inject=1 AND status='active'", (), max_directives)]
         ctx = self.core.retrieval.get_context("what seat should I book", token_budget=2000)
         lines = ctx.split("\n")
-        self.assertEqual(lines[:20], [f"[DIRECTIVE] {b}" for b in first20])
-        for body in first20 + [self.SEAT]:
+        for body in first_n + [self.SEAT]:
             self.assertEqual(lines.count(f"[DIRECTIVE] {body}"), 1, body)
 
     def test_include_directives_false_still_suppresses_notes(self):
@@ -1052,6 +1310,17 @@ class _BatchSpyEmbedder:
     def embed_batch(self, texts, chunk=64):
         self.batches += 1
         return [self._h.embed(t) for t in texts]
+
+    def embed_query(self, query):
+        self.singles += 1
+        return self._h.embed_query(query)
+
+    def embed_document(self, document):
+        self.singles += 1
+        return self._h.embed_document(document)
+
+    def model_with_prefix_marker(self):
+        return self.model
 
 
 class TestBulkAppendBatchesEmbeddings(unittest.TestCase):

@@ -71,8 +71,15 @@ def check1_digest_gets_memory_vector():
         if not has_vec:
             return _fail("check1", "digest note has no memory_vectors row under kind='note' — "
                                     "the belief-kind embed path is not reaching it")
-        if model != core.embedder.model:
-            return _fail("check1", "vector model %r != live embedder model %r" % (model, core.embedder.model))
+        # Vectors are recorded via model_with_prefix_marker() (e.g.
+        # "nomic-embed-text[prefixed]"), not the bare embedder.model -- same
+        # marker-aware comparison as health.py's _embedder_mismatch_heal, so
+        # this check doesn't false-fail under a real nomic model with task
+        # prefixes enabled.
+        marker_fn = getattr(core.embedder, "model_with_prefix_marker", None)
+        active_model = marker_fn() if callable(marker_fn) else core.embedder.model
+        if model != active_model:
+            return _fail("check1", "vector model %r != live embedder model %r" % (model, active_model))
 
         # Not merely present — actually the SAME text the digest body carries,
         # not a stale/blank embed queued for some other reason.

@@ -37,6 +37,15 @@ def _load_core():
     return ChronicleCore
 
 
+def _load_hostmodel():
+    """engine.hostmodel, dual-mode like every other engine import here."""
+    try:
+        from .engine import hostmodel  # plugin-package context
+    except Exception:
+        from engine import hostmodel  # top-level (dev/tests)
+    return hostmodel
+
+
 def _op_markers():
     """The reducer's own operational-exhaust markers (§issue-7.1): reused rather
     than re-invented, so a tool result that would never be promoted out of an
@@ -166,9 +175,99 @@ class ChronicleMemoryProvider(MemoryProvider):
     # -- capture -----------------------------------------------------------
 
     def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
-        if self.core:  # MUST be non-blocking — one local append, no network
-            self.core.capture.observe(user_content, assistant_content,
-                                      session_id=session_id or self._session_id, messages=messages)
+        if not self.core:
+            return
+        # MUST be non-blocking — one local append, no network. Unchanged, and it
+        # runs FIRST: durable capture never waits on, or is affected by, the
+        # optional piggyback below.
+        event_id = self.core.capture.observe(user_content, assistant_content,
+                                             session_id=session_id or self._session_id,
+                                             messages=messages)
+        if not self._piggyback_enabled():
+            return  # §H1: default OFF — nothing below this line ever runs
+        try:
+            self._host_model_turn(event_id, user_content, assistant_content,
+                                  session_id or self._session_id)
+        except Exception as e:  # a side channel may never break capture (I12/I18)
+            logger.debug("Chronicle host-model piggyback skipped this turn: %s", e)
+
+    # -- host-model piggyback (§H1) ---------------------------------------
+
+    def _piggyback_enabled(self) -> bool:
+        """host_model.piggyback — the single gate on every H1 path.
+
+        False by default and on any error reading config, so a malformed config
+        degrades to today's behavior rather than to an enabled side channel.
+        """
+        try:
+            return bool(self.core.cfg.get("host_model.piggyback", False))
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    def _host_model_turn(self, event_id, user_content, assistant_content, session_id):
+        """One turn of the piggyback loop: resolve, then enqueue.
+
+        Order matters. A fenced JSON block in THIS turn's assistant content is an
+        answer to the request attached on the PREVIOUS turn, so resolution runs
+        before the new request is queued — otherwise a request could be answered
+        by the same turn that created it.
+        """
+        hostmodel = _load_hostmodel()
+        registry = self.core.host_model
+
+        # 1. Resolve whatever was attached last turn. Anything other than a
+        #    valid, in-schema, correctly-addressed reply expires it silently.
+        pending = registry.attached_request()
+        if pending is not None:
+            result = hostmodel.parse_reply(assistant_content, pending,
+                                           registry.reply_char_cap())
+            if result is None:
+                registry.mark_expired(pending["request_id"])
+            else:
+                registry.mark_answered(pending["request_id"])
+                hostmodel.apply_result(self.core, pending, result,
+                                       session_id=session_id, owner=self._principal_id)
+
+        # 2. Offer this turn as new extraction work. Agent-only turns are skipped
+        #    for the same reason the reducer refuses to promote them: memory is
+        #    about the user and their world, not the assistant running itself.
+        if not (event_id and (user_content or "").strip()):
+            return
+        excerpt = "User: %s\nAssistant: %s" % (user_content or "", assistant_content or "")
+        registry.enqueue("extract_facts", {"source_event": event_id, "session_id": session_id,
+                                           "text": excerpt[:1000]})
+
+    def pre_llm_call(self, messages=None, *, query="", session_id="", **kw) -> str:
+        """Attach AT MOST ONE compact enrichment request to the outgoing prompt.
+
+        Returns a string the host appends to its prompt, or "" — which is what a
+        default-configured Chronicle always returns, without reading the store.
+        Hosts that never call this hook are unaffected either way; the piggyback
+        simply never gets a ride.
+
+        At most one, twice over: only one request is rendered per call, and a
+        request already in flight suppresses the next one entirely — so a full
+        32-deep queue still attaches exactly one request per turn, and a reply
+        can never be ambiguous about which request it answers.
+        """
+        if not self.core or not self._piggyback_enabled():
+            return ""
+        try:
+            hostmodel = _load_hostmodel()
+            registry = self.core.host_model
+            if registry.attached_request() is not None:
+                return ""  # one already riding; never two at once
+            request = registry.next_pending()
+            if request is None:
+                return ""
+            rendered = hostmodel.render_request(request, registry.request_char_cap())
+            if not rendered:
+                return ""
+            registry.mark_attached(request["request_id"])
+            return rendered
+        except Exception as e:  # never break the host's turn over enrichment
+            logger.debug("Chronicle host-model request not attached: %s", e)
+            return ""
 
     def on_pre_compress(self, messages) -> str:
         if not self.core:
@@ -309,6 +408,29 @@ class ChronicleMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return self.core.retrieval.static_block(self._principal_id) if self.core else ""
 
+    def list_identity_candidates(self, status="pending", kind="", limit=50) -> list[dict[str, Any]]:
+        """Identity split/merge candidates awaiting adjudication (§E7, issue #8).
+
+        The host-facing surface on the queue: each row says "these mention
+        contexts suggest one entity id is carrying two subjects (split), or two
+        ids are carrying one (merge)", with the cosine that suggested it. It is
+        EVIDENCE — reading it changes nothing, and neither Chronicle nor this
+        method ever merges or splits an entity. Deciding is the caller's job and
+        is out of scope here.
+
+        `status=''` returns every status; results are filtered to entities this
+        principal may read. No core (or an old store) → an empty list, never an
+        error, so a host can call this unconditionally.
+        """
+        if not self.core:
+            return []
+        try:
+            return self.core.identity_candidates(self._principal_id, status=status,
+                                                 kind=kind, limit=limit)
+        except Exception as e:
+            logger.warning("Chronicle: identity candidate listing unavailable (%s)", e)
+            return []
+
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return self.core.tools.schemas() if self.core else []
 
@@ -316,3 +438,19 @@ class ChronicleMemoryProvider(MemoryProvider):
         if not self.core:
             return json.dumps({"error": "Chronicle not initialized"})
         return self.core.tools.dispatch(self._principal_id, tool_name, args)
+
+    def verify_answer(self, answer_text, evidence_refs=None) -> dict:
+        """Answer-support verification (E11): a read-only cosine-similarity
+        check between a host-generated answer and its cited evidence,
+        intended for host-LLM mode to flag likely hallucinations before an
+        answer reaches the user. See RetrievalEngine.verify_answer for the
+        scoring contract ({support, supported}, both None when there is no
+        embedder or no evidence ref resolves to a stored vector).
+
+        {"support": None, "supported": None} when Chronicle isn't
+        initialized -- "can't check" must never look like "checked and
+        failed".
+        """
+        if not self.core:
+            return {"support": None, "supported": None}
+        return self.core.retrieval.verify_answer(answer_text, evidence_refs or [])

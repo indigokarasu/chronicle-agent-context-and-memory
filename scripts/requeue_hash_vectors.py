@@ -96,6 +96,15 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
                 queued += 1
         conn.execute(f"DELETE FROM observed_vectors WHERE model IN ({_MARKS})", _MODELS)
         conn.execute(f"DELETE FROM memory_vectors WHERE model IN ({_MARKS})", _MODELS)
+        # E2 doc2query proxies carry their own model tag and were invisible to
+        # this script, so a hash-embedded store kept scoring hash proxies
+        # against real-model query vectors long after every content vector had
+        # been re-embedded. Dropped, not requeued: the embed-job queue writes
+        # exactly one vector per (target, kind), which cannot express a
+        # variable-length proxy set. The reducer regenerates them on the
+        # parent belief's next write. Same reasoning as
+        # HealthEngine._embedder_mismatch_heal.
+        conn.execute(f"DELETE FROM query_proxy_vectors WHERE model IN ({_MARKS})", _MODELS)
     _report("", rows, queued, len(rows))
     return 0
 
