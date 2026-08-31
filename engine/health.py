@@ -107,7 +107,12 @@ class HealthEngine:
         if embedder is None or not hasattr(embedder, "model"):
             return {"embedder_mismatch": {"mismatched": 0, "requeued": 0}}
 
-        active_model = embedder.model
+        # Vectors are recorded via model_with_prefix_marker() (e.g.
+        # "nomic-embed-text[prefixed]"), not the bare embedder.model. Comparing
+        # against the bare name would mark correctly-tagged vectors as
+        # mismatched forever and requeue them in an infinite loop.
+        marker_fn = getattr(embedder, "model_with_prefix_marker", None)
+        active_model = marker_fn() if callable(marker_fn) else embedder.model
         mismatched = 0
         requeued = 0
 
@@ -144,5 +149,33 @@ class HealthEngine:
             if text and self.store.enqueue_embed_job(belief_id, kind, text) is not None:
                 requeued += 1
                 self._fingerprint("embedder_mismatch", "tier1", "requeue_embed", auto=1)
+
+        # Scan query_proxy_vectors (E2 doc2query) for mismatched model.
+        #
+        # Without this the heal has a permanent blind spot: proxies are stored
+        # with their own `model` tag, but only observed_vectors and
+        # memory_vectors were ever scanned, so after a model change -- or an E1
+        # task-prefix flip, which rewrites the tag to "<model>[prefixed]" --
+        # every proxy stays stale FOREVER. Nothing else notices: proxies are
+        # regenerated only on a rewrite of their parent belief, and retrieval
+        # happily scores the stale vectors against new-model query embeddings,
+        # so doc2query silently degrades to noise while health reports clean.
+        #
+        # Deleted rather than requeued, because a proxy is not requeueable the
+        # way a content vector is: the embed-job queue is keyed (target, kind)
+        # and regenerates ONE vector from stored text, whereas a proxy set is
+        # the variable-length output of doc2query generation over the parent's
+        # key/body. Deleting is the convergent move -- a stale proxy is worse
+        # than no proxy (it scores garbage similarity into the fused ranking),
+        # the parent belief and its own vector are untouched, and the reducer
+        # regenerates the set on that belief's next write. Two heals in a row
+        # therefore report the mismatch once and then zero.
+        stale_proxy_ids = [r[0] for r in self.store._conn().execute(
+            "SELECT DISTINCT belief_id FROM query_proxy_vectors WHERE model != ?",
+            (active_model,)).fetchall()]
+        for belief_id in stale_proxy_ids:
+            mismatched += self.store.count_query_proxy_vectors(belief_id)
+            self.store.delete_query_proxy_vectors(belief_id)
+            self._fingerprint("embedder_mismatch", "tier1", "drop_stale_proxies", auto=1)
 
         return {"embedder_mismatch": {"mismatched": mismatched, "requeued": requeued}}

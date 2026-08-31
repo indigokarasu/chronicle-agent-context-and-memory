@@ -15,7 +15,7 @@ import os
 import urllib.parse
 
 from . import access
-from .embeddings import EmbeddingsUnavailable, pack
+from .embeddings import EmbeddingsUnavailable, cosine, pack, unpack
 from .serialize import belief_id as compute_belief_id
 from .store import KIND_TABLE, now_iso
 
@@ -38,6 +38,12 @@ _FEDERATE_ROW_BUDGET = 200
 # Entities one name collision may propose for review. A name matching hundreds of
 # entities is not evidence of anything; it is noise, and it is capped like noise.
 _FEDERATE_MAX_CANDIDATES = 10
+# Session-summary caps (§E6): per-episode line stays at the pre-E6 single-blob
+# cap so a homogeneous (one-episode) session renders byte-identical to today.
+# The whole-summary cap is raised past that so a genuinely multi-episode
+# session isn't squeezed back down to one episode's worth of text.
+_SESSION_EPISODE_MAX_CHARS = 1000
+_SESSION_SUMMARY_MAX_CHARS = 4000
 
 
 def _backoff_seconds(attempt: int) -> int:
@@ -73,6 +79,53 @@ _DOMAIN = {"user_direct": "user", "session_transcript": "user", "rescue_extracti
 
 def domain_for(source_type: str) -> str:
     return _DOMAIN.get(source_type, "general")
+
+
+# -- topic-shift episode boundaries (§E6, curation.topic_shift_threshold) --
+#
+# Pure functions, kept free of CurationWorker/store so the boundary rule is
+# directly unit-testable against hand-built vectors (no ChronicleCore, no
+# embedder, no DB) the same way E3's _rerank blend is.
+
+def session_episode_boundaries(vectors: list, threshold: float) -> list:
+    """Split one session's ordered per-event embeddings into episodes.
+
+    `vectors` holds one entry per event in session order: a list[float]
+    embedding, or None where an event has no vector yet (deferred embed,
+    forbidden-content redaction, etc.). Returns the 0-based start index of
+    each episode, always beginning with 0 for any non-empty input.
+
+    The comparison is against the nearest PRECEDING event that does have a
+    vector, not strictly i-1 -- a lone missing vector must not silently
+    collapse the run into one episode, and must not itself count as a shift
+    either direction. Consecutive cosine similarity below `threshold` opens a
+    new episode; the threshold is an absolute floor (§27), not a rolling
+    baseline, so a single sharp topic change is caught but does not shift the
+    baseline for what follows it.
+    """
+    if not vectors:
+        return []
+    boundaries = [0]
+    prev = vectors[0]
+    for i in range(1, len(vectors)):
+        v = vectors[i]
+        if v is not None:
+            if prev is not None and cosine(prev, v) < threshold:
+                boundaries.append(i)
+            prev = v
+    return boundaries
+
+
+def group_by_boundaries(items: list, boundaries: list) -> list:
+    """Slice `items` into consecutive runs starting at each index in
+    `boundaries` (ascending, first entry 0). Empty/degenerate boundaries
+    (falsy) yield one run -- the whole list -- matching the pre-E6 single-
+    episode behavior."""
+    if not items:
+        return []
+    bounds = boundaries or [0]
+    return [items[start:(bounds[i + 1] if i + 1 < len(bounds) else len(items))]
+            for i, start in enumerate(bounds)]
 
 
 class CurationWorker:
@@ -328,9 +381,10 @@ class CurationWorker:
         if not target or not kind or not text or emb is None:
             return
         provider = external_id = None
+        model_name = emb.model_with_prefix_marker()
         if kind == "observed":
             existing_model = self.store.get_observed_vector_model(target)
-            if existing_model is not None and existing_model == emb.model:
+            if existing_model is not None and existing_model == model_name:
                 return  # Vector exists and model matches, no-op
         elif kind == "projection":
             # External-DB projection (§g5a): no belief table backs this — identity
@@ -340,11 +394,11 @@ class CurationWorker:
             if not provider or not external_id:
                 return
             existing_model = self.store.get_projection_vector_model(provider, external_id)
-            if existing_model is not None and existing_model == emb.model:
+            if existing_model is not None and existing_model == model_name:
                 return  # Vector exists and model matches, no-op
         else:
             existing_model = self.store.get_memory_vector_model(target, kind)
-            if existing_model is not None and existing_model == emb.model:
+            if existing_model is not None and existing_model == model_name:
                 return  # Vector exists and model matches, no-op
             table = KIND_TABLE.get(kind)
             # Retracted/forgotten between capture and retry: no vector to write back.
@@ -356,19 +410,19 @@ class CurationWorker:
         if recheck is not None:
             recheck()
         try:
-            blob = pack(emb.embed(text))
+            blob = pack(emb.embed_document(text))
         except EmbeddingsUnavailable as e:
             raise JobDeferred(str(e))
         except Exception as e:
             raise JobDeferred(f"embed failed: {e}", max_attempts=_EMBED_MAX_ATTEMPTS)
         if kind == "observed":
             ev = self.store.get_event(target)
-            self.store.add_observed_vector(target, blob, emb.model, (ev or {}).get("owner", "default"))
+            self.store.add_observed_vector(target, blob, model_name, (ev or {}).get("owner", "default"))
         elif kind == "projection":
             owner = payload.get("owner") or "default"
-            self.store.add_projection_vector(provider, external_id, blob, emb.model, owner)
+            self.store.add_projection_vector(provider, external_id, blob, model_name, owner)
         else:
-            self.store.add_memory_vector(target, kind, blob, emb.model)
+            self.store.add_memory_vector(target, kind, blob, model_name)
 
     def _task_digest(self, payload):
         """Entity consolidation digest (§u2): one note per entity, re-rendered in
@@ -481,19 +535,41 @@ class CurationWorker:
         if any(sid.startswith(prefix) for prefix in excluded):
             return
         events = self.store.get_events_by_session(sid)
-        excerpts = []
+        obs = []  # (event_id, excerpt) for every observed event, in session order
         for ev in events:
             if ev["type"] == "observed":
                 p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
-                excerpts.append(p.get("excerpt", ""))
-        if not excerpts:
+                obs.append((ev["event_id"], p.get("excerpt", "")))
+        if not obs:
             return
-        summary = " ".join(excerpts)[:1000]
         owner = events[0]["owner"] if events else "default"
+
+        # §E6: open a new episode wherever consecutive event embeddings show a
+        # topic shift, then emit one summary line per episode instead of one
+        # blob. Falls back to a single episode -- today's behavior, byte-
+        # identical -- whenever fewer than two events have a usable vector
+        # (no embedder, hashing not yet run, everything still queued for
+        # _task_embed): session_episode_boundaries needs at least one
+        # comparable neighbor pair to find anything to split on.
+        threshold = self.cfg.get("curation.topic_shift_threshold", 0.35)
+        vec_rows = self.store.get_observed_vectors_by_ids([eid for eid, _ in obs])
+        vectors = []
+        for eid, _ in obs:
+            row = vec_rows.get(eid)
+            blob = row.get("embedding") if row else None
+            vectors.append(unpack(blob) if blob else None)
+        boundaries = (session_episode_boundaries(vectors, threshold)
+                      if sum(1 for v in vectors if v) >= 2 else [0])
+        lines = []
+        for episode in group_by_boundaries([ex for _, ex in obs], boundaries):
+            line = " ".join(episode)[:_SESSION_EPISODE_MAX_CHARS]
+            if line:
+                lines.append(line)
+        summary = "\n".join(lines)[:_SESSION_SUMMARY_MAX_CHARS]
         vec = b""
         if self.core.embedder is not None:
             try:
-                vec = pack(self.core.embedder.embed(summary))
+                vec = pack(self.core.embedder.embed_document(summary))
             except Exception:
                 vec = b""  # incl. degraded: the summary row still indexes, unvectored
         self.store.add_session_vector(sid, summary, vec, owner, events[0].get("occurred_at", now_iso()))

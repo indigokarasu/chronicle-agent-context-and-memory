@@ -12,12 +12,16 @@ justifications because both are written in that single transaction.
 from __future__ import annotations
 
 import datetime
+import heapq
 import json
 import logging
 import sqlite3
 import threading
 from collections.abc import Sequence
 from contextlib import contextmanager
+from typing import List, Optional  # names this module already annotates with
+
+from .embeddings import batch_cosine_f64
 
 logger = logging.getLogger("chronicle.store")
 
@@ -26,7 +30,37 @@ logger = logging.getLogger("chronicle.store")
 # 3 = task 'digest' (entity consolidation digests, §u2).
 # 4 = task 'federate_sweep' + federation_watermarks/link_candidates (§14, g4).
 # 5 = task 'backfill_sweep' (session-index backfill sweep, issue #6).
-SCHEMA_VERSION = 5
+# 6 = belief_tables + novelty (near-duplicate scoring, issue #8/E5).
+# 7 = belief_tables + occurrence_count (E5 occurrence count for EVERY kind, not
+#     just facts' confirm_count — see _merge_duplicate).
+# 8 = entity_centroids + identity_candidates (identity evidence, issue #8 E7).
+# 9 = host_model_requests + host_model_results (host-model piggyback, §H1).
+#     Both tables stay EMPTY unless host_model.piggyback is turned on.
+# 10 = host_model_proxies + rerank_hints (host-model DRAIN, §H2). The two
+#     consumers H1 deliberately left unbuilt: a doc2query reply's questions are
+#     kept in host_model_proxies so they survive proxy re-generation (and so a
+#     proxy row's host provenance is recorded WITHOUT widening
+#     query_proxy_vectors, whose column set is pinned byte-for-byte by the H1
+#     inertness proof), and a rerank reply becomes bounded, expiring
+#     query->evidence hints in rerank_hints. Both tables stay EMPTY unless
+#     host_model.piggyback is turned on and a host actually answers.
+# 11 = rerank_hints + owner (ladder-9 F4c). rerank_hints was store-global: any
+#     owner's hint re-weighted every OTHER owner's textually-similar query, an
+#     ordering-only but still real cross-owner leak. `owner` records who the
+#     host verdict was FOR (RetrievalEngine._hint_scores now reads it back
+#     scoped to the querying principal's owner). Defaulted to 'default' on
+#     migration so an old, necessarily-empty-at-defaults row (§H2's own
+#     invariant) never needs backfilling.
+#
+# Ladder 9 renumbering: E5, E7 and H1 were each built against a v5 store and
+# each claimed "6" independently. They are sequenced here into ONE ladder --
+# there is only one meta.schema_version, so two features cannot both be 6 and
+# still be distinguishable on an upgrade. Every step below stays probe-then-
+# apply (_has_col / _has_table), so the ladder is order-independent and
+# re-entrant: a store at ANY prior version converges by running all of them,
+# and the version is stamped LAST so an interrupted migration re-runs rather
+# than claiming a shape it never reached.
+SCHEMA_VERSION = 11
 
 # SQLite busy timeouts, milliseconds.
 #
@@ -199,6 +233,68 @@ class MemoryStore:
         if not _has_col(conn, "link_candidates", "provider"):
             logger.info("schema migration: link_candidates + provider")
             conn.execute("ALTER TABLE link_candidates ADD COLUMN provider TEXT")
+        # novelty (schema_version 6, E5): CREATE TABLE IF NOT EXISTS in _SCHEMA added
+        # `novelty REAL` to all 6 BELIEF_TABLES, but that DDL is a no-op on a table
+        # that already exists — an existing store never got the column and crashed
+        # on its first fact write (OperationalError: table facts has no column
+        # named novelty). Same probe-then-ALTER pattern as every migration above.
+        for t in BELIEF_TABLES:
+            if not _has_col(conn, t, "novelty"):
+                logger.info("schema migration: %s + novelty", t)
+                conn.execute(f"ALTER TABLE {t} ADD COLUMN novelty REAL")
+        # occurrence_count (schema_version 7, E5): how many times this item has
+        # been observed. Facts already had confirm_count, so the first E5 pass
+        # counted occurrences for facts ONLY and silently dropped the count on
+        # every other kind — a near-duplicate episode/reference/procedure merged
+        # away with nothing left to say it had been seen twice. One explicit
+        # column on all six belief tables, defaulted to 1 (the row itself is the
+        # first occurrence), so an insert never has to name it and a pre-E5 row
+        # migrates to a truthful value rather than 0/NULL.
+        for t in BELIEF_TABLES:
+            if not _has_col(conn, t, "occurrence_count"):
+                logger.info("schema migration: %s + occurrence_count", t)
+                conn.execute(
+                    f"ALTER TABLE {t} ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1")
+        # schema_version 8 (E7): the identity-evidence pair. Spliced into _SCHEMA
+        # as well, so a fresh install and a migrated one cannot drift — but kept
+        # here too because _migrate has to be sufficient on its OWN connection:
+        # anything that hands this method a conn (a repair path, a test opening a
+        # raw old-version file) must end up with the same shape as a fresh store,
+        # without depending on _SCHEMA having been executed first.
+        if not _has_table(conn, "identity_candidates") or not _has_table(conn, "entity_centroids"):
+            logger.info("schema migration: entity_centroids + identity_candidates (identity evidence)")
+            conn.executescript(_IDENTITY_DDL)
+        # schema_version 9 (§H1). executescript(_SCHEMA) above already ran the
+        # CREATE TABLE IF NOT EXISTS, so this probe is normally a no-op — it is
+        # here so the migration ladder states every version's change explicitly
+        # and so a store whose _SCHEMA run was interrupted still converges.
+        for table, ddl in (("host_model_requests", _HOST_MODEL_REQUESTS_DDL),
+                           ("host_model_results", _HOST_MODEL_RESULTS_DDL)):
+            if not _has_table(conn, table):
+                logger.info("schema migration: %s (host-model piggyback)", table)
+                conn.execute(ddl)
+        # schema_version 10 (§H2) — same probe-then-apply shape, same reason.
+        if not _has_table(conn, "host_model_proxies") or not _has_table(conn, "rerank_hints"):
+            logger.info("schema migration: host_model_proxies + rerank_hints (host-model drain)")
+            conn.executescript(_HOST_DRAIN_DDL)
+        # schema_version 11 (ladder-9 F4c): rerank_hints + owner. Plain
+        # probe-then-ALTER, same as curation_jobs.run_after and
+        # federation_watermarks.rescan_cursor above -- no PK change, so a
+        # store on ANY prior version converges with one ADD COLUMN. Existing
+        # rows default to 'default': §H2's own inertness proof already
+        # guarantees the table is empty unless host_model.piggyback was
+        # turned on, so there is nothing real to backfill correctly, only a
+        # column to add.
+        if not _has_col(conn, "rerank_hints", "owner"):
+            logger.info("schema migration: rerank_hints + owner (owner-scoped rerank hints)")
+            conn.execute("ALTER TABLE rerank_hints ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'")
+        # Unconditional and OUTSIDE the probe above: by this point the owner
+        # column exists either way (added just now, or already there on a
+        # fresh install whose _SCHEMA run created it directly) -- see
+        # _HOST_DRAIN_DDL's comment for why the index itself cannot live in
+        # _SCHEMA.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rerank_hints_owner "
+                     "ON rerank_hints(owner, expires_at)")
         conn.execute("INSERT INTO meta(key,value) VALUES('schema_version',?) "
                      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
 
@@ -426,9 +522,18 @@ class MemoryStore:
         """Drop a single observed event's vector (both the brute-force row and
         its ANN mirror). Used where a raw event stops being retrievable outright
         -- e.g. §20.5 unlearn/forbidden content -- as opposed to
-        prune_observed_vectors's bulk keep-list rebuild."""
+        prune_observed_vectors's bulk keep-list rebuild.
+
+        §H2: the event's doc2query EXCERPT proxies go with it. Those rows are
+        keyed by event_id under kind='observed' and, now that the excerpt tier
+        actually resolves through the raw channel, a surviving proxy would keep
+        scoring a span whose own vector has just been deleted -- i.e. it would
+        resurrect forbidden content by the back door. Unconditional because it
+        is a delete: on a store that never enabled embeddings.doc2query.excerpts
+        there are no such rows and the statement is a no-op."""
         with self.transaction() as conn:
             conn.execute("DELETE FROM observed_vectors WHERE event_id=?", (event_id,))
+            self.delete_excerpt_proxies(event_id)   # re-entrant: same transaction
             if self.vector_index:
                 try:
                     self.vector_index.delete_observed_vector(conn, event_id)
@@ -460,6 +565,15 @@ class MemoryStore:
                                    (belief_id, kind)).fetchone()
         return row["model"] if row else None
 
+    def get_memory_vector(self, belief_id: str, kind: str) -> Optional[bytes]:
+        """Get a single belief's packed embedding blob, or None if it has none
+        (never embedded, or dropped via delete_memory_vector). Used by geometric
+        abstention (E10) to compare the query embedding against the specific
+        candidate that ranked first, rather than a fused score."""
+        row = self._conn().execute("SELECT embedding FROM memory_vectors WHERE belief_id=? AND kind=?",
+                                   (belief_id, kind)).fetchone()
+        return row["embedding"] if row else None
+
     def delete_memory_vector(self, belief_id: str):
         """Drop a belief's embedding once it is no longer searchable. Without
         this, retracted/superseded beliefs leak vectors that bloat the brute-
@@ -468,13 +582,260 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("DELETE FROM memory_vectors WHERE belief_id=?", (belief_id,))
 
+    # -- doc2query proxy vectors (§24.4, E2) -------------------------------
+
+    def add_query_proxy_vector(self, belief_id: str, proxy_idx: int, kind: str, question: str,
+                               embedding: bytes, model: str):
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO query_proxy_vectors"
+                "(belief_id,proxy_idx,kind,question,embedding,model,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (belief_id, proxy_idx, kind, question, embedding, model, now_iso()))
+
+    def delete_query_proxy_vectors(self, belief_id: str):
+        """Drop every proxy vector for one item, mirroring delete_memory_vector's
+        cleanup on retract/supersede/forget so a proxy never outlives the belief
+        it resolves to.
+
+        NOTE this is also the delete half of the reducer's delete-then-write
+        regeneration, so it must NOT touch host_model_proxies: that table is
+        exactly what has to survive a regeneration (§H2). Retract/supersede
+        cleans it up separately, at the call sites that mean "this item is
+        gone" rather than "this item's proxies are being rewritten"."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM query_proxy_vectors WHERE belief_id=?", (belief_id,))
+
+    def iter_query_proxy_vectors(self) -> list[dict]:
+        return [dict(r) for r in self._conn().execute("SELECT * FROM query_proxy_vectors").fetchall()]
+
+    def query_proxy_rows(self, belief_id: str) -> list:
+        """One item's proxy rows, proxy_idx-ordered. The scoped companion to
+        iter_query_proxy_vectors, which reads the whole table — retrieval needs
+        every row, but the §H2 drain only ever needs one parent's."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM query_proxy_vectors WHERE belief_id=? ORDER BY proxy_idx",
+            (belief_id,)).fetchall()]
+
+    def count_query_proxy_vectors(self, belief_id: str) -> int:
+        row = self._conn().execute(
+            "SELECT COUNT(*) AS n FROM query_proxy_vectors WHERE belief_id=?", (belief_id,)).fetchone()
+        return row["n"] if row else 0
+
+    def delete_excerpt_proxies(self, event_id: str):
+        """Drop the doc2query proxies of ONE raw event (§H2/E2 excerpt tier).
+
+        Keyed by event_id under kind='observed', which is why this cannot just
+        be delete_query_proxy_vectors: that one is scoped by belief_id alone,
+        and an event id and a belief id are drawn from different namespaces —
+        deleting by id without the kind guard would be a wider statement than
+        the caller means. Called wherever a raw event stops being retrievable,
+        so an excerpt proxy can never outlive the span it resolves to."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM query_proxy_vectors WHERE belief_id=? AND kind='observed'",
+                         (event_id,))
+
+    # -- host-model drain: doc2query questions (§H2) ------------------------
+
+    def set_host_proxy_questions(self, belief_id: str, questions, request_id: str = ""):
+        """Record the question set a host model returned for one item.
+
+        Replaces the previous set outright (a fresh host answer supersedes an
+        older one), so the stored rows are always exactly the latest reply."""
+        now = now_iso()
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM host_model_proxies WHERE belief_id=?", (belief_id,))
+            for idx, q in enumerate(questions):
+                conn.execute(
+                    "INSERT INTO host_model_proxies"
+                    "(belief_id,proxy_idx,question,source,request_id,created_at) "
+                    "VALUES(?,?,?,'host_model',?,?)", (belief_id, idx, q, request_id or None, now))
+
+    def host_proxy_questions(self, belief_id: str) -> list:
+        """The host-generated questions for one item, in the order returned.
+
+        [] for every item on a default-configured store — nothing writes this
+        table unless host_model.piggyback is on and a host answered."""
+        return [r["question"] for r in self._conn().execute(
+            "SELECT question FROM host_model_proxies WHERE belief_id=? ORDER BY proxy_idx",
+            (belief_id,)).fetchall()]
+
+    def host_proxy_rows(self, belief_id=None) -> list:
+        sql = "SELECT * FROM host_model_proxies"
+        params: tuple = ()
+        if belief_id:
+            sql += " WHERE belief_id=?"
+            params = (belief_id,)
+        return [dict(r) for r in self._conn().execute(
+            sql + " ORDER BY belief_id, proxy_idx", params).fetchall()]
+
+    def delete_host_proxy_questions(self, belief_id: str):
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM host_model_proxies WHERE belief_id=?", (belief_id,))
+
+    # -- host-model drain: rerank hints (§H2) ------------------------------
+
+    def add_rerank_hints(self, query_key: str, query_text: str, tokens, hints,
+                         expires_at: str, max_entries: int = 200, owner: str = "default"):
+        """Persist one host rerank verdict as (belief_id -> weight) hints,
+        scoped to `owner` (schema_version 11, ladder-9 F4c).
+
+        `hints` is an iterable of (belief_id, weight). The whole verdict for a
+        query_key is replaced -- but ONLY this owner's prior verdict for it:
+        two different owners' queries hashing to the same query_key (a very
+        plausible collision -- the signature is just a sorted, stemmed token
+        set) must not let one owner's write delete the other's hints. Then
+        the table is pruned within this owner's own rows: expired rows go
+        first, then oldest-first eviction down to `max_entries` -- a per-owner
+        budget, not a shared one, so one noisy owner can never evict another
+        owner's hints. Both bounds are enforced HERE, in the same transaction
+        as the insert, so the table length is an invariant rather than a hope
+        — the same discipline host_model_requests' queue cap uses."""
+        now = now_iso()
+        token_json = json.dumps(list(tokens), sort_keys=False)
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM rerank_hints WHERE query_key=? AND owner=?",
+                        (query_key, owner))
+            for belief_id, weight in hints:
+                conn.execute(
+                    "INSERT OR REPLACE INTO rerank_hints"
+                    "(query_key,belief_id,weight,tokens,query_text,created_at,expires_at,owner) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (query_key, belief_id, float(weight), token_json, query_text or "", now,
+                     expires_at, owner))
+            conn.execute("DELETE FROM rerank_hints WHERE expires_at<=? AND owner=?", (now, owner))
+            cap = max(1, int(max_entries))
+            over = conn.execute(
+                "SELECT COUNT(*) FROM rerank_hints WHERE owner=?", (owner,)).fetchone()[0] - cap
+            if over > 0:
+                conn.execute(
+                    "DELETE FROM rerank_hints WHERE rowid IN "
+                    "(SELECT rowid FROM rerank_hints WHERE owner=? "
+                    "ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+                    (owner, over))
+
+    def live_rerank_hints(self, now: str = "", limit: int = 400, owner: Optional[str] = None) -> list:
+        """Every unexpired hint row, newest first, hard-capped.
+
+        `owner=None` (the default) returns hints across every owner -- kept
+        for introspection call sites (tests, admin tooling) that want the
+        table's whole live contents. The real query path,
+        RetrievalEngine._hint_scores, always passes the querying principal's
+        owner so a search() from one owner can never be re-weighted by
+        another owner's verdict.
+
+        One statement, and it returns nothing at all on a default store, so the
+        read side costs a single indexed lookup against an empty table."""
+        sql = "SELECT * FROM rerank_hints WHERE expires_at>?"
+        params: list = [now or now_iso()]
+        if owner is not None:
+            sql += " AND owner=?"
+            params.append(owner)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [dict(r) for r in self._conn().execute(sql, tuple(params)).fetchall()]
+
+    def count_rerank_hints(self) -> int:
+        return self._conn().execute("SELECT COUNT(*) FROM rerank_hints").fetchone()[0]
+
     def add_session_vector(self, session_id: str, summary: str, embedding: bytes, owner: str, occurred_at: str):
         with self.transaction() as conn:
             conn.execute("INSERT OR REPLACE INTO session_index(session_id,summary,embedding,owner,occurred_at) "
                          "VALUES(?,?,?,?,?)", (session_id, summary, embedding, owner, occurred_at))
 
+    def nearest_memory_vectors(self, kind: str, query_vec, owner: str, domain: str, k: int = 25,
+                               extra_where: str = "", extra_params: Sequence = (),
+                               batch_size: int = 500) -> list:
+        """Top-k `(belief_id, cosine)` among ACTIVE same-KIND memory vectors,
+        scoped to owner+domain, cosine-descending.
+
+        This is the nearest-neighbour path E5's novelty and near-duplicate
+        checks run on. What it replaces mattered: a `query_beliefs(..., limit=
+        100)` call with NO ORDER BY — i.e. the OLDEST 100 rows by rowid — plus
+        one `SELECT embedding` per row. Past 100 items of a kind the newest ones
+        stopped being candidates entirely, so a fresh duplicate of a recent item
+        scored as fully novel and stored a second copy, and the degradation was
+        invisible. Here the join covers EVERY same-kind vector; it is paged by
+        rowid so memory stays O(batch_size) whatever the corpus size, cosines
+        come from the vectorized `batch_cosine_f64` (one numpy matmul per page,
+        float64 so the stored novelty stays exactly `1 − max cosine`), and
+        only the top-k survives, in a bounded heap.
+
+        `extra_where` is an optional boolean SQL fragment over the belief
+        table's own columns — it is how the caller makes a subject / natural-key
+        restriction STRUCTURAL. A merge candidate that must match a subject is
+        filtered in SQL here, not checked afterwards in Python, so no code path
+        can produce a candidate from a different subject.
+
+        Ordering is fully determined by (cosine, belief_id): no clock, no RNG,
+        so replay stays byte-identical (I3).
+        """
+        table = KIND_TABLE.get(kind)
+        if table not in BELIEF_TABLES or not query_vec:
+            return []
+        k = max(1, int(k))
+        where = "v.kind=? AND b.owner=? AND b.domain=? AND b.status='active'"
+        params = [kind, owner, domain]
+        if extra_where:
+            where += f" AND ({extra_where})"
+            params.extend(extra_params)
+        sql = (f"SELECT v.rowid AS rid, v.belief_id AS bid, v.embedding AS emb "
+               f"FROM memory_vectors v JOIN {table} b ON b.belief_id = v.belief_id "
+               f"WHERE v.rowid > ? AND {where} ORDER BY v.rowid LIMIT ?")
+        conn = self._conn()
+        best: list = []          # min-heap of (cosine, belief_id), size ≤ k
+        min_rowid = 0
+        while True:
+            rows = conn.execute(sql, (min_rowid, *params, batch_size)).fetchall()
+            if not rows:
+                break
+            sims = batch_cosine_f64(query_vec, [r["emb"] for r in rows])
+            for r, sim in zip(rows, sims):
+                if len(best) < k:
+                    heapq.heappush(best, (sim, r["bid"]))
+                elif sim > best[0][0]:
+                    heapq.heapreplace(best, (sim, r["bid"]))
+            min_rowid = rows[-1]["rid"]
+            if len(rows) < batch_size:
+                break
+        return [(bid, sim) for sim, bid in sorted(best, reverse=True)]
+
     def iter_memory_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM memory_vectors").fetchall()]
+
+    def get_memory_vectors_by_ids(self, belief_ids) -> dict[str, dict]:
+        """Stored vectors for specific beliefs, keyed by belief_id.
+
+        TWO consumers, one accessor (E3 and E8 each introduced an identical
+        copy; they are merged here so the later definition cannot shadow the
+        earlier one):
+
+        - E3's reranker needs embeddings for a bounded top-K slice of
+          already-fused candidates, for the query-side cosine.
+        - E8's MMR selection needs pairwise similarity among a small candidate
+          set (typically limit*overfetch, tens of rows).
+
+        Both want random access rather than the full-table scan that
+        iter_memory_vectors()/_vector_beliefs pay. Random access mirrors
+        get_observed_vectors_by_ids. A belief_id with no row is simply absent
+        from the result -- callers treat that as "no vector", not an error.
+        Chunked to stay under SQLITE_MAX_VARIABLE_NUMBER; a belief_id repeated
+        in the input is only looked up once.
+        """
+        out: dict[str, dict] = {}
+        ids = [b for b in dict.fromkeys(belief_ids) if b]
+        if not ids:
+            return out
+        conn = self._conn()
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            ph = ",".join("?" * len(part))
+            for r in conn.execute(
+                    "SELECT belief_id, kind, embedding FROM memory_vectors "
+                    f"WHERE belief_id IN ({ph})", part).fetchall():
+                out[r["belief_id"]] = dict(r)
+        return out
 
     def iter_observed_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM observed_vectors").fetchall()]
@@ -611,6 +972,15 @@ class MemoryStore:
             yield batch
 
     def vector_count(self) -> int:
+        """Content vectors only: memory_vectors + observed_vectors.
+
+        Deliberately EXCLUDES query_proxy_vectors (E2) and projection_vectors.
+        Its consumer is the tier_triggers.vector_count sizing threshold, which
+        is about how much primary memory this store holds; doc2query proxies
+        are a derived multiplier on that (up to 4 per belief) and counting them
+        would trip the threshold at a quarter of the real corpus. Anything that
+        wants the physical row total must add count_rows("query_proxy_vectors")
+        explicitly."""
         return self.count_rows("memory_vectors") + self.count_rows("observed_vectors")
 
     # -- belief CRUD -------------------------------------------------------
@@ -638,6 +1008,12 @@ class MemoryStore:
                          [*fields.values(), belief_id])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
+            self.delete_query_proxy_vectors(belief_id)
+            # §H2: the item is GONE (retracted/superseded/expired), not being
+            # regenerated, so the host's questions for it go too. Left behind
+            # they are a slow leak that a belief_id collision could one day
+            # hand to a different item entirely.
+            self.delete_host_proxy_questions(belief_id)
 
     def update_belief_all_tables(self, belief_id: str, **fields):
         sets = ",".join(f"{k}=?" for k in fields)
@@ -648,6 +1024,12 @@ class MemoryStore:
                                  [*fields.values(), belief_id])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
+            self.delete_query_proxy_vectors(belief_id)
+            # §H2: the item is GONE (retracted/superseded/expired), not being
+            # regenerated, so the host's questions for it go too. Left behind
+            # they are a slow leak that a belief_id collision could one day
+            # hand to a different item entirely.
+            self.delete_host_proxy_questions(belief_id)
 
     def get_belief(self, table: str, belief_id: str) -> dict | None:
         row = self._conn().execute(f"SELECT * FROM {table} WHERE belief_id=?", (belief_id,)).fetchone()
@@ -714,6 +1096,62 @@ class MemoryStore:
     def resolve_contradiction(self, contradiction_id: str):
         with self.transaction() as conn:
             conn.execute("UPDATE contradictions SET status='resolved' WHERE id=?", (contradiction_id,))
+
+    # -- supersede candidates (Ladder 9 E4, §issue-8) -----------------------
+
+    def add_supersede_candidate(self, new_belief_id: str, old_belief_id: str, similarity: float,
+                                new_value: str = "", old_value: str = "", kind: str = "fact",
+                                created_at: str | None = None):
+        """Record a dated, non-destructive "this looks like an update of that"
+        edge. INSERT OR IGNORE on the (new,old) pair so re-deriving the same
+        candidate (e.g. a rebuild replay) never raises or duplicates."""
+        import uuid
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO supersede_candidates"
+                "(id,new_belief_id,old_belief_id,kind,similarity,new_value,old_value,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), new_belief_id, old_belief_id, kind, similarity,
+                 new_value, old_value, created_at or now_iso()))
+
+    def get_supersede_candidates(self, belief_id: str) -> list[dict]:
+        """Direct edges touching `belief_id`, either side, oldest first."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM supersede_candidates WHERE new_belief_id=? OR old_belief_id=? "
+            "ORDER BY created_at", (belief_id, belief_id)).fetchall()]
+
+    def get_supersede_chain(self, belief_id: str, max_nodes: int = 10) -> list[dict]:
+        """The connected component of supersede-candidate edges containing
+        `belief_id`, as dated (value, created_at) points, oldest first -- so a
+        reader can apply "latest wins" just by taking the last entry.
+
+        A small BFS over the edge table rather than a single-hop lookup: a
+        belief can be superseded more than once (A -> B -> C), and each hop is
+        its own edge row. Bounded (`max_nodes`) so a pathological, densely
+        cross-linked store can never make one get_context call unbounded.
+        """
+        seen = {belief_id}
+        frontier = [belief_id]
+        while frontier and len(seen) < max_nodes:
+            nxt = []
+            for bid in frontier:
+                for row in self.get_supersede_candidates(bid):
+                    for other in (row["new_belief_id"], row["old_belief_id"]):
+                        if other not in seen and len(seen) < max_nodes:
+                            seen.add(other)
+                            nxt.append(other)
+            frontier = nxt
+        if len(seen) <= 1:
+            return []
+        points = []
+        for bid in seen:
+            row = self.get_belief("facts", bid)
+            if not row:
+                continue
+            points.append({"belief_id": bid, "value": row.get("value", ""),
+                           "created_at": row.get("valid_from") or row.get("created_at") or ""})
+        points.sort(key=lambda p: p["created_at"] or "")
+        return points
 
     # -- corrections -------------------------------------------------------
 
@@ -1142,6 +1580,129 @@ class MemoryStore:
             conn.execute("UPDATE link_candidates SET reviewed=1, decision=?, reviewed_at=? "
                          "WHERE id=?", (decision, now_iso(), candidate_id))
 
+    # -- identity evidence (§E7): centroids + adjudication queue -----------
+
+    def get_entity_centroid(self, entity_id: str) -> Optional[dict]:
+        """The running (sum, n, dims, model) state for one entity, or None."""
+        row = self._conn().execute(
+            "SELECT * FROM entity_centroids WHERE entity_id=?", (entity_id,)).fetchone()
+        return dict(row) if row else None
+
+    def put_entity_centroid(self, entity_id: str, sum_vec: bytes, n: int, dims: int,
+                            model: str, now: str):
+        """Persist the folded state. The CALLER does the O(dims) add — the store
+        only stores — so nothing here ever re-reads an entity's mentions."""
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO entity_centroids(entity_id, sum_vec, n, dims, model, updated_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(entity_id) DO UPDATE SET "
+                "sum_vec=excluded.sum_vec, n=excluded.n, dims=excluded.dims, "
+                "model=excluded.model, updated_at=excluded.updated_at",
+                (entity_id, sum_vec, int(n), int(dims), model, now or now_iso()))
+
+    def recent_entity_centroids(self, exclude_id: str = "", model: str = "", dims: int = 0,
+                                limit: int = 50) -> List[dict]:
+        """The `limit` most recently updated centroids in the SAME geometry.
+
+        This is the bound on E7's pairwise merge check: the entity just written is
+        compared against this capped, recently-touched working set instead of
+        every entity in the store, so a write costs O(limit·dims) and never O(N²).
+        Ordering is (updated_at DESC, entity_id DESC) — total and deterministic,
+        so a projection replay sees the identical candidate set."""
+        return [dict(r) for r in self._conn().execute(
+            "SELECT * FROM entity_centroids WHERE entity_id<>? AND model=? AND dims=? AND n>0 "
+            "ORDER BY updated_at DESC, entity_id DESC LIMIT ?",
+            (exclude_id, model, int(dims), int(limit))).fetchall()]
+
+    def enqueue_identity_candidate(self, kind: str, entity_id: str, other_id: str,
+                                   mention_ref: str, similarity: float,
+                                   now: str = "") -> Optional[str]:
+        """Queue a POSSIBLE split/merge for adjudication. NEVER applies anything.
+
+        Idempotent on (kind, entity_id, other_id, mention_ref): re-processing the
+        same mention, or meeting the same entity pair again, keeps the original
+        row — decision included — instead of duplicating a pending question.
+        Returns the new candidate id, or None when it was already queued."""
+        import uuid
+        cand_id = str(uuid.uuid4())
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO identity_candidates"
+                "(id, kind, entity_id, other_id, mention_ref, similarity, status, created_at) "
+                "VALUES(?,?,?,?,?,?,'pending',?)",
+                (cand_id, kind, entity_id, other_id or "", mention_ref or "",
+                 float(similarity), now or now_iso()))
+            inserted = cur.rowcount
+        return cand_id if inserted else None
+
+    def get_identity_candidates(self, status: str = "pending", kind: str = "",
+                                limit: int = 100) -> List[dict]:
+        """The adjudication queue. `status=''`/None returns every status."""
+        where, params = [], []
+        if status:
+            where.append("status=?")
+            params.append(status)
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        clause = " AND ".join(where) if where else "1=1"
+        params.append(int(limit))
+        return [dict(r) for r in self._conn().execute(
+            f"SELECT * FROM identity_candidates WHERE {clause} ORDER BY created_at, id LIMIT ?",
+            tuple(params)).fetchall()]
+
+    def get_identity_candidate(self, candidate_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT * FROM identity_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return dict(row) if row else None
+
+    def resolve_identity_candidate(self, candidate_id: str, status: str):
+        """Record an adjudication OUTCOME on a queue row. Data only -- a direct
+        projection write, addressed by row id.
+
+        Nothing in this codebase reads this status and then merges or splits an
+        entity: performing the decision is deliberately out of scope (issue #8
+        E7). This exists so a reviewer can take a question off the queue.
+
+        DOES NOT SURVIVE a projection rebuild (ladder-9 F4d): identity_candidates
+        is projection state truncated and re-derived by truncate_projection +
+        replay, and a row's id is a fresh uuid4 minted only on first creation --
+        re-derivation from the same mention events after a truncate mints a
+        NEW id for the same logical candidate. Calling this method durably
+        records nothing an event log can replay. Use
+        resolve_identity_candidate_by_key (via capture.append("adjudicated",
+        ...) -- see reducer._on_adjudicated) for an outcome that must survive
+        a rebuild."""
+        with self.transaction() as conn:
+            conn.execute("UPDATE identity_candidates SET status=?, resolved_at=? WHERE id=?",
+                         (status, now_iso(), candidate_id))
+
+    def resolve_identity_candidate_by_key(self, kind: str, entity_id: str, other_id: str,
+                                          mention_ref: str, status: str,
+                                          resolved_at: str = "") -> None:
+        """Record an adjudication outcome addressed by the candidate's DEDUPE
+        KEY (kind, entity_id, other_id, mention_ref) -- the same tuple
+        enqueue_identity_candidate's UNIQUE index is keyed on -- rather than
+        its row id (ladder-9 F4d).
+
+        This is what makes an adjudication REPLAY-SAFE: reducer._on_adjudicated
+        calls this from the 'adjudicated' event, and because the dedupe key
+        (unlike the row's uuid4 id) is the same before and after a
+        truncate_projection + full replay, the same UPDATE lands on whichever
+        row identity.py's mention-driven enqueue just re-derived -- even
+        though that row's id is brand new.
+
+        A no-op, not an error, when the candidate does not exist yet -- e.g. a
+        replay ordering where this fires before defensive-programming allows
+        for (matches the "if found" shape _on_grant/_on_revoke already use for
+        an event whose target may not resolve)."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE identity_candidates SET status=?, resolved_at=? "
+                "WHERE kind=? AND entity_id=? AND other_id=? AND mention_ref=?",
+                (status, resolved_at or now_iso(), kind, entity_id, other_id or "",
+                 mention_ref or ""))
+
     # -- user knowledge (§19) ---------------------------------------------
 
     def upsert_user_knowledge(self, uk: dict):
@@ -1260,9 +1821,34 @@ class MemoryStore:
     def truncate_projection(self):
         """Drop everything derived (I3); the event log + extractions are kept."""
         with self.transaction() as conn:
+            # query_proxy_vectors (E2) is derived exactly like the other three
+            # vector tables here -- the reducer regenerates it on replay -- so
+            # leaving it out would let doc2query proxies for beliefs that no
+            # longer exist survive a projection rebuild and keep resolving to
+            # ids the rebuild may never reissue.
+            #
+            # entity_centroids/identity_candidates are PROJECTION state (§E7):
+            # both are folded from the log on the write path, so a rebuild that
+            # kept them would double-count every mention into the running sums
+            # and break byte-identical replay (I3). link_candidates is NOT here
+            # for the opposite reason — it is fed by the federation sweep from
+            # databases outside the log, so replaying the log cannot recreate it.
+            #
+            # rerank_hints (§H2) joins the list for the query_proxy_vectors
+            # reason, not the entity_centroids one: a hint is a (query ->
+            # belief_id) pointer, and a rebuild may never reissue those belief
+            # ids, so a surviving hint would boost an id that no longer names
+            # anything (or, worse, a DIFFERENT belief that happened to hash the
+            # same way). Hints are cheap, bounded and expiring; stale pointers
+            # into a rebuilt projection are not. host_model_proxies is NOT here
+            # — it holds a host's reply verbatim, which the log cannot
+            # regenerate, and the reducer re-applies it on the next write.
             for t in (BELIEF_TABLES + ["entities", "user_knowledge", "justifications",
-                                       "corrections", "nogoods", "contradictions",
-                                       "observed_vectors", "session_index", "memory_vectors", "projection_vectors"]):
+                                       "corrections", "nogoods", "contradictions", "supersede_candidates",
+                                       "entity_centroids", "identity_candidates",
+                                       "observed_vectors", "session_index", "memory_vectors",
+                                       "projection_vectors", "query_proxy_vectors",
+                                       "rerank_hints"]):
                 conn.execute(f"DELETE FROM {t}")
             conn.execute("DELETE FROM observed_fts")
             conn.execute("DELETE FROM belief_fts")
@@ -1282,6 +1868,19 @@ def _as_json(v) -> str:
 def _has_col(conn, table: str, col: str) -> bool:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(r["name"] == col for r in rows)
+
+
+def _has_table(conn, table: str) -> bool:
+    """Companion probe to _has_col, for migrations that add whole TABLES.
+
+    PRAGMA table_info on a missing table returns an empty set rather than
+    raising, so this is the same cheap catalog read _has_col does.
+
+    E7 and H1 each introduced an identical copy of this helper; merged to one
+    definition so the later cannot shadow the earlier (ruff F811)."""
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                       (table,)).fetchone()
+    return row is not None
 
 
 def _belief_fts_text(table: str, b: dict) -> tuple[str, str]:
@@ -1340,6 +1939,129 @@ _JOBS_INDEX_DDL = "\n".join(_JOBS_INDEX_DDLS)
 _JOB_COLS = ("id,task,payload,depends_on,status,attempts,created_at,started_at,finished_at,"
              "error,run_after")
 
+# Identity evidence (§E7, issue #8). Spliced into _SCHEMA below AND executed by
+# _migrate, from this ONE definition, so a fresh install and an upgraded store
+# can never disagree about the shape.
+#
+# entity_centroids is INCREMENTAL state, not a cache of a derivable value: it
+# holds the running SUM of an entity's mention-context vectors plus the count, so
+# a write folds a mention in with one O(dims) add instead of re-reading every
+# mention. `model`/`dims` are part of the state because a sum accumulated under
+# one embedding model is incomparable geometry under another (§24.4) — the row is
+# reset, never mixed.
+#
+# identity_candidates is a review QUEUE and nothing else. A row here has never
+# changed an entity: nothing in this codebase merges or splits an entity from a
+# similarity, exactly as nothing links an external row from a name collision
+# (§14.2, I20). Identity is adjudicated, never inferred.
+#   kind='split'  -> (entity_id, mention_ref): this mention looks like a
+#                    different subject than the entity's other mentions.
+#   kind='merge'  -> (entity_id, other_id) held in sorted order so (A,B) and
+#                    (B,A) are ONE row: these two entities look like one subject.
+# The UNIQUE index is the dedupe: re-processing the same mention, or meeting the
+# same pair again on a later write, is a no-op that KEEPS the original row —
+# including any decision already recorded on it — instead of piling up duplicates
+# or resurrecting an answered question (same contract as link_candidates).
+_IDENTITY_DDL = """
+CREATE TABLE IF NOT EXISTS entity_centroids (
+    entity_id TEXT PRIMARY KEY, sum_vec BLOB, n INTEGER NOT NULL DEFAULT 0,
+    dims INTEGER NOT NULL DEFAULT 0, model TEXT, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_entity_centroids_recent
+    ON entity_centroids(updated_at DESC, entity_id DESC);
+
+CREATE TABLE IF NOT EXISTS identity_candidates (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('split','merge')),
+    entity_id TEXT NOT NULL, other_id TEXT NOT NULL DEFAULT '',
+    mention_ref TEXT NOT NULL DEFAULT '', similarity REAL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','merged','split','rejected')),
+    created_at TEXT, resolved_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_candidates_dedupe
+    ON identity_candidates(kind, entity_id, other_id, mention_ref);
+CREATE INDEX IF NOT EXISTS idx_identity_candidates_status
+    ON identity_candidates(status, created_at, id);
+"""
+
+# Host-model piggyback (§H1). Spliced into _SCHEMA below AND probed by _migrate,
+# so a fresh install and an upgraded store get the identical table.
+#
+# host_model_requests is the bounded queue: one row per unit of enrichment work
+# Chronicle would like a host model to answer. `status` is exactly the spec's
+# three-state lifecycle; `attached_at` is bookkeeping for "this one is riding on
+# a turn right now", which is what keeps the hook to ONE in-flight request.
+#
+# host_model_results is the holding table for validated doc2query / rerank
+# answers. H1 was built standalone, where E2/E3 did not exist; both are now in
+# this tree, but H1 is plumbing-only by spec, so the results are still PARKED
+# rather than consumed -- wiring E2's doc2query_callback and E3's reranker to
+# drain this table is follow-up work, not part of H1. See
+# engine/hostmodel.py HostModelRegistry.record_result for the hook.
+#
+# BOTH tables are empty on a default config — nothing writes to them unless
+# host_model.piggyback is explicitly enabled.
+_HOST_MODEL_REQUESTS_DDL = """CREATE TABLE IF NOT EXISTS host_model_requests (
+    request_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('extract_facts','doc2query','rerank')),
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','answered','expired')),
+    attached_at TEXT, resolved_at TEXT);"""
+_HOST_MODEL_RESULTS_DDL = """CREATE TABLE IF NOT EXISTS host_model_results (
+    request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT);"""
+
+# Host-model DRAIN (§H2). The two consumers H1 parked. Both tables are EMPTY on a
+# default config: nothing writes to either unless host_model.piggyback is on AND a
+# host actually returned a valid reply.
+#
+# host_model_proxies — the question set a host returned for one item, kept
+# separately from the query_proxy_vectors rows it produces. Two jobs, one table:
+#   1. DURABILITY. _write_doc2query_proxies is delete-then-write (integration fix
+#      D), so a later re-assertion of the same belief would wipe host questions
+#      and regenerate templates only. Keeping the host set here lets every future
+#      regeneration re-apply the merge rule instead of silently reverting.
+#   2. PROVENANCE. §H2 wants host-sourced proxies marked `source: host_model`.
+#      That mark CANNOT be a new column on query_proxy_vectors: the H1 inertness
+#      proof diffs a full row dump against the pre-H1 tree, that table is
+#      non-empty at defaults, and one extra column changes every one of its rows.
+#      A side table that is empty at defaults carries the mark instead, and is
+#      excluded from the dump exactly the way H1's own two tables are.
+#
+# rerank_hints — a host rerank verdict, persisted as query->evidence relevance
+# hints. A rerank reply arrives a turn LATE and so cannot reorder its own query
+# (§H2); what it can do is inform the NEXT similar query. `query_key` is the
+# hashed signature of the query's distinctive tokens (exact repeat match) and
+# `tokens` is that same token list kept verbatim so a near-miss can still be
+# scored by Jaccard overlap. `weight` is reciprocal-rank in the host's order,
+# `expires_at` is the hard TTL, and the row count is capped
+# (host_model.rerank_hints.max_entries) with oldest-first eviction — the same
+# bounded-queue discipline host_model_requests uses. `owner` (schema_version
+# 11, ladder-9 F4c) scopes both the write-time replace/cap and the read-time
+# lookup so one owner's verdict can never re-weight, or evict, another
+# owner's hints for a textually similar query.
+_HOST_DRAIN_DDL = """
+CREATE TABLE IF NOT EXISTS host_model_proxies (
+    belief_id TEXT NOT NULL, proxy_idx INTEGER NOT NULL, question TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'host_model', request_id TEXT, created_at TEXT NOT NULL,
+    PRIMARY KEY(belief_id, proxy_idx));
+
+CREATE TABLE IF NOT EXISTS rerank_hints (
+    query_key TEXT NOT NULL, belief_id TEXT NOT NULL, weight REAL NOT NULL,
+    tokens TEXT NOT NULL DEFAULT '[]', query_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+    owner TEXT NOT NULL DEFAULT 'default',
+    PRIMARY KEY(query_key, belief_id));
+CREATE INDEX IF NOT EXISTS idx_rerank_hints_expiry ON rerank_hints(expires_at, created_at);
+"""
+# idx_rerank_hints_owner is deliberately NOT here: _SCHEMA (this DDL included)
+# runs unconditionally on every _init_db, BEFORE _migrate. A real store
+# sitting at exactly schema_version 10 has a rerank_hints table but no owner
+# column yet, and CREATE INDEX IF NOT EXISTS still validates the columns it
+# references even when the index itself is new -- "no such column: owner"
+# out of the FIRST executescript, before the migration that would have added
+# it ever runs. The index is created in _migrate, in the same probe-then-
+# ALTER step that adds the column, where it is safe by construction.
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, order_key TEXT,
@@ -1392,7 +2114,7 @@ CREATE TABLE IF NOT EXISTS facts (
     valid_from TEXT, valid_until TEXT, superseded_by TEXT, created_at TEXT, last_seen_at TEXT,
     fidelity TEXT DEFAULT 'verbatim', utility REAL DEFAULT 0, purpose_scope TEXT NOT NULL DEFAULT '["*"]',
     consent TEXT, provenance TEXT NOT NULL, verification TEXT DEFAULT '{"status":"unverified"}',
-    rule_id TEXT, premises TEXT);
+    novelty REAL, occurrence_count INTEGER NOT NULL DEFAULT 1, rule_id TEXT, premises TEXT);
 CREATE INDEX IF NOT EXISTS idx_facts_active ON facts(entity_id, predicate_canonical) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_facts_owner ON facts(owner, domain);
 CREATE INDEX IF NOT EXISTS idx_facts_crit ON facts(criticality) WHERE criticality!='normal';
@@ -1405,6 +2127,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     criticality TEXT DEFAULT 'normal', criticality_reason TEXT, confidence REAL, trust_level INTEGER,
     valid_from TEXT, valid_until TEXT, superseded_by TEXT, created_at TEXT, last_seen_at TEXT,
     fidelity TEXT, utility REAL DEFAULT 0, purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT,
+    novelty REAL, occurrence_count INTEGER NOT NULL DEFAULT 1,
     verification TEXT DEFAULT '{"status":"unverified"}');
 CREATE INDEX IF NOT EXISTS idx_episodes_time ON episodes(occurred_at);
 
@@ -1416,6 +2139,7 @@ CREATE TABLE IF NOT EXISTS notes (
     criticality TEXT DEFAULT 'normal', criticality_reason TEXT, confidence REAL, trust_level INTEGER,
     valid_from TEXT, valid_until TEXT, superseded_by TEXT, created_at TEXT, last_seen_at TEXT,
     fidelity TEXT, utility REAL DEFAULT 0, purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT,
+    novelty REAL, occurrence_count INTEGER NOT NULL DEFAULT 1,
     verification TEXT DEFAULT '{"status":"unverified"}');
 CREATE INDEX IF NOT EXISTS idx_notes_directive ON notes(always_inject) WHERE always_inject=1;
 
@@ -1425,7 +2149,8 @@ CREATE TABLE IF NOT EXISTS refs (
     domain TEXT, owner TEXT, read_acl TEXT, info_label TEXT, status TEXT, salience TEXT DEFAULT 'normal',
     criticality TEXT DEFAULT 'normal', confidence REAL, trust_level INTEGER, valid_from TEXT, valid_until TEXT,
     superseded_by TEXT, created_at TEXT, last_seen_at TEXT, fidelity TEXT DEFAULT 'verbatim',
-    utility REAL DEFAULT 0, purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT);
+    utility REAL DEFAULT 0, purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT, novelty REAL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1);
 CREATE INDEX IF NOT EXISTS idx_refs_stale ON refs(stale_after);
 
 CREATE TABLE IF NOT EXISTS relationships (
@@ -1434,7 +2159,7 @@ CREATE TABLE IF NOT EXISTS relationships (
     criticality TEXT DEFAULT 'normal', confidence REAL, trust_level INTEGER, valid_from TEXT, valid_until TEXT,
     superseded_by TEXT, created_at TEXT, last_seen_at TEXT, fidelity TEXT DEFAULT 'verbatim',
     utility REAL DEFAULT 0, purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT,
-    rule_id TEXT, premises TEXT);
+    novelty REAL, occurrence_count INTEGER NOT NULL DEFAULT 1, rule_id TEXT, premises TEXT);
 CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_id) WHERE status='active';
 CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_id) WHERE status='active';
 
@@ -1444,7 +2169,8 @@ CREATE TABLE IF NOT EXISTS procedures (
     status TEXT, salience TEXT DEFAULT 'normal', criticality TEXT DEFAULT 'normal',
     confidence REAL, trust_level INTEGER, valid_from TEXT, valid_until TEXT, superseded_by TEXT,
     created_at TEXT, last_seen_at TEXT, fidelity TEXT DEFAULT 'verbatim', utility REAL DEFAULT 0,
-    purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT);
+    purpose_scope TEXT DEFAULT '["*"]', consent TEXT, provenance TEXT, novelty REAL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1);
 
 CREATE TABLE IF NOT EXISTS predicates (
     surface TEXT PRIMARY KEY, canonical TEXT NOT NULL,
@@ -1472,6 +2198,22 @@ CREATE TABLE IF NOT EXISTS contradictions (
     id TEXT PRIMARY KEY, belief_a TEXT, belief_b TEXT, detail TEXT,
     status TEXT DEFAULT 'open', created_at TEXT);
 
+-- Ladder 9 E4 (update detection, §issue-8 E4): a NEVER-destructive, dated edge
+-- recording that `new_belief_id` LOOKS like an update of `old_belief_id` --
+-- same subject (or, absent one, the single closest match store-wide),
+-- similarity above curation.supersede_similarity, but a different normalized
+-- value. Nothing here changes belief status or deletes anything; it is a
+-- candidate for a reader (or downstream adjudication) to reason about, e.g.
+-- "latest wins". old_value/new_value are copied in at write time so the
+-- chain renders without a join back through the (possibly since-changed)
+-- belief tables.
+CREATE TABLE IF NOT EXISTS supersede_candidates (
+    id TEXT PRIMARY KEY, new_belief_id TEXT NOT NULL, old_belief_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'fact', similarity REAL, new_value TEXT, old_value TEXT,
+    created_at TEXT, UNIQUE(new_belief_id, old_belief_id));
+CREATE INDEX IF NOT EXISTS idx_supersede_new ON supersede_candidates(new_belief_id);
+CREATE INDEX IF NOT EXISTS idx_supersede_old ON supersede_candidates(old_belief_id);
+
 CREATE TABLE IF NOT EXISTS derivation_rules (
     rule_id TEXT PRIMARY KEY, name TEXT, enabled INTEGER DEFAULT 1, pattern TEXT NOT NULL,
     guards TEXT NOT NULL, conclusion TEXT NOT NULL, scope TEXT NOT NULL,
@@ -1493,6 +2235,17 @@ CREATE TABLE IF NOT EXISTS session_index (
     session_id TEXT PRIMARY KEY, summary TEXT, embedding BLOB, owner TEXT, occurred_at TEXT);
 CREATE TABLE IF NOT EXISTS memory_vectors (
     belief_id TEXT, kind TEXT, embedding BLOB, model TEXT, created_at TEXT, PRIMARY KEY(belief_id, kind));
+
+-- E2 doc2query: question-prediction proxy vectors, linked back to the PARENT
+-- item (belief_id for beliefs, event_id for the off-by-default excerpt path)
+-- by belief_id + a 0-based proxy_idx (<= doc2query.MAX_PROXIES rows/item).
+-- `kind` mirrors the parent's own belief kind ("fact","note",... or
+-- "observed") so retrieval can resolve a proxy hit straight back to the
+-- parent's own table/content -- the `question` text is stored for
+-- inspectability only and is NEVER surfaced as answer content (§E2).
+CREATE TABLE IF NOT EXISTS query_proxy_vectors (
+    belief_id TEXT, proxy_idx INTEGER, kind TEXT, question TEXT,
+    embedding BLOB, model TEXT, created_at TEXT, PRIMARY KEY(belief_id, proxy_idx));
 
 CREATE TABLE IF NOT EXISTS projection_vectors (
     provider TEXT NOT NULL, external_id TEXT NOT NULL, embedding BLOB, model TEXT,
@@ -1568,4 +2321,7 @@ CREATE TABLE IF NOT EXISTS link_candidates (
     created_at TEXT, reviewed_at TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_link_candidates_pair
     ON link_candidates(entity_id, external_ref);
-"""
+""" + _IDENTITY_DDL + "\n" + _HOST_MODEL_REQUESTS_DDL + "\n" + _HOST_MODEL_RESULTS_DDL + """
+CREATE INDEX IF NOT EXISTS idx_host_model_pending
+    ON host_model_requests(created_at) WHERE status='pending';
+""" + _HOST_DRAIN_DDL

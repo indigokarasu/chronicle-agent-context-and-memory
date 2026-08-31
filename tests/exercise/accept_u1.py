@@ -154,11 +154,14 @@ def check2_audit_script():
     output = result.stdout.decode("utf-8", "replace")
 
     known_count = output.count("[known]")
-    if known_count < 4:
+    if known_count < 3:
         print(f"Output:\n{output}")
-        return _fail("check2", f"expected >=4 known-dormant, got {known_count}")
+        return _fail("check2", f"expected >=3 known-dormant, got {known_count}")
 
-    expected_keys = ["hyde", "expand_synonyms", "decompose", "reranker_version"]
+    # F4a removed retrieval.reranker_version from DEFAULTS entirely (no engine
+    # code ever read it), so it no longer appears in the audit at all -- the
+    # audit only reports DEFAULTS leaf keys, and a removed key isn't one.
+    expected_keys = ["hyde", "expand_synonyms", "decompose"]
     found = [k for k in expected_keys if k in output]
     if len(found) < len(expected_keys):
         missing = [k for k in expected_keys if k not in output]

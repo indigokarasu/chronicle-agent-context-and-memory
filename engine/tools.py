@@ -62,6 +62,11 @@ class Tools:
                                        "external row, 'reject' dismisses it.",
               {"candidate_id": text, "decision": {"type": "string", "enum": ["link", "reject"]}},
               ["candidate_id", "decision"]),
+            s("list_identity_candidates", "List possible entity splits/merges waiting for an "
+                                          "identity decision. Evidence only — nothing here has "
+                                          "changed an entity.",
+              {"status": text, "kind": {"type": "string", "enum": ["split", "merge"]},
+               "limit": {"type": "integer"}}),
             s("embedding_status", "Report the active embedder: real local model (with a live test "
                                   "embed) vs offline hashing fallback.", {}),
             s("plan_context", "Bundle facts + procedures + reflections for a goal.", {"goal": text}, ["goal"]),
@@ -238,8 +243,12 @@ class Tools:
         return {"history": self.core.retrieval.history(a["belief_id"])}
 
     def _t_get_context(self, principal, a):
-        return {"context": self.core.retrieval.get_context(a["hint"], principal=principal,
-                                                           epistemic=self.core.epistemic)}
+        # E12: the packing decision travels with the context it produced (route
+        # + precision flag), so a caller/eval can attribute an answer to the
+        # budget it was actually given rather than the one it asked for.
+        ctx = self.core.retrieval.get_context(a["hint"], principal=principal,
+                                              epistemic=self.core.epistemic)
+        return {"context": ctx, "debug": dict(self.core.retrieval.last_context_debug)}
 
     def _t_explain(self, principal, a):
         return self.core.derivation.explain(a["belief_id"])
@@ -263,6 +272,17 @@ class Tools:
                         "external_ref": c["external_ref"], "reason": c.get("candidate_reason"),
                         "score": c.get("score"), "created_at": c.get("created_at")})
         return {"link_candidates": out}
+
+    def _t_list_identity_candidates(self, principal, a):
+        """The identity adjudication queue (§E7), filtered to entities this
+        principal may read (§15).
+
+        Read-only by construction: there is no companion `_t_apply_*`. A split or
+        merge candidate is a QUESTION about identity, and this codebase answers
+        none of them automatically."""
+        return {"identity_candidates": self.core.identity_candidates(
+            principal, status=a.get("status", "pending"), kind=a.get("kind") or "",
+            limit=int(a.get("limit") or 50))}
 
     def _t_review_link_candidate(self, principal, a):
         """Adjudicate one candidate — the only way an external row becomes a link.
