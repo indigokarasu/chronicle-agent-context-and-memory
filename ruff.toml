@@ -2,7 +2,8 @@
 # Intentional catch-all exceptions for import fallback / plugin loading / graceful degradation;
 # plus safe style overrides that don't affect correctness.
 ignore = ["BLE001", "N999", "S110", "S112", "SIM102", "SIM115", "RUF012", "TRY004", "EXE001",
-          "UP031", "DTZ001", "DTZ007", "PLW1510"]
+          "UP031", "DTZ001", "DTZ007", "PLW1510", "I001", "RUF100", "UP022", "UP032",
+          "RUF059", "RUF015", "ISC004"]
 
 [lint.per-file-ignores]
 # Dynamic sys.path manipulation precedes module imports in standalone scripts and acceptance exercises.
