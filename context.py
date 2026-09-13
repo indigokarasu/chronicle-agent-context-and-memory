@@ -1219,7 +1219,7 @@ class ChronicleContextEngine(ContextEngine):
         else:
             reason = "init failed: %s" % (self._last_error or "unknown")
         due = self._retry_due_in()
-        return {
+        res = {
             "engine": self.name,
             "mode": "memory_aware" if live else "heuristic_fallback",
             "reason": reason,
@@ -1231,6 +1231,9 @@ class ChronicleContextEngine(ContextEngine):
             "retry_budget_spent": (not live and self._init_started and due is None),
             "attempts_this_hour": len(self._attempt_times),
         }
+        if live and self.core:
+            res["diagnostics"] = self.core.diagnostics()
+        return res
 
     def log_context_status(self):
         """Emit the status as one operator-readable line.
