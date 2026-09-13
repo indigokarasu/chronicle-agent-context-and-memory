@@ -803,6 +803,21 @@ class MemoryStore:
     def iter_memory_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM memory_vectors").fetchall()]
 
+    def iter_memory_vectors_paged(self, batch_size: int = 1000):
+        """Yield batches of memory_vectors, paged by rowid (streaming, O(batch) memory)."""
+        conn = self._conn()
+        min_rowid = 0
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, * FROM memory_vectors WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (min_rowid, batch_size)).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
+
     def get_memory_vectors_by_ids(self, belief_ids) -> dict[str, dict]:
         """Stored vectors for specific beliefs, keyed by belief_id.
 
