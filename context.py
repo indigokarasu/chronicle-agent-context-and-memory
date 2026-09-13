@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from contextlib import nullcontext
@@ -27,6 +28,12 @@ except Exception:  # … else a local stand-in (plugin-package or top-level)
     except Exception:  # pragma: no cover
         from _base import ContextEngine
 
+def _estimate_tokens_fast(text: str | None) -> int:
+    """Token count estimate with chars/3 ceiling."""
+    if not text:
+        return 0
+    return -(-len(text) // 3)
+
 try:  # real per-span token accounting (§27 embeddings.max_input_tokens) …
     from .engine.embeddings import estimate_tokens  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -36,7 +43,7 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
         def estimate_tokens(text):
             """Fallback if engine.embeddings is unavailable: chars/3 ceiling,
             matching estimate_tokens's own conservative ratio (§27 embeddings)."""
-            return -(-len(text or "") // 3)
+            return _estimate_tokens_fast(text)
 
 try:  # content-addressed span ids for FOLD-tier tombstones (§5.2, R4) …
     from .engine.serialize import hash_str  # type: ignore
@@ -71,6 +78,9 @@ logger = logging.getLogger("chronicle.context_engine")
 _DIGEST_EXTRACTOR = HeuristicExtractor() if HeuristicExtractor is not None else None
 
 _NEVER_EVICT_KW = ["always", "never", "must not", "do not", "don't", "[directive]"]
+
+_SALIENCE_RX = re.compile(r"\b(important|remember|critical|must)\b", re.IGNORECASE)
+_CRITICALITY_RX = re.compile(r"\b(critical|must|urgent|important)\b", re.IGNORECASE)
 
 # Structured focus (§R8). An entity NAME in focus.entities resolves to at most
 # this many candidate entity belief_ids (same substring-on-normalized_name rule
@@ -668,12 +678,12 @@ class ChronicleContextEngine(ContextEngine):
         if any(f and f.lower() in content for f in facets):
             score += w.get("relevance", 0.35)
 
-        # Salience: high-value keywords (critical, important, remember, must)
-        if any(k in content for k in ("important", "remember", "critical", "must")):
+        # Salience: pre-compiled keyword match
+        if _SALIENCE_RX.search(content):
             score += w.get("salience", 0.20)
 
-        # Criticality: criticality-specific keywords (folded into salience concept)
-        if any(k in content for k in ("critical", "must", "urgent", "important")):
+        # Criticality: pre-compiled keyword match
+        if _CRITICALITY_RX.search(content):
             score += w.get("criticality", 0.20)
 
         return min(1.0, score)  # Clamp to [0.0, 1.0]
@@ -887,7 +897,9 @@ class ChronicleContextEngine(ContextEngine):
         kept, dropped, used = [], [], 0
         for idx, m in items:
             content = m.get("content") or ""
-            cost = estimate_tokens(content)
+            cost = m.get("_tokens") if isinstance(m, dict) and "_tokens" in m else estimate_tokens(content)
+            if isinstance(m, dict) and "_tokens" not in m:
+                m["_tokens"] = cost
             remaining = budget - used
             if cost <= remaining:
                 kept.append((idx, m))
@@ -897,14 +909,21 @@ class ChronicleContextEngine(ContextEngine):
                 dropped.append((idx, m))
                 continue
             clipped = content[:remaining * 3]  # chars/3 ceiling -> estimate_tokens(clipped) <= remaining
-            kept.append((idx, dict(m, content=clipped) if clipped != content else m))
-            used += estimate_tokens(clipped)
+            clipped_cost = estimate_tokens(clipped)
+            new_msg = dict(m, content=clipped, _tokens=clipped_cost) if clipped != content else m
+            kept.append((idx, new_msg))
+            used += clipped_cost
         return kept, used, dropped
 
     def _compute_content_hash(self, m) -> str:
         """Compute sha256 hash of message content for span-level pinning (R3)."""
+        if isinstance(m, dict) and "_content_hash" in m:
+            return m["_content_hash"]
         content = (m.get("content") or "").encode("utf-8")
-        return hashlib.sha256(content).hexdigest()
+        h = hashlib.sha256(content).hexdigest()
+        if isinstance(m, dict):
+            m["_content_hash"] = h
+        return h
 
     def _is_pinned(self, m) -> bool:
         """Check if message is pinned by content hash (R3: span-level protection)."""
