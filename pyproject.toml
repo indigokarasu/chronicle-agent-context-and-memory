@@ -24,3 +24,6 @@ py-modules = ["provider", "context", "_base"]
 
 [tool.setuptools.packages.find]
 include = ["engine*"]
+
+[tool.setuptools.package-data]
+engine = ["py.typed"]
