@@ -69,6 +69,8 @@ class Tools:
                "limit": {"type": "integer"}}),
             s("embedding_status", "Report the active embedder: real local model (with a live test "
                                   "embed) vs offline hashing fallback.", {}),
+            s("diagnostics", "Retrieve comprehensive system diagnostics including database event counts, "
+                             "active beliefs, vector index state, pending curation jobs, and embedding health.", {}),
             s("plan_context", "Bundle facts + procedures + reflections for a goal.", {"goal": text}, ["goal"]),
             s("reflect", "Record a reflection lesson.", {"situation": text, "action": text, "outcome": text, "lesson": text}, ["situation", "lesson"]),
             s("remember_goal", "Add a standing goal.", {"goal": text}, ["goal"]),
@@ -319,6 +321,9 @@ class Tools:
 
     def _t_embedding_status(self, principal, a):
         return self.core.embedding_status()
+
+    def _t_diagnostics(self, principal, a):
+        return self.core.diagnostics()
 
     def _t_db_query(self, principal, a):
         """Query a registered external SQLite database (SELECT-only).
