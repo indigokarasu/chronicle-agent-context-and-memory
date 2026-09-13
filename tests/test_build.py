@@ -111,7 +111,8 @@ class TestSerialization(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestStore(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
         self.store = MemoryStore(self.tmp.name)
 
     def tearDown(self):
@@ -183,7 +184,8 @@ class TestStore(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestReducer(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
         self.store = MemoryStore(self.tmp.name)
         self.reducer = Reducer(self.store)
         self.store.reducer = self.reducer
@@ -258,7 +260,8 @@ class TestReducer(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestCapture(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False); self.tmp.close()
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
         self.store = MemoryStore(self.tmp.name)
         self.reducer = Reducer(self.store)
         self.store.reducer = self.reducer
@@ -410,7 +413,8 @@ class TestInvariants(unittest.TestCase):
         from engine.federation import CapabilityProvider
 
         class Contacts(CapabilityProvider):
-            name = "weave"; capability = "contacts"
+            name = "weave"
+            capability = "contacts"
             def is_available(self): return True
 
         self.core.federation.register(Contacts())
@@ -426,7 +430,8 @@ class TestInvariants(unittest.TestCase):
         # model that accepted the healthcheck but rejects real input). Capture,
         # extraction, and retrieval must all still work — FTS carries recall.
         class BoomEmbedder:
-            model = "boom"; dimensions = 768
+            model = "boom"
+            dimensions = 768
             def embed(self, text):
                 raise RuntimeError("embedding server down")
         boom = BoomEmbedder()
@@ -1013,7 +1018,7 @@ class TestDigest(unittest.TestCase):
         entity is its digest, never the entity row itself."""
         import importlib.util
         import types as _types
-        d = self._seed()
+        self._seed()
         if "fastapi" not in sys.modules:
             stub = _types.ModuleType("fastapi")
             class _APIRouter:

@@ -237,7 +237,7 @@ def check4_migration():
         left = conn.execute("SELECT COUNT(*) FROM observed_vectors").fetchone()[0]
         jobs = conn.execute("SELECT COUNT(*) FROM curation_jobs WHERE task='embed'").fetchone()[0]
         conn.close()
-        first = [l for l in run.stdout.decode().splitlines() if "queued" in l]
+        first = [line for line in run.stdout.decode().splitlines() if "queued" in line]
         print(f"  requeue: {first[0].strip() if first else '?'}  vectors_left={left}  embed_jobs={jobs}")
         if left:
             return _fail("check4", f"{left} hash vectors survived the requeue")
