@@ -609,6 +609,32 @@ class MemoryStore:
     def iter_query_proxy_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM query_proxy_vectors").fetchall()]
 
+    def iter_query_proxy_vectors_paged(self, kind_filter: str | None = None, is_not_kind: str | None = None, batch_size: int = 1000):
+        """Yield batches of query_proxy_vectors paged by rowid with optional SQL-level kind filter."""
+        conn = self._conn()
+        min_rowid = 0
+        where_clauses = ["rowid > ?"]
+        params: list = []
+        if kind_filter:
+            where_clauses.append("kind = ?")
+            params.append(kind_filter)
+        elif is_not_kind:
+            where_clauses.append("kind != ?")
+            params.append(is_not_kind)
+
+        where_sql = " AND ".join(where_clauses)
+        sql = f"SELECT rowid, * FROM query_proxy_vectors WHERE {where_sql} ORDER BY rowid LIMIT ?"
+
+        while True:
+            p = [min_rowid] + params + [batch_size]
+            rows = conn.execute(sql, p).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
+
     def query_proxy_rows(self, belief_id: str) -> list:
         """One item's proxy rows, proxy_idx-ordered. The scoped companion to
         iter_query_proxy_vectors, which reads the whole table — retrieval needs
@@ -802,6 +828,21 @@ class MemoryStore:
 
     def iter_memory_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM memory_vectors").fetchall()]
+
+    def iter_memory_vectors_paged(self, batch_size: int = 1000):
+        """Yield batches of memory_vectors, paged by rowid (streaming, O(batch) memory)."""
+        conn = self._conn()
+        min_rowid = 0
+        while True:
+            rows = conn.execute(
+                "SELECT rowid, * FROM memory_vectors WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                (min_rowid, batch_size)).fetchall()
+            if not rows:
+                break
+            batch = [dict(r) for r in rows]
+            if batch:
+                min_rowid = batch[-1]["rowid"]
+            yield batch
 
     def get_memory_vectors_by_ids(self, belief_ids) -> dict[str, dict]:
         """Stored vectors for specific beliefs, keyed by belief_id.

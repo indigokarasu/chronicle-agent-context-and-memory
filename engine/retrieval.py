@@ -3029,12 +3029,23 @@ class RetrievalEngine:
         return bool(t1) and t1[0]["score"] >= (self._fts_w + self._vec_w) / (self._rrf_k + 1) * 0.9
 
     def _vector_beliefs(self, query_emb, limit):
-        rows = self.store.iter_memory_vectors()
-        sims = batch_cosine(query_emb, [v["embedding"] for v in rows])
-        scored = [(rows[i]["belief_id"], rows[i]["kind"], sims[i])
-                  for i in range(len(rows)) if sims[i] > 0.1]
+        heap: list[tuple] = []  # (sim, seq, belief_id, kind)
+        seq = 0
+        for batch in self.store.iter_memory_vectors_paged(batch_size=1000):
+            sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
+            for i, v in enumerate(batch):
+                sim = sims[i]
+                if sim <= 0.1:
+                    continue
+                entry = (sim, seq, v["belief_id"], v["kind"])
+                seq += 1
+                if len(heap) < limit:
+                    heapq.heappush(heap, entry)
+                elif entry[0] > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+        scored = [(bid, kind, sim) for sim, _seq, bid, kind in heap]
         scored.sort(key=lambda x: x[2], reverse=True)
-        return scored[:limit]
+        return scored
 
     def _vector_proxies(self, query_emb, limit):
         """E2 doc2query: brute-force scan of query_proxy_vectors, same shape
@@ -3058,16 +3069,17 @@ class RetrievalEngine:
         call, so returning every matching proxy un-deduped would let proxy
         COUNT, not match quality, decide the ranking (measured regression:
         ctx_eval recall@1500 dropped ~12pt before this reduction)."""
-        rows = [r for r in self.store.iter_query_proxy_vectors() if r["kind"] != "observed"]
-        sims = batch_cosine(query_emb, [v["embedding"] for v in rows])
         best: dict = {}
-        for i in range(len(rows)):
-            if sims[i] <= 0.1:
-                continue
-            bid = rows[i]["belief_id"]
-            cur = best.get(bid)
-            if cur is None or sims[i] > cur[2]:
-                best[bid] = (bid, rows[i]["kind"], sims[i])
+        for batch in self.store.iter_query_proxy_vectors_paged(is_not_kind="observed", batch_size=1000):
+            sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
+            for i, r in enumerate(batch):
+                sim = sims[i]
+                if sim <= 0.1:
+                    continue
+                bid = r["belief_id"]
+                cur = best.get(bid)
+                if cur is None or sim > cur[2]:
+                    best[bid] = (bid, r["kind"], sim)
         scored = list(best.values())
         scored.sort(key=lambda x: x[2], reverse=True)
         return scored[:limit]
@@ -3088,17 +3100,18 @@ class RetrievalEngine:
         Same best-per-parent reduction as the belief tier, for the same measured
         reason — several proxies on one parent must not out-vote one strong
         direct match purely by count."""
-        rows = [r for r in self.store.iter_query_proxy_vectors() if r["kind"] == "observed"]
-        if not rows:
-            return []
-        sims = batch_cosine(query_emb, [v["embedding"] for v in rows])
         best: dict = {}
-        for i in range(len(rows)):
-            if sims[i] <= 0.1:
-                continue
-            eid = rows[i]["belief_id"]        # an EVENT id in this table's excerpt role
-            if sims[i] > best.get(eid, 0.0):
-                best[eid] = sims[i]
+        for batch in self.store.iter_query_proxy_vectors_paged(kind_filter="observed", batch_size=1000):
+            sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
+            for i, r in enumerate(batch):
+                sim = sims[i]
+                if sim <= 0.1:
+                    continue
+                eid = r["belief_id"]        # an EVENT id in this table's excerpt role
+                if sim > best.get(eid, 0.0):
+                    best[eid] = sim
+        if not best:
+            return []
         scored = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
         return scored[:limit]
 
