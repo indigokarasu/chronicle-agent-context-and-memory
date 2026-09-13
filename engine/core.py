@@ -118,7 +118,7 @@ class ChronicleCore:
         self.derivation.seed_rules()
 
     @classmethod
-    def get(cls, hermes_home: str, config=None) -> ChronicleCore:
+    def get(cls, hermes_home: str, config: dict | None = None) -> ChronicleCore:
         with cls._lock:
             if hermes_home not in cls._instances:
                 if config is None:
@@ -147,7 +147,7 @@ class ChronicleCore:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def initialize(self, session_id, *, hermes_home=None, principal_id="default", **kw):
+    def initialize(self, session_id: str, *, hermes_home: str | None = None, principal_id: str = "default", **kw) -> Scope:
         self.set_active_principal(principal_id)
         self.store.upsert_principal({"principal_id": principal_id, "type": "agent", "display": principal_id,
                                      "default_visibility": "shared", "created_at": now_iso()})
@@ -162,16 +162,16 @@ class ChronicleCore:
         self.bind_capabilities()
         return self.open_scope(session_id, principal_id)
 
-    def set_active_principal(self, principal_id):
+    def set_active_principal(self, principal_id: str) -> None:
         self.active_principal = principal_id
         self.retrieval.active_principal = principal_id
         self.capture.owner = principal_id
 
-    def open_scope(self, session_id, principal_id):
+    def open_scope(self, session_id: str, principal_id: str) -> Scope:
         return Scope(self, session_id, principal_id)
 
-    def switch_scope(self, new_session_id, parent_session_id="", reset=False, rewound=False,
-                     principal_id="default"):
+    def switch_scope(self, new_session_id: str, parent_session_id: str = "", reset: bool = False, rewound: bool = False,
+                     principal_id: str = "default") -> Scope:
         if rewound:
             # Mark the abandoned branch: events after the rewind point are not promoted (I16).
             old = self.store.get_session(new_session_id)
@@ -223,7 +223,7 @@ class ChronicleCore:
     def flush_git(self) -> int:
         return self.gitmirror.flush()
 
-    def identity_candidates(self, principal=None, status="pending", kind="", limit=50) -> list:
+    def identity_candidates(self, principal: str | None = None, status: str = "pending", kind: str = "", limit: int = 50) -> list[dict]:
         """The identity adjudication queue (§E7), ACL-filtered and named.
 
         ONE projection shared by every listing surface (the `chronicle_
@@ -289,6 +289,44 @@ class ChronicleCore:
                         detail=f"Selected endpoint {getattr(e, 'base_url', None)} failed a live embed: "
                                f"{ex}. Vectors for this round are queued, never hashed.")
         return info
+
+    def diagnostics(self) -> dict:
+        """Comprehensive system diagnostics for agents and operators.
+
+        Reports database stats, vector index configuration, pending background
+        work, embedding mode, active principal, and component state in one place.
+        """
+        events_count = 0
+        beliefs_count = 0
+        pending_curation = 0
+        try:
+            events_count = self.store.count_rows("events")
+            beliefs_count = self.store.count_rows("beliefs", "status='active'")
+            pending_curation = self.store.count_rows("curation_jobs", "status='pending'")
+        except Exception:
+            pass
+
+        vector_info = {}
+        if hasattr(self, "vector_index") and self.vector_index:
+            try:
+                vector_info = {
+                    "backend": getattr(self.vector_index, "backend", "unknown"),
+                    "total_vectors": self.vector_index.count(),
+                }
+            except Exception as e:
+                vector_info = {"backend": "error", "error": str(e)}
+
+        return {
+            "active_principal": self.active_principal,
+            "hermes_home": self.hermes_home,
+            "database": {
+                "events_count": events_count,
+                "active_beliefs_count": beliefs_count,
+                "pending_curation_jobs": pending_curation,
+            },
+            "vector_index": vector_info,
+            "embedding": self.embedding_status(),
+        }
 
 
 class Scope:
