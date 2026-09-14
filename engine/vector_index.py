@@ -337,7 +337,7 @@ class VectorIndex:
         conn = self.store._conn()
 
         # Stream observed vectors
-        rows = conn.execute("SELECT event_id, vector FROM observed_vectors").fetchall()
+        rows = conn.execute("SELECT event_id, embedding FROM observed_vectors").fetchall()
         scored = []
         for eid, blob in rows:
             if not blob:

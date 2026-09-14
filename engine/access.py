@@ -36,6 +36,12 @@ import json
 
 DEFAULT_ACL = "user_agents"
 
+# Explicit memory domains for clean hygiene/isolation
+DOMAIN_USER = "user"           # User profile, preferences, instructions, identity
+DOMAIN_AGENT_SELF = "agent"    # Agent's own self-learnings, habits, procedures, metacognition
+DOMAIN_AGENT_PEER = "peer"     # Inter-agent signals, shared team memory
+DOMAIN_GENERAL = "general"     # General world facts, references, docs
+
 
 class Topology:
     """A parsed `principals:` config section (§27, §15.8).

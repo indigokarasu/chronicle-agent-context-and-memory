@@ -86,6 +86,12 @@ class Tools:
               {"name": text, "steps": {"type": "array", "items": text}}, ["name", "steps"]),
             s("extract_procedure", "Extract a procedure template from a session's recorded turns.",
               {"session_id": text, "name": text}, ["session_id"]),
+            s("search_user_memory", "Search specifically within the user profile and preferences domain.",
+              {"query": text, "limit": {"type": "integer"}}, ["query"]),
+            s("search_agent_memory", "Search specifically within the agent self-reflection and learned behavior domain.",
+              {"query": text, "limit": {"type": "integer"}}, ["query"]),
+            s("search_peer_memory", "Search specifically within shared inter-agent communication and team domain.",
+              {"query": text, "limit": {"type": "integer"}}, ["query"]),
         ]
 
     # -- dispatch ----------------------------------------------------------
@@ -283,6 +289,18 @@ class Tools:
     def _t_search(self, principal, a):
         return {"results": self.core.retrieval.search(a.get("query", ""), limit=a.get("limit", 10),
                                                       principal=principal)}
+
+    def _t_search_user_memory(self, principal, a):
+        return {"results": self.core.retrieval.search_user_memory(a.get("query", ""), limit=a.get("limit", 10),
+                                                                 principal=principal)}
+
+    def _t_search_agent_memory(self, principal, a):
+        return {"results": self.core.retrieval.search_agent_memory(a.get("query", ""), limit=a.get("limit", 10),
+                                                                  principal=principal)}
+
+    def _t_search_peer_memory(self, principal, a):
+        return {"results": self.core.retrieval.search_peer_memory(a.get("query", ""), limit=a.get("limit", 10),
+                                                                 principal=principal)}
 
     def _t_answer(self, principal, a):
         return self.core.retrieval.answer(a.get("query", ""), principal=principal,

@@ -6,6 +6,18 @@ Abstention support gate; chunked capture; degraded-mode embeddings with retry qu
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.5.0
+
+### Multi-Domain Memory Separation, Binary Quantization, & Pinned Memory Slots
+
+- **Explicit Domain Memory Separation:** Introduced `DOMAIN_USER`, `DOMAIN_AGENT_SELF`, `DOMAIN_AGENT_PEER`, and `DOMAIN_GENERAL` domain tags and domain-scoped search APIs (`search_user_memory`, `search_agent_memory`, `search_peer_memory`) to maintain clean boundaries between user facts, agent self-reflection, and peer knowledge.
+- **Compact Binary Vector Quantization:** Added `quantize_binary`, `hamming_distance`, and `binary_similarity` in `engine/embeddings.py` for bitpacking floating point embeddings into packed integer arrays for high-throughput memory scanning.
+- **Tiered Abstraction Spans & Span-Level Fidelity:** Added `abstract`, `gist`, and `verbatim` span abstraction helpers in `engine/extraction.py` and `context.py`.
+- **Temporal Interval Validity:** Added `valid_from` and `valid_until` support across memory storage, reduction, and derivation rules.
+- **Materialized Profile Summaries:** Active profile summaries (`profile_summary:<owner>`) automatically materialise core user identity traits for zero-latency static block context injection.
+- **Client-Side Git Mirror Encryption:** Enhanced `engine/gitmirror.py` with BLAKE2b keystream derivation for client-side encrypted event log mirrors.
+- **Self-Editing Memory Slots & Procedural Memory Tools:** Added tool schema endpoints for self-editing pinned slots (`chronicle_set_memory_slot`, `chronicle_get_memory_slots`, `chronicle_clear_memory_slot`) and procedure recording.
+
 ## 5.6.0
 
 ### Ladder 9 fix program (F1 / F2X / F5 / F4) — integration summary

@@ -827,6 +827,18 @@ class RetrievalEngine:
         self._offer_rerank(query, out)
         return out
 
+    def search_user_memory(self, query, *, limit=10, principal=None):
+        """Search explicitly within the user memory domain (user traits, profile, preferences)."""
+        return self.search(query, limit=limit, domain=access.DOMAIN_USER, principal=principal)
+
+    def search_agent_memory(self, query, *, limit=10, principal=None):
+        """Search explicitly within the agent self-memory domain (agent habits, reflections, procedures)."""
+        return self.search(query, limit=limit, domain=access.DOMAIN_AGENT_SELF, principal=principal)
+
+    def search_peer_memory(self, query, *, limit=10, principal=None):
+        """Search explicitly within the peer agent domain (inter-agent communications, team coordination)."""
+        return self.search(query, limit=limit, domain=access.DOMAIN_AGENT_PEER, principal=principal)
+
     # -- §H2.2 host-model rerank hints -------------------------------------
 
     def _hint_w(self):

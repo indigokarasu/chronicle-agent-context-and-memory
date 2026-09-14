@@ -106,3 +106,20 @@ def test_memory_slots_and_procedures():
 
         res_proc = core.tools.dispatch("pat", "chronicle_extract_procedure", {"session_id": "session_slots", "name": "Build Workflow"})
         assert "procedure_extracted" in res_proc
+
+
+def test_domain_scoped_search():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        core = ChronicleCore.get(tmpdir)
+        core.initialize("session_dom", principal_id="pat")
+
+        # Remember a user domain fact vs an agent domain note
+        core.tools.dispatch("pat", "chronicle_remember", {
+            "kind": "fact", "content": "Pat prefers dark mode", "entity": "user", "attribute": "prefers"
+        })
+        core.tools.dispatch("pat", "chronicle_remember", {
+            "kind": "note", "content": "Agent self-reflection: always double check inputs"
+        })
+
+        res_user = core.tools.dispatch("pat", "chronicle_search_user_memory", {"query": "prefer"})
+        assert "dark mode" in res_user

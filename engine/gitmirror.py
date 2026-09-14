@@ -29,6 +29,16 @@ class GitMirror:
         self.max_rows = cfg.get("git.max_commit_rows", 1000)
         self.encryption_key = os.environ.get("CHRONICLE_GIT_ENCRYPTION_KEY") or cfg.get("git.encryption_key")
 
+    def _keystream(self, key_bytes: bytes, length: int) -> bytes:
+        import hashlib
+        stream = bytearray()
+        block_idx = 0
+        while len(stream) < length:
+            h = hashlib.blake2b(key_bytes + block_idx.to_bytes(4, "big"), digest_size=64).digest()
+            stream.extend(h)
+            block_idx += 1
+        return bytes(stream[:length])
+
     def _encrypt_payload(self, text: str) -> str:
         """Client-side symmetric payload encryption for git mirror files if key is set."""
         if not self.encryption_key:
@@ -37,9 +47,8 @@ class GitMirror:
         import hashlib
         key_bytes = hashlib.blake2b(self.encryption_key.encode("utf-8"), digest_size=32).digest()
         raw = text.encode("utf-8")
-        cipher = bytearray(len(raw))
-        for i in range(len(raw)):
-            cipher[i] = raw[i] ^ key_bytes[i % len(key_bytes)]
+        ks = self._keystream(key_bytes, len(raw))
+        cipher = bytes(r ^ k for r, k in zip(raw, ks))
         return "ENC:" + base64.b64encode(cipher).decode("utf-8")
 
     def _decrypt_payload(self, text: str) -> str:
@@ -53,9 +62,8 @@ class GitMirror:
         import hashlib
         key_bytes = hashlib.blake2b(self.encryption_key.encode("utf-8"), digest_size=32).digest()
         raw = base64.b64decode(text[4:].encode("utf-8"))
-        plain = bytearray(len(raw))
-        for i in range(len(raw)):
-            plain[i] = raw[i] ^ key_bytes[i % len(key_bytes)]
+        ks = self._keystream(key_bytes, len(raw))
+        plain = bytes(r ^ k for r, k in zip(raw, ks))
         return plain.decode("utf-8")
 
     def _git(self, *args) -> bool:

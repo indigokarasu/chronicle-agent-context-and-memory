@@ -592,8 +592,9 @@ class ChronicleContextEngine(ContextEngine):
             remaining = budget - used
             if remaining > 0:
                 # Tiered selection: if remaining budget is tight (< 100 tokens), use abstract level
-                if remaining < 100:
-                    digest_lines = [line.split("\n")[0][:60] for line in self._checkpoint_lines]
+                checkpoint_lines = getattr(self, "_checkpoint_lines", [])
+                if remaining < 100 and checkpoint_lines:
+                    digest_lines = [line.split("\n")[0][:60] for line in checkpoint_lines]
                     digest_text = "\n".join(digest_lines)
                 content = f"[Checkpoint: {digest_text}]"
                 if estimate_tokens(content) > remaining:
@@ -1224,6 +1225,15 @@ class ChronicleContextEngine(ContextEngine):
              "parameters": {"type": "object",
                             "properties": {"slot_name": {"type": "string"}},
                             "required": ["slot_name"]}},
+            {"name": "chronicle_search_user_memory",
+             "description": "Search specifically within the user profile and preferences domain.",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+            {"name": "chronicle_search_agent_memory",
+             "description": "Search specifically within the agent self-reflection and learned behavior domain.",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
+            {"name": "chronicle_search_peer_memory",
+             "description": "Search specifically within shared inter-agent communication and team domain.",
+             "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}},
         ]
 
     def handle_tool_call(self, name, args, **kw) -> str:
@@ -1254,10 +1264,12 @@ class ChronicleContextEngine(ContextEngine):
                 return json.dumps({"error": "chronicle_expand requires the memory-aware "
                                              "engine (heuristic fallback has no event store)"})
             return json.dumps(self.chronicle_expand(args.get("span_id", "")))
-        if name in ("chronicle_set_memory_slot", "chronicle_get_memory_slots", "chronicle_clear_memory_slot"):
+        if name in ("chronicle_set_memory_slot", "chronicle_get_memory_slots", "chronicle_clear_memory_slot",
+                    "chronicle_search_user_memory", "chronicle_search_agent_memory", "chronicle_search_peer_memory"):
             if not self.core:
-                return json.dumps({"error": "Memory slot tools require core engine."})
-            return self.core.tools.dispatch(self._principal_id, name, args)
+                return json.dumps({"error": "Scoped memory search tools require core engine."})
+            res = self.core.tools.dispatch(self._principal_id, name, args)
+            return json.dumps(res) if not isinstance(res, str) else res
         return json.dumps({"error": f"unknown tool: {name}"})
 
     def context_status(self) -> dict:
