@@ -273,37 +273,55 @@ behind a pluggable interface — a real deployment swaps in a local model withou
 touching the pipeline. Deferred per spec: the distributed CRDT tier (§24.5),
 L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
 
-## Battle card: Chronicle vs. agent memory systems
+## How Chronicle compares
 
-Generic memory tools solve storage and retrieval. Chronicle solves the Hermes
-failure mode: useful context disappearing when a long session is compressed.
+Mem0 and Hindsight are native Hermes memory providers. The meaningful difference
+is which Hermes extension points a system owns and what must run behind it.
 
-| Capability | **Chronicle** | Hermes files | Mem0 | Hindsight | Graphiti |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Native Hermes integration | **✓ Memory + context** | Files only | Adapter | Bridge | Bridge |
-| Pre-eviction capture | **✓** | — | — | — | — |
-| No external stack | **✓ SQLite** | ✓ Markdown | — | — | — |
-| Recall without embeddings | **✓ FTS + raw turns** | Injected only | — | △ Keyword | — |
-| Hermes lifecycle tools | **✓** | Manual | Adapter | Adapter | Adapter |
-| Controls compaction | **✓** | — | — | — | — |
+### Hermes integration
 
-**Legend:** ✓ built in · △ partial · — not provided without custom integration.
+| System | Memory provider | Context engine | Auto-capture | Auto-recall |
+|---|:---:|:---:|:---:|:---:|
+| **Chronicle** | **✓** | **✓** | Every turn | ✓ |
+| Hermes files | Built in | — | Agent-directed | Always injected |
+| Mem0 | ✓ | — | Every turn | ✓ |
+| Hindsight | ✓ | — | Default on | Default on |
+| Graphiti | — | — | MCP/custom | MCP/custom |
 
-The external stack behind the dashes is substantial: Mem0 needs model and
-vector-store configuration; Hindsight needs an LLM plus PostgreSQL/pgvector;
-Graphiti needs LLM/embeddings plus a graph database.
+**Auto-capture** means Hermes stores completed turns without the model choosing a
+tool. **Auto-recall** means memory is added to turn context automatically, not
+merely exposed through a search tool.
 
-For Hermes, the only no-integration choices are the built-in files and
-Chronicle. Use the files for a short, hand-maintained memo. Use Chronicle when
-memory must be automatic, searchable, auditable, and survive compaction. The
-other systems add an integration and infrastructure layer without closing the
-Hermes context-compression gap.
+### Deployment and controls
 
-Comparison is based on documented default architecture and integration surface,
-not a synthetic quality benchmark: [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers),
-[Mem0 OSS](https://docs.mem0.ai/open-source/overview),
-[Hindsight](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api/README.md),
-and [Graphiti](https://help.getzep.com/graphiti/getting-started/quick-start).
+| System | Default Hermes setup | No model/service | Hermes-facing controls |
+|---|---|:---:|---|
+| **Chronicle** | Local SQLite | **✓** | Remember, search, correct, forget |
+| Hermes files | Local Markdown | ✓ | Add, replace, remove |
+| Mem0 | Mem0 Platform | — | Search, add, update, delete |
+| Hindsight | Hindsight Cloud | — | Retain, recall, reflect |
+| Graphiti | No provider | — | MCP episode/graph tools |
+
+Among these systems, Chronicle alone fills both the Hermes memory-provider and
+context-engine slots. Its context engine rescues valuable spans into durable
+memory before compaction, then rebuilds the working context. Mem0 and Hindsight
+also capture every turn, but do not control Hermes compression. Hermes files are
+always injected and have built-in editing tools, but are agent-curated rather
+than automatically extracted. Graphiti currently requires MCP or custom wiring.
+
+Chronicle also runs without a model, API key, or separate service. If embeddings
+are unavailable, it keeps recalling through local full-text, structured, and
+raw-turn fallbacks. Mem0 additionally offers self-hosted and in-process OSS
+modes, which require its model, embedder, and vector-store stack. Hindsight also
+offers embedded-local and external-server modes; embedded-local includes its
+database but still requires a configured LLM. Graphiti supports local components
+but still needs model, embedding, and graph backends.
+
+This compares documented integration and deployment surfaces, not retrieval
+quality: [Hermes provider API](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin),
+[Mem0 for Hermes](https://docs.mem0.ai/integrations/hermes),
+[Hindsight provider](https://github.com/NousResearch/hermes-agent/tree/main/plugins/memory/hindsight),
+and [Graphiti MCP](https://help.getzep.com/graphiti/getting-started/mcp-server).
 
 ## Contributing
 
