@@ -18,6 +18,7 @@ import re
 from . import access
 from . import doc2query
 from . import identity
+from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
 from .criticality import classify as classify_criticality
 from .embeddings import EmbeddingsUnavailable, cosine, pack, unpack
 from .serialize import belief_id as compute_belief_id
@@ -1451,6 +1452,3 @@ def _typed_value(body):
     except Exception:
         pass
     return (None, None)
-
-
-from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)

@@ -106,7 +106,9 @@ class FoldTierTests(unittest.TestCase):
         # one [FOLD ...] tombstone. Uniform span sizes make this structural, not
         # dependent on budget-boundary arithmetic that R3's recency reorder
         # would otherwise perturb.
-        mid = lambda i: "mid " + ("x" * 140) + (" %03d" % i)  # constant length -> ~50 tokens
+        def mid(i):
+            return "mid " + ("x" * 140) + (" %03d" % i)  # constant length -> ~50 tokens
+
         messages = (
             [_msg("system", "sys")]
             + [_msg("user", "head %d" % i) for i in range(3)]

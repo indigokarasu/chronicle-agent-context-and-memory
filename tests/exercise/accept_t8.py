@@ -455,12 +455,12 @@ def test_regression_harness():
     # ABSTENTION never appear on the same line, so we parse the TURN-LEVEL
     # table's union row directly instead of grep'ing for both substrings.
     lines = result.stdout.split("\n")
-    turn_idx = next((i for i, l in enumerate(lines) if "TURN-LEVEL RECALL@k" in l), None)
+    turn_idx = next((i for i, line in enumerate(lines) if "TURN-LEVEL RECALL@k" in line), None)
     if turn_idx is None:
         print("FAIL: Could not find TURN-LEVEL RECALL@k table in harness output")
         return False
 
-    union_line = next((l for l in lines[turn_idx:turn_idx + 10] if l.strip().startswith("union")), None)
+    union_line = next((line for line in lines[turn_idx:turn_idx + 10] if line.strip().startswith("union")), None)
     if not union_line:
         print("FAIL: Could not find union row in TURN-LEVEL RECALL@k table")
         return False

@@ -16,7 +16,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine.core import ChronicleCore
-from engine.embeddings import HashingEmbedder
 from engine.retrieval import RetrievalEngine
 
 
@@ -81,7 +80,7 @@ class TestRoutingDisabledOrDegraded(unittest.TestCase):
     the factual/default route whenever there is no embedder — never an error."""
 
     def test_disabled_by_config_is_factual(self):
-        core, home = make_core({"retrieval": {"query_routing": False}})
+        core, _ = make_core({"retrieval": {"query_routing": False}})
         info = core.retrieval.classify_route("how many times did this happen")
         self.assertEqual(info["route"], "factual")
         self.assertFalse(info["enabled"])
@@ -99,7 +98,7 @@ class TestRoutingDisabledOrDegraded(unittest.TestCase):
             def embed(self, text):
                 raise RuntimeError("embedder is down")
 
-        core, home = make_core()
+        core, _ = make_core()
         eng = RetrievalEngine(core.store, core.cfg, embedder=BoomEmbedder())
         info = eng.classify_route("how many times did this happen")
         self.assertEqual(info["route"], "factual")
@@ -111,8 +110,8 @@ class TestFactualPathByteIdentical(unittest.TestCase):
 
     def test_get_context_byte_identical_on_vs_off(self):
         hint = "where does Pat Testley work"
-        core_on, home_on = make_core({"retrieval": {"query_routing": True}})
-        core_off, home_off = make_core({"retrieval": {"query_routing": False}})
+        core_on, _ = make_core({"retrieval": {"query_routing": True}})
+        core_off, _ = make_core({"retrieval": {"query_routing": False}})
         for core in (core_on, core_off):
             core.capture.observe("Pat Testley works at Acme Fake Co as a veterinarian",
                                   "ok", session_id="s1")
@@ -128,7 +127,7 @@ class TestFactualPathByteIdentical(unittest.TestCase):
         # differs) so this isolates the routing switch itself rather than
         # incidentally comparing two independently content-hashed event sets.
         query = "where does Pat Testley work"
-        core, home = make_core()
+        core, _ = make_core()
         core.capture.observe("Pat Testley works at Acme Fake Co as a veterinarian",
                               "ok", session_id="s1")
         core.process_pending()
@@ -150,10 +149,10 @@ class TestAggregationRouteWidensPool(unittest.TestCase):
     excerpt phase 1 would otherwise have included."""
 
     def test_aggregation_spreads_across_sessions(self):
-        core, home = make_core()
+        core, _ = make_core()
         for i in range(6):
             core.capture.observe(f"I went kayaking on trip number {i}", "ok",
-                                  session_id="s{}".format(i))
+                                  session_id=f"s{i}")
         core.process_pending()
         ctx = core.retrieval.get_context("how many kayaking trips did I take",
                                           token_budget=4000)
@@ -167,7 +166,7 @@ class TestTemporalRouteDatesShown(unittest.TestCase):
     """temporal -> chronological ordering emphasis, dates always shown."""
 
     def test_excerpts_carry_dates_and_are_chronological(self):
-        core, home = make_core()
+        core, _ = make_core()
         core.capture.observe("I went kayaking in Sacramento last June", "ok", session_id="s1")
         core.capture.observe("I prefer window seats when flying", "ok", session_id="s1")
         core.process_pending()
@@ -197,7 +196,7 @@ class TestPreferenceRouteIncludesBeliefs(unittest.TestCase):
     """
 
     def test_preference_content_surfaced_without_the_addendum(self):
-        core, home = make_core()
+        core, _ = make_core()
         for i in range(3):
             core.capture.observe("My favorite color is blue and I like bold colors",
                                  "ok " * 200, session_id="s%d" % i)
@@ -218,7 +217,7 @@ class TestPreferenceRouteIncludesBeliefs(unittest.TestCase):
         addendum's arbitrary `[PREFERENCE]` line. That line was not retrieval
         succeeding; it was a total retrieval miss reported as a preference. An
         empty context is the truthful answer, and the reader treats it as one."""
-        core, home = make_core()
+        core, _ = make_core()
         core.capture.observe("My favorite color is blue", "ok", session_id="s1")
         core.capture.observe("Pat Testley works at Acme Fake Co", "ok", session_id="s1")
         core.process_pending()

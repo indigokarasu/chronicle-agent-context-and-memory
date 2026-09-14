@@ -18,7 +18,6 @@ fixes enable recovery:
 Run:  python3 tests/exercise/accept_m2.py
 """
 
-import json
 import logging
 import sys
 import tempfile
@@ -28,8 +27,6 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from engine.core import ChronicleCore
-from engine.embeddings import HashingEmbedder, HashingEmbedder as Embedder
-from engine.store import now_iso
 
 # Enable logging to capture warnings
 logging.basicConfig(level=logging.WARNING)
@@ -144,7 +141,7 @@ def check2_payload_validation():
         if final != initial:
             return _fail("check2", f"queue changed: {initial} → {final}")
 
-        print(f"PASS: check2 — malformed inputs rejected (queue unchanged)")
+        print("PASS: check2 — malformed inputs rejected (queue unchanged)")
         return True
     finally:
         import shutil
@@ -162,7 +159,6 @@ def check3_job_rearm():
         target = "event-123"
         kind = "observed"
         text = "Pat Testley at Acme Fake Co"
-        payload = json.dumps({"target_id": target, "kind": kind, "text": text}, sort_keys=True)
 
         # Enqueue initially
         job_id_1 = core.store.enqueue_embed_job(target, kind, text)
@@ -179,10 +175,10 @@ def check3_job_rearm():
         # Verify it's failed
         failed_jobs = core.store.get_curation_jobs(f"id={job_id_1}")
         if not failed_jobs or failed_jobs[0]["status"] != "failed":
-            return _fail("check3", f"job not marked as failed")
+            return _fail("check3", "job not marked as failed")
 
         # Re-enqueue same payload
-        job_id_2 = core.store.enqueue_embed_job(target, kind, text)
+        core.store.enqueue_embed_job(target, kind, text)
 
         # Should return the same job_id (re-armed) or a new one, but queue should have the job pending
         rearmed = core.store.get_curation_jobs(f"id={job_id_1}")
@@ -206,7 +202,7 @@ def check3_job_rearm():
         if not final or final[0]["status"] != "done":
             return _fail("check3", f"job not completed: {final[0]['status'] if final else 'not found'}")
 
-        print(f"PASS: check3 — failed job re-armed and drained successfully")
+        print("PASS: check3 — failed job re-armed and drained successfully")
         return True
     finally:
         import shutil
