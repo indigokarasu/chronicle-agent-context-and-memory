@@ -345,6 +345,28 @@ class ChronicleMemoryProvider(MemoryProvider):
         if self.core:
             self.core.capture.delegation(task, result, child_session_id=child_session_id)
 
+    def subagent_start(self, parent_session_id="", parent_turn_id="", child_session_id="",
+                       child_subagent_id="", child_role="", child_goal="", **kw):
+        """Plugin hook: child agent constructed and about to run.
+
+        Pre-allocates subagent session scope and captures the start of the
+        delegation episode so that turn-by-turn memory capture works cleanly
+        during the subagent's run.
+        """
+        if not self.core:
+            return
+        payload = {
+            "source_type": "delegation_start",
+            "excerpt": f"Subagent [{child_role}] started: {child_goal[:200]}",
+            "parent_session_id": parent_session_id,
+            "child_session_id": child_session_id,
+            "child_subagent_id": child_subagent_id,
+            "child_role": child_role,
+            "child_goal": child_goal,
+        }
+        self.core.capture.append("observed", payload, actor="agent",
+                                 session_id=child_session_id or self._session_id or None)
+
     def subagent_stop(self, task="", result="", *, child_session_id="", child_status="",
                       tool_call_history=None, duration_ms=None, **kw):
         """Gateway hook (issue #7.2): richer delegation episode capture.
@@ -381,6 +403,16 @@ class ChronicleMemoryProvider(MemoryProvider):
         }
         self.core.capture.append("observed", payload, actor="agent",
                                  session_id=child_session_id or self._session_id or None)
+
+    def on_session_reset(self, session_id="", platform="", reason="", old_session_id="", new_session_id="", **kw):
+        """Plugin hook: session rotated or reset by user command (/new or /reset).
+
+        Switches scope to the fresh session ID so subsequent turn captures match
+        the new conversation state immediately.
+        """
+        sid = new_session_id or session_id
+        if self.core and sid:
+            self.on_session_switch(sid, reset=True)
 
     def on_turn_start(self, turn_number, message, **kw):
         if self.core:
