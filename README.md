@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/readme/hero.jpg" width="100%" alt="Chronicle — durable memory moving through an indigo and magenta archive">
+</p>
+
 # Chronicle
 
 ### Local-first memory for Hermes Agent that survives restarts, long chats, and context compression.
@@ -269,23 +273,31 @@ behind a pluggable interface — a real deployment swaps in a local model withou
 touching the pipeline. Deferred per spec: the distributed CRDT tier (§24.5),
 L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
 
-## Choosing an agent memory system
+## Battle card: Chronicle vs. agent memory systems
 
-This is a routing guide, not a benchmark. Each option optimizes for a different
-deployment shape; links point to the projects' own current documentation.
+Generic memory tools solve storage and retrieval. Chronicle solves the Hermes
+failure mode: useful context disappearing when a long session is compressed.
 
-| System | Deployment shape | Required infrastructure | Retrieval model | Choose it when… |
-|---|---|---|---|---|
-| **Chronicle** | Native Hermes memory provider **and** context engine | None; embedded SQLite, with optional local embeddings | Full-text + structured lookup + optional vectors, with raw-turn fallback | You want the smallest local Hermes setup, inspectable provenance, explicit correction/forgetting, and memory-aware context compression |
-| **Hermes built-in memory** | Always-on `MEMORY.md` / `USER.md` files | None | Prompt-injected curated files | A small, human-readable set of durable facts is enough; Hermes keeps this active alongside any provider ([Hermes docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers)) |
-| **Mem0 OSS** | In-process Python/Node library or self-hosted server | Configurable LLM, embedder, and vector store; defaults use OpenAI plus local Qdrant for the library or Postgres/pgvector for the server | Vector retrieval, with optional graph memory and reranking | You need a general-purpose memory layer across many frameworks and want to swap storage/model providers ([Mem0 OSS docs](https://docs.mem0.ai/open-source/overview)) |
-| **Hindsight** | Standalone API/MCP service or embedded Python engine | LLM provider plus embedded or external PostgreSQL/pgvector | Semantic + keyword + graph + temporal retrieval, with reflection | You want a feature-rich shared memory service with temporal reasoning and opinion formation across multiple agent clients ([Hindsight API docs](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api/README.md)) |
-| **Graphiti** | Python library or experimental MCP server | Graph database (Neo4j, FalkorDB, or another supported backend) plus an LLM/embedding provider | Temporal knowledge graph + semantic, keyword, and graph search | Relationships, changing facts, and graph traversal are central enough to justify a graph database ([Graphiti quickstart](https://help.getzep.com/graphiti/getting-started/quick-start)) |
+| Hermes buying question | **Chronicle** | Hermes files | Mem0 OSS | Hindsight | Graphiti |
+|---|---|---|---|---|---|
+| Native install with no adapter to build | **Yes — memory provider + context engine** | Built-in files only | No | No | No |
+| Saves useful context before Hermes evicts it | **Yes** | No | No | No | No |
+| No API key, model server, or database service required | **Yes — embedded SQLite** | Yes — Markdown files | No — configure a model and vector store | No — LLM plus PostgreSQL/pgvector | No — LLM/embeddings plus graph database |
+| Useful recall when embeddings are unavailable | **Yes — full-text, structured, and raw-turn fallback** | No retrieval layer | Not the default path | Keyword search exists, but ingestion still needs its stack | Still requires the graph/model stack |
+| Hermes-native correction, forgetting, provenance, and health tools | **Yes** | No — manual file edits | No — custom integration required | No — custom integration required | No — custom integration required |
+| Owns both sides of the compression boundary | **Yes — persistence and compaction** | No | No | No | No |
 
-Chronicle's sharpest distinction is scope: it is designed specifically for
-Hermes and couples durable long-term memory with the context-compression path.
-The other systems are broader memory platforms or services and may be a better
-fit when several unrelated applications need to share one memory backend.
+For Hermes, the only no-integration choices are the built-in files and
+Chronicle. Use the files for a short, hand-maintained memo. Use Chronicle when
+memory must be automatic, searchable, auditable, and survive compaction. The
+other systems add an integration and infrastructure layer without closing the
+Hermes context-compression gap.
+
+Comparison is based on documented default architecture and integration surface,
+not a synthetic quality benchmark: [Hermes memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers),
+[Mem0 OSS](https://docs.mem0.ai/open-source/overview),
+[Hindsight](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api/README.md),
+and [Graphiti](https://help.getzep.com/graphiti/getting-started/quick-start).
 
 ## Contributing
 
