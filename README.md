@@ -278,14 +278,20 @@ L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
 Generic memory tools solve storage and retrieval. Chronicle solves the Hermes
 failure mode: useful context disappearing when a long session is compressed.
 
-| Hermes buying question | **Chronicle** | Hermes files | Mem0 OSS | Hindsight | Graphiti |
-|---|---|---|---|---|---|
-| Native install with no adapter to build | **Yes — memory provider + context engine** | Built-in files only | No | No | No |
-| Saves useful context before Hermes evicts it | **Yes** | No | No | No | No |
-| No API key, model server, or database service required | **Yes — embedded SQLite** | Yes — Markdown files | No — configure a model and vector store | No — LLM plus PostgreSQL/pgvector | No — LLM/embeddings plus graph database |
-| Useful recall when embeddings are unavailable | **Yes — full-text, structured, and raw-turn fallback** | No retrieval layer | Not the default path | Keyword search exists, but ingestion still needs its stack | Still requires the graph/model stack |
-| Hermes-native correction, forgetting, provenance, and health tools | **Yes** | No — manual file edits | No — custom integration required | No — custom integration required | No — custom integration required |
-| Owns both sides of the compression boundary | **Yes — persistence and compaction** | No | No | No | No |
+| Capability | **Chronicle** | Hermes files | Mem0 | Hindsight | Graphiti |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Native Hermes integration | **✓ Memory + context** | Files only | Adapter | Bridge | Bridge |
+| Pre-eviction capture | **✓** | — | — | — | — |
+| No external stack | **✓ SQLite** | ✓ Markdown | — | — | — |
+| Recall without embeddings | **✓ FTS + raw turns** | Injected only | — | △ Keyword | — |
+| Hermes lifecycle tools | **✓** | Manual | Adapter | Adapter | Adapter |
+| Controls compaction | **✓** | — | — | — | — |
+
+**Legend:** ✓ built in · △ partial · — not provided without custom integration.
+
+The external stack behind the dashes is substantial: Mem0 needs model and
+vector-store configuration; Hindsight needs an LLM plus PostgreSQL/pgvector;
+Graphiti needs LLM/embeddings plus a graph database.
 
 For Hermes, the only no-integration choices are the built-in files and
 Chronicle. Use the files for a short, hand-maintained memo. Use Chronicle when
