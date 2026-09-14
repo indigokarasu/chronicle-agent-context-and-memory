@@ -317,3 +317,37 @@ class VectorIndex:
                 logger.debug("vector_index: KNN query error (falling back to brute-force): %s", e)
             return []
         return [(row[0], max(-1.0, min(1.0, 1.0 - (row[1] * row[1]) / 2.0))) for row in rows]
+
+    def retrieve_binary_quantized(self, query_vec: list[float], limit: int) -> list:
+        """Fast binary-quantized similarity search fallback over store vectors.
+
+        Converts query to bitpacked format and evaluates normalized Hamming
+        similarity over stored binary bitpacks.
+        """
+        try:
+            from engine.embeddings import quantize_binary, binary_similarity, unpack
+        except ImportError:
+            from .embeddings import quantize_binary, binary_similarity, unpack
+
+        if not query_vec:
+            return []
+
+        query_bin = quantize_binary(query_vec)
+        dims = len(query_vec)
+        conn = self.store._conn()
+
+        # Stream observed vectors
+        rows = conn.execute("SELECT event_id, vector FROM observed_vectors").fetchall()
+        scored = []
+        for eid, blob in rows:
+            if not blob:
+                continue
+            float_vec = unpack(blob)
+            if len(float_vec) != dims:
+                continue
+            b_vec = quantize_binary(float_vec)
+            sim = binary_similarity(query_bin, b_vec, dims)
+            scored.append((eid, sim))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:limit]

@@ -689,6 +689,42 @@ def unpack(blob: bytes | None) -> list[float]:
     return list(struct.unpack(f"<{n}f", blob))
 
 
+def quantize_binary(vec: list[float]) -> bytes:
+    """Quantize a float vector into a compact binary bitpack.
+
+    Each coordinate becomes a single bit: 1 if > 0.0 else 0.
+    1024 floats -> 128 bytes (32x compression).
+    """
+    if not vec:
+        return b""
+    byte_list = bytearray((len(vec) + 7) // 8)
+    for i, val in enumerate(vec):
+        if val > 0.0:
+            byte_list[i // 8] |= (1 << (7 - (i % 8)))
+    return bytes(byte_list)
+
+
+_BIT_COUNTS = [bin(i).count("1") for i in range(256)]
+
+
+def hamming_distance(a: bytes, b: bytes) -> int:
+    """Compute Hamming distance between two bitpacked byte strings."""
+    if not a or not b or len(a) != len(b):
+        return max(len(a), len(b)) * 8
+    dist = 0
+    for byte_a, byte_b in zip(a, b):
+        dist += _BIT_COUNTS[byte_a ^ byte_b]
+    return dist
+
+
+def binary_similarity(a: bytes, b: bytes, total_bits: int) -> float:
+    """Normalized Hamming similarity in range [0.0, 1.0]."""
+    if not a or not b or total_bits <= 0:
+        return 0.0
+    dist = hamming_distance(a, b)
+    return max(0.0, min(1.0, 1.0 - (dist / float(total_bits))))
+
+
 def cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0

@@ -27,6 +27,36 @@ class GitMirror:
         self.remote = cfg.get("git_remote")
         self.enabled = cfg.get("git.enabled", True)
         self.max_rows = cfg.get("git.max_commit_rows", 1000)
+        self.encryption_key = os.environ.get("CHRONICLE_GIT_ENCRYPTION_KEY") or cfg.get("git.encryption_key")
+
+    def _encrypt_payload(self, text: str) -> str:
+        """Client-side symmetric payload encryption for git mirror files if key is set."""
+        if not self.encryption_key:
+            return text
+        import base64
+        import hashlib
+        key_bytes = hashlib.blake2b(self.encryption_key.encode("utf-8"), digest_size=32).digest()
+        raw = text.encode("utf-8")
+        cipher = bytearray(len(raw))
+        for i in range(len(raw)):
+            cipher[i] = raw[i] ^ key_bytes[i % len(key_bytes)]
+        return "ENC:" + base64.b64encode(cipher).decode("utf-8")
+
+    def _decrypt_payload(self, text: str) -> str:
+        """Client-side symmetric payload decryption for git mirror files if encrypted."""
+        if not text.startswith("ENC:"):
+            return text
+        if not self.encryption_key:
+            logger.warning("Encrypted mirror log found but no encryption_key configured")
+            return text
+        import base64
+        import hashlib
+        key_bytes = hashlib.blake2b(self.encryption_key.encode("utf-8"), digest_size=32).digest()
+        raw = base64.b64decode(text[4:].encode("utf-8"))
+        plain = bytearray(len(raw))
+        for i in range(len(raw)):
+            plain[i] = raw[i] ^ key_bytes[i % len(key_bytes)]
+        return plain.decode("utf-8")
 
     def _git(self, *args) -> bool:
         try:
@@ -66,10 +96,11 @@ class GitMirror:
                 fp = d / f"{stamp}-{evs[0]['event_id'][3:11]}.jsonl"
                 with open(fp, "a", encoding="utf-8") as fh:
                     for e in evs:
-                        fh.write(json.dumps({k: e[k] for k in (
+                        line_raw = json.dumps({k: e[k] for k in (
                             "event_id", "seq", "type", "payload", "parents", "actor", "owner",
                             "trust_level", "session_id", "occurred_at", "recorded_at")},
-                            ensure_ascii=False) + "\n")
+                            ensure_ascii=False)
+                        fh.write(self._encrypt_payload(line_raw) + "\n")
                         gids.append(e["gid"])
             commit = "uncommitted"
             if self._git("add", "-A") and self._git("commit", "-m", f"chronicle: {len(gids)} events"):
@@ -94,6 +125,7 @@ class GitMirror:
                     line = line.strip()
                     if not line:
                         continue
+                    line = self._decrypt_payload(line)
                     ev = json.loads(line)
                     ev.setdefault("prev_head", None)
                     ev.setdefault("sig", None)
