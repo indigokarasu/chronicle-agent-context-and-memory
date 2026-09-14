@@ -904,11 +904,15 @@ class Reducer:
                 "extractor_version": p.get("extractor_version", ""), "domain": domain, "owner": owner,
                 "read_acl": access.DEFAULT_ACL, "status": status, "salience": salience, "criticality": crit,
                 "criticality_reason": crit_reason, "confidence": confidence, "trust_level": trust,
-                "valid_from": p.get("valid_from", now), "created_at": now, "last_seen_at": now,
+                "valid_from": p.get("valid_from", now), "valid_until": p.get("valid_until"),
+                "created_at": now, "last_seen_at": now,
                 "fidelity": "verbatim", "utility": 0,
                 "purpose_scope": json.dumps(p.get("purpose_scope", ["*"])), "provenance": provenance,
                 "novelty": novelty, "verification": '{"status":"unverified"}', "rule_id": extras.get("rule_id"),
                 "premises": extras.get("premises")})
+            # Update materialized profile summary when identity/core traits arrive
+            if domain in ("user", "general") and (crit in ("high", "critical") or key.get("predicate_canonical") in _IDENTITY_PREDICATES):
+                self._update_materialized_profile(owner, key.get("predicate_canonical"), body)
         elif kind == "episode":
             self.store.upsert_belief("episodes", {
                 "belief_id": b_id, "title": key.get("title", body[:60]), "summary": body,
@@ -1310,6 +1314,23 @@ class Reducer:
                 self._retract(dep_id)
                 self.store.record_correction(dep_id, "cascade_from_retraction", b_id, [b_id])
                 self._cascade(dep_id)
+
+    def _update_materialized_profile(self, owner: str, predicate: str, value: str):
+        """Update materialized active profile summary for an owner."""
+        p = self.store.get_principal(owner)
+        if not p:
+            return
+        key = f"profile_summary:{owner}"
+        curr_raw = self.store.get_meta(key, "")
+        try:
+            curr = json.loads(curr_raw) if curr_raw else {"static": {}, "dynamic": {}}
+        except Exception:
+            curr = {"static": {}, "dynamic": {}}
+        if predicate in _IDENTITY_PREDICATES:
+            curr["static"][predicate] = value
+        else:
+            curr["dynamic"][predicate] = value
+        self.store.set_meta(key, json.dumps(curr))
 
     def _beliefs_matching_hash(self, content_hash):
         out = [r["belief_id"] for r in self.store.query_beliefs("notes", "body_hash=?", (content_hash,), limit=1000)]
