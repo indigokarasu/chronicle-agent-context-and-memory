@@ -1,0 +1,23 @@
+name: Feature or use case
+description: Propose a concrete memory or context workflow
+title: "[Use case]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: What should your agent be able to do?
+      description: Describe the workflow and why existing Chronicle behavior is insufficient.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would success look like?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Privacy, latency, or compatibility constraints
+      description: Note any local-only, multi-agent, platform, or model requirements.
