@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible Chronicle problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Chronicle. Do not attach a Chronicle database or private conversation content.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest sequence of steps that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Chronicle status
+      description: Paste sanitized `/chronicle` output. Remove private paths, memory content, and secrets.
+      render: text
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes version
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and Python version
+    validations:
+      required: true
+  - type: dropdown
+    id: embeddings
+    attributes:
+      label: Embedding mode
+      options:
+        - Local model
+        - Offline hashing
+        - Degraded / full-text only
+        - Unknown
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant sanitized logs
+      description: Remove secrets and private memory content.
+      render: text
