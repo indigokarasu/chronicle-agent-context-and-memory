@@ -153,3 +153,34 @@ def register(ctx) -> None:
                 description="Show Chronicle status: embedder (local model vs offline hashing) + store counts.")
         except Exception as e:
             logger.warning("Chronicle: register_command failed: %s", e)
+
+    # Register additional lifecycle and observer plugin hooks
+    if hasattr(ctx, "register_hook"):
+        mp = mp_cls() if mp_cls is not None else None
+        if mp is not None:
+            try:
+                ctx.register_hook("subagent_start", mp.subagent_start)
+                ctx.register_hook("subagent_stop", mp.subagent_stop)
+                ctx.register_hook("on_session_reset", mp.on_session_reset)
+                ctx.register_hook("post_tool_call", mp.post_tool_call)
+            except Exception as e:
+                logger.warning("Chronicle: register_hook failed: %s", e)
+
+    # Cache-safe system prompt section registration
+    if hasattr(ctx, "register_system_prompt_section"):
+        try:
+            def memory_block_factory(session_info):
+                core = _active_core()
+                if core is None:
+                    return ""
+                principal = session_info.get("principal_id", "default") if isinstance(session_info, dict) else "default"
+                return core.retrieval.static_block(principal)
+
+            ctx.register_system_prompt_section(
+                "chronicle.memory-guidelines",
+                memory_block_factory,
+                position="after_memory",
+                max_chars=4000,
+            )
+        except Exception as e:
+            logger.warning("Chronicle: register_system_prompt_section failed: %s", e)
