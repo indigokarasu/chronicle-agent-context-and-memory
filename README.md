@@ -1,82 +1,103 @@
-# Chronicle Agent Memory and Context (for Hermes)
+# Chronicle
 
-Two plugins, one core. A local-first memory system for Hermes Agent.
+### Local-first memory for Hermes Agent that survives restarts, long chats, and context compression.
 
-**ChronicleMemoryProvider** persists conversation history, facts, and agent knowledge across sessions using an event-sourced SQLite store. **ChronicleContextEngine** replaces the default context compressor with memory-aware compaction that evicts only durable spans and re-injects relevant long-term memory.
+[![CI](https://github.com/indigokarasu/chronicle-agent-context-and-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/indigokarasu/chronicle-agent-context-and-memory/actions/workflows/ci.yml)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
+[![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.4.1.
+Chronicle gives your Hermes agent durable long-term memory and safer working-memory
+compression in one install. Names, preferences, decisions, and prior work stay on
+your machine in SQLite; relevant memories come back when they are useful.
 
-## 🤖 If you are an agent: how to install & set up
+## Why Chronicle
 
-> Read this first if you're an AI agent installing or wiring up Chronicle. It is self-contained and matches the actual code — the `engine/` core plus the root `provider.py` / `context.py` adapters and the `register(ctx)` in `__init__.py`.
+- **Local by default.** No account, API key, or hosted memory service is required.
+- **Survives context compression.** Chronicle persists a span before the context
+  engine evicts it, then rehydrates relevant memory later.
+- **Inspectable and correctable.** Memories are event-sourced with provenance,
+  history, correction, forgetting, and access-control tools.
+- **Honest when evidence is weak.** Retrieval can fall back to captured turns and
+  abstains instead of confidently inventing an answer.
+- **Works without an embedding model.** Full-text recall remains available; a local
+  OpenAI-compatible embedding server can improve semantic recall when present.
 
-**What you're installing.** Two Hermes plugins over one shared in-process core (`ChronicleCore`): a **memory provider** (long-term memory) and a **context engine** (working memory). Either runs without the other. Pure Python standard library — no required pip dependencies. Embeddings default to **`auto`**: they detect a running local OpenAI-compatible server (LM Studio :1234 / Ollama :11434 / llama.cpp :8080) and use **whatever embedding model it serves** (no model id hardcoded). If none is reachable it runs **degraded** — no vectors are written, each embed is queued and retried until a server appears — instead of silently substituting hash vectors; set `model: hashing` (or `$CHRONICLE_EMBED_MODEL=hashing`) to choose the offline embedder deliberately. FTS retrieval works either way, so it runs with or without a model.
+## Try it in two minutes
 
-**1. Install**
+Install directly from GitHub:
 
 ```bash
-# Managed by Hermes (registers both plugin slots from plugin.yaml):
 hermes plugins install indigokarasu/chronicle-agent-context-and-memory
-
-# OR local/dev install:
-git clone https://github.com/indigokarasu/chronicle-agent-context-and-memory.git
-cd chronicle-agent-context-and-memory
-pip install -e .            # add ".[dev]" for pytest, ".[hash]" for spec-exact BLAKE3
 ```
 
-Requires **Python ≥ 3.9**. Without the optional `blake3` package, content addressing falls back to BLAKE2b-256 (set `CHRONICLE_REQUIRE_BLAKE3=1` to require BLAKE3).
-
-**2. Both slots register automatically.** `__init__.py` exposes a `register(ctx)`
-that the Hermes loader calls; it registers **both** slots from the one shared core:
-
-```python
-def register(ctx):
-    if hasattr(ctx, "register_memory_provider"):
-        ctx.register_memory_provider(ChronicleMemoryProvider())
-    if hasattr(ctx, "register_context_engine"):
-        ctx.register_context_engine(ChronicleContextEngine())
-```
-
-Then activate them in `~/.hermes/config.yaml` (each slot is single-select):
+Then open `hermes plugins` and select **Chronicle** for the Memory Provider.
+Selecting it for the Context Engine is optional, but enables memory-aware
+compression. The equivalent manual configuration is:
 
 ```yaml
-memory:  { provider: chronicle }   # everything else has safe defaults (engine/config.py)
-context: { engine: chronicle }     # optional — enables memory-aware compression
-plugins: { enabled: [chronicle] }  # if not auto-enabled on install
+memory:  { provider: chronicle }
+context: { engine: chronicle }
+plugins: { enabled: [chronicle] }
 ```
 
-**3. First run is zero-setup.** On the first `initialize(...)` the SQLite database and full schema are created automatically at `~/.hermes/commons/db/chronicle/chronicle.db`. There is no migration or `createdb` step. Startup recovery + the reaper finalize any sessions left by a crash.
+Start Hermes and try this small persistence test:
 
-**4. Verify it works**
+1. Say: `Remember that my project launch day is Friday.`
+2. Start a new session and ask: `When is my project launch day?`
+3. Run `/chronicle` to see the active embedder and local store counts.
 
-```bash
-python -m pytest tests/ -q        # property/acceptance tests (P1–P21, B.1–B.6)
-```
+The database is created automatically at
+`~/.hermes/commons/db/chronicle/chronicle.db`. Chronicle has no required Python
+dependencies and no separate database or migration step.
 
-**5. How you drive it at runtime.** Under Hermes the hooks fire for you (`sync_turn` captures every turn durably; `on_turn_start` drains a slice of background work; `on_pre_compress`/`compress` handle the window). You get agent tools via `get_tool_schemas` — `chronicle_remember`, `chronicle_search`, `chronicle_answer`, `chronicle_ask_about`, `chronicle_get_context`, `chronicle_explain`, `chronicle_correct`, `chronicle_forget`, plus ACL/derivation/reasoning tools (see [Tools](#tools)).
+> If Chronicle earns a place in your agent setup, please
+> [star the repository](https://github.com/indigokarasu/chronicle-agent-context-and-memory)
+> so other Hermes users can find it.
 
-**Programmatic quickstart (no Hermes needed — good for validating an install):**
+## What gets installed
+
+Two Hermes plugin slots share one in-process core:
+
+- **ChronicleMemoryProvider** durably captures conversation history and retrieves
+  relevant facts, episodes, and raw turns across sessions.
+- **ChronicleContextEngine** replaces the default compressor with memory-aware
+  compaction that makes spans durable before eviction.
+
+Either slot can run without the other. Under Hermes, capture and lifecycle hooks
+run automatically. The agent receives memory tools including `chronicle_remember`,
+`chronicle_search`, `chronicle_answer`, `chronicle_explain`, `chronicle_correct`,
+and `chronicle_forget`.
+
+### Embeddings and graceful degradation
+
+Embeddings default to `auto`: Chronicle checks local OpenAI-compatible servers
+(LM Studio on `:1234`, Ollama on `:11434`, and llama.cpp on `:8080`) and uses the
+model they serve. If none is reachable, vector work is queued while full-text
+retrieval remains active. Set `model: hashing` or
+`CHRONICLE_EMBED_MODEL=hashing` to deliberately choose the offline embedder.
+
+Requires Python 3.9 or newer. The optional `blake3` package enables BLAKE3
+content addressing; otherwise Chronicle uses BLAKE2b-256.
+
+## Programmatic quickstart
+
+This smoke test does not require Hermes:
 
 ```python
 from engine.core import ChronicleCore
 
-core = ChronicleCore.get("/tmp/hermes_home")          # singleton; auto-creates the db
+core = ChronicleCore.get("/tmp/hermes_home")
 core.initialize(session_id="s1", principal_id="assistant")
+core.capture.observe(
+    "My name is Pat Testley. I work at Acme Fake Co.",
+    "Hi Pat!",
+    session_id="s1",
+)
+core.process_pending()
 
-core.capture.observe("My name is Pat Testley. I work at Acme Fake Co.", "Hi Pat!", session_id="s1")
-core.capture.observe("My office is in downtown", "noted", session_id="s1")
-core.process_pending()                                 # run extraction → derivation → curation
-
-print(core.retrieval.answer("where is my workplace"))  # dual-tier read-and-answer (abstains if unknown)
-print(core.tools.dispatch("assistant", "chronicle_search", {"query": "Acme Fake Co"}))
+print(core.retrieval.answer("where do I work?"))
 ```
-
-**Good to know.**
-- **Capture is durable and cheap; understanding is deferred.** `sync_turn`/`observe` only appends one local event; extraction, derivation, and curation run in the background (drained by `on_turn_start` or `core.process_pending()`).
-- **Recall floor:** anything captured is answerable even if eager extraction missed it — the raw tier + read step recover it and write the belief back. The system abstains rather than fabricates when there's no support.
-- **Abstention is a gate, not an accident.** Ranking alone never returns nothing, so `answer()` puts a support gate in front of the confident path — `retrieval.abstain_gate`: `score`, `overlap`, or `focus` (the default: the support must cover `retrieval.focus_coverage` of the question's distinctive words). Retune it with `scripts/sweep_abstain.py`; the default trades a lot of recall for refusals, which is the right call only when a wrong answer costs more than "I don't know".
-- **Extraction & read-and-answer use a deterministic offline heuristic** behind a pluggable `Extractor` interface (`engine/extraction.py`). Swap in a local model there for higher precision — nothing else changes.
-- **Multi-agent default is open within one user** (every agent reads the user's and siblings' memory); restriction is explicit via `chronicle_set_acl` / `chronicle_revoke_read`.
 
 ## Architecture
 
@@ -188,10 +209,11 @@ The context engine adds:
 ## Development
 
 ```bash
-git clone https://github.com/indigokarasu/chronicle-plugin.git
-cd chronicle-plugin
+git clone https://github.com/indigokarasu/chronicle-agent-context-and-memory.git
+cd chronicle-agent-context-and-memory
 pip install -e ".[dev]"
-pytest tests/
+python -m pytest tests/ -q
+ruff check .
 ```
 
 Tests run against an in-memory SQLite database. No external services needed.
@@ -248,7 +270,9 @@ L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
 
 ## Contributing
 
-Open an issue or pull request on GitHub. Keep changes small and tested. Run `pytest tests/` before submitting.
+Bug reports, use cases, and focused pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and the best
+places to start.
 
 ## License
 

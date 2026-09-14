@@ -1,0 +1,17 @@
+name: Hermes Plugin Validation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate against the Hermes plugin admission checks
+        uses: NousResearch/hermes-agent/.github/actions/plugin-validate@main
+        with:
+          path: .

@@ -6,5 +6,8 @@ name: chronicle
 kind: standalone
 version: 5.6.0
 description: "Event-sourced long-term memory + memory-aware context compression for Hermes. Captures every turn durably, extracts beliefs with provenance, answers from memory (raw-tier fallback + abstention), derives scoped conclusions, and compresses the window losslessly."
-hooks:
-  - on_session_end
+provides_hooks:
+  - subagent_start
+  - subagent_stop
+  - on_session_reset
+  - post_tool_call
