@@ -112,7 +112,56 @@ class WorkplaceLocationRule(Rule):
         }]
 
 
-_STARTER_RULES = [WorkplaceLocationRule()]
+class TransitiveLocationRule(Rule):
+    """A located_in B ∧ B located_in C  ⇒  A located_in C (guarded, 1-hop max)."""
+
+    rule_id = "transitive_location"
+    name = "Transitive location"
+    materialize = "high_value"
+
+    def antecedent_predicates(self):
+        return ["located_in", "lives_in", "works_in"]
+
+    def derive(self, subject, store, principal, cfg):
+        # Check if subject has lives_in or works_in or located_in
+        direct_locs = []
+        for pred in ("lives_in", "works_in", "located_in"):
+            direct_locs.extend(_active_facts(store, subject, pred, principal))
+        if not direct_locs:
+            return []
+
+        results = []
+        from .extraction import entity_token
+        for dloc in direct_locs:
+            b_entity = entity_token(dloc["value"])
+            b_locs = _active_facts(store, b_entity, "located_in", principal)
+            for bloc in b_locs:
+                if not temporal_overlap(dloc, bloc):
+                    continue
+                if dloc["domain"] != bloc["domain"]:
+                    continue
+                if not (access.can_read(dloc.get("read_acl"), dloc.get("owner"), principal) and
+                        access.can_read(bloc.get("read_acl"), bloc.get("owner"), principal)):
+                    continue
+
+                c_val = bloc["value"]
+                pred = "lives_in" if dloc["attribute"] == "lives_in" else "located_in"
+                conf = min(dloc["confidence"], bloc["confidence"]) * cfg.get("derivation.confidence.rule_factor", 0.9)
+                conf = min(conf, cfg.get("derivation.confidence.ceiling", 0.70))
+                status = cfg.get("derivation.default_status.agent", "active")
+                body = f"{subject} is in {c_val}"
+                key = {"entity_id": subject, "predicate_canonical": pred,
+                       "attribute": pred, "qualifiers_hash": "", "qualifiers": {},
+                       "entity_name": subject, "owner": dloc["owner"], "domain": dloc["domain"]}
+                results.append({
+                    "kind": "fact", "key": key, "body": body, "confidence": conf,
+                    "rule_id": self.rule_id, "premises": sorted([dloc["belief_id"], bloc["belief_id"]]),
+                    "status": status, "owner": dloc["owner"], "domain": dloc["domain"],
+                })
+        return results
+
+
+_STARTER_RULES = [WorkplaceLocationRule(), TransitiveLocationRule()]
 
 
 class DerivationEngine:
