@@ -3,6 +3,7 @@
 ### Local-first memory for Hermes Agent that survives restarts, long chats, and context compression.
 
 [![CI](https://github.com/indigokarasu/chronicle-agent-context-and-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/indigokarasu/chronicle-agent-context-and-memory/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/indigokarasu/chronicle-agent-context-and-memory)](https://github.com/indigokarasu/chronicle-agent-context-and-memory/releases/latest)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
@@ -267,6 +268,24 @@ epistemic + procedures (Phase 5); git-mirror recovery + the property suite
 behind a pluggable interface — a real deployment swaps in a local model without
 touching the pipeline. Deferred per spec: the distributed CRDT tier (§24.5),
 L3 parametric adapters (§20.4), and the TLA⁺ models (§29).
+
+## Choosing an agent memory system
+
+This is a routing guide, not a benchmark. Each option optimizes for a different
+deployment shape; links point to the projects' own current documentation.
+
+| System | Deployment shape | Required infrastructure | Retrieval model | Choose it when… |
+|---|---|---|---|---|
+| **Chronicle** | Native Hermes memory provider **and** context engine | None; embedded SQLite, with optional local embeddings | Full-text + structured lookup + optional vectors, with raw-turn fallback | You want the smallest local Hermes setup, inspectable provenance, explicit correction/forgetting, and memory-aware context compression |
+| **Hermes built-in memory** | Always-on `MEMORY.md` / `USER.md` files | None | Prompt-injected curated files | A small, human-readable set of durable facts is enough; Hermes keeps this active alongside any provider ([Hermes docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers)) |
+| **Mem0 OSS** | In-process Python/Node library or self-hosted server | Configurable LLM, embedder, and vector store; defaults use OpenAI plus local Qdrant for the library or Postgres/pgvector for the server | Vector retrieval, with optional graph memory and reranking | You need a general-purpose memory layer across many frameworks and want to swap storage/model providers ([Mem0 OSS docs](https://docs.mem0.ai/open-source/overview)) |
+| **Hindsight** | Standalone API/MCP service or embedded Python engine | LLM provider plus embedded or external PostgreSQL/pgvector | Semantic + keyword + graph + temporal retrieval, with reflection | You want a feature-rich shared memory service with temporal reasoning and opinion formation across multiple agent clients ([Hindsight API docs](https://github.com/vectorize-io/hindsight/blob/main/hindsight-api/README.md)) |
+| **Graphiti** | Python library or experimental MCP server | Graph database (Neo4j, FalkorDB, or another supported backend) plus an LLM/embedding provider | Temporal knowledge graph + semantic, keyword, and graph search | Relationships, changing facts, and graph traversal are central enough to justify a graph database ([Graphiti quickstart](https://help.getzep.com/graphiti/getting-started/quick-start)) |
+
+Chronicle's sharpest distinction is scope: it is designed specifically for
+Hermes and couples durable long-term memory with the context-compression path.
+The other systems are broader memory platforms or services and may be a better
+fit when several unrelated applications need to share one memory backend.
 
 ## Contributing
 
