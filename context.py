@@ -583,16 +583,18 @@ class ChronicleContextEngine(ContextEngine):
             if inject_budget > 0:
                 injected, used = self._rehydrate_working_set(focus, inject_budget, used)
 
-        # 4b) checkpoint digest (§R7): a deterministic, no-model rolling digest
-        # of everything compression has folded out of the window this session,
-        # capped so it can never grow unbounded. Built from extraction
-        # artifacts (facts/entities/directives/episodes) — never a model call.
-        # Injected only into whatever budget room is left, always clipped to
-        # fit, so it never breaks the compress() output<=budget guarantee (§R2).
+        # 4b) checkpoint digest (§R7) with tiered abstraction selection:
+        # a deterministic, no-model rolling digest of everything compression has
+        # folded out of the window this session. Selects abstract, gist, or verbatim
+        # depending on available token budget.
         digest_text = self._update_checkpoint_digest(durable_evicted)
         if digest_text:
             remaining = budget - used
             if remaining > 0:
+                # Tiered selection: if remaining budget is tight (< 100 tokens), use abstract level
+                if remaining < 100:
+                    digest_lines = [line.split("\n")[0][:60] for line in self._checkpoint_lines]
+                    digest_text = "\n".join(digest_lines)
                 content = f"[Checkpoint: {digest_text}]"
                 if estimate_tokens(content) > remaining:
                     content = content[:max(0, remaining * 3)]
