@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: python -m pip install pytest blake3 ruff
+      - name: Verify release
+        run: |
+          python -m pytest tests/ -q
+          ruff check .
+      - name: Check tag matches plugin version
+        shell: bash
+        run: |
+          set -euo pipefail
+          plugin_version=$(awk '/^version:/ { print $2; exit }' plugin.yaml)
+          if [[ "${GITHUB_REF_NAME}" != "v${plugin_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match plugin.yaml version ${plugin_version}" >&2
+            exit 1
+          fi
+      - name: Build installable plugin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p dist/chronicle/dashboard
+          cp __init__.py _base.py context.py provider.py plugin.yaml LICENSE README.md dist/chronicle/
+          cp -R engine dist/chronicle/
+          cp dashboard/manifest.json dashboard/plugin_api.py dist/chronicle/dashboard/
+          find dist -type f -name '*.pyc' -delete
+          (cd dist && zip -qr "chronicle-${version}.zip" chronicle)
+          (cd dist && shasum -a 256 "chronicle-${version}.zip" > "chronicle-${version}.zip.sha256")
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/chronicle-${version}.zip" \
+            "dist/chronicle-${version}.zip.sha256" \
+            --verify-tag \
+            --generate-notes \
+            --title "Chronicle ${version}"

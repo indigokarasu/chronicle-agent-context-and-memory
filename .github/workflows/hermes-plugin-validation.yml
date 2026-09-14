@@ -1,0 +1,39 @@
+name: Hermes Plugin Validation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: .hermes-validator
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install validator dependency
+        run: python -m pip install pyyaml
+      - name: Validate against the Hermes plugin admission checks
+        env:
+          HERMES_VALIDATOR: .hermes-validator
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, os.environ["HERMES_VALIDATOR"])
+          from hermes_cli.plugin_validate import validate_plugin_dir
+
+          report = validate_plugin_dir(Path("."))
+          print(json.dumps(report.to_dict(), indent=2))
+          raise SystemExit(report.exit_code)
+          PY
