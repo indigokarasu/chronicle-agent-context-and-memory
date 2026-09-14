@@ -22,9 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine import doc2query
-from engine.config import Config
 from engine.core import ChronicleCore
-from engine.embeddings import HashingEmbedder
 from engine.reducer import Reducer
 from engine.store import MemoryStore
 

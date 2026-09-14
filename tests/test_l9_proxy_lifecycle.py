@@ -28,7 +28,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from engine import doc2query
 from engine.core import ChronicleCore
-from engine.embeddings import pack
 
 
 _FACT_KEY = {"entity_id": "ent_pat_testley", "entity_name": "Pat Testley",

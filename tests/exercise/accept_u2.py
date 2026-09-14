@@ -237,7 +237,7 @@ def test_get_context_surfaces_digest():
 
     hint = "what do we know about the user"
     ctx = core.retrieval.get_context(hint)
-    digest_lines = [l for l in ctx.split("\n") if l.startswith("[DIGEST]")]
+    digest_lines = [line for line in ctx.split("\n") if line.startswith("[DIGEST]")]
     assert len(digest_lines) == 1, f"expected 1 digest line in context, got {digest_lines}"
     assert "=" in digest_lines[0], f"digest line carries no attributes: {digest_lines[0]}"
 

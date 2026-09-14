@@ -23,7 +23,6 @@ Run: python3 tests/exercise/accept_r12.py
 
 import importlib.util
 import shutil
-import sqlite3
 import sys
 import tempfile
 import types
@@ -232,7 +231,7 @@ def check3_coverage_reports_digest_and_entity_stays_zero():
     try:
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"}})
         core.initialize("s1", principal_id="assistant")
-        d = _seed_digest(core)
+        _seed_digest(core)
 
         # A second, ordinary (non-digest) note, so the 'note' bucket is not
         # accidentally left empty once digests are broken out of it.
