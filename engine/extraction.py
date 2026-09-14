@@ -107,12 +107,15 @@ class HeuristicExtractor(Extractor):
                                         "session_transcript", entity_name=m.group(1).strip()))
                 continue
 
-        # An episodic summary of the turn (multi-granularity, §16.0)
+        # An episodic summary of the turn with tiered abstraction levels
         if len(text) > 60:
+            abstract_level = text[:60] + "..." if len(text) > 60 else text
+            gist_level = text[:200] + "..." if len(text) > 200 else text
             items.append({"type": "asserted", "kind": "episode",
                           "key": {"title": text[:48], "session_ref": session_id},
                           "body": text[:400], "confidence": 0.6, "source_event": source_event,
-                          "source_type": "session_transcript", "route": "promote"})
+                          "source_type": "session_transcript", "route": "promote",
+                          "abstract": abstract_level, "gist": gist_level, "verbatim": text})
         route = "promote" if items else "skip"
         return ExtractionResult(items, ambiguous, route)
 

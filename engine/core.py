@@ -290,6 +290,17 @@ class ChronicleCore:
                                f"{ex}. Vectors for this round are queued, never hashed.")
         return info
 
+    def get_materialized_profile(self, owner: str = "default") -> dict:
+        """Retrieve the materialized profile summary for an owner."""
+        raw = self.store.get_meta(f"profile_summary:{owner}", "")
+        if not raw:
+            return {"static": {}, "dynamic": {}}
+        try:
+            import json
+            return json.loads(raw)
+        except Exception:
+            return {"static": {}, "dynamic": {}}
+
     def diagnostics(self) -> dict:
         """Comprehensive system diagnostics for agents and operators.
 
