@@ -68,6 +68,38 @@ class ReasoningLayer:
         return self.store.get_active_goals()
 
     # procedures
+    def record_procedure(self, name: str, steps: list[str], params: list[str] | None = None,
+                         success_criteria: list[str] | None = None, owner: str = "default") -> str:
+        proc_id = "proc_" + uuid.uuid4().hex[:12]
+        now = now_iso()
+        self.store.upsert_belief("procedures", {
+            "belief_id": proc_id, "name": name, "params": json.dumps(params or []),
+            "steps": json.dumps(steps or []), "success_criteria": json.dumps(success_criteria or []),
+            "domain": "general", "owner": owner, "read_acl": '["*"]', "status": "active",
+            "salience": "normal", "confidence": 0.85, "trust_level": 2, "created_at": now, "last_seen_at": now
+        })
+        return proc_id
+
+    def extract_procedure_from_session(self, session_id: str, name: str = "") -> str | None:
+        """Analyze tool execution events in a session and store a reusable procedure template."""
+        events = self.store.get_events_by_session(session_id)
+        tool_calls = []
+        for ev in events:
+            payload = ev.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            excerpt = payload.get("excerpt") or ""
+            if "tool" in excerpt.lower() or ev.get("type") in ("observed", "asserted"):
+                if excerpt and len(excerpt) > 5:
+                    tool_calls.append(excerpt[:200])
+        if not tool_calls:
+            return None
+        proc_name = name or f"Procedure for {session_id}"
+        return self.record_procedure(proc_name, steps=tool_calls[:10])
+
     def get_procedure(self, name: str, params: dict | None = None):
         rows = self.store.query_beliefs("procedures", "name=? AND status='active'", (name,), 1)
         if not rows:

@@ -583,22 +583,44 @@ class ChronicleContextEngine(ContextEngine):
             if inject_budget > 0:
                 injected, used = self._rehydrate_working_set(focus, inject_budget, used)
 
-        # 4b) checkpoint digest (§R7): a deterministic, no-model rolling digest
-        # of everything compression has folded out of the window this session,
-        # capped so it can never grow unbounded. Built from extraction
-        # artifacts (facts/entities/directives/episodes) — never a model call.
-        # Injected only into whatever budget room is left, always clipped to
-        # fit, so it never breaks the compress() output<=budget guarantee (§R2).
+        # 4b) checkpoint digest (§R7) with tiered abstraction selection:
+        # a deterministic, no-model rolling digest of everything compression has
+        # folded out of the window this session. Selects abstract, gist, or verbatim
+        # depending on available token budget.
         digest_text = self._update_checkpoint_digest(durable_evicted)
         if digest_text:
             remaining = budget - used
             if remaining > 0:
+                # Tiered selection: if remaining budget is tight (< 100 tokens), use abstract level
+                if remaining < 100:
+                    digest_lines = [line.split("\n")[0][:60] for line in self._checkpoint_lines]
+                    digest_text = "\n".join(digest_lines)
                 content = f"[Checkpoint: {digest_text}]"
                 if estimate_tokens(content) > remaining:
                     content = content[:max(0, remaining * 3)]
                 if content:
                     injected.append({"role": "system", "content": content})
                     used += estimate_tokens(content)
+
+        # 4c) Pinned memory slots: inject active memory slots into context if budget permits
+        if self.core:
+            remaining = budget - used
+            if remaining > 0:
+                raw = self.core.store.get_meta(f"memory_slots:{self._principal_id}", "")
+                if raw:
+                    try:
+                        slots = json.loads(raw)
+                        if slots:
+                            slot_lines = [f"[{k}]: {v}" for k, v in slots.items() if v]
+                            if slot_lines:
+                                slot_text = "[Pinned Memory Slots]\n" + "\n".join(slot_lines)
+                                if estimate_tokens(slot_text) > remaining:
+                                    slot_text = slot_text[:max(0, remaining * 3)]
+                                if slot_text:
+                                    injected.append({"role": "system", "content": slot_text})
+                                    used += estimate_tokens(slot_text)
+                    except Exception:
+                        pass
 
         # 5) audit event (§R6/R4): evicted_spans/kept_spans/folded_spans carry
         # actual span ids (not counts) so the kept/evicted/folded partition of
@@ -1189,6 +1211,19 @@ class ChronicleContextEngine(ContextEngine):
              "parameters": {"type": "object",
                             "properties": {"span_id": {"type": "string"}},
                             "required": ["span_id"]}},
+            {"name": "chronicle_set_memory_slot",
+             "description": "Set a pinned memory slot (e.g. persona, user_preferences, tool_guidelines, project_context, pending_items).",
+             "parameters": {"type": "object",
+                            "properties": {"slot_name": {"type": "string"}, "content": {"type": "string"}},
+                            "required": ["slot_name", "content"]}},
+            {"name": "chronicle_get_memory_slots",
+             "description": "Retrieve all pinned memory slots for the active user.",
+             "parameters": {"type": "object", "properties": {}, "required": []}},
+            {"name": "chronicle_clear_memory_slot",
+             "description": "Clear a specific pinned memory slot.",
+             "parameters": {"type": "object",
+                            "properties": {"slot_name": {"type": "string"}},
+                            "required": ["slot_name"]}},
         ]
 
     def handle_tool_call(self, name, args, **kw) -> str:
@@ -1219,6 +1254,10 @@ class ChronicleContextEngine(ContextEngine):
                 return json.dumps({"error": "chronicle_expand requires the memory-aware "
                                              "engine (heuristic fallback has no event store)"})
             return json.dumps(self.chronicle_expand(args.get("span_id", "")))
+        if name in ("chronicle_set_memory_slot", "chronicle_get_memory_slots", "chronicle_clear_memory_slot"):
+            if not self.core:
+                return json.dumps({"error": "Memory slot tools require core engine."})
+            return self.core.tools.dispatch(self._principal_id, name, args)
         return json.dumps({"error": f"unknown tool: {name}"})
 
     def context_status(self) -> dict:

@@ -78,6 +78,14 @@ class Tools:
             s("what_user_knows", "What the user has been told about a topic.", {"topic": text}, ["topic"]),
             s("note_informed", "Record that the user was told something.", {"proposition": text}, ["proposition"]),
             s("unmerge", "Reverse an entity merge.", {"entity_id": text}, ["entity_id"]),
+            s("set_memory_slot", "Set a pinned memory slot (e.g. persona, user_preferences, tool_guidelines, project_context, pending_items).",
+              {"slot_name": text, "content": text}, ["slot_name", "content"]),
+            s("get_memory_slots", "Retrieve all pinned memory slots for the active user.", {}),
+            s("clear_memory_slot", "Clear a specific pinned memory slot.", {"slot_name": text}, ["slot_name"]),
+            s("record_procedure", "Record a reusable procedure template with steps.",
+              {"name": text, "steps": {"type": "array", "items": text}}, ["name", "steps"]),
+            s("extract_procedure", "Extract a procedure template from a session's recorded turns.",
+              {"session_id": text, "name": text}, ["session_id"]),
         ]
 
     # -- dispatch ----------------------------------------------------------
@@ -225,6 +233,51 @@ class Tools:
         self._emit("informed", {"proposition": a["proposition"], "importance": a.get("importance", 0.5)},
                    principal, actor="agent")
         return {"status": "noted"}
+
+    def _t_set_memory_slot(self, principal, a):
+        slot_name = a.get("slot_name", "").strip()
+        content = a.get("content", "").strip()
+        if not slot_name:
+            return {"error": "slot_name required"}
+        raw = self.core.store.get_meta(f"memory_slots:{principal}", "")
+        slots = json.loads(raw) if raw else {}
+        if content:
+            slots[slot_name] = content
+        else:
+            slots.pop(slot_name, None)
+        self.core.store.set_meta(f"memory_slots:{principal}", json.dumps(slots))
+        return {"status": "slot_updated", "slot": slot_name}
+
+    def _t_get_memory_slots(self, principal, a):
+        raw = self.core.store.get_meta(f"memory_slots:{principal}", "")
+        slots = json.loads(raw) if raw else {}
+        return {"slots": slots}
+
+    def _t_clear_memory_slot(self, principal, a):
+        slot_name = a.get("slot_name", "").strip()
+        raw = self.core.store.get_meta(f"memory_slots:{principal}", "")
+        slots = json.loads(raw) if raw else {}
+        slots.pop(slot_name, None)
+        self.core.store.set_meta(f"memory_slots:{principal}", json.dumps(slots))
+        return {"status": "slot_cleared", "slot": slot_name}
+
+    def _t_record_procedure(self, principal, a):
+        name = a.get("name", "").strip()
+        steps = a.get("steps", [])
+        if not name or not steps:
+            return {"error": "name and steps required"}
+        proc_id = self.core.reasoning.record_procedure(name, steps, owner=principal)
+        return {"status": "procedure_recorded", "procedure_id": proc_id}
+
+    def _t_extract_procedure(self, principal, a):
+        session_id = a.get("session_id", "").strip()
+        name = a.get("name", "").strip()
+        if not session_id:
+            return {"error": "session_id required"}
+        proc_id = self.core.reasoning.extract_procedure_from_session(session_id, name)
+        if not proc_id:
+            return {"error": "no executable steps found in session"}
+        return {"status": "procedure_extracted", "procedure_id": proc_id}
 
     # reads
     def _t_search(self, principal, a):
