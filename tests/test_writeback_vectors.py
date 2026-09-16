@@ -341,6 +341,23 @@ class TestTheAnnMirrorKeepsCorrectedRowsVisible(_WBCase):
                              "the mirror must receive the CORRECTED blob for %s, or it keeps "
                              "serving the pre-image" % eid)
 
+    def test_refuses_and_writes_nothing_when_the_mirror_cannot_be_kept_in_step(self):
+        """A vec0 mirror this Python cannot load sqlite-vec for must STOP the run.
+
+        Warning and carrying on (an earlier revision) changed observed_vectors
+        while upsert_observed() quietly returned 0, leaving the pre-image in a
+        mirror that an extension-capable process trusts over the table. Refused
+        before WriteBack is built, so the store is untouched; dry-run too."""
+        before = self._observed()
+        for dry in (False, True):
+            with mock.patch.object(WB, "_vec0_unmaintainable", lambda conn: True):
+                rc, counts, out = self._run_counts(dry_run=dry)
+            self.assertEqual(rc, 1, "dry_run=%s did not refuse:\n%s" % (dry, out))
+            self.assertIn("REFUSED", out)
+            self.assertIn("Nothing was written to the live store.", out)
+            self.assertEqual(self._observed(), before,
+                             "a REFUSED run (dry_run=%s) still changed observed_vectors" % dry)
+
     def test_the_tool_never_deletes_from_the_mirror(self):
         self.assertFalse(hasattr(WB, "_vec0_delete"),
                          "writeback_vectors imports a vec0 DELETE again. A corrected row that "

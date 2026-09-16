@@ -149,6 +149,21 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
         print(f"ERROR: no database at {path}")
         return 1
 
+    # REFUSE before anything is opened for writing -- including MemoryStore,
+    # which migrates the schema on open. Probed on a read-only connection, in
+    # dry-run as well, so a dry run cannot report success for a run that would
+    # refuse. An earlier revision only warned, from INSIDE the transaction and
+    # after the DELETE had already run.
+    probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        unmaintainable = _vec0_unmaintainable(probe)
+    finally:
+        probe.close()
+    if unmaintainable:
+        print("REFUSED: this database has a vec0 ANN mirror, but this Python's sqlite3 cannot load sqlite-vec, so the mirror cannot be kept equal to observed_vectors. A process that CAN load it trusts a nonempty KNN result instead of scanning the table, and would go on serving rows this tool deletes, as orphans. The mirror cannot be dropped or edited without the extension either. Re-run under a Python whose sqlite3 can load sqlite-vec.")
+        print("Nothing was changed.")
+        return 1
+
     if dry_run:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
@@ -175,8 +190,12 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
         if models:
             # Name the rows BEFORE deleting them: the delete is by model, and once
             # it runs nothing identifies which event_ids left observed_vectors.
-            doomed = [r[0] for r in conn.execute(
-                f"SELECT event_id FROM observed_vectors WHERE model IN ({marks})", models)]
+            # One bound `model = ?` per tag rather than an interpolated IN list:
+            # the tag set is a handful of spellings, and this builds no SQL text
+            # at all -- so there is nothing to argue about injection here, only
+            # the same rows (NULL matches neither form).
+            doomed = [r[0] for tag in models for r in conn.execute(
+                "SELECT event_id FROM observed_vectors WHERE model = ?", (tag,))]
             conn.execute(f"DELETE FROM observed_vectors WHERE model IN ({marks})", models)
             # Remove exactly those from the vec0 ANN mirror, and nothing else. An
             # earlier revision cleared the WHOLE mirror; once the requeued vectors
@@ -185,10 +204,6 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
             # vector search, not merely slower, because retrieve_raw takes a
             # nonempty KNN result instead of the paged scan. Targeted removal
             # keeps the mirror equal to the table at every step.
-            if _vec0_unmaintainable(conn):
-                print("WARNING: this database has a vec0 ANN mirror this Python cannot load "
-                      "sqlite-vec for; %d deleted row(s) stay in it as orphans that KNN can "
-                      "still return. Re-run under a Python that can load sqlite-vec." % len(doomed))
             _vec0_delete_ids(conn, doomed)
             conn.execute(f"DELETE FROM memory_vectors WHERE model IN ({marks})", models)
         # E2 doc2query proxies carry their own model tag and were invisible to
