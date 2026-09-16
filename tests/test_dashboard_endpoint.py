@@ -52,6 +52,7 @@ def _load_module():
     The fastapi stub is installed only if fastapi is genuinely absent, so this
     runs the same code on a machine that has it."""
     routes = []
+    installed_stub = False
     if "fastapi" not in sys.modules:
         try:
             import fastapi  # noqa: F401
@@ -70,9 +71,22 @@ def _load_module():
             stub.APIRouter = _APIRouter
             stub.Query = lambda default=None, **k: default
             sys.modules["fastapi"] = stub
-    spec = importlib.util.spec_from_file_location("chronicle_plugin_api_a13", str(_PLUGIN_API))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+            installed_stub = True
+    try:
+        spec = importlib.util.spec_from_file_location("chronicle_plugin_api_a13", str(_PLUGIN_API))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        # Removed as soon as plugin_api has bound what it imports. Left in place
+        # it leaked for the rest of the pytest session: a later module doing
+        # `import fastapi` got a stub with two methods, and one that skips on
+        # ImportError stopped skipping. It also broke THIS helper quietly --
+        # the stub's get/post close over the FIRST call's `routes`, and with the
+        # stub still present every later call skipped reinstalling it, so from
+        # the second setUp on the returned `routes` was a fresh list nothing
+        # ever appended to.
+        if installed_stub:
+            sys.modules.pop("fastapi", None)
     return mod, routes
 
 

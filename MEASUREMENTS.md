@@ -262,7 +262,7 @@ BOTH tight tiers. N=8 buys one more @1500 hit and pays for it at @4000, which
 is the shape of the whole finding in miniature: rationing a budget that already
 held four or five sessions only shortens each of them.
 
-### Shipped result (N=5, `context.breadth_floor` on)
+### Shipped result (`context.breadth_floor_sessions` = 5)
 
 ctx_eval **75.9 / 84.5 / 89.7 -> 77.6 / 86.2 / 89.7**. Per-instance, at 1 500:
 gained #16 and #27, lost #19. At 4 000: gained #25, lost nothing. At 12 000:

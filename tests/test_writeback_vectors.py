@@ -43,6 +43,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -291,6 +292,59 @@ class TestAppliesTheMigratedVectors(_WBCase):
 # ==========================================================================
 # W1 — the resurrection test
 # ==========================================================================
+class TestTheAnnMirrorIsInvalidated(_WBCase):
+    """The vec0 ANN mirror must not keep serving a PRE-image this tool replaced.
+
+    `MemoryStore.add_observed_vector` writes `observed_vectors` and its vec0
+    mirror in ONE transaction; this tool writes raw SQL, so nothing maintains
+    the mirror for it. Left alone, a KNN query returns the stale embedding for a
+    corrected row -- and because a nonempty KNN result SKIPS the paged scan that
+    would have read the corrected blob, nothing downstream ever contradicts it.
+
+    Asserted as a contract on the call rather than on vec0 itself, deliberately:
+    sqlite-vec cannot load under Apple's system Python (no
+    `enable_load_extension`), so a test that needed a real vec0 would SKIP on the
+    machine this suite is gated on, which is the same as not having one.
+    """
+
+    def _applied_observed_keys(self):
+        c = self._live()
+        before = {tuple(r)[0]: tuple(r) for r in c.execute(
+            'SELECT event_id, embedding FROM observed_vectors').fetchall()}
+        c.close()
+        return before
+
+    def test_every_corrected_observed_row_invalidates_its_mirror_entry(self):
+        before = self._applied_observed_keys()
+        calls = []
+        real = WB._vec0_delete
+
+        def spy(conn, predicate_sql, params):
+            calls.append((predicate_sql, tuple(params)))
+            return real(conn, predicate_sql, params)
+
+        with mock.patch.object(WB, "_vec0_delete", spy):
+            rc, counts, out = self._run_counts()
+        self.assertIn(rc, (0, 2), out)
+        self.assertGreater(counts.get("applied", 0), 0, out)
+
+        c = self._live()
+        after = {tuple(r)[0]: tuple(r) for r in c.execute(
+            'SELECT event_id, embedding FROM observed_vectors').fetchall()}
+        c.close()
+        changed = {k for k, v in after.items() if before.get(k) != v}
+        self.assertTrue(changed, "no observed_vectors row changed; nothing to assert about")
+        self.assertEqual(
+            len(calls), len(changed),
+            "one mirror invalidation per corrected observed_vectors row: "
+            "%d corrected, %d invalidations" % (len(changed), len(calls)))
+        for predicate_sql, params in calls:
+            self.assertIn("event_id", predicate_sql,
+                          "the mirror delete must be scoped by the same key column")
+        self.assertEqual({p[0] for p in (c2[1] for c2 in calls)}, changed,
+                         "the invalidated ids must be exactly the corrected ids")
+
+
 class TestW1NeverResurrects(_WBCase):
     def test_row_deleted_on_live_stays_deleted(self):
         key = self._any_memory_key()

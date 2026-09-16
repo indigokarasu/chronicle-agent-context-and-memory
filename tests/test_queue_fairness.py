@@ -418,8 +418,14 @@ class TestQueueRetention(_CoreCase):
         self._seed("done", 30, finished_days_ago=30)
         self.assertEqual(self.core.health.queue_maintenance()["job_retention"]["pruned_age"], 30)
 
-        off = ChronicleCore(tempfile.mkdtemp(prefix="a7ret_"),
-                            dict(CFG, curation={"retention": {"enabled": False}}))
+        # Bound and cleaned up like every other fixture in this file; passed
+        # inline, the path was never named, so each run left a store and its WAL
+        # sidecars behind. The core is closed first so those sidecars are gone
+        # before the directory is removed.
+        off_home = tempfile.mkdtemp(prefix="a7ret_")
+        self.addCleanup(shutil.rmtree, off_home, ignore_errors=True)
+        off = ChronicleCore(off_home, dict(CFG, curation={"retention": {"enabled": False}}))
+        self.addCleanup(off.close)
         with off.store.transaction() as c:
             c.executemany("INSERT INTO curation_jobs(task,payload,created_at,status,finished_at) "
                           "VALUES('embed','{}','2026-01-01T00:00:00.00Z','done',?)",

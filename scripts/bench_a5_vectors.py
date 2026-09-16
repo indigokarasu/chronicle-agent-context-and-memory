@@ -183,14 +183,21 @@ def seed(path, rows, seed_value=20260910):
             "owner,domain,status,provenance,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (bid, "e%06d" % (i % 5000), rng.choice(_WORDS), rng.choice(_WORDS), val,
              "default", "personal", "active", "{}", "2026-01-01T00:00:00Z"))
+    proxy_parents = max(1, n_proxy // 3)   # ~3 proxies per parent belief
     for i in range(n_proxy):
-        bid = "b%08d" % (i % rows)          # several proxies land on one belief
+        # `n_proxy` is a FRACTION of `rows`, so `i % rows` was always `i` and
+        # `i // rows` always 0: every belief got exactly one proxy at index 0 and
+        # the comment claiming a fan-out was false. That made the benchmark time
+        # `_vector_proxies` over a corpus that never exercises its best-per-belief
+        # dedupe or the multi-proxy tail merge -- i.e. it measured the easy case
+        # and reported it as the shape A5 has to handle.
+        bid = "b%08d" % (i % proxy_parents)   # several proxies DO land on one belief
         dims = QUERY_DIMS if (i % 100) < int(MATCHING_FRACTION * 100) else FOREIGN_DIMS
         kind = "observed" if i % 5 == 0 else "fact"
         conn.execute("INSERT INTO query_proxy_vectors"
                      "(belief_id,proxy_idx,kind,question,embedding,model,created_at) "
                      "VALUES(?,?,?,?,?,?,?)",
-                     (bid, i // rows if rows else 0, kind, "q?", blobs.blob(dims),
+                     (bid, i // proxy_parents, kind, "q?", blobs.blob(dims),
                       "m", "2026-01-01T00:00:00Z"))
     for i in range(n_sess):
         dims = QUERY_DIMS if (i % 100) < int(MATCHING_FRACTION * 100) else FOREIGN_DIMS

@@ -1457,7 +1457,13 @@ class MemoryStore:
         if kind:
             where, params = "kind = ?", [kind]
         elif exclude_kind:
-            where, params = "kind != ?", [exclude_kind]
+            # COALESCE, not a bare `kind != ?`: `kind` has no NOT NULL constraint,
+            # and SQL evaluates `NULL != 'observed'` as NULL -- i.e. NOT a match --
+            # so a bare inequality silently DROPS every NULL-kind proxy row. The
+            # Python filter this predicate replaced kept them (`None != "observed"`
+            # is True there), so pushing the filter into SQL without this would be
+            # a behaviour change hidden inside a performance fix.
+            where, params = "COALESCE(kind, '') != ?", [exclude_kind]
         yield from self._paged_vector_scan("query_proxy_vectors", batch_size, width,
                                            where, params)
 
@@ -1748,7 +1754,8 @@ class MemoryStore:
         yield from self._paged_vector_scan("memory_vectors", batch_size, width)
 
     def wrong_dim_vector_ids(self, table: str, id_col: str, width: int,
-                             extra_where: str = "", extra_params: Sequence = ()) -> list:
+                             extra_where: str = "", extra_params: Sequence = (),
+                             limit: Optional[int] = None) -> list:
         """(id, byte_length) for every row whose embedding is PRESENT but is not
         `width` bytes -- the exact COMPLEMENT of `_paged_vector_scan`'s filter.
 
@@ -1771,14 +1778,49 @@ class MemoryStore:
         if extra_where:
             where += " AND (%s)" % extra_where
             params.extend(extra_params)
+        sql = ("SELECT %s AS ident, length(embedding) AS nbytes FROM %s WHERE %s"
+               % (qid, qtable, where))
+        if limit is not None:
+            # A5's bound applies to the DIAGNOSTIC too. Pushed into SQL rather
+            # than sliced in Python so the rows past the sample are never
+            # materialised at all. The reported COUNT does not come from here --
+            # see `wrong_dim_vector_count` -- so bounding the sample cannot make
+            # the number wrong, which is the one thing A0c must not do.
+            sql += " LIMIT ?"
+            params.append(int(limit))
         try:
-            rows = self._conn().execute(
-                "SELECT %s AS ident, length(embedding) AS nbytes FROM %s WHERE %s"
-                % (qid, qtable, where), tuple(params)).fetchall()
+            rows = self._conn().execute(sql, tuple(params)).fetchall()
         except sqlite3.Error as e:                 # table absent on an old store
             logger.debug("wrong-dim probe skipped for %s (%s)", table, e)
             return []
         return [(r["ident"], r["nbytes"]) for r in rows if r["ident"] is not None]
+
+    def wrong_dim_vector_count(self, table: str, id_col: str, width: int,
+                               extra_where: str = "", extra_params: Sequence = ()) -> int:
+        """How many rows `wrong_dim_vector_ids` would return, unbounded.
+
+        Split from the identity query so the identities can be SAMPLED while the
+        number stays exact. `length(embedding)` is answerable from
+        `idx_{ov,mv,qpv}_model_width`, so this is an index scan that loads no
+        blob and builds no Python object per row -- which is the whole point:
+        on an 88%-mismatched store the identity list was ~93k tuples per
+        channel, five to six times per top-level query, retained until the next
+        one. The count is what every consumer actually reports; the identities
+        are a 20-item sample in one debug field."""
+        qtable, qid = self._checked_ident(table, id_col)
+        where = "embedding IS NOT NULL AND length(embedding) != ?"
+        params: list = [int(width)]
+        if extra_where:
+            where += " AND (%s)" % extra_where
+            params.extend(extra_params)
+        try:
+            row = self._conn().execute(
+                "SELECT COUNT(*) FROM %s WHERE %s AND %s IS NOT NULL"
+                % (qtable, where, qid), tuple(params)).fetchone()
+        except sqlite3.Error as e:                 # table absent on an old store
+            logger.debug("wrong-dim count skipped for %s (%s)", table, e)
+            return 0
+        return int(row[0]) if row else 0
 
     def _paged_vector_scan(self, table: str, batch_size: int, width: Optional[int],
                            extra_where: str = "", extra_params: Sequence = ()):

@@ -24,7 +24,6 @@ import io
 import re
 import shutil
 import sys
-import tempfile
 import tokenize
 import unittest
 from pathlib import Path
@@ -33,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from context import ChronicleContextEngine  # noqa: E402
 from engine import embeddings as emb  # noqa: E402
+from _tmp_support import temp_home  # noqa: E402
 from engine.core import ChronicleCore  # noqa: E402
 from engine.embeddings import (COMPRESSION_BUDGET, CONTEXT_BUDGET, EMBED_INPUT,  # noqa: E402
                                MARGINS, HashingEmbedder, OpenAICompatEmbedder,
@@ -482,7 +482,7 @@ class TestContextBudgetGetsTheWholeEstimate(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.home = tempfile.mkdtemp(dir=str(ROOT / "tests"))
+        cls.home = temp_home(prefix="token_margins_")
         cls.core = cls.build(cls.home)
 
     @classmethod
@@ -539,7 +539,7 @@ class TestContextBudgetGetsTheWholeEstimate(unittest.TestCase):
         Asserted on ids AND on the delivered context: the ids are the
         mechanism and the context is what the sibling tests measure.
         """
-        other = tempfile.mkdtemp(dir=str(ROOT / "tests"))
+        other = temp_home(prefix="token_margins_")
         try:
             twin = self.build(other)
             mine = [r["event_id"] for r in self.core.retrieval.retrieve_raw(self.Q, limit=20)]
@@ -575,7 +575,7 @@ class TestContextBudgetGetsTheWholeEstimate(unittest.TestCase):
         `test_a_saturating_caller_actually_receives_the_extra_third` asserts.
         """
         original = self.__class__._stamp
-        other = tempfile.mkdtemp(dir=str(ROOT / "tests"))
+        other = temp_home(prefix="token_margins_")
         try:
             # One turn per DAY, against `_stamp`'s five-minute grid: the same
             # 75 turns in the same order, on a chronology that shares no
@@ -636,7 +636,7 @@ class TestCompressionBudgetGetsTheWholeEstimate(unittest.TestCase):
 
     def test_a_window_worth_exactly_the_budget_survives_compression(self):
         """The same, end to end: nothing is evicted from a window that fits."""
-        home = tempfile.mkdtemp(dir=str(ROOT / "tests"))
+        home = temp_home(prefix="token_margins_")
         try:
             cfg = {"embeddings": {"model": "hashing"},
                    "context": {"default_token_budget": 400}}

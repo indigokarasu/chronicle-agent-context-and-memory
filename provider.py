@@ -296,7 +296,16 @@ class ChronicleMemoryProvider(MemoryProvider):
             # decision — no turn is waiting on it — and it is the one hook a
             # host that never calls on_turn_start still calls. Enqueue only:
             # the work is drained by the next session's turns.
-            self.core.scheduler.on_hook("session_end")
+            #
+            # Guarded like every other optional side channel in this file
+            # (sync_turn's piggyback: "a side channel may never break capture",
+            # I12/I18). finalize_session has ALREADY succeeded by this line, so
+            # a locked store, a migration mid-flight or an older core with no
+            # `scheduler` must not turn a clean session end into a host error.
+            try:
+                self.core.scheduler.on_hook("session_end")
+            except Exception as e:
+                logger.debug("Chronicle: session_end maintenance hook skipped: %s", e)
 
     def on_memory_write(self, action, target, content, metadata=None):
         if self.core:

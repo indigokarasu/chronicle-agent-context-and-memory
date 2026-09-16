@@ -81,14 +81,14 @@ class PreflightWatermarkGateTests(unittest.TestCase):
 
     def test_false_below_low_watermark(self):
         """No pressure yet -- nothing worth prepping for."""
-        messages = _messages(22)  # ~981 tokens, under the 1100 LOW watermark
+        messages = _messages(22)  # ~749 tokens, under the 825 LOW watermark
         self.assertFalse(self.eng.should_compress_preflight(messages))
         self.assertEqual(_durability_events(self.core, "r10-s1"), [],
                           "preflight must not do fold-candidate work below the low watermark")
 
     def test_false_at_or_above_high_watermark(self):
         """Already due -- should_compress() owns this pass now, not preflight."""
-        messages = _messages(40)  # ~1791 tokens, over the 1500 HIGH watermark
+        messages = _messages(40)  # ~1361 tokens, over the 1125 HIGH watermark
         self.assertGreaterEqual(sum(self._tokens(m) for m in messages), self.eng.threshold_tokens)
         self.assertFalse(self.eng.should_compress_preflight(messages))
 
@@ -117,7 +117,7 @@ class PreflightDoesTheWorkTests(unittest.TestCase):
         # A10b units restatement: 2000 tok x 3 chars = 6000 = 1500 tok x 4 chars; the watermarks
         # this fixture is built around are unchanged in chars: LOW 1100x3 = 3300 = 825x4,
         # HIGH 1500x3 = 4500 = 1125x4.
-        self.messages = _messages(28)  # ~1251 tokens: squarely inside the gap
+        self.messages = _messages(28)  # ~953 tokens: squarely inside the 825..1125 gap
 
     def tearDown(self):
         ChronicleCore._instances.pop(self.home, None)

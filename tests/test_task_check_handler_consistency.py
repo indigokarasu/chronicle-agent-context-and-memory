@@ -47,10 +47,17 @@ _ROOT = Path(__file__).parent.parent
 # Every shipped .py file — the engine, the two plugin adapters, the scripts and
 # the dashboard. Tests are excluded on purpose: a test may legitimately enqueue
 # a bogus task name to prove the schema rejects it.
+# Judged on the path RELATIVE to the repo root. Testing absolute `p.parts`
+# would exclude every file if the checkout itself lived under a dot-directory
+# or a directory named `tests`. Dot-directories are excluded wholesale: work
+# trees keep note dirs such as `.a10logs/` holding stale COPIES of engine
+# sources (see test_token_margins), and a stale copy that still enqueues a
+# retired task would fail this scan while naming a file nobody ships.
 _SHIPPED = sorted(
     p for p in _ROOT.rglob("*.py")
-    if "tests" not in p.parts and ".git" not in p.parts
-    and "__pycache__" not in p.parts)
+    if "tests" not in p.relative_to(_ROOT).parts
+    and "__pycache__" not in p.relative_to(_ROOT).parts
+    and not any(part.startswith(".") for part in p.relative_to(_ROOT).parts))
 
 
 def _check_tasks(conn) -> set:

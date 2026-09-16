@@ -1529,7 +1529,17 @@ class FakeStore:
         # A set, deliberately: the order rows reach the scorer is not a contract.
         yield [{"event_id": e, "embedding": BLOB, "owner": "default"} for e in set(IDS)]
 
-    def wrong_dim_vector_ids(self, table, id_col, width, extra_where="", extra_params=()):
+    def wrong_dim_vector_count(self, table, id_col, width, extra_where="", extra_params=()):
+        # The COUNT half of the same complement. Split from the identity query so
+        # the identities can be SAMPLED while the number stays exact; kept here
+        # rather than left to fall back to `len(wrong_dim_vector_ids(...))`,
+        # because a double that quietly answers a method it does not implement is
+        # how interface drift stops being visible. Zero, for the same reason the
+        # identity list is empty: every blob this fake serves is the right width.
+        return 0
+
+    def wrong_dim_vector_ids(self, table, id_col, width, extra_where="", extra_params=(),
+                             limit=None):
         # v5.7.0 integration: `retrieve_raw` now asks for the ID-ONLY complement
         # of its own width filter (the A0 x A5 cancellation, see
         # RetrievalEngine._note_wrong_dim_table). Every blob this fake serves is

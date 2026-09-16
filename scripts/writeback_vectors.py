@@ -188,6 +188,7 @@ from engine.embeddings import (
     get_embedder,
     is_usable_model_tag,
 )
+from engine.vector_index import delete_matching as _vec0_delete
 from engine.reducer import (
     belief_vector_text,
     observed_vector_text,
@@ -756,6 +757,8 @@ class WriteBack:
         where = _where(table)
         targets = sorted(set(_job_target_id(table, it[1]) for it in items))
         applied_rows = []
+        pending_applied = 0
+        pending_at_risk = 0
         self.live.execute("BEGIN IMMEDIATE" if not self.dry_run else "BEGIN")
         try:
             queued = self._queued_targets(targets)
@@ -830,10 +833,32 @@ class WriteBack:
                 if not cur.rowcount:
                     self._note("skipped-changed", ident)
                     continue
+                # The vec0 ANN mirror (engine/vector_index.py) shadows
+                # observed_vectors and is kept in step by MemoryStore on the
+                # NORMAL write path. This tool writes raw SQL, so it must
+                # invalidate the mirrored row itself: otherwise a KNN query keeps
+                # serving the PRE-image embedding for a row this batch just
+                # corrected, and because a nonempty KNN result skips the paged
+                # scan that would have read the corrected blob, the staleness is
+                # SILENT. Deleting is sufficient -- retrieval falls through to the
+                # paged scan when the ANN returns nothing (`if knn_results:`), and
+                # the mirror repopulates on the next normal write. vec0 carries
+                # the same key column, so this WHERE applies unchanged. Runs on
+                # THIS connection inside THIS transaction, never commits, and is a
+                # no-op returning 0 unless sqlite-vec is really engaged here.
+                if table == "observed_vectors":
+                    _vec0_delete(self.live, where, tuple(key))
                 applied_rows.append({"k": list(key), "h": _hex(sha_blob(new_blob))})
-                self.counts["applied"] += 1
+                # Counted into LOCALS, banked after COMMIT. A later row in this
+                # same batch can raise Refused (W5), and the handler rolls the
+                # whole batch back -- but a counter already incremented keeps the
+                # rows that were just un-written, and writeback()'s refusal path
+                # then prints them as "applied by earlier batches and are correct
+                # and committed", which is false. Same discipline as
+                # migrate_vectors._counted_batch.
+                pending_applied += 1
                 if at_risk:
-                    self.counts["applied-at-risk"] += 1
+                    pending_at_risk += 1
             if self.dry_run:
                 self.live.execute("ROLLBACK")
             else:
@@ -845,6 +870,12 @@ class WriteBack:
                         "cursor_after": items[-1][0] if items else None}
                     self.state.save()
                 self.live.execute("COMMIT")
+                # Banked ONLY now. Until this line these rows could still be
+                # un-written by a later Refused in this same batch, and a counter
+                # that survives its own rollback makes writeback()'s refusal
+                # message claim rows are "correct and committed" when they are not.
+                self.counts["applied"] += pending_applied
+                self.counts["applied-at-risk"] += pending_at_risk
         except Exception:
             try:
                 self.live.execute("ROLLBACK")
