@@ -86,7 +86,7 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         # evictable middle span is even considered.
         self.eng.update_model("test-model", context_length=750)  # -> budget = 0.55 * 750 = 412
         # A10b units restatement: 1000 x 3 = 3000 = 750 x 4.
-        huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~2009 tokens, alone > budget
+        huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~1507 tokens (chars/4), alone > budget
         messages = (
             [_msg("system", "sys")]
             + [_msg("user", "head %d" % i) for i in range(3)]
@@ -109,10 +109,11 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         # detects last_prompt_tokens >= threshold_tokens, the HIGH watermark)
         # must be counted against the SAME budget as everything else. A first
         # cut appended it after budget-fitting, uncounted, and landed at 615
-        # tokens against this exact fixture's 550-token budget.
+        # tokens against this fixture's then-550-token budget -- pre-A10b units;
+        # ~461 against today's 412, the same overrun restated in chars/4.
         self.eng.update_model("test-model", context_length=750)  # budget = 412, threshold = 562
         # A10b units restatement: 1000 x 3 = 3000 = 750 x 4.
-        huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~2009 tokens alone, > budget
+        huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~1507 tokens (chars/4) alone, > budget
         messages = (
             [_msg("system", "sys")]
             + [_msg("user", "head %d" % i) for i in range(3)]

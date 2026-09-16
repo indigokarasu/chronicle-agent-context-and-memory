@@ -14,11 +14,12 @@ ignore = ["E501", "BLE001", "N999", "S110", "S112", "SIM102", "SIM115", "RUF012"
 # future `select` narrowing cannot drop one by accident.
 #
 # F601  duplicate dict key literal      — the later silently wins
+# F602  duplicate dict key variable     — the same defect with names as keys
 # F811  redefinition of unused name     — the same defect for defs/imports
 # F821  undefined name
 # F822  undefined name in __all__
 # F402  import shadowed by loop variable
-# F502/F506/F602  malformed % and `in` usages
+# F502/F506  malformed %-format usages
 # E9    syntax / IO errors
 extend-select = ["F601", "F811", "F821", "F822", "F402", "F502", "F506", "F602", "E9"]
 

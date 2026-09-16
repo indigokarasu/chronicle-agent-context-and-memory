@@ -240,9 +240,9 @@ class CheckpointDigestTests(unittest.TestCase):
         # A10b units restatement: 100000 x 3 = 300000 = 75000 x 4; the budget is
         # the same window in chars (55000 x 3 = 165000 = 41250 x 4).
         budget = self.eng._target_budget()
-        item_chars = 900                              # -> estimate_tokens == 300 per item
+        item_chars = 900                              # -> estimate_tokens == 225 per item (chars/4)
         item_cost = estimate_tokens("z" * item_chars)
-        n_items = 200                                  # total middle cost (60000) > budget
+        n_items = 200                                  # total middle cost (45000) > budget (41250)
         target_index = 0                               # oldest -> recency-evicted first (§R3)
 
         def item(i):

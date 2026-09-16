@@ -26,13 +26,13 @@ import io
 import re
 import shutil
 import sys
-import tempfile
 import tokenize
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from _tmp_support import temp_home  # noqa: E402
 from context import ChronicleContextEngine  # noqa: E402
 from engine.core import ChronicleCore  # noqa: E402
 from engine.embeddings import _CHARS_PER_TOKEN, budget_chars, estimate_tokens  # noqa: E402
@@ -49,7 +49,12 @@ QUERY = "what did the Springfield maintenance report say about the heating loop"
 
 
 def make_core(cfg_overrides=None):
-    home = tempfile.mkdtemp(dir=str(ROOT / "tests"))
+    # Outside the working tree, via the shared tracked helper. `dir=ROOT/"tests"`
+    # wrote a sqlite store INTO the repository: cleanup ran in tearDown/finally,
+    # but an exception in setUp skips tearDown and an interrupted run skips both,
+    # leaving `tests/tmp*` directories in `git status` and in pytest's collection
+    # root. temp_home registers the path so the harness removes it regardless.
+    home = temp_home(prefix="ctx_budget_")
     cfg = {"embeddings": {"model": "hashing"}}
     for k, v in (cfg_overrides or {}).items():
         cfg[k] = v
@@ -292,14 +297,21 @@ class TestFinalCutDropsWholeUnits(unittest.TestCase):
         text = "\n".join(self.UNITS)
         for cap in range(0, len(text) + 2):
             fitted, dropped = _fit_units(text, cap)
-            self.assertLessEqual(len(fitted), cap if cap else len(fitted) * 0 + cap,
+            self.assertLessEqual(len(fitted), cap,
                                  "cap=%d emitted %d chars" % (cap, len(fitted)))
             lines = fitted.split("\n") if fitted else []
             body = [ln for ln in lines if not ln.startswith("…")]
             self.assertEqual(body, self.UNITS[:len(body)],
                              "cap=%d body is not a whole-unit prefix: %r" % (cap, body))
-            self.assertEqual(dropped, len(self.UNITS) - len(body) if fitted or cap == 0
-                             else dropped)
+            # Unconditional. The old form fell back to `dropped` when `fitted`
+            # was empty and `cap != 0` -- comparing the value to itself for every
+            # cap between 1 and the length of the first unit, which is exactly the
+            # boundary this sweep exists to cover. When nothing fits, `body` is
+            # empty and every unit was dropped, so the same expression is already
+            # the right answer there.
+            self.assertEqual(dropped, len(self.UNITS) - len(body),
+                             "cap=%d dropped %d of %d with body %r"
+                             % (cap, dropped, len(self.UNITS), body))
 
     def test_the_drop_is_reported_and_counted(self):
         """It says how many units went, and the report itself is inside the
@@ -419,8 +431,15 @@ class TestDraftsAreMarked(unittest.TestCase):
     def test_a_draft_reaches_answer_marked(self):
         """answer()'s text comes from `_answer_from_beliefs`, which renders
         through the same `_render`. Killed by the same revert."""
-        values = draft_all_beliefs(self.core)
-        ans = self.core.retrieval.answer(SPREAD_Q)
+        # Opts the confident path IN explicitly. The default now EXCLUDES drafts
+        # from it, and this test is about the MARKING, not the gate -- left on the
+        # default it would pass by never rendering a draft at all, which is the
+        # vacuous-green this class exists to prevent.
+        core, home = make_core({"retrieval": {"confident_answer_from_drafts": True}})
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        seed_spread(core)
+        values = draft_all_beliefs(core)
+        ans = core.retrieval.answer(SPREAD_Q)
         lines = self._draft_lines(ans.get("answer") or "", values)
         self.assertTrue(lines, "no draft belief reached answer() to test")
         for line in lines:

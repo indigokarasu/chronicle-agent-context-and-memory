@@ -22,6 +22,7 @@ directions, so the planted-fixture tests below prove both:
 """
 
 import sys
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -452,6 +453,7 @@ class TestStoredFactConfidenceFollowsConfig(unittest.TestCase):
 
     def _store_fact(self, overrides):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         cfg = {"embeddings": {"model": "hashing"}}
         cfg.update(overrides)
         core = ChronicleCore(hermes_home=tmp, config=cfg)
@@ -506,11 +508,13 @@ class TestDomainContradictionPolicyHonoursConfig(unittest.TestCase):
 class TestReaperSwitchIsReal(unittest.TestCase):
     def test_enabled_by_default(self):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         core = ChronicleCore(hermes_home=tmp, config={"embeddings": {"model": "hashing"}})
         self.assertTrue(core.reaper_enabled)
 
     def test_disabling_the_reaper_skips_startup_recovery(self):
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         core = ChronicleCore(hermes_home=tmp,
                              config={"embeddings": {"model": "hashing"},
                                      "reaper": {"enabled": False}})

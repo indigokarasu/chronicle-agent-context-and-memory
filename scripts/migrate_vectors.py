@@ -858,7 +858,15 @@ def migrate(db_path, dry_run=False, batch=_DEFAULT_BATCH, endpoint=None, model=N
               % ", ".join(_TABLES))
         return 0
     finally:
-        pass
+        # A11b: MemoryStore owns an explicit lifetime. close() checkpoints the
+        # WAL, returns to journal_mode=DELETE and removes the -wal/-shm residue;
+        # `finally: pass` skipped all of it, so every run of this tool -- the one
+        # pointed at the PRODUCTION store -- left sidecars on disk. Guarded so a
+        # failing close can never mask the return code or exception above it.
+        try:
+            store.close()
+        except Exception as e:
+            print("warning: store close failed: %s" % e)
 
 
 def main() -> int:
