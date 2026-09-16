@@ -18,6 +18,7 @@ a regression back to silence would leave every other test in this file green.
 Fixtures use only fake values (Pat Testley, Acme Fake Co).
 """
 
+import collections
 import logging
 import shutil
 import sys
@@ -151,6 +152,60 @@ class TestWrongDimIsSkippedAndCounted(_WrongDimStore):
         ans = self.core.retrieval.answer(QUERY)
         self.assertEqual((ans.get("debug") or {}).get("vectors_skipped_wrong_dim"), 0)
         self.assertEqual(E.wrong_dim_skipped(), 0)
+
+
+class TestTheDiagnosticIsBoundedButTheCountIsExact(_WrongDimStore):
+    """A0c's identity list was unbounded, which undid A5's bound on the read path.
+
+    `_note_wrong_dim_table` asked for EVERY wrong-width identity and built one
+    Python object and one dict entry per row, once per channel -- five to six
+    times per top-level `answer()`, retained until the next one. On the store
+    A0c was written for (~88% mismatched) that is ~93k rows a channel. The
+    identities exist only to fill `vectors_skipped_wrong_dim_detail`, which is
+    truncated to 20 anyway; the NUMBER is what every other consumer reads.
+
+    So the number now comes from `COUNT(*)` and the identities are sampled.
+    These two tests pin the halves against each other: remove the SQL `LIMIT`
+    and the second fails; take the count from `len(pairs)` again and the first
+    fails with the sample size instead of the truth.
+    """
+
+    EXTRA_BAD = 60
+
+    def setUp(self):
+        super().setUp()
+        with self.core.store.transaction() as c:
+            cols = [r[1] for r in c.execute("PRAGMA table_info(memory_vectors)").fetchall()]
+            src = c.execute("SELECT * FROM memory_vectors WHERE belief_id=?",
+                            (sorted(self.bad_ids)[0],)).fetchone()
+            row = dict(zip(cols, src))
+            for i in range(self.EXTRA_BAD):
+                r = dict(row)
+                r["belief_id"] = "b_bulk_%03d" % i
+                c.execute("INSERT INTO memory_vectors (%s) VALUES (%s)"
+                          % (",".join(r.keys()), ",".join("?" * len(r))),
+                          tuple(r.values()))
+        self.total_bad = self.N_BAD + self.EXTRA_BAD
+
+    def test_the_reported_count_is_exact_not_the_sample_size(self):
+        ans = self.core.retrieval.answer(QUERY)
+        debug = ans.get("debug") or {}
+        self.assertEqual(debug.get("vectors_skipped_wrong_dim"), self.total_bad,
+                         "the count must be the true number of unreadable vectors (%d), "
+                         "not the identity sample size: %r" % (self.total_bad, debug))
+
+    def test_the_identity_sample_stays_bounded(self):
+        from engine.retrieval import _WRONG_DIM_SAMPLE
+        self.core.retrieval.answer(QUERY)
+        seen = self.core.retrieval._wrong_dim_seen
+        per_channel = collections.Counter(ch for ch, _ident in seen)
+        self.assertTrue(per_channel, "no channel reported an identity at all")
+        for ch, n in per_channel.items():
+            self.assertLessEqual(
+                n, _WRONG_DIM_SAMPLE,
+                "channel %r kept %d identities; the sample is bounded at %d, and an "
+                "unbounded one is A5's bound undone by A0c's diagnostic"
+                % (ch, n, _WRONG_DIM_SAMPLE))
 
 
 class TestOldSilentBehaviorFailsTheTest(_WrongDimStore):

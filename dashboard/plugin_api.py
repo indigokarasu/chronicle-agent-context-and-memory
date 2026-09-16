@@ -291,8 +291,14 @@ def _outstanding_extractions(db_path):
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         n = conn.execute(
+            # `type='observed'` because that is what the EXTRACTOR selects
+            # (engine/curation.py: "type='observed' AND event_id NOT IN ...").
+            # Without it this counts asserted and derived events too, which no
+            # extraction will ever cover, so the number could never reach zero
+            # however long the queue ran.
             "SELECT COUNT(*) FROM events e LEFT JOIN extractions ext "
-            "ON ext.observed_event = e.event_id WHERE ext.observed_event IS NULL").fetchone()[0]
+            "ON ext.observed_event = e.event_id "
+            "WHERE ext.observed_event IS NULL AND e.type='observed'").fetchone()[0]
         conn.close()
         return n
     except Exception:
@@ -323,7 +329,7 @@ def get_status():
         # the button acts on.
         "enqueue_candidates": _count(
             db_path, "events e LEFT JOIN extractions ext ON ext.observed_event = e.event_id",
-            "ext.observed_event IS NULL"),
+            "ext.observed_event IS NULL AND e.type='observed'"),
     }
     return {
         "plugin": "chronicle",
@@ -384,7 +390,7 @@ def enqueue_extractions(limit: int = Query(500, ge=1, le=5000)):
         unextracted = conn.execute(
             """SELECT e.event_id, e.session_id FROM events e
                LEFT JOIN extractions ext ON ext.observed_event = e.event_id
-               WHERE ext.observed_event IS NULL
+               WHERE ext.observed_event IS NULL AND e.type='observed'
                ORDER BY e.seq ASC LIMIT ?""", (int(limit),)
         ).fetchall()
         enqueued = 0

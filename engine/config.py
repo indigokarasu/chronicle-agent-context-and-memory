@@ -566,17 +566,26 @@ DEFAULTS: dict[str, Any] = {
         # render, marked `[DRAFT]`, in search()/get_context(); they just never
         # back answer()'s confident path.
         #
-        # DEFAULT IS TRUE, i.e. v5.7.0's shipped behaviour, deliberately: upstream
-        # 7b83049 defaulted its gate to EXCLUDE, but this tree's A16 design is
-        # "readable and MARKED" all the way to the reader, and
-        # test_context_budget_honesty's `test_a_draft_reaches_answer_marked` is a
-        # MUTATION-KILL guard on that marking -- it drafts every belief and asserts
-        # they arrive marked, so an excluding default makes the guard vacuous
-        # rather than making it pass. Flipping a tested default is a product
-        # decision, not a merge decision. Set this False to get upstream's
-        # stricter behaviour: drafts still render marked in search()/get_context(),
-        # they just stop backing answer()'s confident path.
-        "confident_answer_from_drafts": True,
+        # DEFAULT IS FALSE, matching upstream 7b83049. A draft is a belief the
+        # writer declined to assert; letting one back answer()'s CONFIDENT path
+        # returns it with `abstain: false` AND a confidence score, and the
+        # `[DRAFT]` marker in the rendered text does not undo that -- the caller
+        # has already been told the answer is confident. Marking is an honesty
+        # measure for a reader; it is not a substitute for not claiming
+        # confidence in the first place.
+        #
+        # An earlier revision of this merge defaulted it TRUE to avoid changing
+        # v5.7.0's behaviour, on the grounds that `test_a_draft_reaches_answer_
+        # marked` is a mutation-kill guard on the MARKING and an excluding
+        # default makes it vacuous rather than green. That objection was real but
+        # the remedy was wrong: the guard now sets this key explicitly, which is
+        # what a test of marking should have done anyway, and the safer default
+        # no longer costs coverage.
+        #
+        # Set True to let drafts back confident answers; they render `[DRAFT]`
+        # either way, and `include_drafts` above still decides whether they are
+        # READABLE at all.
+        "confident_answer_from_drafts": False,
         # Temporal channel (§18.6): rerank raw-tier survivors when the query names
         # an absolute date/month/year. 0 disables; clamped to [0, 2] in code.
         "temporal_boost": 0.5, "graph_weight": 0.25,

@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from engine.vector_index import delete_matching as _vec0_delete
 from engine.embeddings import VECTOR_TABLES, _HASHING_CANONICAL, canonical_model_id
 from engine.reducer import belief_vector_text, observed_vector_text
 from engine.store import MemoryStore
@@ -172,6 +173,14 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
                 queued += 1
         if models:
             conn.execute(f"DELETE FROM observed_vectors WHERE model IN ({marks})", models)
+            # Same hazard as scripts/writeback_vectors.py, one step worse: these
+            # rows are GONE from observed_vectors, so anything left behind in the
+            # vec0 ANN mirror is an orphan that KNN can still return and that no
+            # primary-table read will ever contradict. There is no id list to
+            # scope this to (the DELETE is by model), so the whole mirror goes;
+            # retrieval falls through to the paged scan while it is empty and the
+            # mirror repopulates as the requeued vectors are rewritten.
+            _vec0_delete(conn, "1=1", ())
             conn.execute(f"DELETE FROM memory_vectors WHERE model IN ({marks})", models)
         # E2 doc2query proxies carry their own model tag and were invisible to
         # this script, so a hash-embedded store kept scoring hash proxies

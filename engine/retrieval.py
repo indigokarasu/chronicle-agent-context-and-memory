@@ -374,6 +374,11 @@ _TOPIC_NOTE_CAP = 5
 # the single `_readable` choke point rather than at each render site.
 _DRAFT_TAG = "[DRAFT]"
 
+# Identity sample per width-filtered channel. Tied to the only consumer that
+# shows identities at all -- `vectors_skipped_wrong_dim_detail`, which is
+# itself truncated to 20 -- so nothing downstream can tell the difference.
+_WRONG_DIM_SAMPLE = 20
+
 # A10: what the final trim says when it has to drop something. The old blind
 # `ctx[:max_chars] + "\n… (truncated)"` named neither what was lost nor how
 # much, and cut mid-word / mid-fact to get there.
@@ -627,6 +632,10 @@ class RetrievalEngine:
         # scan loop tripped over them" -- the same row is scanned by several
         # channels within one query.
         self._wrong_dim_seen: dict = {}
+        # (channel, table) -> EXACT count, for the width-filtered channels whose
+        # identities are only sampled. Assignment (never +=) keeps a channel read
+        # twice in one query idempotent, exactly as the identity dict did.
+        self._wrong_dim_counts: dict = {}
         self._wrong_dim_depth = 0
         min_obs = cfg.get("calibration.min_obs", 50) if cfg else 50
         self.calibrator = Calibrator(store, min_obs)
@@ -883,6 +892,7 @@ class RetrievalEngine:
         can read it (see `last_wrong_dim_skipped`)."""
         if self._wrong_dim_depth == 0:
             self._wrong_dim_seen = {}
+            self._wrong_dim_counts = {}
         self._wrong_dim_depth += 1
         try:
             yield self._wrong_dim_seen
@@ -891,8 +901,19 @@ class RetrievalEngine:
 
     def last_wrong_dim_skipped(self) -> int:
         """Distinct stored vectors the most recent top-level query could not
-        score because their width does not match the active embedder."""
-        return len(self._wrong_dim_seen)
+        score because their width does not match the active embedder.
+
+        Two sources, because the identities behind this number stopped being
+        affordable to hold. A width-filtered channel contributes an EXACT
+        `COUNT(*)` (`_wrong_dim_counts`) and keeps only a 20-row identity
+        sample; a channel that scans rows itself still contributes distinct
+        identities (`_wrong_dim_seen`), which its own paging already bounds.
+        Channels of the first kind are excluded from the identity tally so
+        their sample cannot be added on top of their count."""
+        counted_channels = {ch for ch, _table in self._wrong_dim_counts}
+        identity_only = sum(1 for ch, _ident in self._wrong_dim_seen
+                            if ch not in counted_channels)
+        return sum(self._wrong_dim_counts.values()) + identity_only
 
     def _note_wrong_dim_table(self, query_emb, table, id_col, channel,
                               extra_where: str = "", extra_params=()):
@@ -939,8 +960,20 @@ class RetrievalEngine:
         if not query_emb:
             return
         want = len(query_emb) * 4
+        # COUNT first, identities second and BOUNDED. The pre-bound code asked
+        # for every wrong-width identity and built one object per row, once per
+        # channel, five to six times per top-level query, and held them until
+        # the next one -- on an 88%-mismatched production store that is ~93k
+        # rows a channel, i.e. A5's bound undone by the diagnostic that A5's
+        # own docstring asked for. The number stays exact because it now comes
+        # from SQL rather than from len() of the identities.
+        total = self.store.wrong_dim_vector_count(table, id_col, want,
+                                                  extra_where, extra_params)
+        if not total:
+            return
         pairs = self.store.wrong_dim_vector_ids(table, id_col, want,
-                                                extra_where, extra_params)
+                                                extra_where, extra_params,
+                                                limit=_WRONG_DIM_SAMPLE)
         if not pairs:
             return
         # The process-wide counter and the once-per-process WARNING used to be
@@ -949,13 +982,20 @@ class RetrievalEngine:
         # mutation guard (which patches embeddings.note_wrong_dim) still turns
         # the whole signal off and keeps proving that this file is what makes it
         # loud. tests/test_wrong_dim_read_refusal.py is that guard.
-        _embeddings.note_wrong_dim(len(pairs), "%s (%s)" % (table, channel))
+        _embeddings.note_wrong_dim(total, "%s (%s)" % (table, channel))
+        # The count goes through `_note_wrong_dim_rows` rather than straight into
+        # `_wrong_dim_counts`, so this channel still reports through the ONE
+        # choke point tests/test_wrong_dim_read_refusal.py's mutation guard
+        # patches. A count recorded beside that guard rather than behind it
+        # would be a third reporting path the guard does not cover, and the
+        # guard exists precisely to prove there is no such path.
         self._note_wrong_dim_rows(
             query_emb, [{id_col: ident, "embedding": _WrongDimWidth(nbytes)}
                         for ident, nbytes in pairs],
-            id_col, channel)
+            id_col, channel, table=table, exact_count=total)
 
-    def _note_wrong_dim_rows(self, query_emb, rows, id_key, channel):
+    def _note_wrong_dim_rows(self, query_emb, rows, id_key, channel,
+                             table=None, exact_count=None):
         """Record which of `rows` are present-but-incomparable, by identity.
 
         Cheap: one length comparison per row, over blobs the scan already holds.
@@ -964,6 +1004,11 @@ class RetrievalEngine:
         identity a caller can act on."""
         if not query_emb or not rows:
             return
+        if exact_count is not None:
+            # A width-filtered channel: `rows` is a bounded SAMPLE, so its length
+            # is not the answer. Assignment, never +=, so the same channel read
+            # twice in one query stays idempotent exactly as the identity dict is.
+            self._wrong_dim_counts[(channel, table)] = exact_count
         for i in wrong_dim_indices(len(query_emb), [r.get("embedding") for r in rows]):
             ident = rows[i].get(id_key)
             if ident is not None:
@@ -1787,7 +1832,10 @@ class RetrievalEngine:
                                      principal=principal, now=now)
             dbg = ans.get("debug")
             dbg = dict(dbg) if isinstance(dbg, dict) else {}
-            dbg["vectors_skipped_wrong_dim"] = len(seen)
+            # NOT len(seen): `seen` is a bounded identity SAMPLE for the
+            # width-filtered channels. The number is exact and comes from
+            # `last_wrong_dim_skipped`.
+            dbg["vectors_skipped_wrong_dim"] = self.last_wrong_dim_skipped()
             if seen:
                 dbg["vectors_skipped_wrong_dim_detail"] = sorted(
                     ("%s:%s" % (ch, ident)) for ch, ident in seen)[:20]
@@ -1845,7 +1893,7 @@ class RetrievalEngine:
         # `status` is already on the candidate row (`_readable` reads it), so
         # the common path costs no query; `get_belief` is only a fallback for a
         # row that somehow lacks it, rather than upstream's per-candidate fetch.
-        if self.cfg and not bool(self.cfg.get("retrieval.confident_answer_from_drafts", True)):
+        if not (self.cfg and bool(self.cfg.get("retrieval.confident_answer_from_drafts", False))):
             t1_active = []
             for _c in t1:
                 _st = _c.get("status")
@@ -2517,12 +2565,14 @@ class RetrievalEngine:
         """Assemble a reader-facing context block (§18). Wrapper for the A0c
         wrong-dimension scope; the body is `_get_context_inner`, and the count
         lands in `last_context_debug["vectors_skipped_wrong_dim"]`."""
-        with self._query_diagnostics() as seen:
+        with self._query_diagnostics():
             out = self._get_context_inner(hint, token_budget=token_budget,
                                           include_directives=include_directives, purpose=purpose,
                                           principal=principal, epistemic=epistemic, now=now)
             if isinstance(self.last_context_debug, dict):
-                self.last_context_debug["vectors_skipped_wrong_dim"] = len(seen)
+                # exact count, not the bounded identity sample -- see answer()
+                self.last_context_debug["vectors_skipped_wrong_dim"] = \
+                    self.last_wrong_dim_skipped()
             return out
 
     def _get_context_inner(self, hint, *, token_budget=1500, include_directives=True, purpose="*",

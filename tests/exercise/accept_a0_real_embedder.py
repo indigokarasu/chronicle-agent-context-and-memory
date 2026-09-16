@@ -105,7 +105,12 @@ def _report(label, tags, expected):
     ok = True
     for table, groups in tags.items():
         if not groups:
-            print(f"  {label} {table}: (empty)")
+            # NOT `continue` with `ok` untouched: main() prints "the SAME canonical
+            # tag ... on every vector table", and a table that wrote no rows at all
+            # cannot support that claim. Passing here turns a regression that stops
+            # writing one of the four tables into a green run.
+            print(f"  {label} BAD {table}: (empty) -- no vectors were written")
+            ok = False
             continue
         for tag, cnt, blen in groups:
             mark = "OK " if tag == expected else "BAD"
