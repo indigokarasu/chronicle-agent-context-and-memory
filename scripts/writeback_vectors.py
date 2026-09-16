@@ -188,7 +188,8 @@ from engine.embeddings import (
     get_embedder,
     is_usable_model_tag,
 )
-from engine.vector_index import delete_matching as _vec0_delete
+from engine.vector_index import mirror_unmaintainable as _vec0_unmaintainable
+from engine.vector_index import upsert_observed as _vec0_upsert
 from engine.reducer import (
     belief_vector_text,
     observed_vector_text,
@@ -833,21 +834,23 @@ class WriteBack:
                 if not cur.rowcount:
                     self._note("skipped-changed", ident)
                     continue
-                # The vec0 ANN mirror (engine/vector_index.py) shadows
-                # observed_vectors and is kept in step by MemoryStore on the
-                # NORMAL write path. This tool writes raw SQL, so it must
-                # invalidate the mirrored row itself: otherwise a KNN query keeps
-                # serving the PRE-image embedding for a row this batch just
-                # corrected, and because a nonempty KNN result skips the paged
-                # scan that would have read the corrected blob, the staleness is
-                # SILENT. Deleting is sufficient -- retrieval falls through to the
-                # paged scan when the ANN returns nothing (`if knn_results:`), and
-                # the mirror repopulates on the next normal write. vec0 carries
-                # the same key column, so this WHERE applies unchanged. Runs on
-                # THIS connection inside THIS transaction, never commits, and is a
-                # no-op returning 0 unless sqlite-vec is really engaged here.
+                # Keep the vec0 ANN mirror (engine/vector_index.py) in step with the
+                # row just rewritten. MemoryStore does this on the normal write path;
+                # this tool writes raw SQL, so it must do it itself.
+                #
+                # UPSERT the corrected blob -- NOT delete. An earlier revision
+                # deleted the mirror entry on the theory that retrieval "falls
+                # through to the paged scan" when the ANN has nothing. That is true
+                # only when KNN returns NOTHING AT ALL. retrieve_raw takes a
+                # nonempty KNN result INSTEAD of the paged scan, and a row missing
+                # from a partly-filled mirror is then never a vector candidate
+                # unless full-text search finds it -- so deleting turned "ranked on
+                # a stale embedding" into "not found". Same transaction, never
+                # commits, never creates vec0, and a no-op when sqlite-vec cannot
+                # load here or vec0's width differs (the engine disables ANN on
+                # that mismatch itself).
                 if table == "observed_vectors":
-                    _vec0_delete(self.live, where, tuple(key))
+                    _vec0_upsert(self.live, key[0], new_blob)
                 applied_rows.append({"k": list(key), "h": _hex(sha_blob(new_blob))})
                 # Counted into LOCALS, banked after COMMIT. A later row in this
                 # same batch can raise Refused (W5), and the handler rolls the
@@ -1133,6 +1136,12 @@ def writeback(live_db, copy_db, manifest_path=None, dry_run=False,
         print("manifest       : %s  (%d rows, built %s)"
               % (manifest_path, sum((header.get("row_counts") or {}).values()),
                  header.get("created_at")))
+        if not dry_run and _vec0_unmaintainable(live):
+            print("WARNING        : this database has a vec0 ANN mirror, but this Python cannot "
+                  "load sqlite-vec, so rows corrected here will stay STALE in the mirror. A "
+                  "process that can load it will keep serving them, because a nonempty KNN "
+                  "result skips the paged scan. Run under a Python whose sqlite3 can load "
+                  "sqlite-vec, or rebuild the mirror afterwards.")
         print("active tag     : %s" % active_tag)
         print("expected width : %d dims (%d bytes)" % (expect_len // 4, expect_len))
         print("mode           : %s" % ("DRY RUN (live opened read-only, nothing written)"

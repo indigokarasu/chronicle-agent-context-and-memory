@@ -35,7 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from engine.vector_index import delete_matching as _vec0_delete
+from engine.vector_index import delete_ids as _vec0_delete_ids
+from engine.vector_index import mirror_unmaintainable as _vec0_unmaintainable
 from engine.embeddings import VECTOR_TABLES, _HASHING_CANONICAL, canonical_model_id
 from engine.reducer import belief_vector_text, observed_vector_text
 from engine.store import MemoryStore
@@ -172,15 +173,23 @@ def requeue(db_path: str, dry_run: bool = False) -> int:
             if text and store.enqueue_embed_job(target, kind, text) is not None:
                 queued += 1
         if models:
+            # Name the rows BEFORE deleting them: the delete is by model, and once
+            # it runs nothing identifies which event_ids left observed_vectors.
+            doomed = [r[0] for r in conn.execute(
+                f"SELECT event_id FROM observed_vectors WHERE model IN ({marks})", models)]
             conn.execute(f"DELETE FROM observed_vectors WHERE model IN ({marks})", models)
-            # Same hazard as scripts/writeback_vectors.py, one step worse: these
-            # rows are GONE from observed_vectors, so anything left behind in the
-            # vec0 ANN mirror is an orphan that KNN can still return and that no
-            # primary-table read will ever contradict. There is no id list to
-            # scope this to (the DELETE is by model), so the whole mirror goes;
-            # retrieval falls through to the paged scan while it is empty and the
-            # mirror repopulates as the requeued vectors are rewritten.
-            _vec0_delete(conn, "1=1", ())
+            # Remove exactly those from the vec0 ANN mirror, and nothing else. An
+            # earlier revision cleared the WHOLE mirror; once the requeued vectors
+            # were rewritten through MemoryStore it held only them, so every
+            # UNAFFECTED row was missing -- and a missing row is invisible to
+            # vector search, not merely slower, because retrieve_raw takes a
+            # nonempty KNN result instead of the paged scan. Targeted removal
+            # keeps the mirror equal to the table at every step.
+            if _vec0_unmaintainable(conn):
+                print("WARNING: this database has a vec0 ANN mirror this Python cannot load "
+                      "sqlite-vec for; %d deleted row(s) stay in it as orphans that KNN can "
+                      "still return. Re-run under a Python that can load sqlite-vec." % len(doomed))
+            _vec0_delete_ids(conn, doomed)
             conn.execute(f"DELETE FROM memory_vectors WHERE model IN ({marks})", models)
         # E2 doc2query proxies carry their own model tag and were invisible to
         # this script, so a hash-embedded store kept scoring hash proxies
