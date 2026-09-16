@@ -27,11 +27,12 @@ Fixture names are the project's standard fakes (Pat Testley, Acme Fake Co).
 import os
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.config import Config
 from engine.embeddings import pack
@@ -314,7 +315,7 @@ class TestRerankThroughSearch(unittest.TestCase):
     search() — no candidate list is hand-fed to _rerank anywhere here."""
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="e3_")
+        self.home = temp_home(prefix="e3_")
         self.store = MemoryStore(os.path.join(self.home, "chronicle.db"))
         # Five keyword-spam notes that hammer the query's terms and nothing
         # else, plus the one note that actually answers it in words the query

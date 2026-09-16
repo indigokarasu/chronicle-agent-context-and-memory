@@ -29,12 +29,13 @@ from engine.retrieval import RetrievalEngine
 from engine.store import MemoryStore
 
 PRUNE_SCRIPT = os.path.join(chronicle_dir, "scripts", "prune_vectors.py")
-ORACLE_PATH = os.environ.get("T8_ORACLE", "/private/tmp/claude-501/"
-                             "-Users-evaluser-temp/3d6d860f-71ee-406d-9aef-b68dfd0642d1/"
-                             "scratchpad/oracle.json")
-LME_SCRIPT = os.environ.get("T8_HARNESS", "/private/tmp/claude-501/"
-                            "-Users-evaluser-temp/3d6d860f-71ee-406d-9aef-b68dfd0642d1/"
-                            "scratchpad/lme_recall.py")
+# The LongMemEval harness and oracle live OUTSIDE the repo (they are a
+# multi-hundred-MB dataset). Point these at your copy. There is deliberately
+# no default path: the previous one was an absolute scratchpad path carrying a
+# machine-local home directory and a session UUID, which is both unrunnable
+# for anyone else and not something a public repo should carry.
+ORACLE_PATH = os.environ.get("T8_ORACLE", "")
+LME_SCRIPT = os.environ.get("T8_HARNESS", "")
 # Stock SQLite's SQLITE_LIMIT_VARIABLE_NUMBER. This Mac's build allows ~250k,
 # which is exactly why a bind-the-ids prune passes here and dies on Linux.
 VAR_LIMIT = 32766
@@ -435,8 +436,10 @@ def test_regression_harness():
     """Run the regression harness and check recall is within 3 points of baseline."""
     print("\n=== Test: Regression Harness ===")
 
-    if not os.path.exists(ORACLE_PATH) or not os.path.exists(LME_SCRIPT):
-        print(f"FAIL: harness or oracle not found ({LME_SCRIPT}, {ORACLE_PATH})")
+    if not (ORACLE_PATH and LME_SCRIPT
+            and os.path.exists(ORACLE_PATH) and os.path.exists(LME_SCRIPT)):
+        print("FAIL: set T8_HARNESS and T8_ORACLE to your dataset copy "
+              f"(got {LME_SCRIPT!r}, {ORACLE_PATH!r})")
         return False
 
     result = subprocess.run(

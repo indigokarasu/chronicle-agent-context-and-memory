@@ -12,26 +12,69 @@ from __future__ import annotations
 from .config import CONFIDENCE_BASE, TRUST_CEILING
 
 
-def ceiling(trust_level: int) -> float:
-    return TRUST_CEILING.get(trust_level, 0.75)
+# §A12 — THE CONFIG MUST WIN.
+#
+# `confidence.base.*` and `confidence.trust_ceiling.*` were declared in DEFAULTS
+# and then ignored: every caller reached the module constants directly, so an
+# operator who set `confidence: base: user_direct: 0.95` changed nothing, while
+# hostmodel.py's comment told them their host facts used "the operator's
+# configured confidence.base". Both functions now take an optional `cfg` and
+# read it; `cfg=None` keeps the module constants, which is what the several
+# `Reducer(store)`-with-no-config construction paths (and the direct unit tests)
+# rely on. The lookup tolerates a YAML round trip turning the integer trust
+# levels into strings.
 
 
-def base_confidence(source_type: str) -> float:
-    return CONFIDENCE_BASE.get(source_type, 0.6)
+def _table(cfg, path: str, fallback: dict) -> dict:
+    """The configured table at `path`, or the module constant."""
+    if cfg is None:
+        return fallback
+    try:
+        val = cfg.get(path, None)
+    except Exception:                     # a plain dict without .get semantics
+        return fallback
+    return val if isinstance(val, dict) and val else fallback
 
 
-def raw_confidence(source_type: str, confirm_count: int = 0, contradiction_count: int = 0) -> float:
+def ceiling(trust_level: int, cfg=None) -> float:
+    table = _table(cfg, "confidence.trust_ceiling", TRUST_CEILING)
+    # A YAML/JSON round trip turns the integer levels into strings, and the deep
+    # merge then leaves BOTH forms in the table (int 2 from DEFAULTS, "2" from
+    # the operator). The operator's form is the one they wrote, so it wins.
+    if str(trust_level) in table:
+        return _as_float(table[str(trust_level)], 0.75)
+    if trust_level in table:
+        return _as_float(table[trust_level], 0.75)
+    return 0.75
+
+
+def _as_float(val, default: float) -> float:
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def base_confidence(source_type: str, cfg=None) -> float:
+    table = _table(cfg, "confidence.base", CONFIDENCE_BASE)
+    return _as_float(table.get(source_type, 0.6), 0.6)
+
+
+def raw_confidence(source_type: str, confirm_count: int = 0, contradiction_count: int = 0,
+                   cfg=None) -> float:
     """raw = base(source_type) + 0.05·min(confirm,5) − 0.10·contradiction (§10.4)."""
-    raw = base_confidence(source_type) + 0.05 * min(confirm_count, 5) - 0.10 * contradiction_count
+    raw = base_confidence(source_type, cfg) + 0.05 * min(confirm_count, 5) \
+        - 0.10 * contradiction_count
     return max(0.0, min(1.0, raw))
 
 
-def clamp_to_ceiling(confidence: float, trust_level: int, corroborated: bool = False) -> float:
+def clamp_to_ceiling(confidence: float, trust_level: int, corroborated: bool = False,
+                     cfg=None) -> float:
     """Apply the trust ceiling (I6). Independent corroboration raises it one band."""
     lvl = trust_level
     if corroborated:
         lvl = min(trust_level + 1, 4)
-    return min(confidence, ceiling(lvl))
+    return min(confidence, ceiling(lvl, cfg))
 
 
 def bucket_of(score: float) -> str:

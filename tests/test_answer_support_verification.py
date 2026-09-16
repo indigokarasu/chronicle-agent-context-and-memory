@@ -26,11 +26,12 @@ from __future__ import annotations
 import hashlib
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import DegradedEmbedder
@@ -45,7 +46,7 @@ def make_core(cfg_overrides=None):
     # Force the offline hashing embedder so tests are deterministic and never
     # probe localhost embedding servers (same convention as test_build.py /
     # test_query_routing.py).
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if cfg_overrides:
         cfg.update(cfg_overrides)
@@ -318,7 +319,7 @@ class TestVerifyAnswerRealSourcesTier2(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestVerifyAnswerProviderLayer(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.provider = ChronicleMemoryProvider()
         self.provider.initialize("s1", hermes_home=self.home, principal_id="default",

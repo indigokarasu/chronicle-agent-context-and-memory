@@ -225,7 +225,8 @@ def test_backfill_sweep_excludes_indexed():
             })
 
         # Manually add s1 to session_index.
-        store.add_session_vector("s1", "summary", b"", "default", now_iso())
+        # model=None explicitly (A0e): no vector, so no geometry to claim.
+        store.add_session_vector("s1", "summary", b"", "default", now_iso(), model=None)
 
         # Backfill should skip s1 and only queue s0, s2.
         candidates = store.get_sessions_needing_index_backfill(limit=200)

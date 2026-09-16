@@ -22,11 +22,12 @@ file adds the NEW shapes rather than re-proving the old one.
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from context import ChronicleContextEngine  # noqa: E402
 
@@ -34,7 +35,7 @@ CFG = {"embeddings": {"model": "hashing"}}  # offline, deterministic
 
 
 def _make_engine(tag: str):
-    home = tempfile.mkdtemp(prefix=f"chronicle_r8_{tag}_")
+    home = temp_home(prefix=f"chronicle_r8_{tag}_")
     session_id = f"sess-{tag}"
     eng = ChronicleContextEngine()
     eng.on_session_start(session_id, hermes_home=home, principal_id="tester", config=CFG)
@@ -151,7 +152,7 @@ class TestFocusToolCall(unittest.TestCase):
                    + [{"role": "user", "content": "head %d" % i} for i in range(3)]
                    + middle
                    + [{"role": "assistant", "content": "tail %d" % i} for i in range(6)])
-        self.eng.update_model("test-model", context_length=800)
+        self.eng.update_model("test-model", context_length=600)   # A10b units restatement: 800 x 3 = 2400 = 600 x 4
         out = self.eng.compress(list(messages))  # no focus kwarg -- must use self.focus
         kept = {m.get("content") for m in out}
         kept_relevant = sum(1 for m in relevant if m["content"] in kept)
@@ -281,7 +282,7 @@ class TestWorkingSetRehydration(unittest.TestCase):
             eng.core.capture.append(
                 "observed", {"source_type": "test_seed", "excerpt": "topictwo detail " * 200},
                 actor="user", session_id=sid)
-            eng.update_model("test-model", context_length=2000)  # small, real budget
+            eng.update_model("test-model", context_length=1500)  # small, real budget (2000 x 3 = 6000 = 1500 x 4)
             body = _body(10)
             result = eng.compress(body, focus={"topics": ["topicone", "topictwo"]})
             injected_tokens = sum(estimate_tokens(m.get("content"))

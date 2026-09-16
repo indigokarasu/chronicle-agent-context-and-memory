@@ -20,11 +20,12 @@ Contents:
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine import identity
 from engine.config import Config
@@ -36,7 +37,7 @@ _FACT_KEY = {"entity_id": "ent_pat_testley", "entity_name": "Pat Testley",
 
 
 def make_core(overrides=None):
-    home = tempfile.mkdtemp(prefix="l9-integ-")
+    home = temp_home(prefix="l9-integ-")
     cfg = {"embeddings": {"model": "hashing"}}
     if overrides:
         cfg.update(overrides)
@@ -248,6 +249,8 @@ class TestLadder9ConfigDefaults(_CoreCase):
         self.assertIsNone(cfg.get("retrieval.abstain_distance"))                # E10
         self.assertEqual(cfg.get("retrieval.support_threshold"), 0.55)          # E11
         self.assertTrue(cfg.get("context.precision_packing"))                   # E12
+        # Restated with the estimator's unit, twice; the measured quantity
+        # (~6 000 chars) is unchanged: 2000 tok x 3 = 6000 = 1500 tok x 4.
         self.assertEqual(cfg.get("context.precision_budget"), 1500)             # E12
         self.assertEqual(cfg.get("context.precision_concentration"), 0.60)      # E12
         self.assertEqual(cfg.get("context.precision_margin"), 0.0)              # E12 (secondary)

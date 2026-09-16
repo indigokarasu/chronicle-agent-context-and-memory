@@ -11,18 +11,26 @@ audit event.
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import estimate_tokens
 from engine import extraction as extraction_mod
 from context import ChronicleContextEngine
 
-CFG = {"embeddings": {"model": "hashing"}}  # offline, deterministic
+CFG = {"embeddings": {"model": "hashing"},
+       # A10b units restatement. These fixtures were calibrated against
+       # compress() reading the then-default context.default_token_budget
+       # (1500) at chars/3, i.e. a 4 500-CHAR window. The production
+       # default still means 1500 TOKENS and now really delivers them
+       # (1500 x 4 = 6000 chars), so the fixture pins the char size it was
+       # built for instead: 1500 tok x 3 chars = 4500 = 1125 tok x 4 chars.
+       "context": {"default_token_budget": 1125}}  # offline, deterministic
 
 # Big enough that head(3) + tail(6) of this alone consumes the ENTIRE default
 # context.default_token_budget (1500) once _fit_within_budget clips it -- the
@@ -71,7 +79,7 @@ def _body_with_middle(fact_text):
 
 class CheckpointDigestTests(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r7_")
+        self.home = temp_home(prefix="r7_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r7-s1", hermes_home=self.home, principal_id="pat", config=CFG)
@@ -106,7 +114,7 @@ class CheckpointDigestTests(unittest.TestCase):
 
     def test_digest_is_deterministic_across_independent_engines(self):
         body = _body_with_middle("My phone is 555-0100.")
-        home2 = tempfile.mkdtemp(prefix="r7_det_")
+        home2 = temp_home(prefix="r7_det_")
         eng2 = ChronicleContextEngine()
         eng2.on_session_start("r7-s2", hermes_home=home2, principal_id="pat", config=CFG)
         try:
@@ -144,10 +152,11 @@ class CheckpointDigestTests(unittest.TestCase):
             return original_chat(self, prompt)
 
         extraction_mod.LLMExtractor._chat = spy
-        home = tempfile.mkdtemp(prefix="r7_nollm_")
+        home = temp_home(prefix="r7_nollm_")
         try:
             llm_cfg = {
                 "embeddings": {"model": "hashing"},
+                "context": {"default_token_budget": 1125},   # see CFG: same restatement
                 "extraction": {"backend": "llm",
                                "llm": {"base_url": "http://127.0.0.1:1/unreachable",
                                        "model": "does-not-exist"}},
@@ -169,10 +178,11 @@ class CheckpointDigestTests(unittest.TestCase):
     # -- capped size -----------------------------------------------------------
 
     def test_digest_stays_within_configured_cap_across_many_passes(self):
-        cap = 20
-        home = tempfile.mkdtemp(prefix="r7_cap_")
+        cap = 15   # A10b units restatement: 20 tok x 3 = 60 chars = 15 tok x 4
+        home = temp_home(prefix="r7_cap_")
         try:
             small_cfg = {"embeddings": {"model": "hashing"},
+                        "context": {"default_token_budget": 1125},   # see CFG
                         "context_engine": {"checkpoint_digest_max_tokens": cap}}
             eng = ChronicleContextEngine()
             eng.on_session_start("r7-cap", hermes_home=home, principal_id="pat", config=small_cfg)
@@ -194,10 +204,12 @@ class CheckpointDigestTests(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
     def test_digest_rolls_forward_keeping_recent_content(self):
-        home = tempfile.mkdtemp(prefix="r7_roll_")
+        home = temp_home(prefix="r7_roll_")
         try:
             small_cfg = {"embeddings": {"model": "hashing"},
-                        "context_engine": {"checkpoint_digest_max_tokens": 20}}
+                        "context": {"default_token_budget": 1125},   # see CFG
+                        # A10b units restatement: 20 tok x 3 = 60 chars = 15 tok x 4
+                        "context_engine": {"checkpoint_digest_max_tokens": 15}}
             eng = ChronicleContextEngine()
             eng.on_session_start("r7-roll", hermes_home=home, principal_id="pat", config=small_cfg)
             eng.compress(list(_body_with_middle("I work at Acme Fake Co.")))
@@ -224,7 +236,9 @@ class CheckpointDigestTests(unittest.TestCase):
     # -- injected back into the window when there is room ----------------------
 
     def test_digest_injected_into_window_when_budget_allows(self):
-        self.eng.update_model("test-model", context_length=100000)  # -> budget = 55000
+        self.eng.update_model("test-model", context_length=75000)  # -> budget = 41250
+        # A10b units restatement: 100000 x 3 = 300000 = 75000 x 4; the budget is
+        # the same window in chars (55000 x 3 = 165000 = 41250 x 4).
         budget = self.eng._target_budget()
         item_chars = 900                              # -> estimate_tokens == 300 per item
         item_cost = estimate_tokens("z" * item_chars)
