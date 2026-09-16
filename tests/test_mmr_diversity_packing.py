@@ -13,13 +13,14 @@ score, descending, exactly as before this task.
 Fixtures use obviously-fake values (Pat Testley, Acme Fake Co).
 """
 
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db
 
 from engine.config import Config, DEFAULTS
 from engine.embeddings import HashingEmbedder, pack
@@ -49,7 +50,7 @@ class MMRSelectTests(unittest.TestCase):
         self.assertAlmostEqual(self.eng._mmr_lambda, DEFAULTS["retrieval"]["mmr_lambda"])
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def _put(self, belief_id, direction):
         self.store.add_memory_vector(belief_id, "fact", pack(_vec(direction)), "test")
@@ -256,7 +257,7 @@ class MMRConfigTests(unittest.TestCase):
         self.store = MemoryStore(self.tmp.name)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_default_is_point_seven(self):
         self.assertEqual(DEFAULTS["retrieval"]["mmr_lambda"], 0.7)
@@ -289,7 +290,7 @@ class SearchMMRWiringTests(unittest.TestCase):
         self.store = MemoryStore(self.tmp.name)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def _facts(self, n, embedder=None):
         """n distinct facts, all matching the query token "acme", so they all

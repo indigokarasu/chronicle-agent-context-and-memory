@@ -20,11 +20,12 @@ Fixes covered (L9 review ledger):
 """
 
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine import doc2query
 from engine.core import ChronicleCore
@@ -36,7 +37,7 @@ _FACT_KEY = {"entity_id": "ent_pat_testley", "entity_name": "Pat Testley",
 
 
 def make_core(overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if overrides:
         cfg.update(overrides)

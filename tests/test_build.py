@@ -12,8 +12,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db, temp_home
 
 from engine import access
 from engine.capture import CaptureEngine
@@ -27,8 +30,20 @@ from engine.store import SCHEMA_VERSION, MemoryStore
 def make_core():
     # Force the offline hashing embedder so tests are deterministic and never
     # probe localhost embedding servers.
-    home = tempfile.mkdtemp()
+    home = temp_home()
     return ChronicleCore(home, {"embeddings": {"model": "hashing"}}), home
+
+
+def unreachable_endpoint():
+    """Every HTTP call the embedder makes fails as if the port were closed.
+
+    The embedder's only network seam is `urllib.request.urlopen` (healthcheck,
+    /v1/models discovery and embed all go through it), so patching it is enough
+    to make "nothing is listening" a property of the test rather than of the
+    machine it runs on — no socket is opened either way.
+    """
+    return mock.patch("urllib.request.urlopen",
+                      side_effect=ConnectionRefusedError(61, "Connection refused"))
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +93,10 @@ class TestSerialization(unittest.TestCase):
         # An explicit model + endpoint is trusted: an unreachable endpoint at init
         # does NOT fall back to hashing. It returns the retrying client, which
         # waits+retries at runtime and raises on exhaustion (never hash vectors).
+        #
+        # "Unreachable" is INJECTED, not borrowed from the machine: relying on
+        # nothing listening on 127.0.0.1:9 opened a real socket from a unit test
+        # and made the result depend on the host (A11).
         from engine.embeddings import (
             DegradedEmbedder,
             EmbeddingsUnavailable,
@@ -85,16 +104,17 @@ class TestSerialization(unittest.TestCase):
             OpenAICompatEmbedder,
             get_embedder,
         )
-        e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
-        self.assertIsInstance(e, OpenAICompatEmbedder)
-        self.assertEqual(e.dimensions, 768)
-        # 'auto' with nothing reachable is DEGRADED, never a silent hash fallback:
-        # it writes no vectors and the work is queued for retry (§24.4).
-        d = get_embedder("auto", 768, base_url="http://127.0.0.1:9")
-        self.assertIsInstance(d, DegradedEmbedder)
-        self.assertRaises(EmbeddingsUnavailable, d.embed, "anything")
-        # Hashing stays exactly as it was, but only when asked for by name.
-        self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
+        with unreachable_endpoint():
+            e = get_embedder("embeddinggemma-300m", 768, base_url="http://127.0.0.1:9")
+            self.assertIsInstance(e, OpenAICompatEmbedder)
+            self.assertEqual(e.dimensions, 768)
+            # 'auto' with nothing reachable is DEGRADED, never a silent hash fallback:
+            # it writes no vectors and the work is queued for retry (§24.4).
+            d = get_embedder("auto", 768, base_url="http://127.0.0.1:9")
+            self.assertIsInstance(d, DegradedEmbedder)
+            self.assertRaises(EmbeddingsUnavailable, d.embed, "anything")
+            # Hashing stays exactly as it was, but only when asked for by name.
+            self.assertIsInstance(get_embedder("hashing"), HashingEmbedder)
 
     def test_openai_embedder_retries_then_raises(self):
         # A failing endpoint must NOT silently emit hash vectors. embed() waits +
@@ -103,7 +123,7 @@ class TestSerialization(unittest.TestCase):
         from engine.embeddings import OpenAICompatEmbedder
         emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768,
                                    max_attempts=2, backoff_base=0.0, backoff_cap=0.0)
-        with self.assertRaises(OSError):
+        with unreachable_endpoint(), self.assertRaises(OSError):
             emb.embed("hello")
 
 # --------------------------------------------------------------------------
@@ -116,7 +136,7 @@ class TestStore(unittest.TestCase):
         self.store = MemoryStore(self.tmp.name)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def _ev(self, eid="ev_x", type_="observed", payload=None):
         return {"event_id": eid, "type": type_, "payload": payload or {"excerpt": "hi", "source_type": "t"},
@@ -192,7 +212,7 @@ class TestReducer(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def _fact(self, pred, val, **kw):
         key = {"entity_id": kw.get("entity", "user"), "predicate_canonical": pred, "attribute": pred,
@@ -268,7 +288,7 @@ class TestCapture(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_observe_durable(self):  # P11 / I12
         eid = self.cap.observe("Hello", "Hi", session_id="s1")
@@ -500,7 +520,7 @@ class TestInvariants(unittest.TestCase):
         # reason, even though a channel still ranked it #1 (score is high;
         # score is exactly what the FAILED first attempt thresholded instead
         # of geometry, and this fixture would NOT trip a score-based check).
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
                                     "retrieval": {"abstain_distance": 0.5}})
         core.initialize("s1", principal_id="assistant")
@@ -533,7 +553,7 @@ class TestInvariants(unittest.TestCase):
         # under the 0.5 threshold). The distance gate must not fire, so the
         # pipeline falls through to tier 2, where a supporting raw span (from
         # test_P20_support_gate_passes_real_support) answers normally.
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
                                     "retrieval": {"abstain_distance": 0.5}})
         core.initialize("s1", principal_id="assistant")
@@ -568,7 +588,7 @@ class TestInvariants(unittest.TestCase):
         # unrelated_top_hit for this identical t1/query pair) untouched.
         from engine.config import DEFAULTS
 
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"}})  # defaults
         core.initialize("s1", principal_id="assistant")
         try:
@@ -598,7 +618,7 @@ class TestInvariants(unittest.TestCase):
         # there is no geometry to compute from: no embedder at all, and an
         # embedder present but the top candidate was never itself embedded
         # (fts/structured/graph-only hit, or its vector was pruned).
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
                                     "retrieval": {"abstain_distance": 0.01}})
         core.initialize("s1", principal_id="assistant")
@@ -660,7 +680,7 @@ class TestInvariants(unittest.TestCase):
         # TypeError out of answer() at query time. abstain_distance's "off"
         # sentinel is None (not a clamped default), so garbage falls back to
         # None -- same as never having set it.
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
                                     "retrieval": {"abstain_distance": "not-a-number"}})
         core.initialize("s1", principal_id="assistant")
@@ -689,7 +709,7 @@ class TestInvariants(unittest.TestCase):
         # 'str'` out of answer() (the comparison `distance > abstain_dist`
         # with abstain_dist still the string "not-a-number") -- restoring the
         # coerced call makes it pass again.
-        home = tempfile.mkdtemp()
+        home = temp_home()
         core = ChronicleCore(home, {"embeddings": {"model": "hashing"},
                                     "retrieval": {"abstain_distance": "not-a-number"}})
         core.initialize("s1", principal_id="assistant")
@@ -1047,14 +1067,24 @@ class TestDigest(unittest.TestCase):
 # §r6 Topic-relevant standing notes reach the reader
 # --------------------------------------------------------------------------
 class TestTopicGatedStandingNotes(unittest.TestCase):
-    """A user preference ("I always prefer window seats") is stored as a
-    note_type='norm' row. get_context delivers the FIRST 20 always_inject rows
-    in store order, and search()'s LIKE channel covers the facts table only —
-    so past 20 notes the preference that answers the question is reachable only
-    by exact FTS token, and "seats" does not match the query token "seat".
-    get_context appends those from leftover budget, after the raw fill."""
+    """A standing instruction ("Always give me window seats when flying") is
+    stored as a note_type='norm' row. get_context delivers the FIRST 20
+    always_inject rows in store order, and search()'s LIKE channel covers the
+    facts table only — so past 20 notes the note that answers the question is
+    reachable only by exact FTS token, and "seats" does not match the query
+    token "seat". get_context appends those from leftover budget, after the
+    raw fill.
 
-    SEAT = "I always prefer window seats when flying"
+    A6: the fixture sentence used to be "I always prefer window seats when
+    flying". That is a first-person PREFERENCE, and it only became a norm
+    because the pre-A6 directive regex fired on the word "always" anywhere in
+    the line — the same defect that produced ~110 always-inject notes per real
+    store. It now extracts as a `prefers` fact instead. The channel under test
+    here is retrieval's topic gate over norm notes, not extraction's classifier,
+    so the fixture is restated in the imperative shape a norm actually requires;
+    tests/test_extraction_floor.py owns the classifier's behaviour."""
+
+    SEAT = "Always give me window seats when flying"
 
     def setUp(self):
         self.core, self.home = make_core()
@@ -1140,10 +1170,10 @@ class TestTopicGatedStandingNotes(unittest.TestCase):
         """With one note the unconditional block already carries it — the
         topic-gated pass must add nothing and duplicate nothing."""
         self.core.capture.observe("I am Pat Testley", "", session_id="s1")
-        self.core.capture.observe("I always prefer window seats", "", session_id="s1")
+        self.core.capture.observe("Always give me window seats", "", session_id="s1")
         self.core.process_pending()
         ctx = self.core.retrieval.get_context("what seat should I book", token_budget=2000)
-        self.assertEqual(ctx.count("[DIRECTIVE] I always prefer window seats"), 1)
+        self.assertEqual(ctx.count("[DIRECTIVE] Always give me window seats"), 1)
         self.assertIn("window seats", ctx.lower())
 
     def test_raw_evidence_keeps_first_claim_on_budget(self):
@@ -1422,7 +1452,7 @@ class TestCurationQueueDedup(unittest.TestCase):
     make the drain replay one answer N times."""
 
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.store = MemoryStore(os.path.join(self.home, "c.db"))
 
     def tearDown(self):

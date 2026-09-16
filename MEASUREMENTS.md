@@ -180,3 +180,123 @@ behind it instead of only training-set evidence.**
 
 Measured with hashing embeddings (deterministic, no network dependency),
 2026-08.
+
+---
+
+## A18 — does the context packer spend a tight budget on DEPTH when the question needs BREADTH? (measure first, then fix)
+
+The starting point was a single instance: at `token_budget=1500`, ctx_eval
+instance #16 ("How many plants did I acquire in the last month?", an E9
+`aggregation` route) regressed under A10b's honest budget arithmetic, because
+the top-scoring session expanded from 2 941 to 4 487 chars and crowded the
+answer session out. A10b called that a packer property rather than an estimator
+flaw and left it. One instance is not a property, so this is the measurement.
+
+### The instrument
+
+`scripts/ctx_eval_probe.py` is `scripts/ctx_eval.py` with instrumentation and
+the same ingest, the same 58 scored instances and the same hit criterion — and
+it reproduces ctx_eval's three totals exactly (44/49/52 of 58), which is its own
+self-check. Per instance per budget tier it records the E9 route the packer
+actually took (`last_context_debug`), the number of DISTINCT `[SESSION ...]`
+blocks emitted, the char share of the largest one, gold-session coverage, and
+the pass. `scripts/a18_ab.py` diffs two runs and proves byte identity by sha256.
+
+### What the corpus is shaped like
+
+58 scored instances (2 of 60 carry no `has_answer` turn). 33 have evidence in
+TWO OR MORE gold sessions — 25 `multi-session` and 8 `temporal-reasoning` — so
+a majority of this corpus is breadth-shaped. Under the offline hashing embedder
+the E9 routes come out aggregation 28 / factual 26 / preference 3 / temporal 1,
+identically at all three budgets.
+
+### The result: it is a property of tight budgets, not of instance #16
+
+| budget | cohort | distinct sessions | largest session, as a share of the raw-evidence fill (median) | budget saturated |
+|--------|--------|------------------:|----------------:|----------:|
+|  1 500 | aggregation route (28) | 1.64 | **99%** | 100% |
+|  1 500 | multi-gold (33)        | 1.58 | **100%** | 100% |
+|  1 500 | factual route (26)     | 2.12 | 97% | 100% |
+|  4 000 | aggregation route      | 4.04 | 56% | 100% |
+|  4 000 | multi-gold             | 3.61 | 58% | 100% |
+| 12 000 | aggregation route      | 12.21 | 19% | 100% |
+| 12 000 | multi-gold             | 11.42 | 19% | 100% |
+
+At 1 500 tokens the raw-evidence fill is ONE session for 13 of the 28
+aggregation-route instances (2 sessions for 12, 3 for 3), and the median
+largest session claims essentially the whole fill. The budget is 99.9%
+saturated throughout, so this is not under-delivery — it is delivery spent
+entirely on depth.
+
+Gold-session presence at 1 500, on the 33 multi-gold instances: 13 carry NO
+gold session at all; all 13 are saturated and 12 of them emitted <= 2 sessions.
+At 4 000 that count falls to 4 (1 with <= 2 sessions) and at 12 000 to 1 (0).
+**Instance #16 is representative, not an outlier**, and the property is
+specific to the tight tier.
+
+One caveat worth recording because it bounds every "recall" number above:
+ctx_eval's hit criterion (the first 80 chars of a `has_answer` turn appearing
+anywhere in the context) fires on evidence delivered by the TIER-1 `[EPISODE]`
+block with no session header at all — instance #1 at 1 500 passes with the gold
+session absent from the fill entirely. The session-level figures above are
+therefore the stricter measure, and the ctx_eval score an upper bound.
+
+### The fix, and the sweep behind its one number
+
+Group i of the first N gets `remaining // (N - i)` chars of the ranked-excerpt
+fill. `context.breadth_floor_sessions` = N, swept with `A18_FLOOR=n`
+(phase-1 reservation, aggregation+temporal routes, everything else unchanged):
+
+| N | ctx_eval @1500 | @4000 | @12000 | sessions @1500 (covered routes) | largest-of-fill | gold sessions covered |
+|---|---------------|-------|--------|------------------|-----------------|-----------------------|
+| off (pre) | 44/58 | 49/58 | 52/58 | 1.62 | 99% | 58% |
+| 2 | 44/58 | 49/58 | 52/58 | 2.52 | 52% | 58% |
+| 3 | 44/58 | 49/58 | 52/58 | 3.69 | 35% | 58% |
+| 4 | 45/58 | 49/58 | 52/58 | 4.86 | 26% | 61% |
+| **5** | **45/58** | **50/58** | **52/58** | **5.55** | **23%** | **61%** |
+| 6 | 45/58 | 49/58 | 52/58 | 6.66 | 20% | 63% |
+| 8 | 46/58 | **48/58** | 52/58 | 8.62 | 16% | 64% |
+
+**5 is the largest N that costs nothing.** It is the only value that improves
+BOTH tight tiers. N=8 buys one more @1500 hit and pays for it at @4000, which
+is the shape of the whole finding in miniature: rationing a budget that already
+held four or five sessions only shortens each of them.
+
+### Shipped result (N=5, `context.breadth_floor` on)
+
+ctx_eval **75.9 / 84.5 / 89.7 -> 77.6 / 86.2 / 89.7**. Per-instance, at 1 500:
+gained #16 and #27, lost #19. At 4 000: gained #25, lost nothing. At 12 000:
+nothing moved.
+
+The three that moved, and the one that was lost, are the same mechanism read
+forwards and backwards (chars per emitted session block, @1500):
+
+* **#16** ("how many plants…", 2 gold sessions). Before: ONE session,
+  `answer_c2204106_3` at 3 084 chars, neither gold session present. After: five
+  sessions of ~650-820 chars each, including gold `answer_c2204106_1`. Pass.
+* **#27** ("how many days travelling in Hawaii and Seattle", 1 gold session).
+  Before: two non-gold sessions at 1 170 and 1 249 chars. After: five sessions,
+  including the gold one. Pass.
+* **#19** ("how many museums in February", 2 gold sessions) is the honest cost.
+  Before: ONE session, 3 793 chars — and it WAS a gold session, with its
+  answer turn deep inside the block. After: five sessions of ~940 chars, and
+  the top session's 940 chars no longer reach that turn. Fail.
+
+That is breadth-vs-depth in its purest form, and #19 is what it costs: when
+the top-ranked session is already the right one and its evidence is deep, a
+ceiling cuts the evidence out. Two recovered for one lost at 1 500, one more
+recovered at 4 000, nothing given back at 12 000.
+
+**The budget is not held back.** Mean chars emitted over the enforced char
+ceiling goes 99.9 / 97.6 / 94.6 % -> 99.9 / 99.9 / 100.0 %: the floor spends
+MORE of the budget, because breadth reaches sessions that had content left
+after the first one ran out. No covered-route context came back more than 200
+chars shorter than its unfloored twin.
+
+**Byte identity, the hard constraint.** Of the 174 (instance, budget) contexts,
+87 are on routes the floor does not cover (factual and preference). All 87 hash
+identically to the pre-change tree by sha256, and every one of the 60 contexts
+that changed at all is on a covered route (`scripts/a18_ab.py`, which exits
+non-zero if that is ever false).
+
+Measured with hashing embeddings (deterministic, no network), 2026-09.

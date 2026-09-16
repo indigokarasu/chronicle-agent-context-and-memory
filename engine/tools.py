@@ -194,8 +194,13 @@ class Tools:
         return {"status": "revoked"}
 
     def _t_set_acl(self, principal, a):
+        # (A1) A belief this principal cannot READ answers "not_found" -- the
+        # same shape a missing one gets. Without the check this tool was both
+        # an existence oracle over other principals' ids AND a widen: the
+        # non-"private" branch below resets read_acl to the default, which
+        # would have un-privated somebody else's owner_only belief.
         found = self.core.store.find_belief(a["belief_id"])
-        if not found:
+        if not found or not access.can_read(found[1].get("read_acl"), found[1].get("owner"), principal):
             return {"error": "not_found"}
         acl = access.make_private(principal) if a.get("visibility") == "private" else access.DEFAULT_ACL
         self.core.store.update_belief(found[0], a["belief_id"], read_acl=acl)
@@ -214,12 +219,18 @@ class Tools:
         return {"status": "ok"}
 
     def _t_reflect(self, principal, a):
+        # (A1b) The calling principal OWNS the reflection it records. Without
+        # this the row landed unattributed and read as legacy -- and a legacy
+        # row is the one shape the read gate has to be lenient about.
         rid = self.core.reasoning.reflect(a.get("situation", ""), a.get("action", ""),
-                                          a.get("outcome", ""), a.get("lesson", ""), a.get("applicability", ""))
+                                          a.get("outcome", ""), a.get("lesson", ""),
+                                          a.get("applicability", ""), principal=principal)
         return {"status": "reflected", "id": rid}
 
     def _t_remember_goal(self, principal, a):
-        return {"status": "ok", "id": self.core.reasoning.remember_goal(a["goal"])}
+        # (A1b) Same: the goal belongs to whoever asked for it.
+        return {"status": "ok",
+                "id": self.core.reasoning.remember_goal(a["goal"], principal=principal)}
 
     def _t_note_informed(self, principal, a):
         self._emit("informed", {"proposition": a["proposition"], "importance": a.get("importance", 0.5)},
@@ -242,7 +253,7 @@ class Tools:
         return {"timeline": self.core.retrieval.timeline(principal=principal)}
 
     def _t_history(self, principal, a):
-        return {"history": self.core.retrieval.history(a["belief_id"])}
+        return {"history": self.core.retrieval.history(a["belief_id"], principal=principal)}
 
     def _t_get_context(self, principal, a):
         # E12: the packing decision travels with the context it produced (route
@@ -253,14 +264,17 @@ class Tools:
         return {"context": ctx, "debug": dict(self.core.retrieval.last_context_debug)}
 
     def _t_explain(self, principal, a):
-        return self.core.derivation.explain(a["belief_id"])
+        return self.core.derivation.explain(a["belief_id"], principal)
 
     def _t_list_directives(self, principal, a):
-        ds = self.core.store.query_beliefs("notes", "always_inject=1 AND status='active'", (), 50)
+        # The engine owns the query AND the ACL filter (retrieval.directive_rows);
+        # a tool may only ask for what the choke point already narrowed to this
+        # principal, never re-issue the store read itself and widen it (A1).
+        ds = self.core.retrieval.directive_rows(principal, 50)
         return {"directives": [{"belief_id": d["belief_id"], "body": d.get("body")} for d in ds]}
 
     def _t_list_contradictions(self, principal, a):
-        return {"contradictions": self.core.store.get_open_contradictions(50)}
+        return {"contradictions": self.core.retrieval.open_contradictions(50, principal)}
 
     def _t_list_link_candidates(self, principal, a):
         """The federation review queue, filtered to entities this principal may read (§15)."""
@@ -425,10 +439,10 @@ class Tools:
             return {"error": f"unexpected error: {e!s}"}
 
     def _t_plan_context(self, principal, a):
-        return self.core.reasoning.plan_context(a["goal"])
+        return self.core.reasoning.plan_context(a["goal"], principal=principal)
 
     def _t_active_goals(self, principal, a):
-        return {"goals": self.core.reasoning.active_goals()}
+        return {"goals": self.core.reasoning.active_goals(principal)}
 
     def _t_what_user_knows(self, principal, a):
-        return {"knows": self.core.epistemic.what_user_knows(a["topic"])}
+        return {"knows": self.core.epistemic.what_user_knows(a["topic"], principal)}

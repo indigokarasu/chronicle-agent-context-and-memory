@@ -28,22 +28,32 @@ except Exception:  # … else a local stand-in (plugin-package or top-level)
     except Exception:  # pragma: no cover
         from _base import ContextEngine
 
-def _estimate_tokens_fast(text: str | None) -> int:
-    """Token count estimate with chars/3 ceiling."""
-    if not text:
-        return 0
-    return -(-len(text) // 3)
-
 try:  # real per-span token accounting (§27 embeddings.max_input_tokens) …
-    from .engine.embeddings import estimate_tokens  # type: ignore
+    from .engine.embeddings import COMPRESSION_BUDGET, budget_chars, estimate_tokens  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
     try:
-        from engine.embeddings import estimate_tokens
+        from engine.embeddings import COMPRESSION_BUDGET, budget_chars, estimate_tokens
     except Exception:  # pragma: no cover
-        def estimate_tokens(text):
-            """Fallback if engine.embeddings is unavailable: chars/3 ceiling,
-            matching estimate_tokens's own conservative ratio (§27 embeddings)."""
-            return _estimate_tokens_fast(text)
+        # A10b: this branch keeps NO chars/token number of its own. A10's
+        # fallback mirrored `_CHARS_PER_TOKEN = 3` here, which is the exact
+        # shape of the defect this file keeps closing -- a second ratio, locally
+        # reasonable, that nothing ever compares against the first, and that
+        # silently goes stale the moment the real one is restated (as it just
+        # was). There is no honest chars/token constant to keep in a module that
+        # cannot import the estimator, so this keeps none: the import still
+        # SUCCEEDS, because the degraded mode a checkout without
+        # engine.embeddings can still offer is `_heuristic` (message-count
+        # compression, which counts no tokens at all), and any path that would
+        # instead have budgeted against a private ratio now fails loudly.
+        COMPRESSION_BUDGET = None
+
+        def _no_estimator(*_args, **_kwargs):
+            raise RuntimeError(
+                "engine.embeddings is unavailable: token budgeting requires the one "
+                "shared estimator (chronicle A10b). The supported degraded mode is "
+                "the heuristic, token-free compressor, not a second chars/token ratio.")
+
+        estimate_tokens = budget_chars = _no_estimator
 
 try:  # content-addressed span ids for FOLD-tier tombstones (§5.2, R4) …
     from .engine.serialize import hash_str  # type: ignore
@@ -385,14 +395,15 @@ class ChronicleContextEngine(ContextEngine):
         if budget is None:
             budget = self._target_budget()
         if used is None:
-            used = sum(estimate_tokens(m.get("content")) for m in output)
+            used = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in output)
         remaining = budget - used
         if remaining <= 0:
             return output  # no room this call -- stays un-latched, retried next time
         warning = self._pressure_warning_span()
-        cost = estimate_tokens(warning["content"])
+        cost = estimate_tokens(warning["content"], margin=COMPRESSION_BUDGET)
         if cost > remaining:
-            warning = dict(warning, content=warning["content"][:max(0, remaining * 3)])
+            # A10: shared inverse, not a second hand-written ratio.
+            warning = dict(warning, content=warning["content"][:budget_chars(remaining, margin=COMPRESSION_BUDGET)])
         if not warning["content"]:
             return output
         self._pressure_warning_injected = True
@@ -492,7 +503,7 @@ class ChronicleContextEngine(ContextEngine):
         # pass's budget check and is never rescored/reclipped again. Only the
         # budget REMAINING after its real token cost is available to whatever
         # this pass freshly decides.
-        used_locked = sum(estimate_tokens(m.get("content")) for m in locked)
+        used_locked = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in locked)
         fresh_budget = max(0, budget - used_locked)
 
         # compress() must guarantee output <= budget (§R2). Priority order
@@ -523,7 +534,7 @@ class ChronicleContextEngine(ContextEngine):
 
         kept_pos = {p for p in never_pos if middle[p][0] not in dropped_never_idx}
         for _score, pos in scored:
-            cost = estimate_tokens(middle[pos][1].get("content"))
+            cost = estimate_tokens(middle[pos][1].get("content"), margin=COMPRESSION_BUDGET)
             if used + cost <= budget:
                 kept_pos.add(pos)
                 used += cost
@@ -548,7 +559,7 @@ class ChronicleContextEngine(ContextEngine):
             chunk_ids = self._ensure_durable(m)
             span_id, _digest, stub = self._fold(m, chunk_ids)
             evicted_span_ids.append(span_id)
-            stub_cost = estimate_tokens(stub.get("content"))
+            stub_cost = estimate_tokens(stub.get("content"), margin=COMPRESSION_BUDGET)
             if used + stub_cost <= budget:
                 middle[pos] = (orig_idx, stub)
                 kept_pos.add(pos)
@@ -596,11 +607,14 @@ class ChronicleContextEngine(ContextEngine):
                     digest_lines = [line.split("\n")[0][:60] for line in self._checkpoint_lines]
                     digest_text = "\n".join(digest_lines)
                 content = f"[Checkpoint: {digest_text}]"
-                if estimate_tokens(content) > remaining:
-                    content = content[:max(0, remaining * 3)]
+                if estimate_tokens(content, margin=COMPRESSION_BUDGET) > remaining:
+                    # A10: shared inverse of estimate_tokens (the digest is
+                    # one synthetic span, so §R7's "always clipped to fit"
+                    # policy stands -- only the constant moves).
+                    content = content[:budget_chars(remaining, margin=COMPRESSION_BUDGET)]
                 if content:
                     injected.append({"role": "system", "content": content})
-                    used += estimate_tokens(content)
+                    used += estimate_tokens(content, margin=COMPRESSION_BUDGET)
 
         # 5) audit event (§R6/R4): evicted_spans/kept_spans/folded_spans carry
         # actual span ids (not counts) so the kept/evicted/folded partition of
@@ -753,29 +767,49 @@ class ChronicleContextEngine(ContextEngine):
             if remaining <= 0:
                 break
             facet_budget = min(share, remaining)
-            ctx = self.core.retrieval.get_context(hint, token_budget=facet_budget,
+            # A10: budget the WRAPPER too. `get_context` now honours its
+            # token_budget under the shared estimator, but this span is the
+            # context PLUS a `[Relevant memory: …]` header, and the old code
+            # asked for `facet_budget` tokens of context, added the header on
+            # top, and then hard-cut the result at `remaining * 3` chars --
+            # mid-word, through whatever evidence line the slice landed in.
+            # Paying for the header up front means the assembled span fits by
+            # construction and nothing is ever bisected.
+            header = f"[Relevant memory: {hint}]\n"
+            body_budget = facet_budget - estimate_tokens(header, margin=COMPRESSION_BUDGET)
+            if body_budget <= 0:
+                continue
+            ctx = self.core.retrieval.get_context(hint, token_budget=body_budget,
                                                   include_directives=False, principal=self._principal_id)
             if not ctx:
                 continue
-            content = f"[Relevant memory: {hint}]\n{ctx}"
-            if estimate_tokens(content) > remaining:
-                content = content[:max(0, remaining * 3)]
-            if content:
-                injected.append({"role": "system", "content": content})
-                cost = estimate_tokens(content)
-                used += cost
-                remaining -= cost
+            content = header + ctx
+            cost = estimate_tokens(content, margin=COMPRESSION_BUDGET)
+            if cost > remaining:
+                # Whole-unit: a span that does not fit is omitted, not sliced.
+                # `facet_budget <= remaining` and the header is already paid
+                # for, so this is a guard against an estimator edge, not the
+                # normal path.
+                continue
+            injected.append({"role": "system", "content": content})
+            used += cost
+            remaining -= cost
 
         if entity_ids and remaining > 0:
             facet_budget = min(share, remaining)
             lines = self._entity_digest_lines(entity_ids, facet_budget)
             if lines:
-                content = "[Entity working set]\n" + "\n".join(lines)
-                if estimate_tokens(content) > remaining:
-                    content = content[:max(0, remaining * 3)]
-                if content:
+                # A10: same treatment -- `_entity_digest_lines` budgets the
+                # LINES, the header is extra, so pay for it here and drop a
+                # trailing whole line rather than slicing the last digest in
+                # half. `lines` is already ordered by entity relevance.
+                header = "[Entity working set]\n"
+                while lines and estimate_tokens(header + "\n".join(lines), margin=COMPRESSION_BUDGET) > remaining:
+                    lines.pop()
+                if lines:
+                    content = header + "\n".join(lines)
                     injected.append({"role": "system", "content": content})
-                    used += estimate_tokens(content)
+                    used += estimate_tokens(content, margin=COMPRESSION_BUDGET)
 
         return injected, used
 
@@ -814,7 +848,9 @@ class ChronicleContextEngine(ContextEngine):
         still rehydrates SOMETHING rather than silently contributing nothing.
         """
         lines: list[str] = []
-        budget_chars = max(0, token_budget * 3)  # chars/3 ceiling, same as estimate_tokens
+        # A10: through the shared inverse, not a hand-written `* 3`;
+        # A10b: under this subsystem's own named margin.
+        line_budget_chars = budget_chars(token_budget, margin=COMPRESSION_BUDGET)
         used_chars = 0
         for eid in entity_ids:
             try:
@@ -831,9 +867,16 @@ class ChronicleContextEngine(ContextEngine):
                 rendered = "; ".join(f"{f.get('attribute')}={f.get('value')}" for f in facts if f.get("attribute"))
                 if not rendered:
                     continue
+                # (A1) The facts above came back ACL-filtered from ask_about;
+                # the entity row's display NAME is a separate store read, so it
+                # goes through the same choke point rather than riding in on
+                # them. An unreadable (or missing) entity renders as its id.
                 entity_row = self.core.store.get_belief("entities", eid) or {}
+                if entity_row and not self.core.retrieval._readable(
+                        entity_row, self._principal_id, "*", None):
+                    entity_row = {}
                 line = "- {}: {}".format(entity_row.get("name") or eid, rendered)
-            if used_chars + len(line) + 1 > budget_chars:
+            if used_chars + len(line) + 1 > line_budget_chars:
                 break
             lines.append(line)
             used_chars += len(line) + 1
@@ -899,9 +942,7 @@ class ChronicleContextEngine(ContextEngine):
         kept, dropped, used = [], [], 0
         for idx, m in items:
             content = m.get("content") or ""
-            cost = m.get("_tokens") if isinstance(m, dict) and "_tokens" in m else estimate_tokens(content)
-            if isinstance(m, dict) and "_tokens" not in m:
-                m["_tokens"] = cost
+            cost = estimate_tokens(content, margin=COMPRESSION_BUDGET)
             remaining = budget - used
             if cost <= remaining:
                 kept.append((idx, m))
@@ -910,11 +951,15 @@ class ChronicleContextEngine(ContextEngine):
             if remaining <= 0:
                 dropped.append((idx, m))
                 continue
-            clipped = content[:remaining * 3]  # chars/3 ceiling -> estimate_tokens(clipped) <= remaining
-            clipped_cost = estimate_tokens(clipped)
-            new_msg = dict(m, content=clipped, _tokens=clipped_cost) if clipped != content else m
-            kept.append((idx, new_msg))
-            used += clipped_cost
+            # A10: the shared inverse of estimate_tokens, so this cannot
+            # drift from the estimator the loop above counts with. The SHORTEN
+            # (rather than drop) policy here is deliberate and unchanged --
+            # §R5 requires a protected span to be shortened-but-present or
+            # durably archived, never blanked-but-present, and
+            # test_compression_fidelity asserts these bytes.
+            clipped = content[:budget_chars(remaining, margin=COMPRESSION_BUDGET)]
+            kept.append((idx, dict(m, content=clipped) if clipped != content else m))
+            used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET)
         return kept, used, dropped
 
     def _compute_content_hash(self, m) -> str:
@@ -1133,7 +1178,7 @@ class ChronicleContextEngine(ContextEngine):
             cap = max(0, int(cap))
         except (TypeError, ValueError):
             cap = 300
-        while self._checkpoint_lines and estimate_tokens("\n".join(self._checkpoint_lines)) > cap:
+        while self._checkpoint_lines and estimate_tokens("\n".join(self._checkpoint_lines), margin=COMPRESSION_BUDGET) > cap:
             self._checkpoint_lines.pop(0)  # oldest first -- rolling, not a fixed snapshot
 
         digest_text = "\n".join(self._checkpoint_lines)
@@ -1293,7 +1338,7 @@ class ChronicleContextEngine(ContextEngine):
             self.context_length * self._cfg_percent("high_watermark_percent", self.threshold_percent))
         low_tokens = int(self.context_length * self._cfg_percent(
             "low_watermark_percent", self.low_watermark_percent))
-        tokens_now = sum(estimate_tokens(m.get("content")) for m in messages)
+        tokens_now = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in messages)
         if tokens_now < low_tokens or tokens_now >= high_tokens:
             return False
 
@@ -1328,7 +1373,7 @@ class ChronicleContextEngine(ContextEngine):
         )
         middle = body[self.protect_first_n:-self.protect_last_n]
         budget = self._target_budget()
-        used = sum(estimate_tokens(m.get("content")) for m in protected)
+        used = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in protected)
 
         never_idx, scored = [], []
         total_middle = len(middle)
@@ -1342,7 +1387,7 @@ class ChronicleContextEngine(ContextEngine):
 
         kept_idx = set(never_idx)
         for _score, i in scored:
-            cost = estimate_tokens(middle[i].get("content"))
+            cost = estimate_tokens(middle[i].get("content"), margin=COMPRESSION_BUDGET)
             if used + cost <= budget:
                 kept_idx.add(i)
                 used += cost

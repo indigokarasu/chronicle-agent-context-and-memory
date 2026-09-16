@@ -16,12 +16,13 @@ constraint.
 import json
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import HashingEmbedder, OpenAICompatEmbedder, pack
@@ -31,8 +32,11 @@ def make_core():
     # Force the offline hashing embedder at construction time so tests are
     # deterministic and never probe localhost embedding servers; individual
     # tests swap in a fake/real embedder afterward where they need to.
-    home = tempfile.mkdtemp()
-    return ChronicleCore(home, {"embeddings": {"model": "hashing"}}), home
+    home = temp_home()
+    # dimensions declared: the fakes swapped in below are 256-wide but named
+    # nomic-embed-text, which the A0g width guard reads as an endpoint
+    # contradicting a 768-dim model unless the deployment declares otherwise.
+    return ChronicleCore(home, {"embeddings": {"model": "hashing", "dimensions": 256}}), home
 
 
 class _FakeHTTPResponse:

@@ -28,10 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.config import Config
 from engine.embeddings import (
+    ONHOST_KINDS,
     DegradedEmbedder,
     HashingEmbedder,
     _candidate_urls,
     _discover_embedding_models,
+    endpoint_kind,
     get_embedder,
 )
 
@@ -58,24 +60,32 @@ def main() -> int:
     dims = cfg.get("embeddings.dimensions")
     base = cfg.get("embeddings.base_url")
     key = cfg.get("embeddings.api_key")
+    allow_remote = bool(cfg.get("embeddings.allow_remote"))
 
     print("Chronicle embedding diagnostic")
     print(f"  configured model : {model!r}")
     print(f"  base_url         : {base or '(auto-detect)'}")
     print(f"  dimensions       : {dims}")
+    print(f"  allow_remote     : {allow_remote}  (A2: false = memory excerpts never leave this host)")
     print("  local servers:")
     any_server = False
     for url in _candidate_urls(base):
+        kind = endpoint_kind(url)
+        if kind not in ONHOST_KINDS and not allow_remote:
+            # Do not probe it either: /v1/models carries the api_key and would
+            # announce this host to a third party (A2).
+            print(f"    {url}: REFUSED — {kind}; set embeddings.allow_remote: true to permit")
+            continue
         try:
             models = _discover_embedding_models(url, key or "")
             any_server = True
-            print(f"    {url}: reachable — models={models}")
+            print(f"    {url}: reachable ({kind}) — models={models}")
         except Exception as e:
             print(f"    {url}: unreachable ({type(e).__name__})")
     if not any_server:
         print("    (no local OpenAI-compatible server responded)")
 
-    emb = get_embedder(model, dims, base, key)
+    emb = get_embedder(model, dims, base, key, allow_remote=allow_remote)
     print()
 
     if isinstance(emb, HashingEmbedder):

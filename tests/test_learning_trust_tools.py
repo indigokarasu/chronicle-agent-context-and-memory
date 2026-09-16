@@ -3,7 +3,6 @@ Chronicle — tests for learning.py, trust.py, and tools.py (§10, §22, §23).
 """
 
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -11,6 +10,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db, temp_home
 
 from engine.errors import E_LEARN_BOUND
 from engine.trust import (
@@ -119,7 +120,7 @@ class TestCalibrator(unittest.TestCase):
         self.cal = Calibrator(self.store, min_obs=2)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_identity_with_no_obs(self):
         # No calibration data → returns raw
@@ -163,7 +164,7 @@ class TestLearningLoop(unittest.TestCase):
     def setUp(self):
         from engine.core import ChronicleCore
 
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
         self.core.initialize("s1", principal_id="assistant")
         self.learning = self.core.learning
@@ -223,7 +224,7 @@ class TestLearningLoop(unittest.TestCase):
 class TestTools(unittest.TestCase):
     def setUp(self):
         from engine.core import ChronicleCore
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
         self.core.initialize("s1", principal_id="assistant")
         self.tools = self.core.tools

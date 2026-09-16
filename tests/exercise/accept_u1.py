@@ -153,10 +153,19 @@ def check2_audit_script():
 
     output = result.stdout.decode("utf-8", "replace")
 
-    known_count = output.count("[known]")
+    # §A12 rewrote the report: the status column is WIRED / DORMANT / UNREAD and
+    # the DORMANT rows carry their reason from engine.config.DECLARED_DORMANT
+    # (the old "[known]" marker is gone). UNREAD must be zero -- that is the
+    # whole point of the rewrite, and tests/test_config_honesty.py enforces it.
+    known_count = sum(1 for line in output.splitlines()
+                      if " DORMANT " in line and "declared" in line)
     if known_count < 3:
         print(f"Output:\n{output}")
-        return _fail("check2", f"expected >=3 known-dormant, got {known_count}")
+        return _fail("check2", f"expected >=3 declared-dormant, got {known_count}")
+    for line in output.splitlines():
+        if line.startswith("UNREAD (undeclared):"):
+            if line.split(":")[1].split()[0] != "0":
+                return _fail("check2", f"audit reports unread keys: {line.strip()}")
 
     # F4a removed retrieval.reranker_version from DEFAULTS entirely (no engine
     # code ever read it), so it no longer appears in the audit at all -- the
@@ -167,7 +176,7 @@ def check2_audit_script():
         missing = [k for k in expected_keys if k not in output]
         return _fail("check2", f"audit missing expected keys: {missing}")
 
-    print(f"PASS: check2 — audit script reports {known_count} known-dormant flags")
+    print(f"PASS: check2 — audit script reports {known_count} declared-dormant flags, 0 unread")
     for key in expected_keys:
         for line in output.splitlines():
             if key in line:

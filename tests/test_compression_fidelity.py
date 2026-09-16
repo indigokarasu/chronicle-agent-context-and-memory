@@ -41,13 +41,15 @@ from __future__ import annotations
 import copy
 import json
 import sys
-import tempfile
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from _tmp_support import temp_home
+
 from context import ChronicleContextEngine  # noqa: E402
+from engine.embeddings import COMPRESSION_BUDGET, estimate_tokens  # noqa: E402
 
 # -- fidelity-check bookkeeping ---------------------------------------------
 
@@ -103,10 +105,17 @@ def _make_engine(tag: str, config_overrides: dict | None = None):
     config (e.g. {"context": {"default_token_budget": N}}) for tests that
     need to force real eviction under R2's per-token-budget model.
     """
-    home = tempfile.mkdtemp(prefix=f"chronicle_fidelity_{tag}_")
+    home = temp_home(prefix=f"chronicle_fidelity_{tag}_")
     session_id = f"sess-{tag}"
     eng = ChronicleContextEngine()
-    config = {"embeddings": {"model": "hashing"}}
+    # A10b units restatement. Every fixture in this harness was calibrated
+    # against compress() reading the then-default context.default_token_budget
+    # (1500) at chars/3 -- a 4 500-CHAR window. The production default still
+    # means 1500 TOKENS and now delivers them (1500 x 4 = 6000 chars), so the
+    # harness pins the char size it was built for rather than tracking a default
+    # whose unit changed: 1500 tok x 3 chars = 4500 = 1125 tok x 4 chars.
+    config = {"embeddings": {"model": "hashing"},
+              "context": {"default_token_budget": 1125}}
     if config_overrides:
         config.update(config_overrides)
     eng.on_session_start(session_id, hermes_home=home, principal_id="tester", config=config)
@@ -132,7 +141,7 @@ def _patched_home(tag: str):
     the duration keeps the test hitting the real default-resolution logic
     without touching anything outside a tempdir this test owns.
     """
-    tmp_home = Path(tempfile.mkdtemp(prefix=f"chronicle_fidelity_{tag}_home_"))
+    tmp_home = Path(temp_home(prefix=f"chronicle_fidelity_{tag}_home_"))
     return mock.patch("context.Path.home", return_value=tmp_home)
 
 
@@ -158,7 +167,20 @@ def test_i17_small_span_byte_exact():
     filler message needs a small budget to be evicted by at all -- otherwise
     it simply fits and is kept, and there is nothing to recover (R2/R11
     compose)."""
-    eng, sid, _home = _make_engine("i17small", {"context": {"default_token_budget": 250}})
+    # A10b units restatement: 250 tok x 3 chars = 750 = 187.5 tok x 4 chars —
+    # the ONE restated fixture in this change whose conversion is not an
+    # integer. It is written in CHARS through the shared estimator, so it says
+    # 750 and rounds where the estimator rounds (ceil -> 188, i.e. 752 chars,
+    # +0.27%). MEASURED, not assumed: run at both 187 and 188 the fixture
+    # behaves identically to the pre-restatement run at 250 — same 11 output
+    # spans, target evicted, recovery byte-exact — while total output chars go
+    # 750 (base) -> 718 (187) / 722 (188). That residual is NOT the rounding of
+    # the budget: it is the per-span ceiling (a 71-char filler costs 72 chars of
+    # budget at chars/3 and 72 at chars/4, but the clipped span at the boundary
+    # lands differently), and no choice of budget removes it.
+    budget_750_chars = estimate_tokens("x" * 750, margin=COMPRESSION_BUDGET)
+    eng, sid, _home = _make_engine("i17small",
+                                   {"context": {"default_token_budget": budget_750_chars}})
     target = "UNIQUE-SMALL-" + ("x" * 180)
     body = _body(10, middle_content=target)
     result = eng.compress(body)
@@ -286,13 +308,19 @@ def test_output_fits_token_budget():
     spans blow straight through it (R2)."""
     eng, _sid, _home = _make_engine("budget")
     budget_tokens = eng.core.cfg.get("context.default_token_budget", 1500)
-    big = "B" * 2000  # ~500 tokens at the ~4-chars/token estimate used below
+    big = "B" * 2000  # 500 tokens at the shared estimate
     body = ([{"role": "user", "content": f"HEAD{i} " + big} for i in range(3)]
             + [{"role": "assistant" if i % 2 else "user", "content": f"MID{i} " + _filler(i)}
                for i in range(4)]
             + [{"role": "assistant", "content": f"TAIL{i} " + big} for i in range(6)])
     result = eng.compress(body)
-    approx_tokens = sum(len(m.get("content") or "") for m in result) / 4.0
+    # A10b: through the ONE shared estimator instead of this harness's own
+    # private /4.0 -- a ratio that happened to agree with today's estimate and
+    # would have gone stale silently the next time the estimate moved. Strictly
+    # tighter than the old expression (per-span ceiling, not a bulk division),
+    # and it is the same number compress() budgets with.
+    approx_tokens = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET)
+                        for m in result)
     check("output_fits_token_budget", approx_tokens <= budget_tokens, expect_baseline_fail=False,
           detail=f"~{approx_tokens:.0f} tokens vs context.default_token_budget={budget_tokens} "
                  f"-- compress() does not account for tokens, only message count (R2)")

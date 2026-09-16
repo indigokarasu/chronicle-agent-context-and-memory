@@ -20,9 +20,13 @@ Four properties this module exists to preserve:
    database Chronicle does not own and cannot index, so the cost is bounded by
    construction, not by hope.
 3. Never authoritative. A projection is a cache of what the external authority
-   currently says. Nothing here writes a fact, an entity, or a link (I20). A
-   name that matches is a candidate for adjudication, and candidates go to
-   `pending_candidates` for a human/curation decision — never to an edge.
+   currently says. Nothing here writes a fact, an entity, or a link (I20) —
+   nothing here writes AT ALL, because `query()` runs on the retrieval read
+   path. A name that matches is noted in the in-memory `pending_candidates`
+   list and never becomes an edge. The DURABLE adjudication queue is
+   `link_candidates`, written by the federation sweep (`_task_federate_sweep`),
+   which is the path that has an entity to adjudicate against; see
+   `_note_candidate` for why this one does not.
 4. Access-checked. Every read goes through `access.can_read` with the DB's
    declared read_acl, so a principal from another user gets nothing, and a
    database declared owner_only stays owner_only.
@@ -101,32 +105,30 @@ class FederatedChannel:
         return "%s | %s" % (pointer, hit.get("projection") or "")
 
     def _note_candidate(self, provider: LocalDBProvider, hit: Dict):
-        """Record the row as an unadjudicated identity candidate (never a link)."""
+        """Record the row as an unadjudicated identity candidate (never a link).
+
+        In-memory, bounded, and READ-ONLY with respect to the store, because the
+        only caller is `query()` and `query()` is on the retrieval hot path.
+
+        There is deliberately no durable queue behind this. A hit here is a row
+        whose text matched a focus token; it carries `entity_id: None` by
+        construction (LocalDBProvider.identity_candidate) because nothing has
+        proposed WHICH Chronicle entity it might be — so there is no pair for a
+        reviewer to accept or reject. The durable adjudication queue is
+        `link_candidates`, fed by the federation sweep (`_task_federate_sweep`),
+        which matches an EXISTING entity against an external row and therefore
+        has both halves of the decision to offer.
+
+        A13 note: an `enqueue_candidates_for_review(store)` used to sit here and
+        push these into curation as a `federated_identity_review` job. The task
+        name was not in the curation_jobs CHECK and no handler existed, so the
+        method could only ever raise IntegrityError; it had no caller. It was
+        removed rather than completed, because completing it would have built a
+        second review queue holding half a decision.
+        """
         if len(self.pending_candidates) >= MAX_PENDING_CANDIDATES:
             return
         try:
             self.pending_candidates.append(provider.identity_candidate(hit))
         except Exception as e:
             logger.warning("federated: candidate capture failed: %s", e)
-
-    def drain_candidates(self) -> List[Dict]:
-        """Take the pending candidates (for a reviewer / curation job)."""
-        out, self.pending_candidates = self.pending_candidates, []
-        return out
-
-    def enqueue_candidates_for_review(self, store) -> int:
-        """Hand pending candidates to the curation queue for adjudication.
-
-        Deliberately NOT called from `get_context`: retrieval is a read path.
-        A caller that wants the review queue populated (a curation pass, a
-        maintenance tool) calls this explicitly. Either way, nothing links an
-        external row to a Chronicle entity without a decision.
-        """
-        n = 0
-        for candidate in self.drain_candidates():
-            try:
-                store.enqueue_curation("federated_identity_review", candidate)
-                n += 1
-            except Exception as e:
-                logger.warning("federated: enqueue candidate failed: %s", e)
-        return n

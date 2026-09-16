@@ -24,11 +24,12 @@ exercised for real:
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import estimate_tokens
@@ -43,7 +44,7 @@ def _msg(role, text):
 
 class CutPointStabilityTests(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r5_")
+        self.home = temp_home(prefix="r5_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r5-s1", hermes_home=self.home, principal_id="pat", config=CFG)
@@ -56,7 +57,8 @@ class CutPointStabilityTests(unittest.TestCase):
     # -- append-only growth under real eviction pressure ---------------------
 
     def test_settled_prefix_survives_growth_under_real_eviction_pressure(self):
-        self.eng.update_model("test-model", context_length=2000)  # budget = 0.55 * 2000 = 1100
+        self.eng.update_model("test-model", context_length=1500)  # budget = 0.55 * 1500 = 825
+        # A10b units restatement: 2000 x 3 = 6000 = 1500 x 4.
 
         head = [_msg("user", "head %d" % i) for i in range(3)]
         small_middle = [_msg("assistant", "small filler %d" % i) for i in range(4)]
@@ -112,7 +114,8 @@ class CutPointStabilityTests(unittest.TestCase):
         message count converges to a stable bound instead of growing
         forever while quietly destroying data.
         """
-        self.eng.update_model("test-model", context_length=3000)  # budget = 1650
+        self.eng.update_model("test-model", context_length=2250)  # budget = 1237
+        # A10b units restatement: 3000 x 3 = 9000 = 2250 x 4.
         pad = "padding " * 30
         messages = [_msg("system", "sys"), _msg("user", "head 0"), _msg("user", "head 1")]
         prev_result = None
@@ -156,7 +159,7 @@ class CutPointStabilityTests(unittest.TestCase):
         is relative to its neighbors -- compress() must not pull every
         system-role message to the front of the window (the other named R5
         cause of prefix churn: 'system hoist')."""
-        self.eng.update_model("test-model", context_length=100000)  # no budget pressure -- isolate ordering
+        self.eng.update_model("test-model", context_length=75000)  # no budget pressure -- isolate ordering
         messages = (
             [_msg("user", "u0"), _msg("assistant", "a0")]
             + [_msg("system", "MID-SYSTEM-NOTE")]

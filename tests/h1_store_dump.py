@@ -13,21 +13,89 @@ that, so this file is deliberately importable by both and depends on nothing H1
 added — it calls `pre_llm_call` only through hasattr, because the base tree has
 no such method.
 
-Determinism: the clock is frozen (every engine module's `now_iso`/`_iso_in` is
-replaced), the embedder is pinned to `hashing`, and rows are sorted within each
-table, so the only thing that can move the output is a behavior change.
+Determinism: the CAPTURE clock is frozen (every engine module's
+`now_iso`/`_iso_in` is replaced), the embedder is pinned to `hashing`, and rows
+are sorted within each table, so the only thing that can move the output is a
+behavior change.
 
-Two legitimate differences are excluded rather than papered over, and each is
-asserted separately by tests/test_host_model.py:
+The `uuid.uuid4` pin that used to sit beside the clock is GONE (Ladder 10 A4).
+It was not a determinism aid, it was a blindfold: the four projection side
+tables minted uuid4 row ids inside the reducer, so a full-log replay produced
+a different projection every time, and pinning uuid4 here is precisely what
+stopped this dump from showing it. Those ids — and `extractions.id`, the last
+random id a default flow wrote — are now derived from content, so the flow has
+no uuid4 in it and there is nothing left to pin.
+
+The clock pin stays, and is a different kind of thing. It freezes the clock
+that CAPTURE reads: `occurred_at`/`recorded_at` become part of the event log,
+they feed `event_id` and therefore `belief_id`, and two trees probed minutes
+apart would otherwise differ in every row for a reason that has nothing to do
+with either tree. That is legitimate input control. It does mean this dump
+cannot prove the reducer stopped inventing timestamps — with the clock frozen,
+an invented `now_iso()` and the event's own `recorded_at` are the same string.
+That property is proved instead, with nothing pinned at all, by
+tests/test_replay_determinism.py.
+
+Three legitimate differences are excluded rather than papered over, and each is
+asserted separately by tests/test_host_model.py (or, for the third,
+tests/test_a9_sweeps.py):
   * the host-model tables, which H1/H2 add and which must be EMPTY here;
-  * meta.schema_version, which H1/H2 bump to carry those tables.
+  * meta.schema_version, which H1/H2 bump to carry those tables;
+  * meta `sweep:*`, ladder-10 A9's sweep cursors and last-run reports.
+
+The third needs its reason stated, because "a new row appeared" is normally
+exactly what this probe exists to catch. These rows are not memory: they are the
+maintenance bookkeeping that makes a sweep resumable and its partiality visible,
+and their content is a fixed telemetry schema (cursor, processed, remaining,
+bounded, budget, wrapped, total, at) that references no belief, event, session or
+entity. They cannot carry content forward and they cannot change what a query
+returns. tests/test_a9_sweeps.py::TestH1DumpExclusionIsNarrow asserts BOTH halves
+directly — that the H1 fixture flow really does write such a row (so the
+exclusion is exercised, not decorative) and that every excluded row is pure
+telemetry with no identifier in it.
 
 §H2 extends the exclusion list the same way H1 established: only with tables
 that are EMPTY at defaults, and only alongside a test that asserts that
 emptiness directly (tests/test_h2_host_drains.py::TestH2DisabledPathIsInert).
-The exclusion is never allowed to cover a table with rows in it, and never a
-COLUMN — which is why H2's doc2query provenance mark lives in its own table
-instead of widening the already-populated query_proxy_vectors.
+The exclusion is never allowed to cover a table with rows in it — which is why
+H2's doc2query provenance mark lives in its own table instead of widening the
+already-populated query_proxy_vectors.
+
+§A0e needs the one thing that rule forbade — a COLUMN exclusion — and it is
+worth being exact about why the carve-out below is NARROWER rather than a
+loosening. A0e gives `session_index` a `model` column so a session vector's
+geometry is recorded at all; it was the one embedding-bearing table with no
+model, which is how 93% of the live store's session vectors ended up in an
+abandoned model's geometry with nothing in the system that would ever find
+them. `session_index` HAS a row after this flow (on_session_end → the
+session_summarize job), so H2's answer — put it in a new table — does not help:
+the new table would carry that row and could not be excluded either. Every way
+of recording the model changes this dump.
+
+So the COLUMN is excluded, under a rule with teeth:
+
+  * only a column whose value is the ACTIVE embedder's canonical model tag, and
+  * only alongside a test that asserts that value directly, derived from
+    DELIBERATE_MODEL_COLUMNS below (tests/test_host_model.py
+    ::test_deliberate_model_columns_carry_the_active_tag).
+
+That is strictly MORE than byte-identity gives here: byte-identity could only
+say the cell equals the base tree's cell, and the base tree has no such cell.
+The companion test says the cell equals the canonical tag of the embedder that
+actually ran. Every other cell of session_index — id, summary, embedding DIGEST,
+owner, occurred_at — is still compared byte for byte, so a behavior change that
+moved a summary or a vector still fails here.
+
+Ladder-10 A3 adds a table (`maintenance_runs`, the maintenance scheduler's
+watermarks) and deliberately does NOT extend the list with it. It would
+qualify — it is empty at defaults, and that emptiness is asserted directly by
+tests/test_maintenance_scheduler.py::TestInertAtDefaults — but excluding it
+would trade an alarm for a promise. The base tree has no such table, so a
+watermark written on the default path shows up here as a line the base dump
+cannot have, and test_store_dump_is_byte_identical_to_the_base_tree fails on
+the spot. An empty table costs the dump nothing (it renders no lines), so
+leaving it inside the comparison is free. A test asserts it stays out of
+H1_TABLES, so a future failure cannot be "fixed" by hiding the table.
 
 Usage:  python3 tests/h1_store_dump.py <tree_dir>
 """
@@ -48,6 +116,18 @@ FROZEN_LATER = "2026-01-02T03:14:05.00Z"
 H1_TABLES = ("host_model_requests", "host_model_results",
              "host_model_proxies", "rerank_hints")
 
+# (table, column) pairs excluded from the dump because they are DELIBERATE
+# schema additions the base tree cannot have, and because their value is the
+# active embedder's canonical model tag rather than anything the flow could
+# vary. Read the module docstring before adding to this: a pair only earns its
+# place if a test asserts the value directly, and test_host_model.py derives
+# that assertion FROM this tuple so an unasserted addition cannot pass silently.
+DELIBERATE_MODEL_COLUMNS = (("session_index", "model"),)
+# Ladder-10 A9 sweep bookkeeping in `meta`. Kept as a literal rather than
+# imported from engine.store, because this probe must run unchanged inside the
+# pre-A9 base tree, where that constant does not exist.
+SWEEP_META_PREFIX = "sweep:"
+
 # The fixture turn set. Obviously fake people and companies, per the spec's
 # fixture rule, and shaped to exercise the heuristic extractor's real branches:
 # a first-person name + employer, an office location, and a directive.
@@ -59,23 +139,18 @@ TURNS = (
 
 
 def _freeze_clock():
-    """Pin the two sources of run-to-run variance: the clock and uuid4.
+    """Pin the CAPTURE clock — the one remaining source of run-to-run variance.
 
     now_iso/_iso_in are imported by VALUE (`from .store import now_iso`), so
     patching engine.store alone would leave capture.py and reducer.py on the
     real clock — and since occurred_at feeds event_id, which feeds belief_id,
-    that alone would move nearly every row. uuid4 backs surrogate row ids
-    (extractions.id, rescue document_id) that are random by design.
+    that alone would move nearly every row.
+
+    uuid4 is deliberately NOT pinned any more; see this module's docstring.
+    A default flow that still needs a uuid4 pin to produce a stable dump has a
+    random id somewhere in its projection, which is the defect, not the test
+    setup.
     """
-    import uuid
-
-    counter = [0]
-
-    def _fake_uuid4():
-        counter[0] += 1
-        return uuid.UUID(int=counter[0])
-
-    uuid.uuid4 = _fake_uuid4
     for module in list(sys.modules.values()):
         name = getattr(module, "__name__", "") or ""
         if not (name == "provider" or name == "context" or name.startswith("engine")):
@@ -84,8 +159,6 @@ def _freeze_clock():
             setattr(module, "now_iso", lambda: FROZEN_NOW)
         if hasattr(module, "_iso_in"):
             setattr(module, "_iso_in", lambda *a, **kw: FROZEN_LATER)
-        if hasattr(module, "uuid4"):
-            setattr(module, "uuid4", _fake_uuid4)
 
 
 def _norm(value):
@@ -107,11 +180,17 @@ def dump_store(store) -> str:
         columns = [r[1] for r in conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
         if not columns:
             continue  # a virtual table's own name has no columns to read directly
+        # Deliberate model-identity columns are dropped by NAME, so the
+        # surviving cells keep the base tree's own order whether this tree put
+        # the new column first, last or in the middle.
+        skip = {i for i, c in enumerate(columns) if (table, c) in DELIBERATE_MODEL_COLUMNS}
         rendered = []
         for row in conn.execute("SELECT * FROM %s" % table).fetchall():
-            cells = [_norm(row[i]) for i in range(len(columns))]
+            cells = [_norm(row[i]) for i in range(len(columns)) if i not in skip]
             if table == "meta" and cells and cells[0] == "schema_version":
-                continue  # 5 -> 6: the ONE deliberate difference, asserted elsewhere
+                continue  # 5 -> 6: a deliberate difference, asserted elsewhere
+            if table == "meta" and cells and str(cells[0]).startswith(SWEEP_META_PREFIX):
+                continue  # A9 sweep cursor/report: telemetry, asserted elsewhere
             rendered.append(json.dumps(cells, default=str, sort_keys=True))
         for line in sorted(rendered):
             lines.append(table + "\t" + line)

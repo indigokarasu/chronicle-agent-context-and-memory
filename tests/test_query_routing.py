@@ -9,18 +9,19 @@ hashing embedder (deterministic, no network) — the same mode the recall/
 ctx_eval gate harnesses use.
 """
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.retrieval import RetrievalEngine
 
 
 def make_core(cfg_overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if cfg_overrides:
         cfg.update(cfg_overrides)
