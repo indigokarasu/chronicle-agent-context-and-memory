@@ -17,11 +17,12 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from provider import (
     ChronicleMemoryProvider,
@@ -101,7 +102,7 @@ class TestSummarizeToolHistory(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestPostToolCallReferenceCapture(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.provider = ChronicleMemoryProvider()
         self.provider.initialize("s1", hermes_home=self.home, principal_id="assistant",
                                  config={"embeddings": {"model": "hashing"}})
@@ -141,7 +142,7 @@ class TestPostToolCallReferenceCapture(unittest.TestCase):
 
     def test_chronicles_own_tool_never_captured_even_if_allowlisted(self):
         # Explicit guard must win even when an operator misconfigures the allowlist.
-        home2 = tempfile.mkdtemp()
+        home2 = temp_home()
         try:
             p2 = ChronicleMemoryProvider()
             p2.initialize("s1", hermes_home=home2, principal_id="assistant",
@@ -197,7 +198,7 @@ class TestPostToolCallReferenceCapture(unittest.TestCase):
         self.assertEqual(rows[0]["cached_summary"], "Pat Testley result text.")
 
     def test_custom_allowlist_and_ttl_from_config(self):
-        home3 = tempfile.mkdtemp()
+        home3 = temp_home()
         try:
             p3 = ChronicleMemoryProvider()
             p3.initialize("s1", hermes_home=home3, principal_id="assistant",
@@ -229,7 +230,7 @@ class TestPostToolCallReferenceCapture(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestSubagentStopDelegationEpisode(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.provider = ChronicleMemoryProvider()
         self.provider.initialize("s1", hermes_home=self.home, principal_id="assistant",
                                  config={"embeddings": {"model": "hashing"}})

@@ -25,11 +25,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from _tmp_support import temp_home
+
 from engine import identity
 from engine.capture import CaptureEngine
 from engine.config import Config
 from engine.embeddings import HashingEmbedder, cosine, pack
 from engine.reducer import Reducer
+from engine.core import ChronicleCore
 from engine.store import SCHEMA_VERSION, MemoryStore
 from provider import ChronicleMemoryProvider
 
@@ -177,9 +180,11 @@ class TestSplitCandidate(_Rig):
 # ---------------------------------------------------------------------------
 class TestMergeCandidate(_Rig):
     def _two_records(self):
-        # Deliberately DIFFERENT names: an exact-name match is already handled by
-        # the curator's _task_identity, so the interesting case is two records
-        # that do not look alike but whose mention contexts do.
+        # Deliberately DIFFERENT names: an exact-name match has its own producer
+        # (the curator's _task_identity, which since ladder-10 A8 queues a merge
+        # CANDIDATE for one — see TestA8ExactNameIsACandidateNotAMerge), so the
+        # interesting case HERE is two records that do not look alike but whose
+        # mention contexts do.
         _fact(self.cap, "ent_pat_alpha", "role", TESTLEY_CONTEXT, "ev_alpha",
               entity_name="Pat Testley")
         before = self.entities_dump()
@@ -273,7 +278,7 @@ class TestNothingAutoApplies(_Rig):
 # ---------------------------------------------------------------------------
 class TestListingAPI(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.provider = ChronicleMemoryProvider()
         self.provider.initialize("s1", hermes_home=self.home, principal_id="default",
                                  config={"embeddings": {"model": "hashing", "dimensions": 256}})
@@ -586,9 +591,16 @@ class TestReplay(_Rig):
         candidate (TestNothingAutoApplies.test_recording_an_outcome_still_
         moves_no_entity) is a direct projection write with nothing in the
         event log to replay. Resolving through a proper 'adjudicated' event
-        instead -- keyed by the candidate's DEDUPE KEY, since its row id is a
-        fresh uuid4 re-minted on re-derivation and does not survive rebuild --
-        must replay right back onto the row identity.py re-creates.
+        instead -- keyed by the candidate's DEDUPE KEY -- must replay right
+        back onto the row identity.py re-creates.
+
+        Ladder 10 A4 note: this test used to assert the re-derived row had a
+        BRAND NEW id, because the id was a uuid4 and that was the whole reason
+        F4d had to address the outcome by dedupe key. The id is now derived
+        FROM that dedupe key, so it is stable across a rebuild and the
+        assertion is inverted. Re-derivation is still proved -- and proved more
+        directly -- by truncating first and observing the table actually go
+        empty before the replay refills it.
         """
         _fact(self.cap, "ent_pat_alpha", "role", TESTLEY_CONTEXT, "ev_alpha")
         _fact(self.cap, "ent_pat_beta", "role", TESTLEY_CONTEXT, "ev_beta")
@@ -610,20 +622,22 @@ class TestReplay(_Rig):
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0]["id"], old_id)
 
+        # Prove the row really is re-derived rather than re-found: empty the
+        # projection first and check the queue is gone, THEN replay.
+        self.store.truncate_projection()
+        self.assertEqual(self.candidates(status=""), [],
+                         "truncate_projection left identity_candidates rows behind -- "
+                         "the replay below would prove nothing")
         self.reducer.rebuild()
 
-        # The row identity.py re-derives from the replayed mention events has
-        # a BRAND NEW id (enqueue's INSERT OR IGNORE actually inserts this
-        # time, into a table truncate_projection just emptied) -- proving
-        # this test isn't just re-finding the pre-rebuild row.
         after_pending = self.candidates()
         after_resolved = self.candidates(status="merged")
         self.assertEqual(after_pending, [], "resolved candidate came back pending after rebuild")
         self.assertEqual(len(after_resolved), 1,
                          "the adjudicated outcome did not survive truncate_projection + replay")
-        self.assertNotEqual(after_resolved[0]["id"], old_id,
-                            "same id after truncate+replay -- this test is not exercising "
-                            "re-derivation, dedupe-key matching proves nothing")
+        self.assertEqual(after_resolved[0]["id"], old_id,
+                         "A4: the candidate id is derived from the dedupe key, so a "
+                         "re-derived row must carry the SAME id")
         self.assertEqual(after_resolved[0]["kind"], merge["kind"])
         self.assertEqual(after_resolved[0]["entity_id"], merge["entity_id"])
 
@@ -755,6 +769,217 @@ class TestQueueHygiene(_Rig):
         self.store.put_entity_centroid("e", pack([1.0, 2.0]), 2, 2, "m", "t")
         row = self.store.get_entity_centroid("e")
         self.assertEqual((row["n"], row["dims"], row["model"]), (2, 2, "m"))
+
+
+
+# ---------------------------------------------------------------------------
+# Ladder-10 A8 — an exact name match is EVIDENCE, and evidence is a question
+# ---------------------------------------------------------------------------
+#
+# The `identity` curation task used to merge every entity pair sharing
+# (normalized_name, owner, domain), stamping `evidence: exact_name_match` on a
+# `merged` event. That is the premise violation this whole module exists to
+# prevent, pointed at the harder direction: "Robin Placeholder" is one person
+# recorded twice (a split risk), but two DIFFERENT people are both named
+# "Pat Testley" (a merge risk), and an exact name match is exactly the second case.
+#
+# The fixture is two different people who share a name and nothing else: Sam
+# Vimes who bakes before dawn, and Sam Vimes who piloted the docking module.
+# Their mention contexts diverge below identity.split_below, which is the point
+# — the geometry says "different", the name says "same", and the only correct
+# output is a question.
+class _CoreRig(unittest.TestCase):
+    """A real core, so the sweep runs where it actually runs: through the
+    curation worker, on the store's own write path."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="a8-")
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        self.core.initialize("s-a8", principal_id="assistant")
+        self.store = self.core.store
+        self.cap = self.core.capture
+
+    def tearDown(self):
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def two_sam_vimeses(self):
+        """Two entity rows, one name. Distinguishable only by their mentions."""
+        _fact(self.cap, "ent_vimes_baker", "day_work", VIMES_BAKER, "ev_baker",
+              entity_name="Sam Vimes")
+        _fact(self.cap, "ent_vimes_astronaut", "day_work", VIMES_ASTRONAUT, "ev_astro",
+              entity_name="Sam Vimes")
+
+    def entities_dump(self):
+        return self.store._conn().execute(
+            "SELECT * FROM entities ORDER BY belief_id").fetchall()
+
+    def sweep(self):
+        self.core.curation._task_identity({})
+
+    def merge_candidates(self, status="pending"):
+        return self.store.get_identity_candidates(status=status, kind="merge")
+
+    def plain_entity(self, belief_id, name="Sam Vimes"):
+        """An entity row with no mention vector behind it — so the ONLY thing
+        that can propose a merge for it is the name sweep, not E7's centroid
+        path (16 identical contexts would otherwise raise 100 centroid
+        candidates and drown the thing under test)."""
+        self.store.upsert_belief("entities", {
+            "belief_id": belief_id, "type": "", "name": name,
+            "normalized_name": name.lower(), "aliases": "[]", "domain": "user",
+            "owner": "default", "read_acl": '["*"]', "fact_count": 1,
+            "relationship_count": 0, "created_at": "2026-01-01T00:00:00.00Z",
+            "last_seen_at": "2026-01-01T00:00:00.00Z"})
+
+    def merged_events(self):
+        return self.store.get_events_by_type("merged")
+
+
+class TestA8ExactNameIsACandidateNotAMerge(_CoreRig):
+    def test_the_fixture_really_is_two_different_people(self):
+        """Guard against a vacuous acceptance: the two records must share a
+        normalized_name (so the sweep sees a collision) while their mention
+        contexts must NOT look alike (so nothing but the name is arguing for a
+        merge). Read from config, so a threshold change fails here."""
+        self.two_sam_vimeses()
+        names = {r["normalized_name"] for r in self.entities_dump()}
+        self.assertEqual(names, {"sam vimes"})
+        self.assertEqual(len(self.entities_dump()), 2)
+
+        emb = HashingEmbedder(dimensions=256)
+        sim = cosine(emb.embed(VIMES_BAKER), emb.embed(VIMES_ASTRONAUT))
+        self.assertLess(sim, Config({}).get("identity.merge_above"),
+                        "the two lives look alike; the name is no longer the only "
+                        "thing proposing a merge and this fixture proves nothing")
+
+    def test_two_same_name_people_stay_two_entities_and_raise_one_question(self):
+        """The acceptance: two entities remain distinct AND a merge candidate is
+        queued. Entity rows are compared column-for-column across the pass."""
+        self.two_sam_vimeses()
+        before = self.entities_dump()
+        self.sweep()
+
+        self.assertEqual(before, self.entities_dump(), "the sweep moved an entity row")
+        self.assertTrue(all(r["merged_into"] is None for r in self.entities_dump()))
+        self.assertEqual(self.merged_events(), [], "the sweep emitted a `merged` event")
+
+        cands = self.merge_candidates()
+        self.assertEqual(len(cands), 1, cands)
+        c = cands[0]
+        self.assertEqual(c["status"], "pending")
+        # Canonical sorted pair, so the queue key does not depend on scan order.
+        self.assertEqual([c["entity_id"], c["other_id"]],
+                         sorted(["ent_vimes_baker", "ent_vimes_astronaut"]))
+        self.assertEqual(c["mention_ref"], "")
+        self.assertEqual(c["similarity"], 1.0)   # the NAMES are identical
+
+    def test_reprocessing_does_not_duplicate_the_candidate(self):
+        """E7's dedupe key (kind, entity_id, other_id, mention_ref) is reused
+        rather than a parallel one being built, so a sweep on a cadence asks the
+        same question once, not once per run."""
+        self.two_sam_vimeses()
+        self.sweep()
+        first = self.merge_candidates()[0]["id"]
+        for _ in range(4):
+            self.sweep()
+        cands = self.merge_candidates()
+        self.assertEqual(len(cands), 1, cands)
+        self.assertEqual(cands[0]["id"], first, "the candidate row was replaced")
+
+    def test_an_answered_question_is_not_reopened_by_the_next_sweep(self):
+        """INSERT OR IGNORE keeps the decision already on the row. A sweep that
+        re-queued a rejected pair every night would be the auto-merge again,
+        wearing the reviewer down instead of the entity."""
+        self.two_sam_vimeses()
+        self.sweep()
+        cand = self.merge_candidates()[0]
+        self.store.resolve_identity_candidate(cand["id"], "rejected")
+        self.sweep()
+        self.assertEqual(self.merge_candidates(status="pending"), [])
+        self.assertEqual(len(self.store.get_identity_candidates(status="rejected")), 1)
+
+    def test_a_lone_name_proposes_nothing(self):
+        _fact(self.cap, "ent_vimes_baker", "day_work", VIMES_BAKER, "ev_baker",
+              entity_name="Sam Vimes")
+        self.sweep()
+        self.assertEqual(self.merge_candidates(), [])
+
+    def test_a_name_shared_by_many_is_capped_like_the_noise_it_is(self):
+        """A name matching hundreds of entities is not evidence; a queue of
+        hundreds of questions nobody can answer is not adjudication."""
+        from engine.curation import _IDENTITY_MAX_CANDIDATES_PER_NAME as CAP
+        for i in range(CAP + 6):
+            self.plain_entity("ent_vimes_%02d" % i)
+        self.sweep()
+        self.assertEqual(len(self.merge_candidates()), CAP)
+        self.assertEqual(self.merged_events(), [])
+
+
+class TestA8TheLegitimateMergePathSurvives(_CoreRig):
+    def test_an_explicit_merged_event_still_merges(self):
+        """Only the INFERRED path is gone. A `merged` event records a decision a
+        principal made, and reducer._on_merged still applies it."""
+        self.two_sam_vimeses()
+        self.cap.append("merged", {"from_entity": "ent_vimes_astronaut",
+                                   "into_entity": "ent_vimes_baker",
+                                   "evidence": "adjudicated_by_reviewer"},
+                        actor="curator", owner="default")
+        self.assertEqual(
+            self.store.get_belief("entities", "ent_vimes_astronaut")["merged_into"],
+            "ent_vimes_baker")
+
+    def test_the_sweep_skips_an_already_merged_entity(self):
+        self.two_sam_vimeses()
+        self.cap.append("merged", {"from_entity": "ent_vimes_astronaut",
+                                   "into_entity": "ent_vimes_baker",
+                                   "evidence": "adjudicated_by_reviewer"},
+                        actor="curator", owner="default")
+        self.sweep()
+        self.assertEqual(self.merge_candidates(), [])
+
+
+class TestA8ThroughTheRealWorker(_CoreRig):
+    def test_the_queued_job_completes_and_merges_nothing(self):
+        self.two_sam_vimeses()
+        before = self.entities_dump()
+        self.store.enqueue_curation("identity", {})
+        self.core.process_pending()
+        row = [j for j in self.store.get_curation_jobs(limit=200)
+               if j["task"] == "identity"][0]
+        self.assertEqual(row["status"], "done", row)
+        self.assertEqual(before, self.entities_dump())
+        self.assertEqual(self.merged_events(), [])
+        self.assertEqual(len(self.merge_candidates()), 1)
+
+    def test_the_task_is_on_the_schedule_and_out_of_UNSCHEDULED(self):
+        """A8's other half: the handler no longer infers, so A3's `identity`
+        maintenance task is schedulable."""
+        from engine.scheduler import UNSCHEDULED
+        self.assertNotIn("identity", UNSCHEDULED)
+        self.assertIn("identity", {e.task for e in self.core.scheduler.entries()})
+
+    def test_the_historical_inferred_merges_are_counted_not_reversed(self):
+        """Stores that already ran the old sweep keep their merges — un-merging
+        in bulk would be inference in reverse. The count is surfaced instead."""
+        self.two_sam_vimeses()
+        self.cap.append("merged", {"from_entity": "ent_vimes_astronaut",
+                                   "into_entity": "ent_vimes_baker",
+                                   "evidence": "exact_name_match"},
+                        actor="curator", owner="default")
+        self.assertEqual(self.store.count_inferred_entity_merges(), 1)
+        self.assertEqual(self.core.health.run()["inferred_entity_merges"], 1)
+        # Still merged: nothing reversed it.
+        self.assertEqual(
+            self.store.get_belief("entities", "ent_vimes_astronaut")["merged_into"],
+            "ent_vimes_baker")
+
+    def test_an_adjudicated_merge_is_not_counted_as_inferred(self):
+        self.two_sam_vimeses()
+        self.cap.append("merged", {"from_entity": "ent_vimes_astronaut",
+                                   "into_entity": "ent_vimes_baker",
+                                   "evidence": "adjudicated_by_reviewer"},
+                        actor="curator", owner="default")
+        self.assertEqual(self.store.count_inferred_entity_merges(), 0)
 
 
 if __name__ == "__main__":

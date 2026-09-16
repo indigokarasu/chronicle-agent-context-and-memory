@@ -13,6 +13,8 @@ The integration sequences them into one ladder:
     8  = identity tables        (E7)
     9  = host-model tables      (H1)
     10 = host-model drain tables (H2: host_model_proxies + rerank_hints)
+    11 = rerank_hints.owner       (F4c)
+    12 = maintenance_runs         (ladder-10 A3: the scheduler's watermarks)
 
 The property that makes the renumbering safe is that every step is
 probe-then-apply (_has_col / _has_table) and the version is stamped LAST. That
@@ -26,11 +28,12 @@ because of the renumbering (a store stamped 6 or 7 by a pre-integration build).
 import os
 import sqlite3
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.store import SCHEMA_VERSION, BELIEF_TABLES, MemoryStore, _has_col, _has_table
 
@@ -43,12 +46,12 @@ _V5_SUBSET = _PRE_E5_BELIEF_SCHEMA   # already carries its own `meta` table
 
 _NEW_TABLES = ("entity_centroids", "identity_candidates",
                "host_model_requests", "host_model_results",
-               "host_model_proxies", "rerank_hints")
+               "host_model_proxies", "rerank_hints", "maintenance_runs")
 
 
 class _LadderCase(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="l9-ladder-")
+        self.dir = temp_home(prefix="l9-ladder-")
         self.path = os.path.join(self.dir, "chronicle.db")
 
     def tearDown(self):

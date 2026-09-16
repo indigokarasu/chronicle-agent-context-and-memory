@@ -13,13 +13,14 @@ resolves to the PARENT belief's own content/provenance and never surfaces the
 generated question text as an answer.
 """
 
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db, temp_home
 
 from engine import doc2query
 from engine.core import ChronicleCore
@@ -28,7 +29,7 @@ from engine.store import MemoryStore
 
 
 def make_core(overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if overrides:
         cfg = _merge(cfg, overrides)
@@ -155,7 +156,7 @@ class TestQueryProxyVectorStore(unittest.TestCase):
         self.store = MemoryStore(self.tmp.name)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_add_and_iter(self):
         self.store.add_query_proxy_vector("b1", 0, "fact", "where does Pat Testley work",
@@ -278,7 +279,7 @@ class TestDoc2QueryWritePath(unittest.TestCase):
             cap.append("asserted", payload, actor="user", owner="default", trust_level=4)
             self.assertEqual(store.iter_query_proxy_vectors(), [])
         finally:
-            os.unlink(tmp.name)
+            remove_db(tmp.name)
 
 
 # --------------------------------------------------------------------------

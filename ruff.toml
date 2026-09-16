@@ -5,6 +5,23 @@ select = ["E", "F"]
 ignore = ["E501", "BLE001", "N999", "S110", "S112", "SIM102", "SIM115", "RUF012", "TRY004", "EXE001",
           "UP031", "DTZ001", "DTZ007", "PLW1510"]
 
+# The BLOCKING set (see .github/workflows/ci.yml and the `chronicle-lint-gate`
+# comment there). These are the rules that catch code which is WRONG rather
+# than untidy, and CI fails on them. F601 is first for a reason: v5.7.0 shipped
+# a review away from a duplicate `"health"` key in engine/config.py that
+# silently deleted two keys the engine reads. Every one of these is already in
+# ruff's default selection; naming them makes the gate explicit and means a
+# future `select` narrowing cannot drop one by accident.
+#
+# F601  duplicate dict key literal      — the later silently wins
+# F811  redefinition of unused name     — the same defect for defs/imports
+# F821  undefined name
+# F822  undefined name in __all__
+# F402  import shadowed by loop variable
+# F502/F506/F602  malformed % and `in` usages
+# E9    syntax / IO errors
+extend-select = ["F601", "F811", "F821", "F822", "F402", "F502", "F506", "F602", "E9"]
+
 [lint.per-file-ignores]
 # Dynamic sys.path manipulation precedes module imports in standalone scripts and acceptance exercises.
 "scripts/*" = ["E402"]

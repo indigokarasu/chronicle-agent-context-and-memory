@@ -31,6 +31,7 @@ from .localdb import register_local_dbs
 from .reasoning import EpistemicModel, ReasoningLayer
 from .reducer import Reducer
 from .retrieval import RetrievalEngine
+from .scheduler import Scheduler
 from .store import MemoryStore, now_iso
 from .tools import Tools
 from .vector_index import VectorIndex
@@ -48,8 +49,16 @@ class ChronicleCore:
         """The live core for the current process (typically the only one)."""
         return cls._active or (next(iter(cls._instances.values())) if cls._instances else None)
 
-    def __init__(self, hermes_home: str, config: dict | None = None):
+    def __init__(self, hermes_home: str, config: dict | None = None, embedder_probe=None):
+        """`embedder_probe` (A11b): the object embeddings auto-detection uses to
+        contact candidate endpoints. `None` means `embeddings.default_probe()`,
+        i.e. the real network probe — so a core built with no embeddings config
+        DOES open TCP connections to localhost:1234/:11434/:8080 inside this
+        constructor, and which one answers decides which embedder this core
+        holds. Pass `embeddings.NullProbe()` (or `StaticProbe({...})`) to make
+        construction socket-free and machine-independent."""
         self.hermes_home = hermes_home
+        self.embedder_probe = embedder_probe
         self.cfg = Config(config or {})
         # §15.8 (issue #5): install the declarative users/agents ACL topology
         # from `principals:` config into the access.can_read choke point. One
@@ -72,7 +81,9 @@ class ChronicleCore:
                                      self.cfg.get("embeddings.api_key"),
                                      self.cfg.get("embeddings.max_input_tokens"),
                                      self.cfg.get("embeddings.overflow"),
-                                     self.cfg.get("embeddings.task_prefixes"))
+                                     self.cfg.get("embeddings.task_prefixes"),
+                                     self.cfg.get("embeddings.allow_remote"),
+                                     probe=embedder_probe)
         # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
         # the store (add/delete/prune on write) and retrieval (KNN on read); see
         # vector_index.py and RetrievalEngine.__init__ for why sharing matters.
@@ -103,9 +114,20 @@ class ChronicleCore:
         self.host_model = HostModelRegistry(self.store, self.cfg)
         self.tools = Tools(self)
         self.curation = CurationWorker(self)
+        # §A12: `reaper.enabled` was declared and read by nothing, so the one
+        # documented way to turn the reaper off did nothing. It is a real switch
+        # now: disabled, the Reaper is still CONSTRUCTED (every caller of
+        # core.reaper.* keeps working) but its sweep and startup recovery are
+        # not driven from here.
+        self.reaper_enabled = bool(self.cfg.get("reaper.enabled", True))
         self.reaper = Reaper(self.store, self.capture,
                              idle_threshold=self.cfg.get("reaper.idle_threshold", "20m"),
                              reap_threshold=self.cfg.get("reaper.reap_threshold", "45m"))
+        # Maintenance cadence (§17.4). Constructing it is free — it stores three
+        # references, parses no config and touches no SQLite until the first
+        # hook call — and it owns NO thread: everything it does happens inside
+        # a hook, bounded by maintenance.budget_ms.
+        self.scheduler = Scheduler(self)
 
         self._seed()
         ChronicleCore._active = self
@@ -118,12 +140,13 @@ class ChronicleCore:
         self.derivation.seed_rules()
 
     @classmethod
-    def get(cls, hermes_home: str, config: dict | None = None) -> ChronicleCore:
+    def get(cls, hermes_home: str, config: dict | None = None, embedder_probe=None) -> ChronicleCore:
         with cls._lock:
             if hermes_home not in cls._instances:
                 if config is None:
                     config = cls._load_memory_config(hermes_home)
-                cls._instances[hermes_home] = cls(hermes_home, config)
+                cls._instances[hermes_home] = cls(hermes_home, config,
+                                                  embedder_probe=embedder_probe)
             return cls._instances[hermes_home]
 
     @staticmethod
@@ -147,6 +170,32 @@ class ChronicleCore:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def close(self) -> dict:
+        """Release everything this core owns. Idempotent; safe to call twice.
+
+        A11b: the core is the OWNER of the store's lifetime — it is what
+        constructs `MemoryStore` — so it is what closes it. Closing also
+        de-registers this core from the process singleton table, because a
+        cached core whose store is closed would hand every later
+        `ChronicleCore.get()` caller a store that raises `StoreClosed`.
+
+        Returns the store's own close report (see `MemoryStore.close`)."""
+        report = self.store.close()
+        with ChronicleCore._lock:
+            for key, core in list(ChronicleCore._instances.items()):
+                if core is self:
+                    del ChronicleCore._instances[key]
+            if ChronicleCore._active is self:
+                ChronicleCore._active = None
+        return report
+
+    def __enter__(self) -> "ChronicleCore":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
     def initialize(self, session_id: str, *, hermes_home: str | None = None, principal_id: str = "default", **kw) -> Scope:
         self.set_active_principal(principal_id)
         self.store.upsert_principal({"principal_id": principal_id, "type": "agent", "display": principal_id,
@@ -165,6 +214,7 @@ class ChronicleCore:
     def set_active_principal(self, principal_id: str) -> None:
         self.active_principal = principal_id
         self.retrieval.active_principal = principal_id
+        self.derivation.active_principal = principal_id   # explain() is a read surface (A1)
         self.capture.owner = principal_id
 
     def open_scope(self, session_id: str, principal_id: str) -> Scope:
@@ -192,7 +242,9 @@ class ChronicleCore:
             return False
 
     def on_startup_recovery(self):
-        self.reaper.startup_recovery()
+        # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
+        if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
+            self.reaper.startup_recovery()
         self.process_pending()         # drain crash-recovered extraction (I13)
 
     def start_sources(self):
@@ -217,8 +269,32 @@ class ChronicleCore:
         return self.curation.drain(max_jobs)
 
     def tick(self):
-        """on_turn_start: drain a bounded curation slice + decay tick (§12.3)."""
-        self.curation.drain(max_jobs=16)
+        """on_turn_start: drain a bounded curation slice, then take ONE
+        maintenance decision (§12.3, §17.4, §A7).
+
+        The slice size is `curation.drain.per_turn` (default 16, the pre-A7
+        hard-coded value) and its MIX is decided by the queue, not here: a turn
+        asks for N jobs and `CurationWorker.drain` apportions them across task
+        classes so an embed or maintenance flood cannot starve extraction
+        (§A7). Passing no budget is deliberate — a caller that named one would
+        be the second place the per-turn size is configured.
+
+        ORDER MATTERS and is deliberate (§17.4). The drain runs FIRST, so a
+        maintenance job scheduled by this call lands at the back of the queue
+        and is picked up by a LATER turn's slice — a health run or a decay
+        sweep never executes inside the same turn that decided to schedule it.
+        The decision itself is bounded by maintenance.budget_ms and enqueues at
+        most one job, so the cost this hook adds when nothing is due is a
+        handful of integer comparisons (measured: well under 1ms, no SQLite at
+        all). maintenance.budget_ms bounds the TICK only; the drain above is
+        bounded by curation.drain.per_turn and by A7's per-class quotas."""
+        self.curation.drain()
+        self.scheduler.on_hook("turn")
+
+    def maintenance_status(self) -> dict:
+        """Last run / next due, per maintenance schedule entry, plus the tasks
+        that are deliberately NOT scheduled and why (§17.4). Read-only."""
+        return self.scheduler.status()
 
     def flush_git(self) -> int:
         return self.gitmirror.flush()
@@ -265,7 +341,12 @@ class ChronicleCore:
         from .embeddings import DegradedEmbedder, HashingEmbedder
         e = self.embedder
         info = {"embedder": type(e).__name__, "model": getattr(e, "model", None),
-                "endpoint": getattr(e, "base_url", None), "dimensions": getattr(e, "dimensions", None)}
+                "endpoint": getattr(e, "base_url", None), "dimensions": getattr(e, "dimensions", None),
+                # A7: pending work per task AND per fairness class. "embeds are
+                # queued" was already reported; what it never said was whether
+                # anything ELSE was queued behind them, which is the question an
+                # operator staring at a stalled store actually has.
+                "queue": self.store.pending_counts_by_task()}
         if isinstance(e, HashingEmbedder):
             info.update(mode="offline_hashing", supports_embeddings=False,
                         detail="Offline hashing embedder selected explicitly (embeddings.model / "
@@ -348,5 +429,5 @@ class Scope:
 
 
 def _hash_name():
-    from .serialize import HASH_NAME
-    return HASH_NAME
+    from .serialize import hash_name
+    return hash_name()

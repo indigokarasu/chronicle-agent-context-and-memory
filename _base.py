@@ -20,6 +20,14 @@ class MemoryProvider:
 
     def shutdown(self) -> None: ...
 
+    # The real `agent.memory_provider.MemoryProvider` defines this as a no-op
+    # default ("providers that do background prefetching should override this").
+    # Chronicle does not do background prefetching, so it does NOT override it
+    # (A13 removed an override whose body was a second copy of this no-op). It
+    # is declared here so the offline stand-in answers a host call the same way
+    # the real base would, instead of raising AttributeError.
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None: ...
+
 
 class ContextEngine:
     def __init__(self):

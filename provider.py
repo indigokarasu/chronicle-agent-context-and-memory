@@ -142,8 +142,19 @@ class ChronicleMemoryProvider(MemoryProvider):
         logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
     def shutdown(self):
+        """Nothing to flush; one thing to mirror.
+
+        Capture is durable at append time — every turn is an `append_event` in
+        its own transaction (I12), which is the whole premise of an event-sourced
+        store — so there is no write buffer for shutdown to drain. A
+        `capture.flush_best_effort()` used to be called here and its body was
+        `pass`; A13 removed both halves rather than leave a call that reads like
+        a durability guarantee and is not one.
+
+        `flush_git` stays: the git mirror is a genuinely deferred, out-of-store
+        copy, and this is the last chance to write it.
+        """
         if self.core:
-            self.core.capture.flush_best_effort()
             self.core.flush_git()
 
     # -- config (setup wizard) --------------------------------------------
@@ -280,6 +291,12 @@ class ChronicleMemoryProvider(MemoryProvider):
     def on_session_end(self, messages):
         if self.core:
             self.core.capture.finalize_session(self._session_id, "clean_exit")
+            # Second maintenance cadence point (§17.4). A session that ends is
+            # the cheapest moment in the whole lifecycle to take a scheduling
+            # decision — no turn is waiting on it — and it is the one hook a
+            # host that never calls on_turn_start still calls. Enqueue only:
+            # the work is drained by the next session's turns.
+            self.core.scheduler.on_hook("session_end")
 
     def on_memory_write(self, action, target, content, metadata=None):
         if self.core:
@@ -433,9 +450,6 @@ class ChronicleMemoryProvider(MemoryProvider):
         return self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
             principal=self._principal_id, epistemic=self.core.epistemic)
-
-    def queue_prefetch(self, query, *, session_id=""):
-        pass  # predictive warm-cache hook; no-op in the local build
 
     def system_prompt_block(self) -> str:
         return self.core.retrieval.static_block(self._principal_id) if self.core else ""

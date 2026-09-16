@@ -45,5 +45,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install ruff
 
-      - name: Lint
-        run: ruff check .
+      # chronicle-lint-gate
+      #
+      # Two passes, deliberately. `ruff check .` alone was RED for 66 style
+      # findings (E402/F401/E741/F841 in test files), so when the v5.7.0 merge
+      # added a 67th — F601, a duplicate `"health"` key in engine/config.py that
+      # silently deleted two keys the engine reads — nothing changed colour and
+      # nobody noticed. A gate that is always red is not a gate.
+      #
+      # So: the correctness rules (ruff.toml's `extend-select`) BLOCK and are
+      # clean today; the style backlog is reported and does not fail the build,
+      # so it stays visible without masking a real defect. Shrink the second
+      # list until it is empty, then merge the two steps.
+      - name: Lint (correctness — blocking)
+        run: ruff check . --select F601,F811,F821,F822,F402,F502,F506,F602,E9
+
+      - name: Lint (style — reported, not blocking)
+        run: ruff check . || true

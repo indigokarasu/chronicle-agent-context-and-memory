@@ -21,7 +21,6 @@ through the real CaptureEngine/Reducer/MemoryStore stack — no mocks.
 """
 
 import json
-import os
 import shutil
 import sqlite3
 import sys
@@ -30,6 +29,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db, temp_home
 
 from engine.capture import CaptureEngine
 from engine.core import ChronicleCore
@@ -106,7 +107,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 
 def make_core(extra_cfg=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if extra_cfg:
         cfg.update(extra_cfg)
@@ -130,7 +131,7 @@ class TestOldSchemaMigration(unittest.TestCase):
         conn.close()
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_migration_adds_novelty_to_all_belief_tables_without_crashing(self):
         # Opening the store runs _init_db -> _migrate. Before the fix this left
@@ -229,7 +230,7 @@ class TestDistinctFactsGetNovelty(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_second_distinct_fact_gets_populated_novelty(self):
         # Same entity+predicate (so _calculate_novelty has something of the same
@@ -281,7 +282,7 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_fact_stores_with_null_novelty_no_embedder(self):
         key = {"entity_id": "user", "predicate_canonical": "name", "attribute": "name",
@@ -488,7 +489,7 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     @staticmethod
     def _body(i):
@@ -664,7 +665,7 @@ class TestOccurrenceCountForEveryKind(unittest.TestCase):
                                 "%s missing occurrence_count after migration" % t)
             self.assertEqual(store.get_meta("schema_version"), str(SCHEMA_VERSION))
         finally:
-            os.unlink(tmp.name)
+            remove_db(tmp.name)
 
 
 if __name__ == "__main__":

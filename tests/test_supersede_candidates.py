@@ -16,11 +16,12 @@ per the shared Ladder 9 test-fixture convention.
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.reducer import Reducer
@@ -28,7 +29,7 @@ from engine.store import MemoryStore
 
 
 def make_core(cfg_overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if cfg_overrides:
         cfg.update(cfg_overrides)
@@ -47,7 +48,7 @@ class TestSupersedeCandidateStore(unittest.TestCase):
     """Store-layer contract in isolation, no embedder involved."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = temp_home()
         self.store = MemoryStore(str(Path(self.tmp) / "chronicle.db"))
 
     def tearDown(self):
@@ -248,7 +249,7 @@ class TestSupersedeCandidateNoEmbedder(unittest.TestCase):
     """§issue-8 shared constraint: the embedder may be absent -- no-op, no error."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = temp_home()
         self.store = MemoryStore(str(Path(self.tmp) / "chronicle.db"))
         self.reducer = Reducer(self.store, embedder=None, cfg=None)
 

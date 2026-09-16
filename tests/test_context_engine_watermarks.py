@@ -20,11 +20,12 @@ things R2 itself changes:
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import estimate_tokens
@@ -49,7 +50,7 @@ def _messages(n, body_text=_LONG_BODY):
 
 class ContextEngineWatermarkTests(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r2_")
+        self.home = temp_home(prefix="r2_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r2-s1", hermes_home=self.home, principal_id="pat", config=CFG)
@@ -65,7 +66,8 @@ class ContextEngineWatermarkTests(unittest.TestCase):
 
     # -- 1. compress() guarantees output <= budget -----------------------
     def test_compress_output_stays_under_low_watermark_budget(self):
-        self.eng.update_model("test-model", context_length=2000)  # -> budget = 0.55 * 2000 = 1100
+        self.eng.update_model("test-model", context_length=1500)  # -> budget = 0.55 * 1500 = 825
+        # A10b units restatement: 2000 x 3 = 6000 = 1500 x 4 (budget 1100 x 3 = 3300 = 825 x 4).
         messages = _messages(40)
         out = self.eng.compress(list(messages), focus_topic=None)
         budget = self.eng._target_budget()
@@ -82,7 +84,8 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         # (the last 6 messages) is a realistic way for the protected set
         # alone to blow past the LOW watermark budget before a single
         # evictable middle span is even considered.
-        self.eng.update_model("test-model", context_length=1000)  # -> budget = 0.55 * 1000 = 550
+        self.eng.update_model("test-model", context_length=750)  # -> budget = 0.55 * 750 = 412
+        # A10b units restatement: 1000 x 3 = 3000 = 750 x 4.
         huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~2009 tokens, alone > budget
         messages = (
             [_msg("system", "sys")]
@@ -107,7 +110,8 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         # must be counted against the SAME budget as everything else. A first
         # cut appended it after budget-fitting, uncounted, and landed at 615
         # tokens against this exact fixture's 550-token budget.
-        self.eng.update_model("test-model", context_length=1000)  # budget = 550, threshold = 750
+        self.eng.update_model("test-model", context_length=750)  # budget = 412, threshold = 562
+        # A10b units restatement: 1000 x 3 = 3000 = 750 x 4.
         huge = "Acme Fake Co tool output: " + ("x" * 6000)  # ~2009 tokens alone, > budget
         messages = (
             [_msg("system", "sys")]
@@ -134,7 +138,8 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         # only resets when update_from_response observes pressure drop below
         # the watermark. The internal latch must never disagree with whether
         # a warning was actually delivered.
-        self.eng.update_model("test-model", context_length=2000)  # threshold = 1500
+        self.eng.update_model("test-model", context_length=1500)  # threshold = 1125
+        # A10b units restatement: 2000 x 3 = 6000 = 1500 x 4.
         small_body = [_msg("user" if i % 2 == 0 else "assistant", "pad %d" % i) for i in range(4)]
         self.assertLessEqual(len(small_body), self.eng.protect_first_n + self.eng.protect_last_n,
                               "test setup: body must be small enough to hit the early-return shortcut")
@@ -175,7 +180,8 @@ class ContextEngineWatermarkTests(unittest.TestCase):
 
     # -- 2. real per-span accounting replaces the score>=0.5 bit ----------
     def test_highest_scoring_spans_survive_under_pressure(self):
-        self.eng.update_model("test-model", context_length=800)  # budget ~440: too tight for all 12 spans
+        self.eng.update_model("test-model", context_length=600)  # budget ~330: too tight for all 12 spans
+        # A10b units restatement: 800 x 3 = 2400 = 600 x 4.
         focus = "quarterly-roadmap"
         pad = "padding " * 20
         relevant = [_msg("user", "quarterly-roadmap detail %d: %s" % (i, pad)) for i in range(6)]
@@ -200,7 +206,7 @@ class ContextEngineWatermarkTests(unittest.TestCase):
                             % (kept_relevant, kept_irrelevant))
 
     def test_evicted_spans_are_made_durable_before_eviction_I17(self):
-        self.eng.update_model("test-model", context_length=2000)
+        self.eng.update_model("test-model", context_length=1500)
         messages = _messages(40)
         before = len(self.core.store.get_events_by_type("observed"))
         out = self.eng.compress(list(messages), focus_topic=None)
@@ -219,7 +225,7 @@ class ContextEngineWatermarkTests(unittest.TestCase):
             return real_get_context(hint, **kwargs)
 
         self.core.retrieval.get_context = spy
-        self.eng.update_model("test-model", context_length=100000)  # plenty of headroom for injection
+        self.eng.update_model("test-model", context_length=75000)  # plenty of headroom for injection
         messages = _messages(20)
         self.eng.compress(list(messages), focus_topic="something")
         self.assertIn("token_budget", seen, "get_context was not called for reinjection")

@@ -243,9 +243,6 @@ class CaptureEngine:
             self.store.upsert_session({"session_id": session_id, "status": "active", "started_at": now,
                                        "last_activity_at": now, "last_extracted_seq": 0})
 
-    def flush_best_effort(self):
-        pass  # not relied upon (§12.3 shutdown)
-
 
 class Reaper:
     """Finalizes stale sessions independently → I13."""

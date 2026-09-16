@@ -31,13 +31,20 @@ import os
 import random
 import shutil
 import sys
-import tempfile
+import tempfile        # A11 converted every call site it SAW to temp_home();
+                      # the sites below are class-scoped (temp_home's dirs are
+                      # reaped after each TEST, which would delete a setUpClass
+                      # home mid-class) or have their own try/finally cleanup.
+                      # conftest still sandboxes TMPDIR, so nothing escapes.
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from _tmp_support import temp_home
+
 from engine.config import Config
+from engine.embeddings import budget_chars
 from engine.core import ChronicleCore
 from engine.retrieval import _PRECISION_HEAD, _PRECISION_TIE_EPS, RetrievalEngine
 
@@ -62,7 +69,7 @@ BULK = ("On day %d the weather in Springfield was unremarkable and the errands "
 
 
 def make_core(cfg_overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     for k, v in (cfg_overrides or {}).items():
         cfg[k] = v
@@ -765,7 +772,12 @@ class TestDebugFieldDiscriminates(unittest.TestCase):
         core.retrieval.get_context(QUERY, token_budget=12000)
         d = core.retrieval.last_context_debug
         self.assertEqual(d["route"], "factual")
+        # Restated twice, for the same reason both times: the E12 measurement
+        # is a CHAR size (~6 000), and only the unit it is written in moved.
+        #   pre-A10 1500 tok x 4 = 6000 | A10 2000 tok x 3 = 6000 | A10b 1500 tok x 4 = 6000
+        # The line below the token figure is the one that pins the measurement.
         self.assertEqual(d["token_budget"], 1500)        # what it actually packed
+        self.assertEqual(budget_chars(d["token_budget"]), 6000)
         self.assertIsNotNone(d["precision_event_id"])
         self.assertEqual(d["precision_session"], "s_evidence")
 
@@ -1292,9 +1304,56 @@ class TestSessionWindowDedupesByEventId(unittest.TestCase):
         self.assertIsNone(seen["ids"])
 
 
+# --------------------------------------------------------------------------
+# The cross-process harness (F1, extended by A15)
+#
+# CPython randomises string hashing per process, so a set's iteration order is
+# a function of PYTHONHASHSEED and is invisible to any assertion made INSIDE
+# one process. Every determinism guard in this file therefore runs its subject
+# in a real subprocess under several seeds and compares the bytes that come
+# back. One runner, one seed list: a new surface is added by writing a script
+# and listing it, never by writing a second harness that could drift from this
+# one about what "the same" means.
+# --------------------------------------------------------------------------
+HASH_SEEDS = ("0", "1", "42", "1234", "99999")
+
+
+def run_under_hash_seed(case, script, seed):
+    """Run `script` in a fresh interpreter with PYTHONHASHSEED=`seed`.
+
+    `script` names the repo root as the literal token __REPO_ROOT__, which is
+    substituted here. Deliberately NOT %-formatting: these scripts print with
+    %-templates of their own, and a script that grows a `%s` must not start
+    failing the harness instead of the code. CHRONICLE_EMBED_MODEL is cleared
+    so an operator's shell cannot point a determinism check at a network
+    embedder.
+    """
+    import subprocess
+    body = script.replace("__REPO_ROOT__", repr(str(Path(__file__).parent.parent)))
+    env = dict(os.environ, PYTHONHASHSEED=seed)
+    env.pop("CHRONICLE_EMBED_MODEL", None)
+    proc = subprocess.run([sys.executable, "-c", body], env=env,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    case.assertEqual(proc.returncode, 0, proc.stderr.decode()[-2000:])
+    return proc.stdout.decode().strip()
+
+
+def assert_one_answer_across_seeds(case, script, what):
+    """The assertion every guard here makes: N seeds, one byte-identical answer."""
+    seen = {}
+    for seed in HASH_SEEDS:
+        seen.setdefault(run_under_hash_seed(case, script, seed), []).append(seed)
+    case.assertEqual(
+        len(seen), 1,
+        "%s depends on PYTHONHASHSEED — %d distinct results across seeds %s:\n%s"
+        % (what, len(seen), list(HASH_SEEDS),
+           "\n".join("  seeds %s -> %r" % (v, k[:400]) for k, v in seen.items())))
+    return next(iter(seen))
+
+
 QUERY_TEXT_SCRIPT = """
 import sys
-sys.path.insert(0, %r)
+sys.path.insert(0, __REPO_ROOT__)
 from engine.retrieval import RetrievalEngine
 
 
@@ -1335,17 +1394,10 @@ class TestTheEmbeddedQueryTextIsProcessStable(unittest.TestCase):
     kind that can.
     """
 
-    SEEDS = ("0", "1", "42", "1234", "99999")
+    SEEDS = HASH_SEEDS
 
     def _text_under(self, seed):
-        import subprocess
-        env = dict(os.environ, PYTHONHASHSEED=seed)
-        env.pop("CHRONICLE_EMBED_MODEL", None)
-        script = QUERY_TEXT_SCRIPT % str(Path(__file__).parent.parent)
-        proc = subprocess.run([sys.executable, "-c", script], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertEqual(proc.returncode, 0, proc.stderr.decode()[-2000:])
-        return proc.stdout.decode().strip()
+        return run_under_hash_seed(self, QUERY_TEXT_SCRIPT, seed)
 
     def test_five_hash_seeds_compose_the_same_query_text(self):
         texts = {self._text_under(s) for s in self.SEEDS}
@@ -1382,6 +1434,507 @@ class TestPrecisionDecisionSignature(unittest.TestCase):
     def test_the_acl_argument_is_still_written_down(self):
         self.assertIn("cleared every candidate in this pool",
                       RetrievalEngine._precision_decision.__doc__ or "")
+
+
+# --------------------------------------------------------------------------
+# A15 — the determinism SIBLINGS of the query-text bug above.
+#
+# Same defect class, same harness, five more surfaces. Each script below is
+# written so it prints NOTHING that varies for an innocent reason (the clock is
+# frozen where event ids depend on it, and uuid4 is counted), so a difference
+# between two seeds can only be an iteration-order difference.
+# --------------------------------------------------------------------------
+
+# Shared preamble: freeze the two sources of run-to-run variance that are not
+# hash order — the wall clock (occurred_at feeds event_id feeds belief_id) and
+# uuid4 (surrogate row ids). Same technique tests/h1_store_dump.py uses, and
+# for the same reason: without it every row moves and the dump proves nothing.
+FREEZE_PREAMBLE = """
+import logging, sys, uuid
+logging.disable(logging.CRITICAL)
+sys.path.insert(0, __REPO_ROOT__)
+import engine.core  # import the whole package before patching its modules
+_FROZEN, _LATER = "2026-01-02T03:04:05.00Z", "2026-01-02T03:14:05.00Z"
+_n = [0]
+def _fake_uuid4():
+    _n[0] += 1
+    return uuid.UUID(int=_n[0])
+uuid.uuid4 = _fake_uuid4
+for _m in list(sys.modules.values()):
+    if not (getattr(_m, "__name__", "") or "").startswith("engine"):
+        continue
+    if hasattr(_m, "now_iso"):
+        setattr(_m, "now_iso", lambda: _FROZEN)
+    if hasattr(_m, "_iso_in"):
+        setattr(_m, "_iso_in", lambda *a, **k: _LATER)
+    if hasattr(_m, "uuid4"):
+        setattr(_m, "uuid4", _fake_uuid4)
+"""
+
+# (1) The event log itself. `_task_extract` collected its touched subjects in a
+#     set and then ITERATED it — to derive, to enqueue a digest per subject,
+#     and to store `list(subjects)` as the canonicalize job's payload. So the
+#     order of the `derived`/`asserted` writes, hence every seq and prev_head
+#     downstream of them, and hence every event_id, was a function of
+#     PYTHONHASHSEED. Six subjects in one turn; the whole log and job queue.
+EVENT_LOG_SCRIPT = FREEZE_PREAMBLE + """
+import shutil, tempfile
+from engine.core import ChronicleCore
+home = tempfile.mkdtemp()
+core = ChronicleCore(home, {"embeddings": {"model": "hashing"}})
+core.initialize("s1", principal_id="assistant")
+core.capture.observe(
+    "For the record, Mara Quill is a veterinarian. Also Pat Testley is an engineer. "
+    "And Rob Vance is a teacher. Sam Vale is a chef. Kim Dorn is a pilot. Lee Voss is a nurse.",
+    "noted", session_id="s1")
+core.process_pending()
+conn = core.store._conn()
+for r in conn.execute("SELECT seq,type,event_id,prev_head FROM events ORDER BY seq").fetchall():
+    print("EV %s|%s|%s|%s" % (r[0], r[1], r[2], r[3]))
+for r in conn.execute("SELECT id,task,payload FROM curation_jobs ORDER BY id").fetchall():
+    print("JOB %s|%s|%s" % (r[0], r[1], r[2]))
+shutil.rmtree(home, ignore_errors=True)
+"""
+
+# (2) `retrieve_raw`'s tie order. The fake store hands every candidate over in
+#     a SET's iteration order, which is exactly the freedom the real thing has:
+#     a paged scan re-batching the same rows, a rebuilt store, or an ANN window
+#     returning a superset from the top. Every candidate carries the same
+#     vector, so they tie on score to the last float and only the tie-break can
+#     separate them. It must be the id, not the arrival order.
+RETRIEVE_TIE_SCRIPT = """
+import logging, sys
+logging.disable(logging.CRITICAL)
+sys.path.insert(0, __REPO_ROOT__)
+from engine.embeddings import get_embedder, pack
+from engine.retrieval import RetrievalEngine
+
+EMB = get_embedder("hashing")
+IDS = ("ev_b7", "ev_a3", "ev_c1", "ev_e9", "ev_d5", "ev_f2")
+BLOB = pack(EMB.embed("quarterly budget review vendor discounts"))
+
+
+class FakeStore:
+    def predicate_synonyms(self, canonical):
+        return []
+
+    def fts_search_observed(self, query, limit=20):
+        return []
+
+    def get_event(self, eid):
+        return {"event_id": eid, "owner": "default", "payload": {"excerpt": "x " + eid},
+                "occurred_at": "2026-01-01T00:00:00.000Z"}
+
+    def iter_observed_vectors_paged(self, batch_size=1000, width=None):
+        # A set, deliberately: the order rows reach the scorer is not a contract.
+        yield [{"event_id": e, "embedding": BLOB, "owner": "default"} for e in set(IDS)]
+
+    def wrong_dim_vector_ids(self, table, id_col, width, extra_where="", extra_params=()):
+        # v5.7.0 integration: `retrieve_raw` now asks for the ID-ONLY complement
+        # of its own width filter (the A0 x A5 cancellation, see
+        # RetrievalEngine._note_wrong_dim_table). Every blob this fake serves is
+        # the right width, so the complement is empty -- which is the honest
+        # answer here, not a stub that hides the call.
+        return []
+
+    def iter_session_vectors_paged(self, batch_size=1000, width=None):
+        return iter(())
+
+    def iter_projection_vectors_paged(self, batch_size=1000, width=None):
+        return iter(())
+
+    def get_observed_vectors_by_ids(self, ids):
+        return {}
+
+
+e = RetrievalEngine(FakeStore(), None, embedder=EMB)
+out = e.retrieve_raw("quarterly budget review vendor discounts", limit=10)
+print(" ".join("%s:%.9f" % (o["event_id"], o["score"]) for o in out))
+"""
+
+# (3) `search`'s tie order. The structured channel credits every hit at the
+#     CONSTANT rank 5 (`add(..., "facts", 5, "structured")`), so a query whose
+#     tokens match several facts produces an exact multi-way tie by
+#     construction — no contrivance needed beyond handing the rows over in a
+#     set's order.
+SEARCH_TIE_SCRIPT = """
+import logging, sys
+logging.disable(logging.CRITICAL)
+sys.path.insert(0, __REPO_ROOT__)
+from engine.retrieval import RetrievalEngine
+
+BIDS = ("bf_b7", "bf_a3", "bf_c1", "bf_e9", "bf_d5", "bf_f2")
+
+
+def _row(bid):
+    return {"belief_id": bid, "kind": "fact", "entity_id": "user", "attribute": "discount",
+            "value": "discount recorded", "confidence": 0.8, "status": "active",
+            "owner": "default", "domain": "user", "read_acl": None, "provenance": "{}"}
+
+
+class FakeStore:
+    def predicate_synonyms(self, canonical):
+        return []
+
+    def fts_search_beliefs(self, query, limit=20):
+        return []
+
+    def get_belief(self, table, bid):
+        return _row(bid) if bid in BIDS else None
+
+    def query_beliefs(self, table, where="1=1", params=(), limit=50, order=""):
+        if table != "facts" or "LIKE" not in where:
+            return []
+        return [_row(b) for b in set(BIDS)]
+
+    def live_rerank_hints(self, *a, **k):
+        return []
+
+    def get_memory_vectors_by_ids(self, ids):
+        return {}
+
+
+e = RetrievalEngine(FakeStore(), None, embedder=None)
+out = e.search("what discount did the vendor give me", limit=10)
+print(" ".join("%s:%.9f" % (o["belief_id"], o["score"]) for o in out))
+"""
+
+# (4) The supersession chain get_context RENDERS. `get_supersede_chain` BFSes
+#     into a set and then iterates it, and sorts the result on `created_at`
+#     alone — which ties constantly, because facts extracted from one source
+#     event share a `valid_from`. The chain is printed verbatim into context as
+#     `[history: a (d) -> b (d)]`, so this was user-visible output.
+SUPERSEDE_CHAIN_SCRIPT = """
+import logging, os, sys, tempfile
+logging.disable(logging.CRITICAL)
+sys.path.insert(0, __REPO_ROOT__)
+from engine.store import MemoryStore
+
+tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+tmp.close()
+store = MemoryStore(tmp.name)
+SAME = "2026-01-01T00:00:00.000Z"
+BIDS = ["fb7", "fa3", "fc1", "fe9", "fd5", "ff2"]
+for b in BIDS:
+    store.upsert_belief("facts", {
+        "belief_id": b, "entity_id": "pat_testley", "attribute": "works_at",
+        "predicate_canonical": "works_at", "value": "Fake Co " + b, "domain": "general",
+        "owner": "assistant", "status": "active", "provenance": "{}",
+        "created_at": SAME, "valid_from": SAME})
+for older, newer in zip(BIDS, BIDS[1:]):
+    store.add_supersede_candidate(newer, older, 0.9, created_at=SAME)
+print(" ".join(c["belief_id"] for c in store.get_supersede_chain("fc1", max_nodes=10)))
+os.unlink(tmp.name)
+"""
+
+# (5) Which subjects the `derive` curation task visits, and in what order —
+#     `_affected_subjects` iterated a set of antecedent predicates, and
+#     `materialize_all` appends a `derived` event per subject in that order.
+DERIVE_SUBJECTS_SCRIPT = """
+import logging, os, sys, tempfile
+logging.disable(logging.CRITICAL)
+sys.path.insert(0, __REPO_ROOT__)
+from engine.config import Config
+from engine.derivation import DerivationEngine
+from engine.store import MemoryStore
+
+tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+tmp.close()
+store = MemoryStore(tmp.name)
+SAME = "2026-01-01T00:00:00.000Z"
+# One entity per predicate, so the returned subject list IS the predicate order.
+for bid, ent, pred in (("fw1", "ent_alpha", "works_at"), ("fw2", "ent_beta", "works_at"),
+                       ("fi1", "ent_gamma", "works_in"), ("fi2", "ent_delta", "works_in")):
+    store.upsert_belief("facts", {
+        "belief_id": bid, "entity_id": ent, "attribute": pred, "predicate_canonical": pred,
+        "value": "Fake Co", "domain": "general", "owner": "assistant", "status": "active",
+        "provenance": "{}", "created_at": SAME, "valid_from": SAME})
+d = DerivationEngine(store, Config({}), lambda *a, **k: None)
+d.seed_rules()
+print(" ".join(d._affected_subjects(50)))
+os.unlink(tmp.name)
+"""
+
+# (6) THE OUTPUT ITSELF — the bytes `get_context` hands a caller, assembled on
+#     a real store whose ranked pool is mostly EXACT ties (25 sessions of the
+#     same claim: measured, 11 of the top 20 candidates sit in two tie groups).
+#     Everything above tests a component; this tests the product, on the shape
+#     that makes the tie-break decide the answer.
+#
+#     Added when v5.7.0's last flake was pinned on the harness's missing parent
+#     seed pin. It was not the seed: the test's own fixture left the wall clock
+#     in, `occurred_at` feeds `event_id` (§5.3), `event_id` IS `_rank_key`'s
+#     secondary key, so the pack order was decided by the microsecond the
+#     fixture was built. Freezing the clock here — as every script above
+#     already does — isolates hash order, and this is the measurement that
+#     licenses the claim the diagnosis rests on: on ONE store, packing is
+#     byte-identical across seeds, so the clock is an input to the STORE and
+#     never to retrieval. Without this test that claim was a paragraph.
+PACKED_CONTEXT_SCRIPT = FREEZE_PREAMBLE + """
+import hashlib, shutil, tempfile
+from engine.core import ChronicleCore
+LONG = ("The quarterly maintenance report for the Springfield branch noted "
+        "that the heating loop was rebalanced, the filters were replaced on "
+        "schedule, and the night crew logged no faults of any kind during the "
+        "entire reporting period, which is unusual for that time of year.")
+SPREAD = ("in the mornings", "on weekends", "as the duty lead",
+          "part time since April", "out of the downtown branch",
+          "when the crew is short handed", "on the late shift",
+          "since the refit", "under the new rota", "with the relief team")
+home = tempfile.mkdtemp()
+core = ChronicleCore(home, {"embeddings": {"model": "hashing"}})
+core.initialize("s1", principal_id="assistant")
+for i in range(25):
+    tail = "%s (site %d)" % (SPREAD[i % len(SPREAD)], i)
+    for j in range(3):
+        core.capture.observe(
+            "%s Pat Testley manages the Springfield branch %s (note %d)" % (LONG, tail, j),
+            "Noted.", session_id="sp_%02d" % i)
+core.process_pending()
+Q = "who manages the Springfield branch"
+raw = core.retrieval.retrieve_raw(Q, limit=20)
+print("TIED %d of %d" % (len(raw) - len(set(r["score"] for r in raw)) + 1, len(raw)))
+print("RANK " + " ".join(r["event_id"] for r in raw))
+for budget in (1500, 4000, 12000):
+    ctx = core.retrieval.get_context(Q, token_budget=budget)
+    print("CTX %d len=%d sha=%s" % (budget, len(ctx),
+                                    hashlib.sha256(ctx.encode()).hexdigest()))
+    for line in ctx.splitlines():
+        if line.startswith("[SESSION "):
+            print("  HDR %d %s" % (budget, line))
+shutil.rmtree(home, ignore_errors=True)
+"""
+
+
+class TestDeterminismSiblingsAreProcessStable(unittest.TestCase):
+    """A15: every surface where set/dict iteration order, or a sort with no
+    total order, could reach output, a stored value or a ranking decision.
+
+    Written against the SAME harness as
+    `TestTheEmbeddedQueryTextIsProcessStable` above (same runner, same five
+    seeds) because these are the same bug. That one cost three investigations
+    and weeks of blaming embedder float jitter; it was invisible to every
+    offline gate because the hashing embedder is a bag of hashed tokens and so
+    cannot see order at all. These five would have been invisible for exactly
+    the same reason.
+
+    Each test states what the base tree actually did, measured on it:
+
+      * the event log — five seeds, five different logs (different digest
+        order, different `derived` writes, therefore different seq/prev_head
+        chains and different event ids) and five different `canonicalize`
+        payloads, which also defeated `enqueue_curation`'s dedupe key;
+      * `retrieve_raw` and `search` on a tied pool — five seeds, five
+        different orders of the same equal-scoring candidates;
+      * `get_supersede_chain` — five seeds, five different renderings of the
+        `[history: ...]` line get_context prints;
+      * `_affected_subjects` — the subject order flipped between seeds.
+
+    Reintroducing any of them fails a NAMED test here, with the differing
+    outputs printed side by side.
+    """
+
+    def test_the_event_log_is_byte_identical_across_hash_seeds(self):
+        assert_one_answer_across_seeds(
+            self, EVENT_LOG_SCRIPT,
+            "the event log and curation queue after ingesting one transcript")
+
+    def test_retrieve_raw_orders_a_tied_pool_by_event_id(self):
+        out = assert_one_answer_across_seeds(
+            self, RETRIEVE_TIE_SCRIPT, "retrieve_raw's order on a tied pool")
+        ids = [p.split(":")[0] for p in out.split()]
+        self.assertEqual(ids, sorted(ids),
+                         "tied candidates must come back id-ascending: %r" % (ids,))
+        scores = {p.split(":")[1] for p in out.split()}
+        self.assertEqual(len(scores), 1, "fixture is not actually tied: %r" % (scores,))
+
+    def test_search_orders_a_tied_pool_by_belief_id(self):
+        out = assert_one_answer_across_seeds(
+            self, SEARCH_TIE_SCRIPT, "search()'s order on a tied pool")
+        ids = [p.split(":")[0] for p in out.split()]
+        self.assertEqual(ids, sorted(ids),
+                         "tied candidates must come back id-ascending: %r" % (ids,))
+        scores = {p.split(":")[1] for p in out.split()}
+        self.assertEqual(len(scores), 1, "fixture is not actually tied: %r" % (scores,))
+
+    def test_the_supersession_chain_renders_in_one_order(self):
+        out = assert_one_answer_across_seeds(
+            self, SUPERSEDE_CHAIN_SCRIPT,
+            "get_supersede_chain's order on equally-dated facts")
+        self.assertEqual(out.split(), sorted(out.split()),
+                         "equal timestamps must fall back to belief_id: %r" % (out,))
+
+    def test_the_derive_task_visits_subjects_in_one_order(self):
+        out = assert_one_answer_across_seeds(
+            self, DERIVE_SUBJECTS_SCRIPT, "_affected_subjects' order")
+        self.assertEqual(out.split(),
+                         ["ent_alpha", "ent_beta", "ent_delta", "ent_gamma"],
+                         "subjects follow the SORTED antecedent predicates "
+                         "(works_at before works_in): %r" % (out,))
+
+    def test_the_packed_context_is_byte_identical_across_hash_seeds(self):
+        """The product, not a component: same store, five seeds, one context.
+
+        This is the claim v5.7.0's last flake was diagnosed against — that
+        `get_context` reads a store and nothing else, so two processes holding
+        one store pack it identically. It also states the precondition that
+        makes the claim worth anything: the pool has to be TIED, or the
+        tie-break the test is about is never reached.
+        """
+        out = assert_one_answer_across_seeds(
+            self, PACKED_CONTEXT_SCRIPT,
+            "the context get_context emits on a tied 25-session store")
+        tied = next(ln for ln in out.splitlines() if ln.startswith("TIED "))
+        self.assertGreaterEqual(int(tied.split()[1]), 5,
+                                "fixture is not tied enough to exercise the "
+                                "tie-break: %r" % tied)
+        ids = next(ln for ln in out.splitlines() if ln.startswith("RANK ")).split()[1:]
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(len({ln for ln in out.splitlines() if ln.startswith("CTX ")}), 3)
+
+
+class TestTheTieRelationIsDefinedOnce(unittest.TestCase):
+    """A15: `retrieve_raw`, `search` and the E3 reranker break their ties with
+    the same relation the precision gate does, and there is one definition of
+    it. Two definitions of "tied" that disagree is the exact defect F1 fixed
+    INSIDE the gate (`_precision_order` vs `_precision_head`); re-acquiring it
+    between the gate and the ranking it reads would be the same bug one level
+    out.
+    """
+
+    def test_the_key_is_score_descending_then_id_ascending(self):
+        from engine.retrieval import _rank_key
+        key = _rank_key("event_id")
+        pool = [{"event_id": "b", "score": 1.0}, {"event_id": "a", "score": 1.0},
+                {"event_id": "c", "score": 2.0}]
+        self.assertEqual([c["event_id"] for c in sorted(pool, key=key)], ["c", "a", "b"])
+
+    def test_it_survives_a_row_with_no_id(self):
+        from engine.retrieval import _rank_key
+        key = _rank_key("belief_id")
+        pool = [{"belief_id": None, "score": 1.0}, {"belief_id": "a", "score": 1.0}]
+        self.assertEqual([c["belief_id"] for c in sorted(pool, key=key)], [None, "a"])
+
+    def test_a_strictly_ordered_pool_is_untouched(self):
+        """The tie-break may only decide ties: a pool with distinct scores must
+        come out in exactly score order, which is what makes this change
+        differentially invisible to every non-tied query."""
+        from engine.retrieval import _rank_key
+        pool = [{"event_id": "z", "score": 3.0}, {"event_id": "a", "score": 1.0},
+                {"event_id": "m", "score": 2.0}]
+        self.assertEqual([c["event_id"] for c in sorted(pool, key=_rank_key("event_id"))],
+                         ["z", "m", "a"])
+
+    def test_the_ranking_and_the_precision_gate_agree_on_the_id_half(self):
+        """`_precision_order` breaks its bucket ties on the same expression.
+        Pinned by reading it, so a future edit to either one that makes them
+        disagree fails here rather than in a recall number six weeks later."""
+        src = inspect.getsource(RetrievalEngine._precision_order)
+        self.assertIn('str(candidates[i].get("event_id") or "")', src)
+        self.assertIn('str(c.get("event_id") or "")', src)
+
+
+class TestTheTieBreakOnlyEverMovesTies(unittest.TestCase):
+    """A15's differential claim, as an invariant rather than a snapshot.
+
+    Measured against the base tree (L10_A10) on a 12-turn store and 12 queries
+    — 24 ranked lists, 46 candidates: exactly 4 positions moved, every one of
+    them inside a run of BYTE-IDENTICAL scores; no candidate crossed a score
+    boundary, appeared, or disappeared. That comparison needs two trees, so
+    what is pinned here is the property that made it true: the returned order
+    is score-descending, and within a run of equal scores it is id-ascending.
+    A tie-break that reached across a score boundary would break the first
+    half; a tie-break that stopped applying would break the second.
+
+    Where the mutation power actually is, so a reader does not over-read this:
+    deleting `retrieve_raw`'s tie key fails
+    `test_retrieve_raw_returns_a_total_order` here (the four sessions are
+    named in DESCENDING id order for exactly that reason). Deleting `search`'s
+    does NOT fail this class — a real store's Tier-1 ties are small (the
+    biggest this fixture produces is two) and land id-ascending by luck about
+    half the time. `search`'s tie relation is guarded by
+    `TestDeterminismSiblingsAreProcessStable::test_search_orders_a_tied_pool_by_belief_id`,
+    whose fake store hands over a six-way tie in a set's order and does fail.
+    What this class adds for `search` is the differential half: the returned
+    scores are monotone, so the tie-break never moved anything across a score
+    boundary.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        from engine.core import ChronicleCore
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        turns = [
+            ("My name is Pat Testley and I work at Acme Fake Co.", "Noted, Pat."),
+            ("My office is in Fake City near the river.", "Got it."),
+            ("Always use metric units when you answer me.", "Understood."),
+            ("The quarterly budget review covered vendor discounts.", "ok"),
+            ("Mara Quill is a veterinarian in Fake City.", "noted"),
+            ("I prefer window seats on long flights.", "noted"),
+            ("Rob Vance is a teacher at Fake High School.", "noted"),
+            ("The vendor gave us a 12 percent discount on the annual plan.", "ok"),
+            ("Kim Dorn is a pilot and Lee Voss is a nurse.", "noted"),
+            ("Sam Vale is a chef at the Fake Bistro.", "noted"),
+        ]
+        for i, (u, a) in enumerate(turns):
+            sid = "s%d" % (i % 4)
+            self.core.initialize(sid, principal_id="assistant")
+            self.core.capture.observe(u, a, session_id=sid)
+        # Four sessions holding the SAME turn. Identical text -> identical
+        # summary -> identical vector -> identical cosine, so the raw tier's
+        # session channel scores them equal to the last float. This is how a
+        # tie arises in a real store (a phrase repeated across conversations),
+        # and without it `retrieve_raw` below would have nothing tied to order.
+        #
+        # Written in DESCENDING id order on purpose: the store hands these back
+        # rowid-ascending, i.e. in the order they were created, so a fixture
+        # named s4..s7 would already be id-sorted and the assertion below would
+        # hold whether or not the tie-break existed. Named zt/ys/xr/wq, arrival
+        # order and id order disagree, and only the tie-break can reconcile them.
+        for sid in ("zt", "ys", "xr", "wq"):
+            self.core.initialize(sid, principal_id="assistant")
+            self.core.capture.observe(
+                "The quarterly budget review covered vendor discounts.", "ok", session_id=sid)
+        self.core.process_pending()
+
+    def tearDown(self):
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    QUERIES = ("where does Pat Testley work",
+               "what discount did the vendor give me on the annual plan",
+               "who is Mara Quill", "what seat do I prefer", "where is my office",
+               "quarterly budget review vendor discounts", "who is a teacher",
+               "what units should you use")
+
+    def _assert_total_order(self, rows, id_field, label):
+        scores = [r["score"] for r in rows]
+        self.assertEqual(scores, sorted(scores, reverse=True),
+                         "%s is not score-descending: %r" % (label, scores))
+        for i in range(1, len(rows)):
+            if rows[i]["score"] == rows[i - 1]["score"]:
+                self.assertLess(
+                    str(rows[i - 1][id_field]), str(rows[i][id_field]),
+                    "%s: a tie at %r is ordered %r before %r — the tie-break "
+                    "is not being applied" % (label, rows[i]["score"],
+                                              rows[i - 1][id_field], rows[i][id_field]))
+
+    def test_search_returns_a_total_order(self):
+        seen_tie = False
+        for q in self.QUERIES:
+            rows = self.core.retrieval.search(q, limit=10)
+            self._assert_total_order(rows, "belief_id", "search(%r)" % q)
+            seen_tie = seen_tie or any(rows[i]["score"] == rows[i - 1]["score"]
+                                       for i in range(1, len(rows)))
+        self.assertTrue(seen_tie, "fixture produced no ties — it proves nothing")
+
+    def test_retrieve_raw_returns_a_total_order(self):
+        seen_tie = False
+        for q in self.QUERIES:
+            rows = self.core.retrieval.retrieve_raw(q, limit=20)
+            self._assert_total_order(rows, "event_id", "retrieve_raw(%r)" % q)
+            seen_tie = seen_tie or any(rows[i]["score"] == rows[i - 1]["score"]
+                                       for i in range(1, len(rows)))
+        self.assertTrue(seen_tie, "fixture produced no ties — it proves nothing")
 
 
 if __name__ == "__main__":
