@@ -3876,7 +3876,13 @@ class RetrievalEngine:
         if limit <= 0 or query_emb is None or len(query_emb) == 0:
             return []
         self._note_wrong_dim_table(query_emb, "query_proxy_vectors", "belief_id",
-                                   "proxy", "kind != ?", ("observed",))
+                                   # MUST match store.iter_query_proxy_vectors_paged's
+                                   # exclude_kind predicate exactly: this call reports the
+                                   # COMPLEMENT of that scan, and a bare `kind != ?` here
+                                   # drops NULL-kind rows the COALESCE'd scan keeps -- so a
+                                   # NULL-kind wrong-width row would be neither scored nor
+                                   # counted, and the store would read cleaner than it is.
+                                   "proxy", "COALESCE(kind, '') != ?", ("observed",))
         best: dict = {}          # belief_id -> [best_sim, kind_of_best, first_pos]
         pos = 0
         for batch in _tail_merged(self.store.iter_query_proxy_vectors_paged(
