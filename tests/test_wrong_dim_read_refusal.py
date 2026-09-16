@@ -208,6 +208,37 @@ class TestTheDiagnosticIsBoundedButTheCountIsExact(_WrongDimStore):
                 % (ch, n, _WRONG_DIM_SAMPLE))
 
 
+class TestTheDiagnosticIsTheExactComplementOfTheScan(_WrongDimStore):
+    """A NULL-kind wrong-width proxy row must be COUNTED, not silently lost.
+
+    `_vector_proxies` scans `query_proxy_vectors` excluding kind='observed', and
+    `_note_wrong_dim_table` reports the rows that scan's width filter removed.
+    The two predicates must agree row for row or the diagnostic stops being the
+    complement. `kind` is nullable: the scan uses `COALESCE(kind,'') != ?` so a
+    NULL-kind row stays in it, and if the diagnostic used a bare `kind != ?` a
+    NULL-kind row of the WRONG width would fall out of both -- never scored, and
+    never reported. This pins the two against each other on exactly that row.
+    """
+
+    def test_a_null_kind_wrong_width_proxy_is_counted(self):
+        bid = sorted(self.good_ids)[0]
+        with self.core.store.transaction() as c:
+            for idx, kind in ((900, None), (901, "fact")):
+                c.execute("INSERT INTO query_proxy_vectors"
+                          "(belief_id,proxy_idx,kind,question,embedding,model,created_at) "
+                          "VALUES(?,?,?,?,?,?,?)",
+                          (bid, idx, kind, "q?", E.pack([0.02] * 2048), "m",
+                           "2026-01-01T00:00:00Z"))
+        self.core.retrieval.answer(QUERY)
+        counts = self.core.retrieval._wrong_dim_counts
+        self.assertIn(("proxy", "query_proxy_vectors"), counts,
+                      "the proxy channel reported no wrong-width rows at all: %r" % counts)
+        self.assertEqual(
+            counts[("proxy", "query_proxy_vectors")], 2,
+            "both non-observed wrong-width proxies (one NULL-kind, one 'fact') must be "
+            "counted; a count of 1 means the NULL-kind row fell out of the complement")
+
+
 class TestOldSilentBehaviorFailsTheTest(_WrongDimStore):
     """MUTATION GUARD. Restore the pre-A0c read path — score a wrong-length
     blob as 0.0 and count nothing — and the assertions above must FAIL. If they

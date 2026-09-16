@@ -292,57 +292,60 @@ class TestAppliesTheMigratedVectors(_WBCase):
 # ==========================================================================
 # W1 — the resurrection test
 # ==========================================================================
-class TestTheAnnMirrorIsInvalidated(_WBCase):
-    """The vec0 ANN mirror must not keep serving a PRE-image this tool replaced.
+class TestTheAnnMirrorKeepsCorrectedRowsVisible(_WBCase):
+    """A corrected row must be UPSERTED into the vec0 ANN mirror, never deleted.
 
     `MemoryStore.add_observed_vector` writes `observed_vectors` and its vec0
-    mirror in ONE transaction; this tool writes raw SQL, so nothing maintains
-    the mirror for it. Left alone, a KNN query returns the stale embedding for a
-    corrected row -- and because a nonempty KNN result SKIPS the paged scan that
-    would have read the corrected blob, nothing downstream ever contradicts it.
+    mirror in ONE transaction; this tool writes raw SQL, so it keeps the mirror
+    in step itself. The obvious move -- delete the stale mirror entry -- is wrong:
+    `retrieve_raw` takes a nonempty KNN result INSTEAD of the paged scan, so a
+    row missing from a partly-filled mirror is never a vector candidate unless
+    full-text search finds it. Deleting would turn "ranked on a stale embedding"
+    into "not found". An earlier revision of this tool did exactly that; this
+    class exists so it cannot come back.
 
-    Asserted as a contract on the call rather than on vec0 itself, deliberately:
-    sqlite-vec cannot load under Apple's system Python (no
-    `enable_load_extension`), so a test that needed a real vec0 would SKIP on the
-    machine this suite is gated on, which is the same as not having one.
+    Asserted as a contract on the call rather than on vec0: sqlite-vec cannot load
+    under Apple's system Python, so a test needing a real vec0 would SKIP on the
+    machine this suite is gated on.
     """
 
-    def _applied_observed_keys(self):
+    def _observed(self):
         c = self._live()
-        before = {tuple(r)[0]: tuple(r) for r in c.execute(
+        rows = {r[0]: r[1] for r in c.execute(
             'SELECT event_id, embedding FROM observed_vectors').fetchall()}
         c.close()
-        return before
+        return rows
 
-    def test_every_corrected_observed_row_invalidates_its_mirror_entry(self):
-        before = self._applied_observed_keys()
+    def test_every_corrected_observed_row_is_upserted_with_its_new_blob(self):
+        before = self._observed()
         calls = []
-        real = WB._vec0_delete
+        real = WB._vec0_upsert
 
-        def spy(conn, predicate_sql, params):
-            calls.append((predicate_sql, tuple(params)))
-            return real(conn, predicate_sql, params)
+        def spy(conn, event_id, embedding):
+            calls.append((event_id, bytes(embedding)))
+            return real(conn, event_id, embedding)
 
-        with mock.patch.object(WB, "_vec0_delete", spy):
+        with mock.patch.object(WB, "_vec0_upsert", spy):
             rc, counts, out = self._run_counts()
         self.assertIn(rc, (0, 2), out)
         self.assertGreater(counts.get("applied", 0), 0, out)
 
-        c = self._live()
-        after = {tuple(r)[0]: tuple(r) for r in c.execute(
-            'SELECT event_id, embedding FROM observed_vectors').fetchall()}
-        c.close()
+        after = self._observed()
         changed = {k for k, v in after.items() if before.get(k) != v}
         self.assertTrue(changed, "no observed_vectors row changed; nothing to assert about")
-        self.assertEqual(
-            len(calls), len(changed),
-            "one mirror invalidation per corrected observed_vectors row: "
-            "%d corrected, %d invalidations" % (len(changed), len(calls)))
-        for predicate_sql, params in calls:
-            self.assertIn("event_id", predicate_sql,
-                          "the mirror delete must be scoped by the same key column")
-        self.assertEqual({p[0] for p in (c2[1] for c2 in calls)}, changed,
-                         "the invalidated ids must be exactly the corrected ids")
+        self.assertEqual({eid for eid, _ in calls}, changed,
+                         "the mirror must be told about exactly the corrected rows")
+        self.assertEqual(len(calls), len(changed), "one mirror write per corrected row")
+        for eid, blob in calls:
+            self.assertEqual(blob, bytes(after[eid]),
+                             "the mirror must receive the CORRECTED blob for %s, or it keeps "
+                             "serving the pre-image" % eid)
+
+    def test_the_tool_never_deletes_from_the_mirror(self):
+        self.assertFalse(hasattr(WB, "_vec0_delete"),
+                         "writeback_vectors imports a vec0 DELETE again. A corrected row that "
+                         "still exists must be upserted: a row missing from the mirror is "
+                         "invisible to vector search, not merely slower")
 
 
 class TestW1NeverResurrects(_WBCase):

@@ -129,6 +129,76 @@ def _declared_dims(conn):
     return int(m.group(1)) if m else None
 
 
+def mirror_present(conn) -> bool:
+    """Whether a vec0 mirror exists in this database at all.
+
+    Read from sqlite_master, so it needs no extension: a process that cannot
+    load sqlite-vec can still tell that some OTHER process built a mirror it is
+    now unable to keep in step."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec0'").fetchone() is not None
+
+
+def mirror_unmaintainable(conn) -> bool:
+    """A vec0 mirror exists here, but THIS process cannot load sqlite-vec.
+
+    The case a raw-SQL script must not stay quiet about: any change it makes to
+    observed_vectors leaves the mirror disagreeing with the table, and a process
+    that CAN load the extension will keep serving those stale rows -- a nonempty
+    KNN result skips the paged scan that would have read the real blobs."""
+    return mirror_present(conn) and not _try_load_extension(conn)
+
+
+def upsert_observed(conn, event_id: str, embedding: bytes) -> int:
+    """Best-effort INSERT OR REPLACE into vec0, for standalone scripts that
+    REWRITE an `observed_vectors` embedding via raw SQL (scripts/
+    writeback_vectors.py) rather than through MemoryStore.
+
+    Upsert, never delete, for a row that still exists. A mirror is only trusted
+    when it is complete: retrieve_raw takes a nonempty KNN result INSTEAD of the
+    paged scan, and a row absent from the mirror is then never a vector
+    candidate unless full-text search happens to find it. Deleting a corrected
+    row would trade a stale embedding for an invisible row.
+
+    Returns 1 when written, 0 (never raises) when sqlite-vec cannot load here,
+    vec0 was never created, or vec0's declared width does not match this
+    vector. The last is not a failure to keep in step: vec0 would reject the
+    insert, and VectorIndex._prepare disables the ANN fast path on exactly that
+    mismatch, so a mirror at the old width goes unused rather than wrong.
+
+    Never CREATES vec0 -- a script that did would build a mirror holding only
+    the rows it happened to touch, which is the incomplete mirror above. Does
+    not commit; the caller's transaction owns this write with its primary one.
+    """
+    declared = _declared_dims(conn)
+    if declared is None or declared * 4 != len(embedding or b""):
+        return 0
+    if not _try_load_extension(conn):
+        return 0
+    try:
+        conn.execute("INSERT OR REPLACE INTO vec0(event_id, embedding) VALUES(?, ?)",
+                     (event_id, embedding))
+        return 1
+    except sqlite3.OperationalError:
+        return 0
+
+
+def delete_ids(conn, event_ids) -> int:
+    """Best-effort delete of exactly these event_ids from vec0, chunked under
+    SQLite's bound-variable limit. For scripts that DELETE observed_vectors rows
+    by some other key (scripts/requeue_hash_vectors.py deletes by model): the
+    ids must be collected BEFORE the primary delete, because afterwards nothing
+    names them. Invalidating the whole mirror instead would leave every
+    UNAFFECTED row absent once the deleted ones are rewritten -- see
+    `upsert_observed` for why an absent row is invisible, not merely slow."""
+    ids = list(event_ids)
+    removed = 0
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        removed += delete_matching(conn, "event_id IN (%s)" % ",".join("?" * len(chunk)), chunk)
+    return removed
+
+
 def delete_matching(conn, predicate_sql: str, params) -> int:
     """Best-effort delete from vec0 for standalone scripts that mutate
     `observed_vectors` directly via raw SQL (scripts/prune_vectors.py) instead
