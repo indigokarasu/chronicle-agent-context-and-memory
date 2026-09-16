@@ -96,5 +96,37 @@ class TestRequeueRemovesOnlyTheRowsItDeletes(unittest.TestCase):
         self.assertFalse(self.doomed & left, "requeue left a hash-tagged row in place")
 
 
+class TestRequeueRefusesWhenTheMirrorCannotBeKeptInStep(TestRequeueRemovesOnlyTheRowsItDeletes):
+    """A vec0 mirror this Python cannot load sqlite-vec for must STOP requeue.
+
+    Deleting rows it cannot also remove from the mirror leaves orphans that an
+    extension-capable process returns from KNN. Refused on a read-only probe
+    before MemoryStore opens, so nothing -- not even the schema -- is touched;
+    and dry-run refuses too, so it cannot predict success for a refused run."""
+
+    # the parent's own tests are not re-run under this class
+    test_exactly_the_deleted_ids_leave_the_mirror = None
+    test_the_primary_table_agrees_with_what_the_mirror_was_told = None
+
+    def _count(self):
+        c = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        try:
+            return c.store._conn().execute("SELECT COUNT(*) FROM observed_vectors").fetchone()[0]
+        finally:
+            c.close()
+
+    def test_refuses_and_deletes_nothing(self):
+        before = self._count()
+        for dry in (False, True):
+            buf = io.StringIO()
+            with mock.patch.object(RQ, "_vec0_unmaintainable", lambda conn: True), \
+                    contextlib.redirect_stdout(buf):
+                rc = RQ.requeue(self.db, dry_run=dry)
+            self.assertEqual(rc, 1, "dry_run=%s did not refuse:\n%s" % (dry, buf.getvalue()))
+            self.assertIn("REFUSED", buf.getvalue())
+            self.assertEqual(self._count(), before,
+                             "a REFUSED requeue (dry_run=%s) still deleted rows" % dry)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

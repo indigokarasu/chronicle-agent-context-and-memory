@@ -1136,12 +1136,13 @@ def writeback(live_db, copy_db, manifest_path=None, dry_run=False,
         print("manifest       : %s  (%d rows, built %s)"
               % (manifest_path, sum((header.get("row_counts") or {}).values()),
                  header.get("created_at")))
-        if not dry_run and _vec0_unmaintainable(live):
-            print("WARNING        : this database has a vec0 ANN mirror, but this Python cannot "
-                  "load sqlite-vec, so rows corrected here will stay STALE in the mirror. A "
-                  "process that can load it will keep serving them, because a nonempty KNN "
-                  "result skips the paged scan. Run under a Python whose sqlite3 can load "
-                  "sqlite-vec, or rebuild the mirror afterwards.")
+        # REFUSE, not warn. An earlier revision printed a warning and carried
+        # on: the rows changed, upsert_observed() quietly returned 0, and the
+        # mirror kept the pre-image -- the silent partial state W1-W8 exist to
+        # rule out. Checked before WriteBack is built, so nothing has been
+        # written, and in dry-run too, which must predict the real run.
+        if _vec0_unmaintainable(live):
+            raise Refused("this database has a vec0 ANN mirror, but this Python's sqlite3 cannot load sqlite-vec, so the mirror cannot be kept equal to observed_vectors. A process that CAN load it trusts a nonempty KNN result instead of scanning the table, and would go on serving the embeddings this tool is about to replace. The mirror cannot be dropped or edited without the extension either. Re-run under a Python whose sqlite3 can load sqlite-vec.")
         print("active tag     : %s" % active_tag)
         print("expected width : %d dims (%d bytes)" % (expect_len // 4, expect_len))
         print("mode           : %s" % ("DRY RUN (live opened read-only, nothing written)"
