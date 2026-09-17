@@ -63,6 +63,12 @@ class TestFtsFindsNonAsciiWords(unittest.TestCase):
         self.assertEqual(_fts_query("猫"), '"猫"')
         self.assertEqual(self._hits("猫"), ["ev_cat"])
 
+    def test_a_decomposed_spelling_is_one_word(self):
+        """NFD "Zürich" (u + combining diaeresis) is one token to FTS5."""
+        nfd = "Zu\u0308rich"
+        self.assertEqual(_fts_query(nfd), '"Zürich"')
+        self.assertEqual(self._hits(nfd), ["ev_zurich"])
+
     def test_unaccented_spelling_still_matches(self):
         """unicode61 removes diacritics at index and query time."""
         self.assertEqual(self._hits("Zurich"), ["ev_zurich"])
