@@ -3,6 +3,56 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.1
+
+Three fixes from an audit of other agent-memory systems (Hindsight, Graphiti,
+Mem0, agentmemory, Honcho, OpenViking and others), each checked against the
+production store before it was changed, and a dashboard navigator for memory.
+
+* **Duplicate merge is exact, and no longer eats updates.** The E5 merge folded
+  a new belief into an existing same-subject one at cosine >= 0.95, discarding
+  the new body. On the production nomic model that threshold merges real
+  updates: "Standup is at 9am" -> "10am" scores 0.9945, "allergic to peanuts" ->
+  "not allergic" 0.9795, "offsite in Denver" -> "Boston" 0.9547, while a pure
+  paraphrase scores 0.9948, so no threshold can separate them. The check also
+  ran only when an inline embed succeeded: with the embedder timing out or down,
+  every repeat became a new active row (one production scope holds 25,054
+  active directive notes with 2,696 distinct bodies), and a projection rebuild
+  under a different model merged differently, breaking I3. A merge now requires
+  a byte-identical body in the same owner, domain and natural key, is decided
+  before anything is embedded, and never reads a vector. `curation.dup_similarity`
+  is deleted. Legacy duplicates stay until a projection rebuild folds them.
+* **Keyword search keeps non-English words.** Every keyword path tokenized with
+  an ASCII-only class while FTS5 indexes Unicode letters, so a query for
+  "Zürich" searched for "rich", "José" became "Jos", and a Cyrillic or CJK
+  question produced no terms at all. Because the focus support gate treats "no
+  distinctive tokens" as nothing to fail on, such questions could never abstain.
+  One word-token definition (`store.word_tokens`) now serves the FTS query,
+  routing, overlap and hint tokens. On LongMemEval (hashing embedder) context
+  recall is unchanged; turn recall@1 moves by 0.6 points in each tier (belief
+  down, raw up) and union@3 rises 0.3. Porter stemming was measured and
+  rejected: it lost 1-2 questions of context recall.
+* **The dashboard tab has a UI again, and an Atlas.** `dashboard/manifest.json`
+  named `dist/index.js` as its entry, but `dist/` was gitignored and the bundle
+  was deployed by hand, so a deploy from the repo left the tab with nothing to
+  load. The hand-deployed bundle also still POSTed `/process-embeddings`, which
+  A13 renamed. The UI is now built from `dashboard/web/src` into a committed
+  `dashboard/dist`, and a test requires every route the UI calls to be declared
+  by `plugin_api.py` and present in the built bundle. The new **Atlas** view
+  draws every event as a point on its writer's row (cron job, session or
+  background actor) over time, with inspectors that follow an event, run or
+  belief to its sources, replacements, contradictions and identical copies,
+  plus lenses for open contradictions, replaced facts and duplicate notes. It
+  reads through `mode=ro` connections, streams the log as delta-encoded columns
+  (419,490 production events load in about 10 s) and renders with deck.gl,
+  loaded only when the tab opens. Verified against a production snapshot in a
+  local harness (`dashboard/web/harness/`).
+* **`prune_vectors.py --orphans`** removes observed vectors, and their excerpt
+  proxies, whose source event is no longer in the log. No Chronicle code deletes
+  events, but the production log starts at seq 79,993, and 18,394 vectors of
+  events that are gone remain (their FTS rows do not): they cannot be rendered or
+  re-embedded, and every brute-force scan still pays for them.
+
 ## 5.7.0
 
 The ladder-10 integration: eighteen independent work trees merged into one
