@@ -82,7 +82,16 @@ def _connect_ro(path: str) -> sqlite3.Connection:
 
 
 class _Events:
-    """event_id -> (type, session_id, actor, payload), cached."""
+    """event_id -> (type, session_id, actor, payload), cached.
+
+    BOUNDED. Beliefs share supporting events, so a cache pays for itself, but an
+    unbounded one holds every payload it has seen: on the production store this
+    run reached 697 MB of RSS behind a live agent on a box with an OOM history.
+    At the cap the whole cache is dropped rather than evicted one by one — the
+    work is a single ordered pass, so the next belief's events are re-read at
+    most once."""
+
+    _CAP = 20000
 
     def __init__(self, conn):
         self.conn = conn
@@ -90,6 +99,8 @@ class _Events:
 
     def get(self, eid):
         if eid not in self.cache:
+            if len(self.cache) >= self._CAP:
+                self.cache.clear()
             row = self.conn.execute("SELECT type, session_id, actor, payload FROM events WHERE event_id=?",
                                     (eid,)).fetchone()
             if row is None:
@@ -199,15 +210,15 @@ def _label(rec) -> str:
     return rec["kind"]
 
 
-def apply(db_path: str, records, batch: int = _DEFAULT_BATCH) -> tuple:
-    """Append the retractions. Returns (beliefs, events)."""
+def apply(db_path: str, targets, batch: int = _DEFAULT_BATCH) -> tuple:
+    """Append the retractions for `(belief_id, owner)` pairs. Returns (beliefs, events)."""
     from engine.capture import CaptureEngine
     from engine.config import Config
     from engine.reducer import Reducer
     from engine.store import MemoryStore
     by_owner = collections.defaultdict(list)
-    for rec in records:
-        by_owner[rec["owner"] or "default"].append(rec["belief_id"])
+    for belief_id, owner in targets:
+        by_owner[owner or "default"].append(belief_id)
     store = MemoryStore(db_path)
     try:
         reducer = Reducer(store, None, Config({}))
@@ -221,7 +232,7 @@ def apply(db_path: str, records, batch: int = _DEFAULT_BATCH) -> tuple:
                 beliefs += len(chunk)
                 events += 1
                 if events % 20 == 0:
-                    print("  retracted %d of %d beliefs" % (beliefs, len(records)), flush=True)
+                    print("  retracted %d of %d beliefs" % (beliefs, len(targets)), flush=True)
         return beliefs, events
     finally:
         store.close()
@@ -239,22 +250,36 @@ def main(argv=None) -> int:
         print("no database at %s" % args.db, file=sys.stderr)
         return 1
 
+    # Streamed, not collected: the report goes to disk as it is decided and only
+    # the ids to retract stay in memory. Holding every record cost 438 MB of RSS
+    # on the production store, behind a live agent on a box with an OOM history.
     retract, kept = [], collections.Counter()
     by_label = collections.Counter()
     samples = collections.defaultdict(list)
+    report_fh = None
     try:
+        if args.report:
+            report_fh = open(args.report, "w", encoding="utf-8")
         for verdict, rec in scan(args.db):
             if verdict == "keep":
                 kept[_label(rec)] += 1
                 continue
-            retract.append(rec)
+            retract.append((rec["belief_id"], rec["owner"]))
             label = "%s [%s]" % (_label(rec), ",".join(rec["channels"]))
             by_label[label] += 1
             if len(samples[label]) < 3:
                 samples[label].append(str(rec["text"] or "")[:100])
+            if report_fh:
+                report_fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
     except sqlite3.Error as e:
         print("database error: %s" % e, file=sys.stderr)
         return 1
+    except OSError as e:
+        print("cannot write the report: %s" % e, file=sys.stderr)
+        return 1
+    finally:
+        if report_fh:
+            report_fh.close()
 
     print("would retract %d beliefs:" % len(retract) if not args.apply else "retracting %d beliefs:" % len(retract))
     for label, n in by_label.most_common():
@@ -266,9 +291,6 @@ def main(argv=None) -> int:
         print("  %7d  %s" % (n, label))
 
     if args.report:
-        with open(args.report, "w", encoding="utf-8") as fh:
-            for rec in retract:
-                fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
         print("report: %s" % args.report)
 
     if args.apply and retract:
