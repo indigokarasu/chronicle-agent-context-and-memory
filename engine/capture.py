@@ -87,7 +87,8 @@ class CaptureEngine:
     def append(self, type_: str, payload: dict, *, parents=None, actor="agent",
                owner: str | None = None, trust_level: int = 2,
                session_id: str | None = None, branch_id: str | None = None,
-               occurred_at: str | None = None) -> str:
+               occurred_at: str | None = None,
+               pointer: str | None = None) -> str:
         now = self._now()
         owner = owner or self.owner
         occurred_at = occurred_at or now
@@ -98,7 +99,8 @@ class CaptureEngine:
             "actor": actor, "owner": owner, "trust_level": trust_level,
             "session_id": session_id, "branch_id": branch_id or session_id,
             "occurred_at": occurred_at, "recorded_at": now,
-            "prev_head": self.store.get_head_event_id(), "sig": None})
+            "prev_head": self.store.get_head_event_id(), "sig": None,
+            "pointer": pointer})
 
     def append_many(self, events: list[dict], *, window: int = 64) -> list[str]:
         """Append a KNOWN run of events, embedding each window's text in one round trip.
