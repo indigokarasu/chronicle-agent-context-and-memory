@@ -67,17 +67,20 @@
   }
 
   // src/index.js
-  if (!SDK || !PLUGINS) {
-    console.error("[chronicle] Hermes plugin SDK not available.");
-  } else {
-    let Kpi = function(label, value, unit) {
+  function main() {
+    const { useState, useEffect, useCallback } = hooks;
+    const { Card, CardHeader, CardTitle, CardContent, Badge, Button } = C;
+    const KIND_COLORS = { event: "#3b82f6", note: "#ab47bc", episode: "#f9a825", fact: "#f57c00", document: "#43a047", entity: "#9b59b6" };
+    const LABELS = { event: "Events", note: "Notes", episode: "Episodes", fact: "Facts", document: "Documents", entity: "Entities" };
+    function Kpi(label, value, unit) {
       return h(
         "div",
         { className: "chr-kpi" },
         h("div", { className: "chr-kpi-l" }, label),
         h("div", { className: "chr-kpi-v" }, value, unit ? h("span", { className: "chr-kpi-u" }, unit) : null)
       );
-    }, CompositionCard = function(store) {
+    }
+    function CompositionCard(store) {
       const segs = ["event", "note", "episode", "fact", "document", "entity"].map((k) => ({ kind: k, name: LABELS[k], count: store[k + "s"] || 0, color: KIND_COLORS[k] })).filter((s) => s.count > 0).sort((a, b) => b.count - a.count);
       const total = segs.reduce((a, s) => a + s.count, 0);
       let acc = 0;
@@ -118,7 +121,8 @@
           )
         )
       );
-    }, CoverageCard = function(emb, store) {
+    }
+    function CoverageCard(emb, store) {
       const rows = ["event", "note", "episode", "fact", "document"].map((k) => ({ kind: k, ...emb[k] || {} })).filter((r) => (r.total || 0) > 0).sort((a, b) => (store[b.kind + "s"] || 0) - (store[a.kind + "s"] || 0));
       return h(
         Card,
@@ -136,7 +140,8 @@
           h("span", { className: "chr-cov-v", style: (r.pct || 0) >= 100 ? null : { color: "var(--warn)" } }, fmt(r.pct || 0) + "%")
         )))
       );
-    }, ActivityCard = function(events) {
+    }
+    function ActivityCard(events) {
       return h(
         Card,
         null,
@@ -151,7 +156,8 @@
           h("span", { className: "chr-act-time" }, relTime(e.created_at))
         ))))
       );
-    }, Overview = function() {
+    }
+    function Overview() {
       const [data, setData] = useState(null);
       const [recent, setRecent] = useState(null);
       const [err, setErr] = useState(null);
@@ -227,12 +233,15 @@
         ) : null,
         ActivityCard(recent && recent.events)
       );
-    }, loadAtlas = function() {
+    }
+    let atlasPromise = null;
+    function loadAtlas() {
       if (window.__CHRONICLE_ATLAS__) return Promise.resolve(window.__CHRONICLE_ATLAS__);
       if (atlasPromise) return atlasPromise;
       atlasPromise = new Promise((resolve, reject) => {
         const self = document.querySelector('script[data-hermes-plugin="chronicle"]');
-        const base = self && self.src ? self.src.replace(/index\.js(\?.*)?$/, "") : "";
+        const src = self && self.src ? self.src.split("?")[0] : "";
+        const base = src ? src.slice(0, src.lastIndexOf("/") + 1) : "";
         if (!base) {
           reject(new Error("could not locate the Chronicle plugin bundle"));
           return;
@@ -248,7 +257,8 @@
         document.head.appendChild(s);
       });
       return atlasPromise;
-    }, AtlasTab = function() {
+    }
+    function AtlasTab() {
       const [mod, setMod] = useState(window.__CHRONICLE_ATLAS__ || null);
       const [err, setErr] = useState(null);
       useEffect(() => {
@@ -257,7 +267,8 @@
       if (err) return h("div", { className: "chr-err" }, "The Atlas could not load: " + err);
       if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading the Atlas\u2026");
       return h(mod.Atlas, null);
-    }, ChronicleDashboard = function() {
+    }
+    function ChronicleDashboard() {
       const initial = (() => {
         try {
           return sessionStorage.getItem("chr-tab") || "overview";
@@ -287,12 +298,9 @@
         ),
         tab === "atlas" ? h(AtlasTab) : h(Overview)
       );
-    };
-    const { useState, useEffect, useCallback } = hooks;
-    const { Card, CardHeader, CardTitle, CardContent, Badge, Button } = C;
-    const KIND_COLORS = { event: "#3b82f6", note: "#ab47bc", episode: "#f9a825", fact: "#f57c00", document: "#43a047", entity: "#9b59b6" };
-    const LABELS = { event: "Events", note: "Notes", episode: "Episodes", fact: "Facts", document: "Documents", entity: "Entities" };
-    let atlasPromise = null;
+    }
     PLUGINS.register("chronicle", ChronicleDashboard);
   }
+  if (SDK && PLUGINS) main();
+  else console.error("[chronicle] Hermes plugin SDK not available.");
 })();

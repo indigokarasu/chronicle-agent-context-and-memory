@@ -167,17 +167,16 @@ export function createCanvas(container, model, handlers) {
     return layers;
   }
 
-  function tooltip({ layer, index, coordinate, viewport }) {
-    if (layer && layer.id === "writers-events" && index >= 0) {
-      const k = index;
-      const lane = model.lanes[model.lane[k]];
-      const d = new Date(model.t[k] * 1000);
-      return {
-        html: `<div class="atl-tip"><b>${escapeHtml(typeStyle(model.types[model.type[k]]).label)}</b><br>${escapeHtml(laneLabel(lane.key, cronNames))}<br><span>${d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span></div>`,
-        style: { background: "transparent", padding: "0", boxShadow: "none" },
-      };
-    }
-    return null;
+  function tooltip({ layer, index }) {
+    if (!layer || layer.id !== "writers-events" || index < 0) return null;
+    const lane = model.lanes[model.lane[index]];
+    const d = new Date(model.t[index] * 1000);
+    return {
+      text: typeStyle(model.types[model.type[index]]).label + "\n" + laneLabel(lane.key, cronNames) + "\n" +
+        d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      className: "atl-tip",
+      style: { whiteSpace: "pre", background: "#12121f", color: "#e7e5f1", border: "1px solid rgba(150,130,230,.3)", borderRadius: "6px", padding: "6px 8px", fontSize: "12px", lineHeight: "1.35" },
+    };
   }
 
   const deck = new Deck({
@@ -226,48 +225,57 @@ export function createCanvas(container, model, handlers) {
   });
 
   // -- overlays ------------------------------------------------------------------
+  // Overlays are built as DOM nodes with textContent: lane names come from the
+  // store and from the cron registry, and nothing read from either is markup.
   function drawLabels() {
     const px = rowPx();
-    const cy = viewState.writers.target[1];
-    const top = cy - writersH() / 2 / px;
+    const top = viewState.writers.target[1] - writersH() / 2 / px;
     const first = Math.max(0, Math.floor(top));
     const last = Math.min(model.lanes.length - 1, Math.ceil(top + writersH() / px));
     const every = px >= 11 ? 1 : Math.ceil(11 / px);
-    const parts = [];
+    const frag = document.createDocumentFragment();
     for (let r = first; r <= last; r++) {
       if ((r % every) !== 0) continue;
       const lane = model.lanes[model.laneAtRow[r]];
       if (!lane) continue;
-      const y = (r - top) * px + px / 2;
-      const selected = selection && selection.laneRow === r;
-      parts.push(`<div class="atl-label${selected ? " is-sel" : ""}" data-row="${r}" style="top:${y.toFixed(1)}px">${escapeHtml(laneLabel(lane.key, cronNames))}<span>${lane.count.toLocaleString()}</span></div>`);
+      const el = document.createElement("div");
+      el.className = "atl-label" + (selection && selection.laneRow === r ? " is-sel" : "");
+      el.dataset.row = String(r);
+      el.style.top = ((r - top) * px + px / 2).toFixed(1) + "px";
+      el.textContent = laneLabel(lane.key, cronNames);
+      const count = document.createElement("span");
+      count.textContent = lane.count.toLocaleString();
+      el.appendChild(count);
+      frag.appendChild(el);
     }
-    labels.innerHTML = parts.join("");
+    labels.replaceChildren(frag);
   }
 
   function drawAxis() {
     const [x0, x1] = visibleX();
     const hoursPerPx = (x1 - x0) / plotW();
-    const step = TICK_STEPS.find((s) => s / hoursPerPx >= 90) || TICK_STEPS[TICK_STEPS.length - 1];
-    const parts = [];
+    const step = TICK_STEPS.find((st) => st / hoursPerPx >= 90) || TICK_STEPS[TICK_STEPS.length - 1];
     const e0 = model.epochOf(x0), e1 = model.epochOf(x1);
     const stepS = step * 3600;
     // align to local midnight so day ticks sit on day boundaries
-    const d0 = new Date(e0 * 1000); d0.setHours(0, 0, 0, 0);
+    const d0 = new Date(e0 * 1000);
+    d0.setHours(0, 0, 0, 0);
     let t = d0.getTime() / 1000;
     while (t < e0) t += stepS;
+    const frag = document.createDocumentFragment();
     for (let guard = 0; t <= e1 && guard < 200; t += stepS, guard++) {
-      const x = (model.xOf(t) - x0) / hoursPerPx;
       const d = new Date(t * 1000);
-      const label = step >= DAY || (d.getHours() === 0 && d.getMinutes() === 0)
+      const el = document.createElement("div");
+      el.className = "atl-tick";
+      el.style.left = ((model.xOf(t) - x0) / hoursPerPx).toFixed(1) + "px";
+      el.textContent = step >= DAY || (d.getHours() === 0 && d.getMinutes() === 0)
         ? d.toLocaleDateString([], { month: "short", day: "numeric" })
         : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-      parts.push(`<div class="atl-tick" style="left:${x.toFixed(1)}px">${label}</div>`);
+      frag.appendChild(el);
     }
-    axis.innerHTML = parts.join("");
+    axis.replaceChildren(frag);
   }
 
-  wholeBtn.addEventListener("click", () => fitAll());
   labels.addEventListener("click", (ev) => {
     const el = ev.target.closest(".atl-label");
     if (el) handlers.onLane(model.laneAtRow[+el.dataset.row]);
@@ -327,6 +335,3 @@ export function createCanvas(container, model, handlers) {
   };
 }
 
-function escapeHtml(s) {
-  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}

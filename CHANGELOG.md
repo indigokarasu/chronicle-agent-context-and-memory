@@ -19,16 +19,19 @@ production store before it was changed, and a dashboard navigator for memory.
   every repeat became a new active row (one production scope holds 25,054
   active directive notes with 2,696 distinct bodies), and a projection rebuild
   under a different model merged differently, breaking I3. A merge now requires
-  a byte-identical body in the same owner, domain and natural key, is decided
-  before anything is embedded, and never reads a vector. `curation.dup_similarity`
+  a byte-identical body in the same owner, domain and natural key (for a fact:
+  entity, predicate and qualifiers, so "work phone" and "home phone" with the
+  same number stay two facts), is decided before anything is embedded, and never
+  reads a vector. `curation.dup_similarity`
   is deleted. Legacy duplicates stay until a projection rebuild folds them.
 * **Keyword search keeps non-English words.** Every keyword path tokenized with
   an ASCII-only class while FTS5 indexes Unicode letters, so a query for
   "Zürich" searched for "rich", "José" became "Jos", and a Cyrillic or CJK
   question produced no terms at all. Because the focus support gate treats "no
   distinctive tokens" as nothing to fail on, such questions could never abstain.
-  One word-token definition (`store.word_tokens`) now serves the FTS query,
-  routing, overlap and hint tokens. On LongMemEval (hashing embedder) context
+  One word-token definition (`store.word_tokens`, NFC-normalized so a decomposed
+  "Zürich" is one word, as FTS5 indexes it) now serves the FTS query, routing,
+  overlap and hint tokens. On LongMemEval (hashing embedder) context
   recall is unchanged; turn recall@1 moves by 0.6 points in each tier (belief
   down, raw up) and union@3 rises 0.3. Porter stemming was measured and
   rejected: it lost 1-2 questions of context recall.
@@ -37,8 +40,10 @@ production store before it was changed, and a dashboard navigator for memory.
   was deployed by hand, so a deploy from the repo left the tab with nothing to
   load. The hand-deployed bundle also still POSTed `/process-embeddings`, which
   A13 renamed. The UI is now built from `dashboard/web/src` into a committed
-  `dashboard/dist`, and a test requires every route the UI calls to be declared
-  by `plugin_api.py` and present in the built bundle. The new **Atlas** view
+  `dashboard/dist`; CI rebuilds it from source and fails on any difference, a
+  test requires every route the UI calls to be declared by `plugin_api.py` and
+  present in the built bundle, and the release zip now ships `atlas_api.py` and
+  `dist/` (it carried only `manifest.json` and `plugin_api.py`). The new **Atlas** view
   draws every event as a point on its writer's row (cron job, session or
   background actor) over time, with inspectors that follow an event, run or
   belief to its sources, replacements, contradictions and identical copies,

@@ -30,6 +30,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
 _BUSY_MS = 5000
 _EXCERPT = 600          # characters of any text returned for display
@@ -64,7 +65,8 @@ def _connect(db_path) -> sqlite3.Connection:
     It cannot open a WAL database whose -shm does not exist; the live store
     always has one while Hermes runs, and a store nothing has open is read with
     `immutable=1`, which is exact when no -wal holds frames."""
-    uri = "file:%s?mode=ro" % Path(db_path).as_posix()
+    # quoted: a "?" or "#" in the path would otherwise end the file name
+    uri = "file:%s?mode=ro" % quote(Path(db_path).as_posix())
     last = None
     for suffix in ("", "&immutable=1"):
         if suffix:
@@ -173,9 +175,15 @@ _cache = _TTLCache()
 # --------------------------------------------------------------------------
 # data functions
 # --------------------------------------------------------------------------
+# The kinds whose status counts the Atlas header shows. Counting every belief
+# table scanned 67k episodes and 44k notes per call: 5.7 s warm and 57 s cold on
+# the CPU-capped production host, every minute the tab was open.
+_SUMMARY_KINDS = ("fact", "note")
+
+
 def summary(db_path) -> dict:
-    """Store-wide numbers the Atlas header shows. Plain counts, nothing derived
-    beyond a GROUP BY."""
+    """The numbers the Atlas header shows, and only those: event count and
+    extent, fact and note counts by status, open contradictions."""
     conn = _connect(db_path)
     try:
         def one(sql, params=()):
@@ -193,18 +201,13 @@ def summary(db_path) -> dict:
             "beliefs": {},
         }
         for table, kind, _text, _label in _BELIEF_TABLES:
-            cols = _cols(conn, table)
-            if not cols:
+            if kind not in _SUMMARY_KINDS or "status" not in _cols(conn, table):
                 continue
-            if "status" in cols:
-                rows = conn.execute('SELECT COALESCE(status, \'active\'), COUNT(*) FROM "%s" '
-                                    "GROUP BY 1" % table).fetchall()
-                out["beliefs"][kind] = {r[0]: r[1] for r in rows}
-            else:
-                out["beliefs"][kind] = {"active": one('SELECT COUNT(*) FROM "%s"' % table) or 0}
+            rows = conn.execute('SELECT COALESCE(status, \'active\'), COUNT(*) FROM "%s" '
+                                "GROUP BY 1" % table).fetchall()
+            out["beliefs"][kind] = {r[0]: r[1] for r in rows}
         out["contradictions_open"] = one(
             "SELECT COUNT(*) FROM contradictions WHERE COALESCE(status,'open')='open'") or 0
-        out["sessions_indexed"] = one("SELECT COUNT(*) FROM session_index") or 0
         return out
     finally:
         conn.close()
@@ -414,111 +417,128 @@ def session_detail(db_path, session_id: str) -> dict:
         conn.close()
 
 
+def _find_belief(conn, belief_id):
+    """(table, kind, text_col, label_col, row) for a belief id, or None."""
+    for table, kind, text_col, label_col in _BELIEF_TABLES:
+        if not _cols(conn, table):
+            continue
+        r = conn.execute('SELECT * FROM "%s" WHERE belief_id=?' % table, (belief_id,)).fetchone()
+        if r is not None:
+            return table, kind, text_col, label_col, dict(r)
+    return None
+
+
+def _supports(conn, belief_id):
+    rows = conn.execute(
+        "SELECT e.seq, e.type, e.actor, e.session_id, e.recorded_at, e.payload, j.rule "
+        "FROM justifications j JOIN events e ON e.event_id = j.support "
+        "WHERE j.belief_id=? ORDER BY e.seq LIMIT ?", (belief_id, _SUPPORT_MAX)).fetchall()
+    return [{"seq": s["seq"], "type": s["type"], "actor": s["actor"], "session_id": s["session_id"],
+             "recorded_at": s["recorded_at"], "rule": s["rule"],
+             "text": event_text(s["type"], _payload(s["payload"]))} for s in rows]
+
+
+def _replaced_by(conn, first_successor, seen, cap=20):
+    """The chain of beliefs that replaced this one, oldest replacement first."""
+    chain, cur = [], first_successor
+    while cur and cur not in seen and len(chain) < cap:
+        seen.add(cur)
+        nxt = _belief_rows(conn, [cur])
+        if not nxt:
+            break
+        chain.append(nxt[0])
+        try:
+            r = conn.execute('SELECT superseded_by FROM "%s" WHERE belief_id=?' % nxt[0]["table"],
+                             (cur,)).fetchone()
+        except sqlite3.Error:
+            r = None
+        cur = r[0] if r else None
+    return chain
+
+
+def _replaced(conn, table, belief_id, seen, cap=20):
+    """The chain of beliefs this one replaced, oldest first."""
+    if "superseded_by" not in _cols(conn, table):
+        return []
+    chain, cur = [], belief_id
+    while len(chain) < cap:
+        r = conn.execute('SELECT belief_id FROM "%s" WHERE superseded_by=? ORDER BY created_at'
+                         % table, (cur,)).fetchone()
+        if r is None or r[0] in seen:
+            break
+        seen.add(r[0])
+        prev = _belief_rows(conn, [r[0]])
+        if not prev:
+            break
+        chain.insert(0, prev[0])
+        cur = r[0]
+    return chain
+
+
+def _contradictions_of(conn, belief_id):
+    try:
+        cons = conn.execute(
+            "SELECT id, belief_a, belief_b, detail, COALESCE(status,'open'), created_at "
+            "FROM contradictions WHERE belief_a=? OR belief_b=? ORDER BY created_at DESC LIMIT 50",
+            (belief_id, belief_id)).fetchall()
+    except sqlite3.Error:
+        return []
+    other_id = {c[0]: (c[2] if c[1] == belief_id else c[1]) for c in cons}
+    by_id = {b["belief_id"]: b for b in _belief_rows(conn, list(other_id.values()))}
+    return [{"id": c[0], "detail": _clip(c[3], 200), "status": c[4], "created_at": c[5],
+             "other": by_id.get(other_id[c[0]])} for c in cons]
+
+
+def _identical_active(conn, table, text_col, row):
+    """Active rows with this belief's exact text in the scope the exact-content
+    merge uses: identical text under another owner or subject is not a copy."""
+    body = row.get(text_col)
+    tcols = _cols(conn, table)
+    if not body or "status" not in tcols:
+        return None
+    scope = [c for c in ("owner", "domain", "note_type", "subject") if c in tcols]
+    where = " AND ".join(["status='active'", "%s=?" % text_col] +
+                         ["COALESCE(%s,'')=COALESCE(?,'')" % c for c in scope])
+    return conn.execute('SELECT COUNT(*) FROM "%s" WHERE %s' % (table, where),
+                        [body] + [row.get(c) for c in scope]).fetchone()[0]
+
+
+_BELIEF_FIELDS = ("status", "confidence", "trust_level", "created_at", "last_seen_at", "valid_from",
+                  "valid_until", "superseded_by", "occurrence_count", "entity_id", "note_type",
+                  "domain", "owner", "salience", "criticality")
+
+
 def belief_detail(db_path, belief_id: str) -> dict:
     """A belief with everything that explains it: the events that justify it,
     what it replaced and what replaced it, what contradicts it, and how many
     identical active copies exist."""
     conn = _connect(db_path)
     try:
-        for table, kind, text_col, label_col in _BELIEF_TABLES:
-            cols = _cols(conn, table)
-            if not cols:
-                continue
-            r = conn.execute('SELECT * FROM "%s" WHERE belief_id=?' % table, (belief_id,)).fetchone()
-            if r is not None:
-                break
-        else:
+        found = _find_belief(conn, belief_id)
+        if found is None:
             return {"found": False, "belief_id": belief_id}
-        row = dict(r)
+        table, kind, text_col, label_col, row = found
         out: Dict[str, Any] = {
             "found": True, "belief_id": belief_id, "kind": kind, "table": table,
             "label": _clip(row.get(label_col), 120), "text": _clip(row.get(text_col), 4000),
         }
-        for k in ("status", "confidence", "trust_level", "created_at", "last_seen_at",
-                  "valid_from", "valid_until", "superseded_by", "occurrence_count",
-                  "entity_id", "note_type", "domain", "owner", "salience", "criticality"):
-            if k in row:
-                out[k] = row[k]
+        out.update({k: row[k] for k in _BELIEF_FIELDS if k in row})
         prov = _payload(row.get("provenance"))
-        out["provenance"] = {
-            "source_type": prov.get("source_type"),
-            "sightings": len(prov.get("provenances") or []) or (1 if prov else 0),
-        }
+        out["provenance"] = {"source_type": prov.get("source_type"),
+                             "sightings": len(prov.get("provenances") or []) or (1 if prov else 0)}
         if kind == "fact" and row.get("entity_id"):
-            try:
-                e = conn.execute("SELECT name FROM entities WHERE belief_id=?",
-                                 (row["entity_id"],)).fetchone()
-                out["entity_name"] = e[0] if e else None
-            except sqlite3.Error:
-                out["entity_name"] = None
-
-        sup = conn.execute(
-            "SELECT e.seq, e.event_id, e.type, e.actor, e.session_id, e.recorded_at, e.payload, j.rule "
-            "FROM justifications j JOIN events e ON e.event_id = j.support "
-            "WHERE j.belief_id=? ORDER BY e.seq LIMIT ?", (belief_id, _SUPPORT_MAX)).fetchall()
-        out["supports"] = [{
-            "seq": s["seq"], "type": s["type"], "actor": s["actor"], "session_id": s["session_id"],
-            "recorded_at": s["recorded_at"], "rule": s["rule"],
-            "text": event_text(s["type"], _payload(s["payload"])),
-        } for s in sup]
+            e = conn.execute("SELECT name FROM entities WHERE belief_id=?", (row["entity_id"],)).fetchone()
+            out["entity_name"] = e[0] if e else None
+        out["supports"] = _supports(conn, belief_id)
         out["supports_total"] = conn.execute(
             "SELECT COUNT(*) FROM justifications WHERE belief_id=?", (belief_id,)).fetchone()[0]
-
-        # supersession: walk both directions, bounded
-        chain_after, cur, seen = [], row.get("superseded_by"), {belief_id}
-        while cur and cur not in seen and len(chain_after) < 20:
-            seen.add(cur)
-            nxt = _belief_rows(conn, [cur])
-            if not nxt:
-                break
-            chain_after.append(nxt[0])
-            try:
-                r2 = conn.execute('SELECT superseded_by FROM "%s" WHERE belief_id=?'
-                                  % nxt[0]["table"], (cur,)).fetchone()
-            except sqlite3.Error:
-                r2 = None
-            cur = r2[0] if r2 else None
-        chain_before, cur = [], belief_id
-        if "superseded_by" in _cols(conn, table):
-            while len(chain_before) < 20:
-                r3 = conn.execute('SELECT belief_id FROM "%s" WHERE superseded_by=? ORDER BY created_at'
-                                  % table, (cur,)).fetchone()
-                if r3 is None or r3[0] in seen:
-                    break
-                seen.add(r3[0])
-                prev = _belief_rows(conn, [r3[0]])
-                if not prev:
-                    break
-                chain_before.insert(0, prev[0])
-                cur = r3[0]
-        out["replaced"] = chain_before
-        out["replaced_by"] = chain_after
-
-        try:
-            cons = conn.execute(
-                "SELECT id, belief_a, belief_b, detail, COALESCE(status,'open'), created_at "
-                "FROM contradictions WHERE belief_a=? OR belief_b=? ORDER BY created_at DESC LIMIT 50",
-                (belief_id, belief_id)).fetchall()
-        except sqlite3.Error:
-            cons = []
-        others = _belief_rows(conn, [c[2] if c[1] == belief_id else c[1] for c in cons])
-        by_id = {b["belief_id"]: b for b in others}
-        out["contradictions"] = [{
-            "id": c[0], "detail": _clip(c[3], 200), "status": c[4], "created_at": c[5],
-            "other": by_id.get(c[2] if c[1] == belief_id else c[1]),
-        } for c in cons]
-
-        body = row.get(text_col)
-        tcols = _cols(conn, table)
-        if body and "status" in tcols:
-            # The same scope the exact-content merge uses: identical text under
-            # another owner or subject is not a copy of this belief.
-            scope = [c for c in ("owner", "domain", "note_type", "subject") if c in tcols]
-            where = " AND ".join(["status='active'", "%s=?" % text_col] +
-                                 ["COALESCE(%s,'')=COALESCE(?,'')" % c for c in scope])
-            out["identical_active"] = conn.execute(
-                'SELECT COUNT(*) FROM "%s" WHERE %s' % (table, where),
-                [body] + [row.get(c) for c in scope]).fetchone()[0]
+        seen = {belief_id}
+        out["replaced_by"] = _replaced_by(conn, row.get("superseded_by"), seen)
+        out["replaced"] = _replaced(conn, table, belief_id, seen)
+        out["contradictions"] = _contradictions_of(conn, belief_id)
+        identical = _identical_active(conn, table, text_col, row)
+        if identical is not None:
+            out["identical_active"] = identical
         return out
     finally:
         conn.close()
@@ -659,7 +679,7 @@ def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Cal
 
     @router.get("/atlas/summary")
     def atlas_summary():
-        return _safe(lambda: _cache.get(("summary", str(_db())), 20, lambda: summary(_db())),
+        return _safe(lambda: _cache.get(("summary", str(_db())), 300, lambda: summary(_db())),
                      {"events": 0})
 
     try:
@@ -684,12 +704,12 @@ def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Cal
         return _safe(lambda: event_detail(_db(), seq), {"found": False})
 
     @router.get("/atlas/session")
-    def atlas_session(id: str = Q("")):
-        return _safe(lambda: session_detail(_db(), id), {"found": False})
+    def atlas_session(session_id: str = Q("", alias="id")):
+        return _safe(lambda: session_detail(_db(), session_id), {"found": False})
 
     @router.get("/atlas/belief")
-    def atlas_belief(id: str = Q("")):
-        return _safe(lambda: belief_detail(_db(), id), {"found": False})
+    def atlas_belief(belief_id: str = Q("", alias="id")):
+        return _safe(lambda: belief_detail(_db(), belief_id), {"found": False})
 
     @router.get("/atlas/contradictions")
     def atlas_contradictions(limit: int = Q(100, ge=1, le=500), offset: int = Q(0, ge=0)):

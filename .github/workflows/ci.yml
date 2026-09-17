@@ -62,3 +62,24 @@ jobs:
 
       - name: Lint (style — reported, not blocking)
         run: ruff check . || true
+
+  dashboard:
+    # dashboard/dist is committed because the Hermes dashboard loads it with no
+    # build step on the host. This job is what keeps it a build artifact rather
+    # than a hand-edited file: rebuild from dashboard/web/src and fail on any diff.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Rebuild the dashboard bundles
+        working-directory: dashboard/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Committed bundles match the source
+        run: git diff --exit-code -- dashboard/dist
