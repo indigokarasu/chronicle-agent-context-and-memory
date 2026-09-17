@@ -27,14 +27,16 @@ exclude. Counted separately from observed vectors in the report: they are a
 different row population, and adding them into one total would misreport how
 much of each was actually there.
 
---orphans: vectors whose source EVENT is no longer in the log. The log is the
-truth and every vector is derived from an event, so a vector of an event that
-does not exist is an index entry with nothing behind it: it cannot be rendered,
-cannot be re-embedded (migrate_vectors counts it unrecoverable on every run)
-and still costs a row in every brute-force scan. Events only leave the log by
-hand (no Chronicle code deletes them); one production store kept 18,394 such
-vectors after a manual purge that removed the events and their FTS rows. The
-same excerpt-proxy and ANN-mirror cleanup applies.
+--orphans: vectors with no OBSERVED event behind them. The log is the truth and
+every row here is the embedding of an observed event's excerpt, so a row whose
+event is missing, or is some other event type, is an index entry with nothing
+behind it: it cannot be rendered, cannot be re-embedded (migrate_vectors counts
+it unrecoverable on every run) and still costs a row in every brute-force scan.
+One production store held both kinds: 18,394 vectors of events removed by a
+manual purge (events only leave the log by hand; no Chronicle code deletes
+them), and 7,612 vectors keyed to `asserted` and `signal` events, written by an
+older build, which carry no excerpt to embed. The same excerpt-proxy and
+ANN-mirror cleanup applies.
 
 Usage:  python3 scripts/prune_vectors.py --db PATH [--session-prefix P]... [--orphans] [--dry-run]
 
@@ -61,15 +63,17 @@ _PROXY_MATCH = ("kind='observed' AND belief_id IN "
                 "(SELECT event_id FROM events WHERE session_id LIKE ? || '%')")
 
 
-# Orphans (--orphans): the source event is gone. `NOT IN` rather than a correlated
-# NOT EXISTS so the SAME fragment applies to vec0, whose table name differs.
-_ORPHAN_MATCH = "event_id NOT IN (SELECT event_id FROM events)"
-_ORPHAN_PROXY_MATCH = "kind='observed' AND belief_id NOT IN (SELECT event_id FROM events)"
+# Orphans (--orphans): no observed event behind the row. `NOT IN` rather than a
+# correlated NOT EXISTS so the SAME fragment applies to vec0, whose table name
+# differs.
+_OBSERVED_IDS = "(SELECT event_id FROM events WHERE type='observed')"
+_ORPHAN_MATCH = "event_id NOT IN " + _OBSERVED_IDS
+_ORPHAN_PROXY_MATCH = "kind='observed' AND belief_id NOT IN " + _OBSERVED_IDS
 
 
 def prune_orphans(db_path: str, dry_run: bool = False) -> int:
     """Delete (or with dry_run only count) observed_vectors, and the doc2query
-    excerpt proxies, whose event is no longer in `events`. Returns the vector
+    excerpt proxies, with no observed event in `events`. Returns the vector
     count; belief-keyed vectors are never touched."""
     conn = sqlite3.connect(db_path)
     try:
@@ -83,7 +87,7 @@ def prune_orphans(db_path: str, dry_run: bool = False) -> int:
             delete_matching(conn, _ORPHAN_MATCH, ())  # best-effort ANN-mirror cleanup
             p = _proxy_rows(conn, "DELETE FROM query_proxy_vectors WHERE " + _ORPHAN_PROXY_MATCH)
             conn.commit()
-        print(f"  orphans (event no longer in the log): {n} vectors, {p} excerpt proxies")
+        print(f"  orphans (no observed event in the log): {n} vectors, {p} excerpt proxies")
         return n
     finally:
         conn.close()
@@ -145,12 +149,12 @@ def _delete_proxies(conn, prefix: str) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Prune observed vectors for sessions matching a prefix, or whose event is gone.")
+        description="Prune observed vectors for sessions matching a prefix, or with no observed event behind them.")
     ap.add_argument("--db", required=True, help="path to chronicle.db")
     ap.add_argument("--session-prefix", action="append", dest="prefixes", default=[], metavar="P",
                     help="session_id prefix to prune (repeatable)")
     ap.add_argument("--orphans", action="store_true",
-                    help="prune vectors whose source event is no longer in the log")
+                    help="prune vectors with no observed event behind them (missing or another event type)")
     ap.add_argument("--dry-run", action="store_true", help="report what would go, delete nothing")
     args = ap.parse_args(argv)
 
