@@ -2382,6 +2382,19 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("UPDATE contradictions SET status='resolved' WHERE id=?", (contradiction_id,))
 
+    def resolve_contradictions_for(self, belief_id: str) -> int:
+        """Close every open contradiction naming `belief_id`. Returns the count.
+
+        Called when a belief stops being active: a contradiction is two beliefs
+        the store cannot both hold, so with one of them gone the pair is no
+        longer a question. Nothing is deleted — the row keeps its detail and its
+        date, and only its status changes."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE contradictions SET status='resolved' "
+                "WHERE status='open' AND (belief_a=? OR belief_b=?)", (belief_id, belief_id))
+            return cur.rowcount or 0
+
     # -- supersede candidates (Ladder 9 E4, §issue-8) -----------------------
 
     def add_supersede_candidate(self, new_belief_id: str, old_belief_id: str, similarity: float,

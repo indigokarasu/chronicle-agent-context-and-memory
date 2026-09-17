@@ -255,6 +255,47 @@ class TestARebuildDoesNotResurrectJunk(_Case):
         self.assertEqual(orphans, [])
 
 
+class TestARetractionClosesItsContradictions(_Case):
+    """A contradiction is two beliefs the store cannot both hold. Retract one and
+    there is nothing left to reconcile — 1,550 open rows naming retracted
+    beliefs is a queue of questions nobody can answer."""
+
+    def _fact(self, predicate, value, src):
+        self.core.capture.append("asserted", {
+            "kind": "fact", "key": {"entity_id": "pat_testley", "predicate_canonical": predicate,
+                                    "attribute": predicate, "qualifiers_hash": "", "qualifiers": {}},
+            "body": value, "confidence": 0.8, "source_event": src,
+            "source_type": "user_direct", "domain": "user"}, actor="user", session_id="s-ent")
+        self.core.process_pending()
+
+    def _open(self):
+        return self._rows("SELECT id, belief_a, belief_b, status FROM contradictions "
+                          "WHERE status='open'")
+
+    def test_retracting_either_side_resolves_it(self):
+        self._fact("lives_in", "Fake City", "ev_a")
+        self._fact("lives_in", "Other Fake City", "ev_b")
+        open_rows = self._open()
+        self.assertTrue(open_rows, "the fixture opened no contradiction")
+        side = open_rows[0]["belief_a"]
+        self.core.capture.append("retracted", {"belief_id": side, "reason": "misattributed"},
+                                 actor="curator")
+        self.core.process_pending()
+        self.assertEqual(self._open(), [])
+        # The row is resolved, not deleted: its detail and date are the record.
+        self.assertEqual([r["status"] for r in self._rows(
+            "SELECT status FROM contradictions")], ["resolved"])
+
+    def test_a_batch_retraction_closes_them_too(self):
+        self._fact("lives_in", "Fake City", "ev_a")
+        self._fact("lives_in", "Other Fake City", "ev_b")
+        ids = [self._open()[0]["belief_a"], self._open()[0]["belief_b"]]
+        self.core.capture.append("retracted", {"belief_ids": ids, "reason": "misattributed"},
+                                 actor="curator")
+        self.core.process_pending()
+        self.assertEqual(self._open(), [])
+
+
 class TestKindsOverTheProjection(_Case):
     def test_an_entitys_kind_comes_from_its_type_then_its_facts(self):
         self._turn("Pat Testley is a pediatrician. Fake City is a city.")
