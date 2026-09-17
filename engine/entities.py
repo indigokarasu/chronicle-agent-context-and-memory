@@ -83,6 +83,11 @@ _KIND_OF_PREDICATE = {
     "birthday": PERSON, "occupation": PERSON, "role": PERSON, "email": PERSON,
     "phone": PERSON, "pronouns": PERSON, "sibling": PERSON, "spouse": PERSON,
     "partner": PERSON, "child": PERSON, "parent": PERSON, "nickname": PERSON,
+    # Only a person attends, is seen, or travels. `attended_event` is the most
+    # common predicate in the production store (366 facts, the calendar import)
+    # and was not here, so a contact whose only trace is a calendar entry stayed
+    # unclassified.
+    "attended_event": PERSON, "had_appointment": PERSON, "traveling_to": PERSON,
     "address": PLACE, "located_in": PLACE, "capital_of": PLACE,
     "occurred_at": EVENT, "attendees": EVENT,
 }
@@ -109,6 +114,18 @@ _SENTENCE_LEAD = re.compile(r"""^(?:so|but|and|or|then|because|since|if|when|whi
                             re.IGNORECASE | re.VERBOSE)
 _MAX_NAME_WORDS, _MAX_NAME_CHARS = 6, 80
 _MAX_TYPE_WORDS, _MAX_TYPE_CHARS = 3, 40
+
+# What people put AFTER their name. A contact record carries these verbatim, and
+# without them the name rule read "<name>, Ph.D." as a sentence (it ends in a
+# full stop) and "<name> (she/her)" as a lower-case word carrying no capital --
+# so several real contacts on the production store could not become entities at
+# all. Both are stripped before the rule looks at the words; neither can make an
+# implausible name plausible, because what is left still has to pass.
+_PRONOUN_TAG = re.compile(r"\s*\((?:[a-z]+/)+[a-z]+\)\s*$")
+_CREDENTIAL = re.compile(r"""[,\s]+(?:ph\.?\s?d|m\.?\s?d|d\.?\s?d\.?\s?s|m\.?b\.?a|m\.?s
+                          |m\.?a|b\.?a|b\.?s|j\.?d|r\.?n|n\.?p|p\.?e|esq|cpa|mph|mfa
+                          |m\.?h\.?c\.?i|jr|sr|ii|iii|iv)\.?$""",
+                         re.IGNORECASE | re.VERBOSE)
 
 
 def entity_token(name: str, etype: str = "") -> str:
@@ -140,6 +157,14 @@ def plausible_name(name) -> bool:
         return False
     if n.lower() in _NOT_A_NAME or _SENTENCE_LEAD.match(n):
         return False
+    n = _PRONOUN_TAG.sub("", n).strip()
+    while True:                       # "<name>, M.A., Ph.D." carries two
+        shorter = _CREDENTIAL.sub("", n).strip()
+        if shorter == n:
+            break
+        n = shorter
+    if not any(ch.isalnum() for ch in n):
+        return False                  # a credential on its own is not a name
     if n[-1] in ".!?,;:" or " | " in n or ": " in n:
         return False           # a sentence, or an importer's subject line
     words = n.split()
