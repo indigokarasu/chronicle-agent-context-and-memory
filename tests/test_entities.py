@@ -296,6 +296,40 @@ class TestARetractionClosesItsContradictions(_Case):
         self.assertEqual(self._open(), [])
 
 
+class TestTheSweepSettlesOldContradictions(_Case):
+    """Rows opened by a build that did not close them: the store is repaired
+    without a one-off script, on the maintenance cadence."""
+
+    def test_an_open_row_naming_a_gone_belief_is_resolved(self):
+        with self.core.store.transaction() as conn:
+            conn.execute("INSERT INTO contradictions(id, belief_a, belief_b, detail, status, "
+                         "created_at) VALUES('con_dead', 'b_gone_a', 'b_gone_b', "
+                         "'value conflict', 'open', '2026-09-01T00:00:00.000Z')")
+        self.assertEqual(self.core.health.settle_dead_contradictions(), 1)
+        self.assertEqual([r["status"] for r in self._rows("SELECT status FROM contradictions")],
+                         ["resolved"])
+        self.assertEqual(self.core.health.settle_dead_contradictions(), 0)
+
+    def test_a_row_between_two_live_beliefs_is_left_open(self):
+        for i, value in enumerate(("Fake City", "Other Fake City")):
+            self.core.capture.append("asserted", {
+                "kind": "fact", "key": {"entity_id": "pat_testley", "predicate_canonical": "lives_in",
+                                        "attribute": "lives_in", "qualifiers_hash": "q%d" % i,
+                                        "qualifiers": {"n": i}},
+                "body": value, "confidence": 0.8, "source_event": "ev_%d" % i,
+                "source_type": "user_direct", "domain": "user"}, actor="user")
+        self.core.process_pending()
+        live = self._rows("SELECT belief_id FROM facts WHERE status='active' LIMIT 2")
+        with self.core.store.transaction() as conn:
+            conn.execute("INSERT INTO contradictions(id, belief_a, belief_b, detail, status, "
+                         "created_at) VALUES('con_live', ?, ?, 'value conflict', 'open', "
+                         "'2026-09-01T00:00:00.000Z')",
+                         (live[0]["belief_id"], live[1]["belief_id"]))
+        self.assertEqual(self.core.health.settle_dead_contradictions(), 0)
+        self.assertEqual([r["status"] for r in self._rows(
+            "SELECT status FROM contradictions WHERE id='con_live'")], ["open"])
+
+
 class TestKindsOverTheProjection(_Case):
     def test_an_entitys_kind_comes_from_its_type_then_its_facts(self):
         self._turn("Pat Testley is a pediatrician. Fake City is a city.")

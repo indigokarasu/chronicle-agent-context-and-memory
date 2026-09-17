@@ -45,8 +45,11 @@ facts — because the extractor's entity token never reached the fold.
   beliefs the store cannot both hold; once one side is retracted there is
   nothing left to reconcile, but the row stayed `open`. The cleanup of 112,652
   beliefs left 1,550 such rows on a production store — a queue of questions
-  nobody can answer. The row is resolved, never deleted: its detail and its date
-  are the record.
+  nobody can answer, and the first number the memory view shows. The row is
+  resolved, never deleted: its detail and its date are the record. The
+  consistency sweep settles the ones a store already holds, so a repair needs no
+  one-off script: on the cleaned production snapshot it settles all 1,550 and
+  leaves every contradiction between two live beliefs open.
 
 **The Tapestry is entity-first.** The memory view was a log: every event on the
 row of whatever wrote it. That is provenance — how a memory arrived — and it is
