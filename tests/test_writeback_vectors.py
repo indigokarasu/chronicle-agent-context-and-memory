@@ -1059,5 +1059,168 @@ class TestManifest(_WBCase):
         self.assertEqual(self._run(manifest_path=junk), 1)
 
 
+# ==========================================================================
+# an unreadable or empty source is a refusal, never an empty success
+# ==========================================================================
+def _to_sidecarless_wal(path):
+    """Put `path` in the state a `.backup` of the production store is in: a WAL
+    header and no -wal/-shm. The fixture's store closes in rollback-journal mode,
+    which `mode=ro` opens fine, and that is how an empty-manifest bug survived
+    every test here while failing on the first real copy."""
+    c = sqlite3.connect(path)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.close()
+    for ext in ("-wal", "-shm"):        # Apple's SQLite keeps them; Linux's removes them
+        p = path + ext
+        if os.path.exists(p):
+            assert ext == "-shm" or os.path.getsize(p) == 0, "uncheckpointed frames"
+            os.remove(p)
+    assert open(path, "rb").read(20)[18:20] == b"\x02\x02", "not a WAL header"
+
+
+class TestUnreadableOrEmptySourceRefuses(_WBCase):
+    def _require_ro_fails(self, path):
+        probe = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            probe.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error:
+            return
+        finally:
+            probe.close()
+        self.skipTest("this SQLite opens a sidecar-less WAL database read-only")
+
+    def _counts_then(self):
+        return json.loads(open(self.manifest).readline())["row_counts"]
+
+    def test_sidecarless_wal_copy_builds_the_full_manifest(self):
+        _to_sidecarless_wal(self.copy)
+        self._require_ro_fails(self.copy)
+        before = _file_sha(self.copy)
+        out = os.path.join(self.home, "wal.jsonl")
+        n = WB.build_manifest(self.copy, out, live_db=self.live, verbose=False)
+        header = json.loads(open(out).readline())
+        self.assertEqual(header["row_counts"], self._counts_then())
+        self.assertEqual(n, sum(self._counts_then().values()))
+        self.assertGreater(n, 0)
+        self.assertEqual(_file_sha(self.copy), before, "reading the copy changed it")
+
+    def test_writeback_reads_a_sidecarless_wal_copy(self):
+        _to_sidecarless_wal(self.copy)
+        self._require_ro_fails(self.copy)
+        rc, counts, out = self._run_counts()
+        self.assertNotIn("REFUSED", out)
+        self.assertIn(rc, (0, 2))
+        self.assertGreater(counts.get("applied", 0), 0)
+
+    def test_live_is_never_opened_immutable(self):
+        _to_sidecarless_wal(self.copy)
+        self._require_ro_fails(self.copy)
+        with self.assertRaises(WB.Refused):
+            WB._open_ro(self.copy)
+
+    def test_a_copy_whose_wal_holds_frames_is_never_read_immutable(self):
+        """immutable=1 ignores the -wal: here it would not even see the table."""
+        db = os.path.join(self.home, "framed.db")
+        c = sqlite3.connect(db)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA wal_autocheckpoint=0")
+        c.execute("CREATE TABLE memory_vectors(belief_id, kind, embedding, model)")
+        c.execute("INSERT INTO memory_vectors VALUES('b_1', 'fact', x'00', 'm')")
+        c.commit()
+        frozen = os.path.join(self.home, "frozen.db")
+        shutil.copy(db, frozen)
+        shutil.copy(db + "-wal", frozen + "-wal")
+        c.close()
+        self.assertGreater(os.path.getsize(frozen + "-wal"), 0)
+        real_connect = sqlite3.connect
+        missing = os.path.join(self.home, "no-such-dir", "x.db")
+
+        def connect(target, *a, **kw):
+            if "immutable=1" not in str(target):
+                target = "file:%s?mode=ro" % missing        # the read-only open fails
+            return real_connect(target, *a, **kw)
+
+        with mock.patch.object(WB.sqlite3, "connect", connect):
+            with self.assertRaises(WB.Refused) as ctx:
+                WB._open_ro(frozen, static=True)
+        self.assertIn("-wal holds frames", str(ctx.exception))
+
+    def test_unreadable_copy_writes_no_manifest(self):
+        import io
+        import contextlib
+        junk = os.path.join(self.home, "junk.db")
+        open(junk, "wb").write(b"Acme Fake Co is not a database. " * 200)
+        out = os.path.join(self.home, "junk.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = WB.main([self.live, junk, "--build-manifest", out])
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(out))
+
+    def test_schema_read_failure_is_not_absence(self):
+        conn = sqlite3.connect(self.copy)
+        conn.close()
+        with self.assertRaises(WB.Refused):
+            WB._has_table(conn, "memory_vectors")
+
+    def test_a_count_that_fails_does_not_drop_the_table(self):
+        real = sqlite3.connect(self.copy)
+
+        class Flaky:
+            def execute(self, sql, *a):
+                if sql.startswith("SELECT COUNT(*)"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real.execute(sql, *a)
+
+        try:
+            with self.assertRaises(WB.Refused):
+                WB._row_counts(Flaky(), ["memory_vectors"])
+        finally:
+            real.close()
+
+    def _empty_the_copy(self):
+        c = sqlite3.connect(self.copy)
+        with c:
+            for t in WB._TABLES:
+                c.execute('DELETE FROM "%s"' % t)
+        c.close()
+
+    def test_a_copy_with_no_vector_rows_refuses_to_build(self):
+        self._empty_the_copy()
+        out = os.path.join(self.home, "none.jsonl")
+        with self.assertRaises(WB.Refused):
+            WB.build_manifest(self.copy, out, verbose=False)
+        self.assertFalse(os.path.exists(out))
+
+    def test_the_empty_manifest_the_old_build_wrote_is_refused(self):
+        header = json.loads(open(self.manifest).readline())
+        header["row_counts"] = {}
+        empty = os.path.join(self.home, "old-empty.jsonl")
+        open(empty, "w").write(json.dumps(header) + "\n")
+        rc, _counts, out = self._run_counts(manifest_path=empty, state_path=self.state + ".e")
+        self.assertEqual(rc, 1)
+        self.assertIn("Nothing was written", out)
+
+    def test_a_zero_row_manifest_is_refused_even_when_it_matches_the_copy(self):
+        self._empty_the_copy()
+        header = json.loads(open(self.manifest).readline())
+        header["row_counts"] = dict((t, 0) for t in header["row_counts"])
+        zero = os.path.join(self.home, "zero.jsonl")
+        open(zero, "w").write(json.dumps(header) + "\n")
+        rc, _counts, out = self._run_counts(manifest_path=zero, state_path=self.state + ".z")
+        self.assertEqual(rc, 1)
+        self.assertIn("records 0 rows", out)
+
+    def test_a_table_the_copy_lost_is_refused(self):
+        c = sqlite3.connect(self.copy)
+        c.execute("DROP TABLE projection_vectors")
+        c.commit()
+        c.close()
+        rc, _counts, out = self._run_counts()
+        self.assertEqual(rc, 1)
+        self.assertIn("projection_vectors is in the manifest", out)
+        self.assertIn("Nothing was written", out)
+
+
 if __name__ == "__main__":
     unittest.main()
