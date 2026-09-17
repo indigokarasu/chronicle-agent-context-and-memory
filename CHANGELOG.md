@@ -48,6 +48,12 @@ What changed:
   unlabelled continuation chunk and role-less rescue text are nobody's, and an
   event's `actor` is trusted only when it has no source type.
   A plain turn with no host context keeps its old payload and event id.
+* **Measured.** LongMemEval oracle turn-level union recall 70.6% / 88.3% /
+  93.0% / 96.3% at k=1/3/5/10, from 68.2 / 87.6 / 93.6 / 96.0; abstention
+  unchanged at 3/17. `ctx_eval` answers 46/58 at a 1500-token budget, one fewer
+  than before, and 50/58 and 52/58 at 4000 and 12000, unchanged. The corpus
+  labels its turns `user`, so on it the new rules mostly change the "X is a Y"
+  typing; the production effect is the 112,652 beliefs below.
 * **`scripts/retract_misattributed.py`** retracts beliefs whose every channel is
   transcript extraction and whose supporting events never show the user saying
   them (a fact's value or note's body must appear in the user's words; an episode
