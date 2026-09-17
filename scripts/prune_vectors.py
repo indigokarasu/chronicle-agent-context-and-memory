@@ -27,7 +27,16 @@ exclude. Counted separately from observed vectors in the report: they are a
 different row population, and adding them into one total would misreport how
 much of each was actually there.
 
-Usage:  python3 scripts/prune_vectors.py --db PATH --session-prefix P [--session-prefix Q]... [--dry-run]
+--orphans: vectors whose source EVENT is no longer in the log. The log is the
+truth and every vector is derived from an event, so a vector of an event that
+does not exist is an index entry with nothing behind it: it cannot be rendered,
+cannot be re-embedded (migrate_vectors counts it unrecoverable on every run)
+and still costs a row in every brute-force scan. Events only leave the log by
+hand (no Chronicle code deletes them); one production store kept 18,394 such
+vectors after a manual purge that removed the events and their FTS rows. The
+same excerpt-proxy and ANN-mirror cleanup applies.
+
+Usage:  python3 scripts/prune_vectors.py --db PATH [--session-prefix P]... [--orphans] [--dry-run]
 
 Exit codes:  0 = pruned (possibly nothing matched)   1 = usage / db error
 """
@@ -50,6 +59,43 @@ _MATCH = "event_id IN (SELECT event_id FROM events WHERE session_id LIKE ? || '%
 # event id in `belief_id` and are distinguished from belief proxies by kind.
 _PROXY_MATCH = ("kind='observed' AND belief_id IN "
                 "(SELECT event_id FROM events WHERE session_id LIKE ? || '%')")
+
+
+# Orphans (--orphans): the source event is gone. `NOT IN` rather than a correlated
+# NOT EXISTS so the SAME fragment applies to vec0, whose table name differs.
+_ORPHAN_MATCH = "event_id NOT IN (SELECT event_id FROM events)"
+_ORPHAN_PROXY_MATCH = "kind='observed' AND belief_id NOT IN (SELECT event_id FROM events)"
+
+
+def prune_orphans(db_path: str, dry_run: bool = False) -> int:
+    """Delete (or with dry_run only count) observed_vectors, and the doc2query
+    excerpt proxies, whose event is no longer in `events`. Returns the vector
+    count; belief-keyed vectors are never touched."""
+    conn = sqlite3.connect(db_path)
+    try:
+        if dry_run:
+            n = conn.execute("SELECT COUNT(*) FROM observed_vectors WHERE " + _ORPHAN_MATCH
+                             ).fetchone()[0]
+            p = _proxy_rows(conn, "SELECT COUNT(*) FROM query_proxy_vectors WHERE "
+                            + _ORPHAN_PROXY_MATCH)
+        else:
+            n = conn.execute("DELETE FROM observed_vectors WHERE " + _ORPHAN_MATCH).rowcount
+            delete_matching(conn, _ORPHAN_MATCH, ())  # best-effort ANN-mirror cleanup
+            p = _proxy_rows(conn, "DELETE FROM query_proxy_vectors WHERE " + _ORPHAN_PROXY_MATCH)
+            conn.commit()
+        print(f"  orphans (event no longer in the log): {n} vectors, {p} excerpt proxies")
+        return n
+    finally:
+        conn.close()
+
+
+def _proxy_rows(conn, sql: str) -> int:
+    """COUNT result or DELETE rowcount; 0 on a store predating query_proxy_vectors."""
+    try:
+        cur = conn.execute(sql)
+        return cur.fetchone()[0] if sql.startswith("SELECT") else cur.rowcount
+    except sqlite3.OperationalError:
+        return 0
 
 
 def prune_vectors(db_path: str, prefixes: list[str], dry_run: bool = False) -> int:
@@ -97,16 +143,19 @@ def _delete_proxies(conn, prefix: str) -> int:
         return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Prune observed vectors for sessions matching a prefix.")
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Prune observed vectors for sessions matching a prefix, or whose event is gone.")
     ap.add_argument("--db", required=True, help="path to chronicle.db")
     ap.add_argument("--session-prefix", action="append", dest="prefixes", default=[], metavar="P",
                     help="session_id prefix to prune (repeatable)")
+    ap.add_argument("--orphans", action="store_true",
+                    help="prune vectors whose source event is no longer in the log")
     ap.add_argument("--dry-run", action="store_true", help="report what would go, delete nothing")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    if not args.prefixes:
-        print("no --session-prefix given; nothing to prune", file=sys.stderr)
+    if not args.prefixes and not args.orphans:
+        print("no --session-prefix or --orphans given; nothing to prune", file=sys.stderr)
         return 1
     if not Path(args.db).exists():
         print(f"no such db: {args.db}", file=sys.stderr)
@@ -114,7 +163,9 @@ def main() -> int:
 
     print(f"{'Would prune' if args.dry_run else 'Pruning'} observed vectors in {args.db}")
     try:
-        total = prune_vectors(args.db, args.prefixes, dry_run=args.dry_run)
+        total = prune_vectors(args.db, args.prefixes, dry_run=args.dry_run) if args.prefixes else 0
+        if args.orphans:
+            total += prune_orphans(args.db, dry_run=args.dry_run)
     except sqlite3.Error as e:
         print(f"sqlite error: {e}", file=sys.stderr)
         return 1
