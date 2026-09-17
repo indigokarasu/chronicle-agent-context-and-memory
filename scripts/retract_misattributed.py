@@ -49,6 +49,7 @@ import collections
 import json
 import sqlite3
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -67,7 +68,8 @@ TABLES = {
 }
 
 REASON = "misattributed"
-_DEFAULT_BATCH = 250          # belief ids per `retracted` event
+_DEFAULT_BATCH = 100          # belief ids per `retracted` event
+_RETRIES = 6                  # per batch, on a write lock held by the live agent
 
 
 def _fold(s) -> str:
@@ -271,19 +273,47 @@ def apply(db_path: str, targets, batch: int = _DEFAULT_BATCH) -> tuple:
     try:
         reducer = Reducer(store, None, Config({}))
         capture = CaptureEngine(store, reducer, cfg=Config({}))
-        beliefs = events = 0
+        beliefs = events = waits = 0
         for owner, ids in sorted(by_owner.items()):
             for i in range(0, len(ids), max(1, batch)):
                 chunk = ids[i:i + batch]
-                capture.append("retracted", {"belief_ids": chunk, "reason": REASON},
-                               actor="curator", owner=owner)
+                waits += _append_with_retry(capture, chunk, owner)
                 beliefs += len(chunk)
                 events += 1
                 if events % 20 == 0:
-                    print("  retracted %d of %d beliefs" % (beliefs, len(targets)), flush=True)
+                    print("  retracted %d of %d beliefs (%d lock waits)"
+                          % (beliefs, len(targets), waits), flush=True)
+        if waits:
+            print("  waited for the store's write lock %d time(s)" % waits, flush=True)
         return beliefs, events
     finally:
         store.close()
+
+
+def _append_with_retry(capture, chunk, owner) -> int:
+    """Append one retraction, waiting out the live agent's write lock.
+
+    A cleanup runs against a store an agent is still writing to, and SQLite has
+    one writer: on the production box the apply reached 17 batches and then died
+    with "database is locked" — the run is restartable (a retracted belief is no
+    longer a candidate), but stopping on the first collision means babysitting a
+    two-hour job. Returns the number of waits so the run reports contention
+    rather than hiding it."""
+    delay, waits = 2.0, 0
+    for attempt in range(_RETRIES):
+        try:
+            capture.append("retracted", {"belief_ids": chunk, "reason": REASON},
+                           actor="curator", owner=owner)
+            return waits
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            if attempt == _RETRIES - 1:
+                raise
+            waits += 1
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
+    return waits
 
 
 def main(argv=None) -> int:

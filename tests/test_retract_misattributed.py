@@ -198,6 +198,40 @@ class TestRetractMisattributed(unittest.TestCase):
         self.p.core.reducer.rebuild()
         self.assertEqual(self._status(), before)
 
+    def test_a_held_write_lock_is_waited_out_not_fatal(self):
+        """The store has one writer and an agent is using it: the apply waits
+        rather than dying 17 batches in, as it did on the production box."""
+        import scripts.retract_misattributed as mod
+        calls = {"n": 0}
+        real_sleep = mod.time.sleep
+
+        class _LockedOnce:
+            def __init__(self, capture):
+                self.capture = capture
+
+            def append(self, *a, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return self.capture.append(*a, **kw)
+
+        mod.time.sleep = lambda _s: None
+        try:
+            waits = mod._append_with_retry(_LockedOnce(self.cap), ["b_x"], "default")
+        finally:
+            mod.time.sleep = real_sleep
+        self.assertEqual((waits, calls["n"]), (1, 2))
+
+    def test_an_error_that_is_not_a_lock_is_raised(self):
+        import scripts.retract_misattributed as mod
+
+        class _Broken:
+            def append(self, *a, **kw):
+                raise sqlite3.OperationalError("no such table: events")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            mod._append_with_retry(_Broken(), ["b_x"], "default")
+
     def test_a_missing_database_is_an_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(main(["--db", str(Path(self.home) / "nope.db")]), 1)
