@@ -20,6 +20,7 @@ from . import doc2query
 from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
 from . import sweeps
+from . import speaker as spk
 from .criticality import classify as classify_criticality
 from .embeddings import EmbeddingsUnavailable, cosine, embedder_model_tag, pack, unpack
 from .serialize import belief_id as compute_belief_id
@@ -675,11 +676,23 @@ class Reducer:
                                      created_at=event.get("recorded_at") or "")
 
     def _on_retracted(self, event):
+        """One retraction, or one decision that retracts many (`belief_ids`).
+
+        A cleanup is a single decision about a whole class of beliefs, and
+        scripts/retract_misattributed.py found 112,652 of them in one production
+        store. Writing that as 112,652 events would put 112,652 transactions,
+        git-mirror rows and reduces through a live agent's write path on a
+        CPU-capped box; as a batch it is a few hundred. Each id is retracted and
+        cascaded exactly as a single-id event would be, so a replay of either
+        shape reaches the same projection (I3)."""
         p = _payload(event)
-        b_id = p.get("belief_id")
-        if b_id:
-            self._retract(b_id)
-            self._cascade(b_id, source=event["event_id"], now=event.get("recorded_at") or "")
+        ids = p.get("belief_ids")
+        if not isinstance(ids, list):
+            ids = [p.get("belief_id")]
+        for b_id in ids:
+            if b_id and isinstance(b_id, str):
+                self._retract(b_id)
+                self._cascade(b_id, source=event["event_id"], now=event.get("recorded_at") or "")
 
     def _on_forbidden(self, event):
         """Erase every trace of forbidden content — the one fold §A9 does NOT
@@ -1759,6 +1772,13 @@ def _is_operational(event, p, excerpt) -> bool:
     # An autonomous agent turn: a session transcript with no user content
     # (capture.observe tags actor='agent' exactly when user_content is empty).
     if src == "session_transcript" and event.get("actor") == "agent":
+        return True
+    # Nobody but the user can be the source of memory about the user: a turn
+    # whose every line is a scheduled job, the assistant, a tool or the host
+    # (engine/speaker.py) is not promoted. The curation worker applies the same
+    # test to jobs already queued.
+    if not spk.has_human(spk.attribute_lines(p, session_id=event.get("session_id") or "",
+                                             actor=event.get("actor") or "")):
         return True
     head = (excerpt or "")[:400]
     low = head.lstrip().lower()

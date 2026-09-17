@@ -37,6 +37,7 @@ import os
 import urllib.parse
 
 from . import access, sweeps
+from . import speaker as spk
 from .embeddings import (
     EmbeddingsUnavailable,
     cosine,
@@ -126,6 +127,19 @@ _DOMAIN = {"user_direct": "user", "session_transcript": "user", "rescue_extracti
 
 def domain_for(source_type: str) -> str:
     return _DOMAIN.get(source_type, "general")
+
+
+def _accepts_lines(extractor) -> bool:
+    """Whether a (possibly third-party) extractor takes the `lines` attribution.
+    One written to the older interface still runs; the no-human gate in
+    _task_extract has already kept automation-only events away from it."""
+    import inspect
+    try:
+        params = inspect.signature(extractor.extract).parameters
+    except (TypeError, ValueError):
+        return False
+    return "lines" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                    for p in params.values())
 
 
 # -- topic-shift episode boundaries (§E6, curation.topic_shift_threshold) --
@@ -329,10 +343,28 @@ class CurationWorker:
         p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
         excerpt = p.get("excerpt", "")
         source_type = p.get("source_type", "session_transcript")
+        # Who said each line (engine/speaker.py): the spans recorded at capture,
+        # or the legacy reading, which never assumes the user. Memory about the
+        # user comes only from the user's own words, so an event with none of
+        # them is left raw-indexed for recall and extracts nothing.
+        lines = spk.attribute_lines(p, session_id=ev.get("session_id") or "",
+                                    actor=ev.get("actor") or "")
+        if source_type != "agent_memory_write" and not spk.has_human(lines):
+            self.store.record_extraction(eid, version, {"skipped": "no_human_speaker"}, 0, "skip")
+            self._advance_watermark(ev)
+            return
+        if source_type == "agent_memory_write":
+            # An explicit save by the agent (on_memory_write) is the agent's own
+            # deliberate record, kept under the agent domain; its text is read as
+            # written.
+            lines = [(ln, spk.HUMAN) for ln in excerpt.split("\n") if ln.strip()]
         domain = domain_for(source_type)
         owner = ev["owner"]
-        result = self.core.extractor.extract(excerpt, source_event=eid, owner=owner,
-                                             domain=domain, session_id=ev.get("session_id") or "")
+        kwargs = {"source_event": eid, "owner": owner, "domain": domain,
+                  "session_id": ev.get("session_id") or ""}
+        if _accepts_lines(self.core.extractor):
+            kwargs["lines"] = lines
+        result = self.core.extractor.extract(excerpt, **kwargs)
         # Every item that survives routing becomes an `asserted` event whose reduce
         # embeds its body — one blocking round trip each against a networked
         # backend, which is where this job spends nearly all of its wall clock. The
@@ -1002,9 +1034,15 @@ class CurationWorker:
                         text = fh.read()
                 except OSError:
                     continue
+                # Skill journals are written by the agent's own runs, not by the
+                # user: kept for recall, never read as the user's words.
+                excerpt = text[:4000]
                 self.core.capture.append("observed",
-                                         {"source_type": "ocas_journal", "excerpt": text[:4000],
-                                          "source_ref": fp}, actor="user", trust_level=2)
+                                         {"source_type": "ocas_journal", "excerpt": excerpt,
+                                          "source_ref": fp,
+                                          "speakers": [[0, len(excerpt), spk.AUTOMATION]]
+                                          if excerpt else []},
+                                         actor="system", trust_level=2)
 
     # -- federation sweep (§14, g4) ----------------------------------------
 

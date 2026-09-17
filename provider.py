@@ -46,6 +46,15 @@ def _load_hostmodel():
     return hostmodel
 
 
+def _speaker():
+    """engine.speaker, dual-mode like every other engine import here."""
+    try:
+        from .engine import speaker  # plugin-package context
+    except Exception:
+        from engine import speaker  # top-level (dev/tests)
+    return speaker
+
+
 def _op_markers():
     """The reducer's own operational-exhaust markers (§issue-7.1): reused rather
     than re-invented, so a tool result that would never be promoted out of an
@@ -125,6 +134,8 @@ class ChronicleMemoryProvider(MemoryProvider):
         self.scope = None
         self._session_id = ""
         self._principal_id = "default"
+        self._host_context = {}
+        self._turn_author = None     # who wrote THIS turn; reset every turn
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -138,6 +149,11 @@ class ChronicleMemoryProvider(MemoryProvider):
         self.core.has_memory_provider = True
         self._session_id = session_id
         self._principal_id = principal_id
+        # Who is on the user side of this agent (engine/speaker.py). Hermes sends
+        # agent_context "primary" | "subagent" | "cron" | "flush" and the platform;
+        # a host that sends neither is treated as a person typing.
+        self._host_context = {k: str(kw[k]) for k in ("agent_context", "platform")
+                              if kw.get(k)}
         self.scope = self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
         logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
@@ -185,20 +201,35 @@ class ChronicleMemoryProvider(MemoryProvider):
 
     # -- capture -----------------------------------------------------------
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+    def _speaker_context(self, turn_author=None) -> dict:
+        ctx = dict(self._host_context)
+        author = turn_author if isinstance(turn_author, dict) else self._turn_author
+        if isinstance(author, dict):
+            ctx["author"] = author
+        return ctx
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None,
+                  turn_author=None):
         if not self.core:
             return
         # MUST be non-blocking — one local append, no network. Unchanged, and it
         # runs FIRST: durable capture never waits on, or is affected by, the
         # optional piggyback below.
+        # `turn_author` is {"id", "name", "is_bot"}; Hermes sends it only to a
+        # sync_turn that accepts it, and only when the turn has a known author.
+        ctx = self._speaker_context(turn_author)
+        sid = session_id or self._session_id
         event_id = self.core.capture.observe(user_content, assistant_content,
-                                             session_id=session_id or self._session_id,
-                                             messages=messages)
+                                             session_id=sid, messages=messages,
+                                             speaker_context=ctx)
         if not self._piggyback_enabled():
             return  # §H1: default OFF — nothing below this line ever runs
+        if _speaker().user_side(agent_context=ctx.get("agent_context", ""),
+                                platform=ctx.get("platform", ""), session_id=sid,
+                                author=ctx.get("author")) != _speaker().HUMAN:
+            return  # enrichment extracts memory about the user; this turn has no user in it
         try:
-            self._host_model_turn(event_id, user_content, assistant_content,
-                                  session_id or self._session_id)
+            self._host_model_turn(event_id, user_content, assistant_content, sid)
         except Exception as e:  # a side channel may never break capture (I12/I18)
             logger.debug("Chronicle host-model piggyback skipped this turn: %s", e)
 
@@ -285,7 +316,8 @@ class ChronicleMemoryProvider(MemoryProvider):
             return ""
         if self.core.has_context_engine:
             return ""  # the Context Engine owns compression when active
-        _, summary = self.core.capture.rescue(messages, session_id=self._session_id)
+        _, summary = self.core.capture.rescue(messages, session_id=self._session_id,
+                                              speaker_context=self._speaker_context())
         return summary
 
     def on_session_end(self, messages):
@@ -441,6 +473,17 @@ class ChronicleMemoryProvider(MemoryProvider):
             self.on_session_switch(sid, reset=True)
 
     def on_turn_start(self, turn_number, message, **kw):
+        # The host names this turn's author here as well as on sync_turn
+        # (MemoryProvider.on_turn_start: "author_id, author_name, author_is_bot
+        # ... None, None, False without one"), and a shared session carries
+        # several participants. Stashed for the turn's capture, and REPLACED on
+        # every turn including with nothing: a cached gateway agent must never
+        # carry the previous turn's bot author into a person's turn.
+        if "author_id" in kw or "author_name" in kw or "author_is_bot" in kw:
+            author = {"id": kw.get("author_id") or None, "name": kw.get("author_name") or None,
+                      "is_bot": bool(kw.get("author_is_bot"))}
+            self._turn_author = author if (author["id"] or author["name"]
+                                           or author["is_bot"]) else None
         if self.core:
             self.core.capture._touch_session(self._session_id)
             self.core.tick()
