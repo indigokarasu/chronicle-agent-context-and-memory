@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from test_dashboard_atlas import _load  # the by-path loader with the fastapi stub
+from test_dashboard_tapestry import _load  # the by-path loader with the fastapi stub
 
 DASH = Path(__file__).parent.parent / "dashboard"
 _CALL = re.compile(r'API \+ "(/[a-z0-9/_-]+)')
@@ -45,8 +45,8 @@ class TestManifestPointsAtRealFiles(unittest.TestCase):
                 self.assertTrue((DASH / manifest[key]).is_file(),
                                 "manifest %s %r does not exist in the plugin" % (key, manifest[key]))
 
-    def test_the_lazy_atlas_bundle_exists(self):
-        self.assertTrue((DASH / "dist" / "atlas.js").is_file())
+    def test_the_lazy_tapestry_bundle_exists(self):
+        self.assertTrue((DASH / "dist" / "tapestry.js").is_file())
 
 
 class TestUiCallsOnlyDeclaredRoutes(unittest.TestCase):
@@ -59,12 +59,12 @@ class TestUiCallsOnlyDeclaredRoutes(unittest.TestCase):
     def test_every_call_is_a_declared_route(self):
         declared = _declared_routes()
         calls = self._calls()
-        self.assertIn("/atlas/events", calls, "source scan found no Atlas calls")
+        self.assertIn("/tapestry/log/events", calls, "source scan found no Tapestry calls")
         self.assertEqual(sorted(calls - declared), [], "UI calls routes plugin_api does not declare")
 
     def test_the_built_bundles_carry_the_same_calls(self):
         built = (DASH / "dist" / "index.js").read_text(encoding="utf-8") + \
-            (DASH / "dist" / "atlas.js").read_text(encoding="utf-8")
+            (DASH / "dist" / "tapestry.js").read_text(encoding="utf-8")
         for path in self._calls():
             # assertTrue, not assertIn: a failing assertIn prints the whole bundle
             self.assertTrue('"%s' % path in built, "dist is stale: %s is not in the built bundles" % path)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 
+from . import entities as ents
 from . import speaker as spk
 from .embeddings import RemoteEndpointRefused, check_endpoint
 from .serialize import qualifiers_hash
@@ -203,9 +204,10 @@ def canonical_predicate(surface: str):
     return (re.sub(r"\s+", "_", s), "single")
 
 
-def entity_token(name: str, etype: str = "") -> str:
-    norm = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
-    return norm or "unknown"
+# An entity's id lives with the rest of what an entity is (engine/entities.py);
+# re-exported here because hostmodel, derivation and the tools import it from
+# this module.
+entity_token = ents.entity_token
 
 
 # -- relation / possession patterns (A6) ----------------------------------
@@ -343,11 +345,14 @@ class HeuristicExtractor(Extractor):
                 # ("My wife Robin ..." is handled by the relation patterns).
                 m = re.match(r"([A-Z][\w .'-]+?)\s+is\s+(?:a|an)\s+([\w ]+)", line)
                 if m and not _THIRD_PERSON_SUBJ.match(m.group(1)):
-                    ent = entity_token(m.group(1))
-                    add(_entity_item(m.group(1).strip(), m.group(2).strip(), owner, domain,
-                                     source_event))
-                    add(_fact_item(ent, "is_a", m.group(2).strip(), owner, domain, source_event,
-                                   "session_transcript", entity_name=m.group(1).strip()))
+                    subject, etype = m.group(1).strip(), m.group(2).strip()
+                    # "This is a real managed challenge" is a sentence, not an
+                    # entity of type "real managed challenge" (engine/entities.py).
+                    if ents.plausible_name(subject) and ents.plausible_type(etype):
+                        tok = entity_token(subject)
+                        add(_entity_item(subject, etype, owner, domain, source_event))
+                        add(_fact_item(tok, "is_a", etype, owner, domain, source_event,
+                                       "session_transcript", entity_name=subject))
 
         # An episodic summary of the turn with tiered abstraction levels
         if len(text) > 60:
@@ -380,7 +385,8 @@ class HeuristicExtractor(Extractor):
         if m:
             name, rel = m.group(1).strip(), m.group(2).strip().lower()
             tok = entity_token(name)
-            out.append(_entity_item(name, "person", owner, domain, source_event))
+            if ents.plausible_name(name):
+                out.append(_entity_item(name, "person", owner, domain, source_event))
             out.append(_fact_item(tok, "role", rel, owner, domain, source_event,
                                   "session_transcript", entity_name=name))
             out.append(_fact_item("user", _REL_PRED[rel], name, owner, domain, source_event,
@@ -392,8 +398,9 @@ class HeuristicExtractor(Extractor):
                 rel, name = m.group(1).strip().lower(), m.group(2).strip()
                 pred = _REL_PRED[rel]
                 tok = entity_token(name)
-                out.append(_entity_item(name, "person" if pred in _PERSON_REL else "animal",
-                                        owner, domain, source_event))
+                if ents.plausible_name(name):
+                    out.append(_entity_item(name, "person" if pred in _PERSON_REL else "animal",
+                                            owner, domain, source_event))
                 out.append(_fact_item("user", pred, name, owner, domain, source_event,
                                       "user_direct"))
                 tail = line[m.end():].strip().lstrip(",").strip()
@@ -415,7 +422,8 @@ class HeuristicExtractor(Extractor):
         m = _PET_NAMED.search(line)
         if m:
             name = m.group(2).strip()
-            out.append(_entity_item(name, "animal", owner, domain, source_event))
+            if ents.plausible_name(name):
+                out.append(_entity_item(name, "animal", owner, domain, source_event))
             out.append(_fact_item("user", "pet", name, owner, domain, source_event, "user_direct"))
             grounded = True
 
@@ -451,7 +459,8 @@ class HeuristicExtractor(Extractor):
             val = _clean_value(m.group(1))
             out.append(_fact_item("user", "works_at", val, owner, domain, source_event,
                                   "user_direct"))
-            out.append(_entity_item(val, "organization", owner, domain, source_event))
+            if ents.plausible_name(val):
+                out.append(_entity_item(val, "organization", owner, domain, source_event))
         else:
             m = re.search(r"\bi\s+(work at|work in|work for|works at|works in|live in|lives in)\s+(.+)",
                           low)
@@ -460,7 +469,7 @@ class HeuristicExtractor(Extractor):
                 val = _clean_value(_trim_clause(line[m.start(2):]))
                 out.append(_fact_item("user", canon, val, owner, domain, source_event,
                                       "user_direct"))
-                if canon == "works_at":
+                if canon == "works_at" and ents.plausible_name(val):
                     out.append(_entity_item(val, "organization", owner, domain, source_event))
         m = _MOVED_TO.search(line)
         if m and not hypothetical:
@@ -584,6 +593,8 @@ def _fact_item(entity_id, predicate, value, owner, domain, source_event, source_
 
 
 def _entity_item(name, etype, owner, domain, source_event):
+    """An entity item. Callers check `entities.plausible_name` first; the ONE
+    caller that cannot (a model's reply) is checked in LLMExtractor.extract."""
     tok = entity_token(name, etype)
     key = {"entity_type": etype, "type": etype, "name": name, "normalized_name": name.lower(),
            "owner": owner, "domain": domain}
@@ -728,7 +739,7 @@ class LLMExtractor(Extractor):
                                             source_event, "session_transcript", entity_name=subj))
             for e in (parsed.get("entities") or [])[:10]:
                 name, etype = str(e.get("name") or "").strip(), str(e.get("type") or "thing").strip()
-                if name:
+                if ents.plausible_name(name) and ents.plausible_type(etype):
                     items.append(_entity_item(name, etype, owner, domain, source_event))
             for d in (parsed.get("directives") or [])[:5]:
                 if str(d).strip() and _grounding_text(d) in said:
