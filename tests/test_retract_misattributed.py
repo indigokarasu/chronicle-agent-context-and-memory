@@ -137,11 +137,28 @@ class TestRetractMisattributed(unittest.TestCase):
         self.assertEqual(names, self.RETRACTED)
         self.assertEqual(self._status(), before)
 
+    def test_a_cron_session_is_answered_without_reading_its_payload(self):
+        """The fast path the live store needs: a scheduled job's session has no
+        person in it by construction, whatever its payload says."""
+        from scripts.retract_misattributed import human_events
+        c = sqlite3.connect(self.db)
+        try:
+            human = human_events(c)
+        finally:
+            c.close()
+        by_session = {}
+        for eid, sid in sqlite3.connect(self.db).execute(
+                "SELECT event_id, session_id FROM events WHERE type='observed'"):
+            by_session.setdefault(sid or "", []).append(eid)
+        self.assertTrue(by_session[CRON_SESSION])
+        self.assertTrue(all(human[e] is False for e in by_session[CRON_SESSION]))
+        self.assertTrue(any(human[e] for e in by_session[HUMAN_SESSION]))
+
     def test_the_report_says_why(self):
         report = Path(self.home) / "report.jsonl"
         self._run("--report", str(report))
         why = {r["belief_id"]: r["why"] for r in map(json.loads, report.read_text().splitlines())}
-        self.assertEqual(why[self.b["cron_email"]], ["no words by the user (assistant/automation, cron session)"])
+        self.assertEqual(why[self.b["cron_email"]], ["no words by the user"])
         self.assertEqual(why[self.b["assistant_norm"]], ["not in the user's words"])
         self.assertEqual(why[self.b["purged"]], ["event no longer in the log"])
 
