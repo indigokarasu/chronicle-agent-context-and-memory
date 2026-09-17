@@ -6,8 +6,9 @@ hand: no Chronicle code deletes events) its vector is an index entry with nothin
 behind it: it cannot be rendered, `migrate_vectors` counts it unrecoverable on
 every run, and every brute-force scan still pays for it. One production store
 kept 18,394 of them after a manual purge that removed the events and their FTS
-rows but not their vectors. `--orphans` removes those vectors and their doc2query
-excerpt proxies, and nothing else.
+rows but not their vectors, and 7,612 more keyed to `asserted` and `signal`
+events, which have no excerpt. `--orphans` removes those vectors and their
+doc2query excerpt proxies, and nothing else.
 
 Fixtures use obviously fake values.
 """
@@ -95,6 +96,21 @@ class TestPruneOrphans(unittest.TestCase):
         self.assertEqual(self._count("SELECT COUNT(*) FROM observed_vectors WHERE event_id=?",
                                      (self.gone,)), 0)
         self.assertEqual(self._state(), (vec - 1, exc - proxies_for_gone, bel_proxies, mem))
+        survivors = [r[0] for r in self.conn.execute("SELECT event_id FROM observed_vectors")]
+        self.assertEqual(sorted(survivors), sorted(self.events[1:]))
+
+    def test_a_vector_keyed_to_a_non_observed_event_is_an_orphan(self):
+        """An older build wrote observed_vectors rows for `asserted` and `signal`
+        events. They have no excerpt, so nothing can re-embed or render them."""
+        asserted = self.conn.execute(
+            "SELECT event_id FROM events WHERE type='asserted' LIMIT 1").fetchone()[0]
+        self.conn.execute("INSERT INTO observed_vectors(event_id, embedding, model, owner, created_at) "
+                          "VALUES(?, x'00000000', 'hashing', 'default', '2026-01-01T00:00:00Z')",
+                          (asserted,))
+        self.conn.commit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = prune_orphans(self.db)
+        self.assertEqual(n, 2)
         survivors = [r[0] for r in self.conn.execute("SELECT event_id FROM observed_vectors")]
         self.assertEqual(sorted(survivors), sorted(self.events[1:]))
 

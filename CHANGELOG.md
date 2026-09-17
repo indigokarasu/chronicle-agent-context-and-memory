@@ -53,10 +53,13 @@ production store before it was changed, and a dashboard navigator for memory.
   loaded only when the tab opens. Verified against a production snapshot in a
   local harness (`dashboard/web/harness/`).
 * **`prune_vectors.py --orphans`** removes observed vectors, and their excerpt
-  proxies, whose source event is no longer in the log. No Chronicle code deletes
-  events, but the production log starts at seq 79,993, and 18,394 vectors of
-  events that are gone remain (their FTS rows do not): they cannot be rendered or
-  re-embedded, and every brute-force scan still pays for them.
+  proxies, with no observed event behind them. No Chronicle code deletes events,
+  but the production log starts at seq 79,993, and 18,394 vectors of events that
+  are gone remain (their FTS rows do not). Another 7,612, written by an older
+  build, are keyed to `asserted` and `signal` events, which have no excerpt.
+  Neither kind can be rendered or re-embedded (they were exactly the 26,006 rows
+  the 5.7.0 vector migration could not repair), and every brute-force scan still
+  pays for them.
 
 ## 5.7.0
 
