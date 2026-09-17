@@ -2382,6 +2382,21 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("UPDATE contradictions SET status='resolved' WHERE id=?", (contradiction_id,))
 
+    def resolve_contradictions_without_two_active(self) -> int:
+        """Close every open contradiction that no longer names two active beliefs.
+
+        The companion of `resolve_contradictions_for` for rows opened before it
+        existed: one production store held 1,550 of them after a cleanup. A
+        belief id that names no row at all counts as not active — the belief is
+        gone, so the pair cannot be in conflict."""
+        active = " UNION ALL ".join(
+            "SELECT belief_id FROM %s WHERE status='active'" % t for t in BELIEF_TABLES)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE contradictions SET status='resolved' WHERE status='open' "
+                "AND (belief_a NOT IN (%s) OR belief_b NOT IN (%s))" % (active, active))
+            return cur.rowcount or 0
+
     def resolve_contradictions_for(self, belief_id: str) -> int:
         """Close every open contradiction naming `belief_id`. Returns the count.
 

@@ -250,7 +250,19 @@ class HealthEngine:
                 self.store.open_contradiction(a["belief_id"], b["belief_id"],
                                               f"{pred} single-cardinality has {len(distinct)} active values")
                 self._fingerprint("cardinality_violation", "tier2", "review", auto=0)
-        return sweeps.commit(self.store, page)
+        report = sweeps.commit(self.store, page)
+        report["contradictions_settled"] = self.settle_dead_contradictions()
+        return report
+
+    def settle_dead_contradictions(self) -> int:
+        """Close open contradictions whose beliefs are no longer both active.
+
+        A contradiction is a pair the store cannot both hold. The reducer closes
+        them as it retracts (reducer._retract), but a store repaired by an older
+        build keeps whatever it opened: one production cleanup left 1,550 open
+        rows naming beliefs that no longer exist, and "open contradictions" is
+        the first number the memory view shows. Resolved, never deleted."""
+        return self.store.resolve_contradictions_without_two_active()
 
     def _fingerprint(self, pattern, tier, action, auto):
         fp = f"{pattern}:{tier}"
