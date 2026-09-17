@@ -222,6 +222,23 @@ class TestReplayDoesNotDependOnTheEmbedder(_Case):
 
 
 class TestScopeStillBoundsTheMerge(_Case):
+    def test_facts_with_different_qualifiers_are_different_facts(self):
+        """Same entity, predicate and value, different qualifiers: "work phone is X"
+        and "home phone is X". Merging them would discard one qualifier."""
+        for qh, src in (("q_work", "ev_work"), ("q_home", "ev_home")):
+            self.core.capture.append("asserted", {
+                "kind": "fact", "key": {"entity_id": "pat_testley", "predicate_canonical": "phone",
+                                        "attribute": "phone", "qualifiers_hash": qh,
+                                        "qualifiers": {"type": qh}},
+                "body": "555-0100", "confidence": 0.9, "source_event": src,
+                "source_type": "user_direct", "domain": "user"}, actor="user", owner="default")
+            self.core.process_pending()
+        c = sqlite3.connect(self.core.store.db_path)
+        rows = sorted(r[0] for r in c.execute(
+            "SELECT qualifiers_hash FROM facts WHERE status='active' AND predicate_canonical='phone'"))
+        c.close()
+        self.assertEqual(rows, ["q_home", "q_work"])
+
     def test_identical_body_under_another_subject_is_kept(self):
         self._note(DIRECTIVE, "ev_a")
         self._note(DIRECTIVE, "ev_b", key={"note_type": "norm", "subject": "other directive",

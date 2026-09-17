@@ -339,6 +339,23 @@ class TestPluginApiMountsTheAtlas(unittest.TestCase):
             self.assertIn(p, paths)
 
 
+class TestAwkwardPaths(unittest.TestCase):
+    def test_a_store_whose_path_has_uri_characters(self):
+        d = temp_home(prefix="atlas-uri-")
+        self.addCleanup(shutil.rmtree, d, True)
+        odd = Path(d) / "weird #1 ?dir"
+        odd.mkdir()
+        core = ChronicleCore(str(odd), {"embeddings": {"model": "hashing"}})
+        core.initialize("s1", principal_id="assistant")
+        core.capture.observe("Robin Placeholder likes kayaking.", "Nice.", session_id="s1")
+        core.process_pending()
+        db = core.store.db_path
+        try:
+            self.assertGreater(A.summary(db)["events"], 0)
+        finally:
+            core.close()
+
+
 class TestCronNames(unittest.TestCase):
     def test_reads_names_and_tolerates_absence(self):
         d = temp_home(prefix="atlas-cron-")

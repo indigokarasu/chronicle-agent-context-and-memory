@@ -205,7 +205,12 @@ export async function loadEvents(model, total, onProgress, signal) {
   let after = model.lastSeq;
   for (;;) {
     if (signal && signal.aborted) return;
-    const ch = await fetchJSON(API + "/atlas/events?after_seq=" + after + "&limit=50000");
+    let ch;
+    try {
+      ch = await fetchJSON(API + "/atlas/events?after_seq=" + after + "&limit=50000");
+    } catch (e) {
+      throw new Error("loading events after seq " + after + " failed: " + ((e && e.message) || e));
+    }
     if (ch.error) throw new Error(ch.error);
     model.append(ch);
     after = ch.next_after_seq;

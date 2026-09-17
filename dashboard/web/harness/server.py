@@ -12,9 +12,11 @@ being called. Standard library only.
 """
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -57,6 +59,7 @@ def main():
 
     # plugin_api locates the store under $HERMES_HOME; point one at --db.
     home = Path(tempfile.mkdtemp(prefix="chr-harness-"))
+    atexit.register(shutil.rmtree, home, True)
     (home / "commons" / "db" / "chronicle").mkdir(parents=True)
     (home / "commons" / "db" / "chronicle" / "chronicle.db").symlink_to(db)
     os.environ["HERMES_HOME"] = str(home)
@@ -95,9 +98,6 @@ def main():
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
-
-        def log_message(self, fmt, *a):
-            sys.stderr.write("harness: " + (fmt % a) + "\n")
 
         def do_GET(self):
             u = urlparse(self.path)

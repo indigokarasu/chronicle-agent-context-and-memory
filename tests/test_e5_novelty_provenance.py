@@ -509,20 +509,29 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
                                      "source_type": "user_direct", "domain": "user"},
                         actor="user", owner="default")
 
+    def _note(self, body, src):
+        self.cap.append("asserted", {"kind": "note", "key": {"note_type": "belief", "subject": "pat likes"},
+                                     "body": body, "confidence": 0.9, "source_event": src,
+                                     "source_type": "user_direct", "domain": "user"},
+                        actor="user", owner="default")
+
     def test_duplicate_of_the_newest_item_is_detected_past_the_old_window(self):
+        # Notes: a fact differing only in qualifiers is a different fact (the
+        # qualifiers are part of its natural key), so an exact duplicate of a fact
+        # never reaches the merge; a note under the same subject does.
         for i in range(self.N):
-            self._write("q%03d" % i, self._body(i), "ev%03d" % i)
-        rows = self.store.query_beliefs("facts", "status='active'", (), 500)
+            self._note(self._body(i), "ev%03d" % i)
+        rows = self.store.query_beliefs("notes", "status='active'", (), 500)
         self.assertEqual(len(rows), self.N, "setup items must be pairwise distinct")
 
         newest_body = self._body(self.N - 1)
-        self._write("q_dup", newest_body, "ev_dup")
+        self._note(newest_body, "ev_dup")
 
-        rows = self.store.query_beliefs("facts", "status='active'", (), 500)
+        rows = self.store.query_beliefs("notes", "status='active'", (), 500)
         self.assertEqual(len(rows), self.N,
                          "a duplicate of the NEWEST item was stored again: the candidate "
                          "window is still bounded to the oldest rows")
-        target = [r for r in rows if r["value"] == newest_body]
+        target = [r for r in rows if r["body"] == newest_body]
         self.assertEqual(len(target), 1)
         self.assertEqual(target[0]["occurrence_count"], 2)
         prov = json.loads(target[0]["provenance"])
@@ -556,17 +565,16 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
 class TestMergeLeavesNoOrphanJustification(unittest.TestCase):
     """I5: every justification must support a belief that exists. The merge path
     returned early from _insert_belief without inserting anything, while the
-    caller went on to justify the belief_id that was never written — 1 fact row,
-    2 justifications, 1 of them pointing at nothing."""
+    caller went on to justify the belief_id that was never written — 1 row,
+    2 justifications, 1 of them pointing at nothing.
 
-    # A merge is only legal between byte-identical bodies (reducer._exact_duplicate).
-    # The keys differ in qualifiers_hash, so the second write is a NEW key for
-    # _apply_fact_conflict and reaches the E5 merge instead of the re-assertion
-    # path. (This fixture used to merge "skiing in the winter" into "skiing in
-    # the winter months" under a lowered cosine floor: the data loss the exact
-    # rule removes.)
-    A = "skiing in the winter"
-    B = "skiing in the winter"
+    Notes, because a fact's exact duplicate under the same key (entity,
+    predicate, qualifiers) is absorbed by _apply_fact_conflict's re-assertion
+    path before the E5 merge sees it. (This fixture used to merge "skiing in the
+    winter" into "skiing in the winter months" under a lowered cosine floor: the
+    data loss the exact rule removes.)"""
+
+    BODY = "Pat Testley goes skiing in the winter"
 
     def setUp(self):
         self.core, self.home = make_core()
@@ -576,18 +584,17 @@ class TestMergeLeavesNoOrphanJustification(unittest.TestCase):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def test_merged_assertion_justifies_the_surviving_belief(self):
-        for qh, body, src in (("q1", self.A, "ev1"), ("q2", self.B, "ev2")):
-            key = {"entity_id": "pat_testley", "predicate_canonical": "likes", "attribute": "likes",
-                   "qualifiers_hash": qh, "qualifiers": {}, "owner": "default", "domain": "user"}
+        key = {"note_type": "belief", "subject": "pat hobbies"}
+        for src in ("ev1", "ev2"):
             self.core.capture.append(
-                "asserted", {"kind": "fact", "key": key, "body": body, "confidence": 0.85,
+                "asserted", {"kind": "note", "key": key, "body": self.BODY, "confidence": 0.85,
                              "source_event": src, "source_type": "user_direct", "domain": "user"},
                 actor="user", owner="default")
             self.core.process_pending()
 
-        facts = self.core.store.query_beliefs("facts", "status='active'", (), 10)
-        self.assertEqual(len(facts), 1, "fixture must actually merge")
-        survivor = facts[0]["belief_id"]
+        notes = self.core.store.query_beliefs("notes", "status='active'", (), 10)
+        self.assertEqual(len(notes), 1, "fixture must actually merge")
+        survivor = notes[0]["belief_id"]
 
         conn = self.core.store._conn()
         live = set()

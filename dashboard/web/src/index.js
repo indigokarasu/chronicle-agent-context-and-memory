@@ -8,9 +8,7 @@
 
 import { SDK, PLUGINS, h, hooks, C, fetchJSON, API, fmt, relTime, injectCSS } from "./common.js";
 
-if (!SDK || !PLUGINS) {
-  console.error("[chronicle] Hermes plugin SDK not available.");
-} else {
+function main() {
   const { useState, useEffect, useCallback } = hooks;
   const { Card, CardHeader, CardTitle, CardContent, Badge, Button } = C;
 
@@ -151,7 +149,9 @@ if (!SDK || !PLUGINS) {
     if (atlasPromise) return atlasPromise;
     atlasPromise = new Promise((resolve, reject) => {
       const self = document.querySelector('script[data-hermes-plugin="chronicle"]');
-      const base = self && self.src ? self.src.replace(/index\.js(\?.*)?$/, "") : "";
+      // dist/atlas.js sits next to the dist/index.js the host loaded
+      const src = self && self.src ? self.src.split("?")[0] : "";
+      const base = src ? src.slice(0, src.lastIndexOf("/") + 1) : "";
       if (!base) { reject(new Error("could not locate the Chronicle plugin bundle")); return; }
       const s = document.createElement("script");
       s.src = base + "atlas.js";
@@ -186,3 +186,6 @@ if (!SDK || !PLUGINS) {
 
   PLUGINS.register("chronicle", ChronicleDashboard);
 }
+
+if (SDK && PLUGINS) main();
+else console.error("[chronicle] Hermes plugin SDK not available.");

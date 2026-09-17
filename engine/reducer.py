@@ -1803,7 +1803,7 @@ def _merge_scope(kind, key, body):
     the restriction is structural. A candidate from another subject cannot be
     returned and then rejected downstream; it cannot be returned at all.
 
-    Kinds that HAVE a subject (fact: entity+predicate; note: type+subject) use
+    Kinds that HAVE a subject (fact: entity+predicate+qualifiers; note: type+subject) use
     it. Kinds that don't use their natural key: an episode's title+session, a
     reference's topic+URL, a procedure's name, a relationship's triple. Anything
     else, or an empty natural key, returns None.
@@ -1816,8 +1816,11 @@ def _merge_scope(kind, key, body):
     path in the system was destroying unrelated content by default.
     """
     if kind == "fact":
-        return ("entity_id=? AND predicate_canonical=?",
-                (key.get("entity_id", "") or "", key.get("predicate_canonical", "") or ""))
+        # qualifiers_hash is part of a fact's natural key: "work phone is X" and
+        # "home phone is X" share entity, predicate and value, and are two facts.
+        return ("entity_id=? AND predicate_canonical=? AND COALESCE(qualifiers_hash,'')=?",
+                (key.get("entity_id", "") or "", key.get("predicate_canonical", "") or "",
+                 key.get("qualifiers_hash", "") or ""))
     if kind == "note":
         return ("note_type=? AND subject=?",
                 (key.get("note_type", "belief") or "belief", key.get("subject", "") or ""))

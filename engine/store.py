@@ -18,6 +18,7 @@ import logging
 import re
 import sqlite3
 import threading
+import unicodedata
 from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import List, Optional  # names this module already annotates with
@@ -3501,8 +3502,13 @@ _WORD_RX = re.compile(r"[^\W_]+(?:'[^\W_]+)*")
 
 
 def word_tokens(text: str) -> list:
-    """Words in `text`, in order, case preserved. See _WORD_RX."""
-    return _WORD_RX.findall((text or "").replace("\u2019", "'"))
+    """Words in `text`, in order, case preserved. See _WORD_RX.
+
+    NFC first: a decomposed "Zürich" (u + U+0308) splits at the combining mark in
+    a `\\w` class, while FTS5 indexes it as one word. After NFC the split points
+    match FTS5's on Latin, Thai, CJK and Devanagari (which unicode61 itself
+    splits at vowel signs, and so does this)."""
+    return _WORD_RX.findall(unicodedata.normalize("NFC", text or "").replace("\u2019", "'"))
 
 
 def _fts_query(query: str) -> str:
