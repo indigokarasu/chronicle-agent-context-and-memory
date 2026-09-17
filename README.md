@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.7.0.
+Version: 5.7.1.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -456,6 +456,49 @@ The context engine adds:
 - **chronicle_pin_context**: Pin a context span so compression never evicts it
 - **chronicle_focus**: Set the focus topic for memory-aware compression
 
+## Dashboard
+
+Chronicle ships a Hermes dashboard tab (`dashboard/`) with two views.
+
+**Overview** shows store counts, embedding coverage, recent activity, and a
+button that queues extraction for turns that have none.
+
+**Atlas** is a navigator for the memory itself. Every event in the log is drawn
+as a point on the row of whatever wrote it: a cron job, a chat session, or a
+background process such as the curator. The chart above it counts events over
+time; drag across it to zoom to a range. Click a point, a row, or an item in
+the lists below the chart, and the side panel shows where it came from and
+what it produced:
+
+- an **event** shows its text, its writer and run, the turn an assertion was
+  extracted from, and the beliefs that cite it;
+- a **run** shows its summary, its events in order, and the beliefs formed from it;
+- a **belief** shows its status and confidence, the events it cites, what it
+  replaced and what replaced it, what contradicts it, and how many identical
+  active copies exist.
+
+The lists below the chart are open **contradictions**, **replaced facts**
+(each fact's values over time) and **duplicate notes**. New events appear
+while the tab is open.
+
+The Atlas reads the store with a `mode=ro` SQLite connection per request, so it
+cannot write memory and never holds a read transaction open. Drawing is done on
+the GPU with deck.gl, which keeps the whole log (hundreds of thousands of events)
+interactive. The deck.gl bundle (`dist/atlas.js`) is loaded only when the Atlas
+tab is opened.
+
+The UI is built from `dashboard/web/src`, and the built files in
+`dashboard/dist` are committed, because the dashboard loads them with no build
+step on the host:
+
+```bash
+cd dashboard/web && npm install && npm run build
+```
+
+`dashboard/web/harness/server.py --db <chronicle.db>` serves the UI and the
+plugin API against a local store behind a stand-in for the plugin SDK, for
+working on the UI without the OAuth-gated dashboard. It never writes.
+
 ## Development
 
 ```bash
@@ -508,6 +551,12 @@ chronicle/             # installs to ~/.hermes/plugins/chronicle/
     embeddings.py      # Pluggable embedder + offline default (§24.4)
     tools.py           # Full agent tool surface (§23)
     errors.py          # Error codes (§32)
+  dashboard/           # Hermes dashboard tab
+    manifest.json      # tab registration
+    plugin_api.py      # FastAPI routes: status, recent activity, extraction queue
+    atlas_api.py       # read-only Atlas routes (event stream, inspectors, lenses)
+    dist/              # built UI the dashboard loads (index.js, atlas.js); committed
+    web/               # UI source + build script + local harness
   tests/
     test_build.py      # Unit + property tests P1–P21 + worked examples B.1–B.6
 ```
