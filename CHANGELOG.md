@@ -3,6 +3,68 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.3
+
+**Memory is organised by what it is about.** An entity was whatever text had
+been typed at: a production store's 1,488 entity rows held 171 pronouns
+("This", "There", "Each one") and 65 sentence fragments, typed with whatever
+followed "is a" ("real managed challenge", "dead end for getting a usable key
+into my environment", "no"); 1,003 were named by another store's id even though
+the `name` fact beside them said "Pat Testley"; and every entity existed
+TWICE — a hash-keyed row carrying its type and a token-keyed row carrying its
+facts — because the extractor's entity token never reached the fold.
+
+* **`engine/entities.py`** decides what an entity is. A name is a proper noun,
+  not a sentence (every significant word carries a capital, so "Acme Fake Co",
+  "NVIDIA", "E.K. Chung" and "iPhone" pass and "Rotating between them" does
+  not); a type is a category, not a clause; and a kind is one of person, place,
+  thing, event or concept, taken from the type, or from the predicates a subject
+  carries, or left empty — `kind_for` answers "" rather than inventing one.
+  The rules are applied at extraction, at the write boundary, and in the fold,
+  the last of these so a rebuild does not resurrect what years of logged
+  `asserted` events named.
+* **An entity is one row, addressed by its name.** The fold derives an entity's
+  belief id from its name (`entities.entity_token`), which is the id its facts
+  already reference, so the row describing an entity and the facts hanging off
+  it are the same entity. Nothing about the event changes, so the same log
+  replays to the repaired projection.
+* **An id resolves to the name the log already carries.** A fact that names an
+  entity whose row is named by another store's id renames the row — never a
+  guess, only the `name` fact that is already there (991 of 1,003 on the
+  production store).
+* **`scripts/clean_entities.py`** repairs the rows a store already holds, which
+  is what a rebuild would do without replaying 400,000 events on a live box.
+  On the production snapshot: 313 dropped, 1,002 renamed from ids, 26 duplicate
+  rows merged, 16 clause-types cleared, 1,488 rows down to 1,149 with every
+  fact still pointing at a row. A row any live fact points at is never dropped
+  — including `user`, whose name is not a proper noun — and two rows that
+  merely share a NAME are never merged: two people called the same thing are
+  the ordinary case, and identity is adjudicated, never inferred.
+
+**The Tapestry is entity-first.** The memory view was a log: every event on the
+row of whatever wrote it. That is provenance — how a memory arrived — and it is
+now a drill-down reached from a fact or a mention, not the way in.
+
+* **`/tapestry/index` and `/tapestry/entity`** read the entity model: what
+  memory holds by kind, and one entity's current facts, its history, the events
+  it appears in, and the captured turns that name it. Every mention carries who
+  was speaking in that turn (engine/speaker.py), so a hit inside a cron job's
+  output says "automation".
+* **Events are the facts that record them.** A calendar appointment is an event
+  even though the store keeps it as a fact about its subject, and its date is
+  the one the importer wrote into its title, not the day Chronicle heard about
+  it. An event links to the people its own title names, whole words only.
+* **Contacts are classified by the store that owns them.** The people store
+  says who is a person and who is a company; Chronicle only references its rows
+  by id (I20), so the dashboard reads it read-only and labels what it says. An
+  unreviewed row stays unreviewed rather than being guessed at — 965 of 1,008
+  on the production store.
+* **The weave** draws the dated events on one time axis with a thread per
+  entity they involve, joined where an event names two of them. The threads are
+  the busiest first; the rest are counted rather than drawn a pixel high.
+* Internals follow the name: `dashboard/tapestry_api.py`, `dist/tapestry.js`,
+  `/tapestry/...` routes, `window.__CHRONICLE_TAPESTRY__`.
+
 ## 5.7.2
 
 **Memory about the user comes only from the user.** Chronicle was built to keep

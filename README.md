@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.7.2.
+Version: 5.7.3.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -477,28 +477,34 @@ Chronicle ships a Hermes dashboard tab (`dashboard/`) with two views.
 **Overview** shows store counts, embedding coverage, recent activity, and a
 button that queues extraction for turns that have none.
 
-**Atlas** is a navigator for the memory itself. Every event in the log is drawn
-as a point on the row of whatever wrote it: a cron job, a chat session, or a
-background process such as the curator. The chart above it counts events over
-time; drag across it to zoom to a range. Click a point, a row, or an item in
-the lists below the chart, and the side panel shows where it came from and
-what it produced:
+**Tapestry** is how the memory itself is browsed, by what it is about rather
+than by how it arrived. The rail counts what Chronicle holds — people, places,
+things, events, ideas, and whatever it cannot classify — and picking one lists
+them, biggest first. An entity's page shows what memory says about it now, what
+it used to say, the events it appears in, and every captured turn that names it,
+each labelled with who was speaking in that turn (you, a scheduled job, the
+assistant, a tool, the host), so nothing reads as yours that was not.
 
-- an **event** shows its text, its writer and run, the turn an assertion was
-  extracted from, and the beliefs that cite it;
-- a **run** shows its summary, its events in order, and the beliefs formed from it;
-- a **belief** shows its status and confidence, the events it cites, what it
-  replaced and what replaced it, what contradicts it, and how many identical
-  active copies exist.
+Above it, the **weave** puts the dated events on one time axis with a thread per
+entity they involve: a knot on your thread and on the person's, joined where an
+event names them both. Threads are ordered by how much of your memory runs
+through them, and the quieter ones are counted rather than drawn a pixel high.
 
-The lists below the chart are open **contradictions**, **replaced facts**
-(each fact's values over time) and **duplicate notes**. New events appear
-while the tab is open.
+Classification comes from the sources, never from a guess: an entity's kind from
+its own recorded type or its predicates, a contact's person-or-company from the
+people store that owns that record (an unreviewed row stays "unreviewed"), and
+an event's date from the date the importer wrote into its title.
 
-The Atlas reads the store with a `mode=ro` SQLite connection per request, so it
+**Provenance is a drill-down, not the way in.** From any fact or mention,
+"provenance" opens the log: every event drawn as a point on the row of whatever
+wrote it — a cron job, a chat session, the curator — with the chart above
+counting events over time, inspectors for an event, a run or a belief, and
+lenses for open contradictions, replaced facts and duplicate notes.
+
+The Tapestry reads the store with a `mode=ro` SQLite connection per request, so it
 cannot write memory and never holds a read transaction open. Drawing is done on
 the GPU with deck.gl, which keeps the whole log (hundreds of thousands of events)
-interactive. The deck.gl bundle (`dist/atlas.js`) is loaded only when the Atlas
+interactive. The deck.gl bundle (`dist/tapestry.js`) is loaded only when the Tapestry
 tab is opened.
 
 The UI is built from `dashboard/web/src`, and the built files in
@@ -568,8 +574,8 @@ chronicle/             # installs to ~/.hermes/plugins/chronicle/
   dashboard/           # Hermes dashboard tab
     manifest.json      # tab registration
     plugin_api.py      # FastAPI routes: status, recent activity, extraction queue
-    atlas_api.py       # read-only Atlas routes (event stream, inspectors, lenses)
-    dist/              # built UI the dashboard loads (index.js, atlas.js); committed
+    tapestry_api.py       # read-only Tapestry routes (event stream, inspectors, lenses)
+    dist/              # built UI the dashboard loads (index.js, tapestry.js); committed
     web/               # UI source + build script + local harness
   tests/
     test_build.py      # Unit + property tests P1–P21 + worked examples B.1–B.6

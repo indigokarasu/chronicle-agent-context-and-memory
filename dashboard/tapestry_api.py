@@ -1,4 +1,4 @@
-"""Chronicle Atlas — read-only data for the dashboard's memory navigator.
+"""Chronicle Tapestry — read-only data for the dashboard's memory navigator.
 
 Loaded by path from plugin_api.py (the dashboard host mounts that file with no
 parent package), so this module imports nothing from the engine and reads the
@@ -32,9 +32,19 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
+# engine/entities.py decides what an entity IS (its kind, whether a name is a
+# name). The dashboard module is loaded by path with no parent package, so the
+# plugin root goes on sys.path here rather than relying on an implicit one.
+import sys as _sys
+
+_PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PLUGIN_ROOT not in _sys.path:
+    _sys.path.insert(0, _PLUGIN_ROOT)
+from engine import entities as ents  # noqa: E402
+
 _BUSY_MS = 5000
 _EXCERPT = 600          # characters of any text returned for display
-_CHUNK_MAX = 50000      # events per /atlas/events call
+_CHUNK_MAX = 50000      # events per /tapestry/log/events call
 _SUPPORT_MAX = 50       # source events returned per belief
 _SESSION_TURNS = 200    # events returned per session inspector
 _SESSION_BELIEFS = 200  # beliefs returned per session inspector
@@ -175,14 +185,14 @@ _cache = _TTLCache()
 # --------------------------------------------------------------------------
 # data functions
 # --------------------------------------------------------------------------
-# The kinds whose status counts the Atlas header shows. Counting every belief
+# The kinds whose status counts the Tapestry header shows. Counting every belief
 # table scanned 67k episodes and 44k notes per call: 5.7 s warm and 57 s cold on
 # the CPU-capped production host, every minute the tab was open.
 _SUMMARY_KINDS = ("fact", "note")
 
 
 def summary(db_path) -> dict:
-    """The numbers the Atlas header shows, and only those: event count and
+    """The numbers the Tapestry header shows, and only those: event count and
     extent, fact and note counts by status, open contradictions."""
     conn = _connect(db_path)
     try:
@@ -275,7 +285,7 @@ def events_json(db_path, after_seq: int = 0, limit: int = _CHUNK_MAX) -> bytes:
     """`events_chunk` serialized, with FULL chunks cached as bytes.
 
     The log is append-only, so a chunk that did not reach the end of it (`done`
-    false) can never change: every later open of the Atlas gets it without a
+    false) can never change: every later open of the Tapestry gets it without a
     query or a serialization, which on a CPU-capped host is the difference
     between a 20-second load and an instant one. The last chunk — the live
     tail — is never cached. Bounded to _CHUNK_CACHE_BYTES, oldest out first."""
@@ -658,9 +668,331 @@ def cron_job_names(hermes_home) -> Dict[str, str]:
 # --------------------------------------------------------------------------
 # routes
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# the entity read model: memory as the things it is about
+# --------------------------------------------------------------------------
+#
+# The log and its lanes answer "how did this arrive". That is provenance, and it
+# is a drill-down. What memory IS about is people, places, things, events and
+# ideas, so that is what this reads: the entity rows, the facts hanging off
+# them, and the events those facts record.
+#
+# NOTHING HERE INVENTS. An entity's kind comes from its own type or its
+# predicates (engine/entities.py) and is "unclassified" when neither says;
+# a derived event carries the fact it was derived from, so the reader can open
+# the provenance and see the calendar row or the email it came from.
+
+# Predicates whose FACT is an event: something that happened, at a time. The
+# value is the title the importer wrote; `when` is the fact's valid_from.
+_EVENT_PREDICATES = {
+    "attended_event": "attended", "had_appointment": "appointment",
+    "appointment_at": "appointment", "scheduled_mandatory_appointment": "appointment",
+    "dined_at": "meal", "traveling_to": "travel", "purchased": "purchase",
+    "health_event": "health", "account_security_event": "account",
+    "received_contractor_estimate": "estimate", "received_paid_project_invitation": "invitation",
+}
+# Predicates whose VALUE names a place.
+_PLACE_PREDICATES = ("lives_in", "works_in", "located_in", "office_location")
+# Predicates whose VALUE is an idea rather than a thing.
+_CONCEPT_PREDICATES = ("likes", "dislikes", "prefers", "goal", "habit", "diet", "allergy",
+                       "active_project", "interest")
+
+_ENTITY_INDEX_MAX = 4000
+
+# The people store owns who is a person and who is a company; Chronicle only
+# references its rows by id (I20), and its `name` fact says nothing about which.
+# Read-only, by path, and absent is normal: without it those entities stay
+# unclassified rather than being guessed at.
+_PEOPLE_STORE_PATHS = ("commons/db/ocas-weave/weave.sqlite", "commons/db/weave/weave.sqlite")
+
+
+def people_store(home) -> Dict[str, dict]:
+    """`{id: {name, is_company, occupation, org, city}}` from the people store.
+
+    `is_company` is NULL for a row nobody has reviewed, and stays None here: on
+    the production store 965 of 1,008 rows are unreviewed, so treating NULL as
+    "person" would file 965 guesses as facts."""
+    for rel in _PEOPLE_STORE_PATHS:
+        path = Path(home) / rel
+        if not path.is_file():
+            continue
+        try:
+            conn = _connect(path)
+        except sqlite3.Error:
+            continue
+        try:
+            cols = _cols(conn, "persons")
+            if not cols:
+                continue
+            want = [c for c in ("id", "name", "is_company", "occupation", "org",
+                                "location_city") if c in cols]
+            rows = conn.execute("SELECT %s FROM persons" % ",".join(want)).fetchall()
+            out = {}
+            for r in rows:
+                d = {k: r[k] for k in want}
+                pid = d.pop("id", None)
+                if pid:
+                    out[str(pid)] = d
+            return out
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+    return {}
+_MENTION_MAX = 40
+
+# Importer tails: a calendar title carries its own date, an email subject its
+# sender and date. Stripped for the LABEL only; the fact keeps its value.
+_TITLE_TAILS = (
+    re.compile(r"\s+—\s+\d{4}-\d{2}-\d{2}(?:–\d{4}-\d{2}-\d{2})?.*$"),
+    re.compile(r"\s*\|\s*from\s.*$", re.IGNORECASE),
+)
+
+
+def _title(value: str) -> str:
+    out = str(value or "").strip()
+    for rx in _TITLE_TAILS:
+        out = rx.sub("", out).strip()
+    return out or str(value or "").strip()
+
+
+def _iso_date(value) -> Optional[str]:
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", str(value or ""))
+    return m.group(1) if m else None
+
+
+_TITLE_DATE = re.compile(r"—\s*(\d{4}-\d{2}-\d{2})")
+
+
+def _event_when(value, valid_from, created_at) -> Optional[str]:
+    """When an event happened.
+
+    The calendar importer writes the date INTO the title ("… — 2025-03-06"), and
+    that is the event's own date; `valid_from` is when the fact became true and
+    `created_at` is when Chronicle heard about it, which for a birthday imported
+    months later is not the same day at all."""
+    m = _TITLE_DATE.search(str(value or ""))
+    return (m.group(1) if m else None) or _iso_date(valid_from) or _iso_date(created_at)
+
+
+def _people_kind(record) -> tuple:
+    """(kind, subtype) for an entity the people store owns."""
+    flag = record.get("is_company")
+    if flag in (1, "1", True):
+        return ents.THING, "organization"
+    if flag in (0, "0", False):
+        return ents.PERSON, "contact"
+    return ents.PERSON, "contact (unreviewed)"
+
+
+def entity_index(db_path, limit: int = _ENTITY_INDEX_MAX, people: Dict[str, dict] = None) -> dict:
+    """Every entity memory holds, with its kind, its size and its span.
+
+    Two origins, both labelled: rows in `entities`, and events derived from the
+    facts that record them (a calendar appointment is an event even though the
+    store keeps it as a fact about its subject)."""
+    conn = _connect(db_path)
+    try:
+        facts = conn.execute(
+            "SELECT entity_id, predicate_canonical, value, valid_from, created_at, belief_id, "
+            "       json_extract(provenance, '$.source_type') AS src "
+            "FROM facts WHERE status IN ('active','draft')").fetchall()
+        rows = conn.execute("SELECT belief_id, name, type, domain FROM entities").fetchall()
+
+        preds: Dict[str, set] = {}
+        counts: Dict[str, int] = {}
+        span: Dict[str, List[Optional[str]]] = {}
+        sources: Dict[str, set] = {}
+        events: List[dict] = []
+        derived: Dict[str, dict] = {}
+        for f in facts:
+            eid = f["entity_id"] or ""
+            if eid:
+                preds.setdefault(eid, set()).add(f["predicate_canonical"] or "")
+                counts[eid] = counts.get(eid, 0) + 1
+                sources.setdefault(eid, set()).add(f["src"] or "")
+                when = _iso_date(f["valid_from"]) or _iso_date(f["created_at"])
+                if when:
+                    lo, hi = span.get(eid, [None, None])
+                    span[eid] = [min(lo or when, when), max(hi or when, when)]
+            kind_of_pred = _EVENT_PREDICATES.get(f["predicate_canonical"] or "")
+            if kind_of_pred:
+                events.append({
+                    "id": f["belief_id"], "kind": ents.EVENT, "subtype": kind_of_pred,
+                    "name": _clip(_title(f["value"]), 120), "origin": "fact",
+                    "of": eid, "when": _event_when(f["value"], f["valid_from"], f["created_at"]),
+                    "facts": 1, "sources": [f["src"] or ""]})
+            elif (f["predicate_canonical"] or "") in _PLACE_PREDICATES:
+                name = _title(f["value"])
+                key = "place:" + name.lower()
+                item = derived.setdefault(key, {"id": key, "kind": ents.PLACE, "subtype": "",
+                                                "name": _clip(name, 120), "origin": "fact",
+                                                "of": eid, "facts": 0, "sources": []})
+                item["facts"] += 1
+                if (f["src"] or "") not in item["sources"]:
+                    item["sources"].append(f["src"] or "")
+            elif (f["predicate_canonical"] or "") in _CONCEPT_PREDICATES:
+                name = _title(f["value"])
+                key = "concept:" + name.lower()
+                item = derived.setdefault(key, {"id": key, "kind": ents.CONCEPT,
+                                                "subtype": f["predicate_canonical"],
+                                                "name": _clip(name, 120), "origin": "fact",
+                                                "of": eid, "facts": 0, "sources": []})
+                item["facts"] += 1
+                if (f["src"] or "") not in item["sources"]:
+                    item["sources"].append(f["src"] or "")
+
+        items: List[dict] = []
+        name_of: Dict[str, str] = {}
+        people = people or {}
+        for r in rows:
+            bid = r["belief_id"]
+            kind = ents.kind_for(r["type"] or "", sorted(preds.get(bid, ())))
+            people_subtype = ""
+            if bid in people:
+                kind, people_subtype = _people_kind(people[bid])
+            lo, hi = span.get(bid, [None, None])
+            items.append({"id": bid, "kind": kind or "unclassified",
+                          "subtype": people_subtype or
+                                     ((r["type"] or "") if ents.plausible_type(r["type"] or "") else ""),
+                          "name": "You" if bid == "user" else _clip(r["name"] or bid, 120),
+                          "origin": "entity", "facts": counts.get(bid, 0),
+                          "first": lo, "last": hi,
+                          "sources": sorted(x for x in sources.get(bid, ()) if x)})
+            if bid != "user" and ents.plausible_name(r["name"] or ""):
+                name_of[r["name"]] = bid
+        items.extend(derived.values())
+        _link_participants(events, name_of)
+        items.extend(events)
+
+        by_kind: Dict[str, int] = {}
+        for it in items:
+            by_kind[it["kind"]] = by_kind.get(it["kind"], 0) + 1
+        # Biggest first within a kind, so a listing opens on what memory knows most
+        # about; the id breaks ties so two runs agree.
+        items.sort(key=lambda it: (it["kind"], -it.get("facts", 0), it.get("name") or "", it["id"]))
+        return {"kinds": by_kind, "total": len(items), "items": items[:limit],
+                "truncated": len(items) > limit}
+    finally:
+        conn.close()
+
+
+_MIN_LINK_NAME = 5      # "AI" and "GIBS" would hit half the calendar
+
+
+def _link_participants(events: List[dict], name_of: Dict[str, str]) -> None:
+    """Who an event's own title names.
+
+    "Zara Vasquez-Evens's birthday" is about a person memory already knows, and
+    that link is what makes a listing of events navigable. It is a match on the
+    entity's OWN name, whole words only — never a guess at who was involved."""
+    names = [n for n in name_of if len(n) >= _MIN_LINK_NAME]
+    if not names:
+        return
+    rx = re.compile(r"(?<![\w'])(%s)(?![\w])" %
+                    "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)),
+                    re.IGNORECASE)
+    lower = {n.lower(): i for n, i in name_of.items()}
+    for ev in events:
+        hits = []
+        for m in rx.finditer(ev.get("name") or ""):
+            eid = lower.get(m.group(1).lower())
+            if eid and eid not in hits:
+                hits.append(eid)
+        if hits:
+            ev["participants"] = hits[:8]
+
+
+def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> dict:
+    """One entity: what memory says about it now, what it used to say, the
+    events it appears in, and where every part of that came from."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT belief_id, name, type, domain, owner, created_at, last_seen_at "
+                           "FROM entities WHERE belief_id=?", (entity_id,)).fetchone()
+        facts = [dict(r) for r in conn.execute(
+            "SELECT belief_id, predicate_canonical, value, status, valid_from, valid_until, "
+            "       confidence, criticality, occurrence_count, created_at, "
+            "       json_extract(provenance, '$.source_type') AS src, "
+            "       json_extract(provenance, '$.source_event') AS src_event "
+            "FROM facts WHERE entity_id=? ORDER BY status!='active', predicate_canonical, created_at",
+            (entity_id,))]
+        name = (row["name"] if row else "") or entity_id
+        if entity_id == "user":
+            name = "You"
+        preds = sorted({f["predicate_canonical"] or "" for f in facts})
+        out = {
+            "id": entity_id, "name": name,
+            "kind": (ents.kind_for((row["type"] if row else "") or "", preds) or "unclassified"),
+            "subtype": (row["type"] if row else "") or "",
+            "exists": bool(row),
+            "current": [f for f in facts if f["status"] in ("active", "draft")],
+            "past": [f for f in facts if f["status"] not in ("active", "draft")],
+            "events": [{"id": f["belief_id"], "subtype": _EVENT_PREDICATES[f["predicate_canonical"]],
+                        "name": _clip(_title(f["value"]), 160),
+                        "when": _event_when(f["value"], f["valid_from"], f["created_at"]),
+                        "value": _clip(f["value"], _EXCERPT), "src": f["src"]}
+                       for f in facts
+                       if (f["predicate_canonical"] or "") in _EVENT_PREDICATES
+                       and f["status"] in ("active", "draft")],
+            "mentions": mentions(conn, name),
+        }
+        record = (people or {}).get(entity_id)
+        if record:
+            kind, subtype = _people_kind(record)
+            out["kind"], out["subtype"] = kind, subtype
+            # Labelled as the other store's, never merged into Chronicle's facts.
+            out["people_store"] = {k: v for k, v in record.items() if v not in (None, "")}
+        for f in out["current"] + out["past"]:
+            f["value"] = _clip(f["value"], _EXCERPT)
+        return out
+    finally:
+        conn.close()
+
+
+def mentions(conn, name: str, limit: int = _MENTION_MAX) -> List[dict]:
+    """Captured turns that name this entity, with who was speaking in them.
+
+    The excerpt is what was captured; `speakers` is what capture recorded about
+    who wrote it (engine/speaker.py), so a hit in a cron job's output is not
+    dressed up as something the user said."""
+    if not name or len(name) < 3 or name == "You":
+        return []
+    try:
+        hits = conn.execute(
+            "SELECT event_id FROM observed_fts WHERE observed_fts MATCH ? LIMIT ?",
+            ('"%s"' % name.replace('"', ""), limit)).fetchall()
+    except sqlite3.Error:
+        return []
+    out = []
+    for h in hits:
+        row = conn.execute("SELECT event_id, seq, session_id, actor, occurred_at, payload "
+                           "FROM events WHERE event_id=?", (h["event_id"],)).fetchone()
+        if not row:
+            continue
+        p = _payload(row["payload"])
+        spans = p.get("speakers") if isinstance(p.get("speakers"), list) else []
+        who = sorted({s[2] for s in spans if isinstance(s, (list, tuple)) and len(s) == 3})
+        out.append({"event_id": row["event_id"], "seq": row["seq"],
+                    "session": row["session_id"] or "", "actor": row["actor"] or "",
+                    "when": row["occurred_at"], "source": p.get("source_type") or "",
+                    "speakers": who,
+                    "excerpt": _clip(_excerpt_around(p.get("excerpt") or "", name), 400)})
+    out.sort(key=lambda m: m["seq"])
+    return out
+
+
+def _excerpt_around(text: str, needle: str, width: int = 320) -> str:
+    i = text.lower().find(needle.lower())
+    if i < 0:
+        return text[:width]
+    start = max(0, i - width // 3)
+    return ("…" if start else "") + text[start:start + width]
+
+
 def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Callable[[], Path],
              query: Callable = None):
-    """Bind the data functions to `router` under /atlas/…"""
+    """Bind the data functions to `router` under /tapestry/log/…"""
     Q = query or (lambda default=None, **_k: default)
 
     def _db():
@@ -677,8 +1009,22 @@ def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Cal
         except sqlite3.Error as e:
             return dict(empty, error="store unreadable: %s" % e)
 
-    @router.get("/atlas/summary")
-    def atlas_summary():
+    def _people():
+        return _cache.get(("people", str(hermes_home())), 300, lambda: people_store(hermes_home()))
+
+    @router.get("/tapestry/index")
+    def tapestry_index():
+        return _safe(lambda: _cache.get(("index", str(_db())), 120,
+                                        lambda: entity_index(_db(), people=_people())),
+                     {"kinds": {}, "items": []})
+
+    @router.get("/tapestry/entity")
+    def tapestry_entity(id: str = Q("", alias="id")):
+        return _safe(lambda: entity_detail(_db(), id, people=_people()),
+                     {"id": id, "current": []})
+
+    @router.get("/tapestry/log/summary")
+    def tapestry_summary():
         return _safe(lambda: _cache.get(("summary", str(_db())), 300, lambda: summary(_db())),
                      {"events": 0})
 
@@ -687,8 +1033,8 @@ def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Cal
     except Exception:   # the test stub has no responses module
         _Response = None
 
-    @router.get("/atlas/events")
-    def atlas_events(after_seq: int = Q(0, ge=0), limit: int = Q(_CHUNK_MAX, ge=1, le=_CHUNK_MAX)):
+    @router.get("/tapestry/log/events")
+    def tapestry_events(after_seq: int = Q(0, ge=0), limit: int = Q(_CHUNK_MAX, ge=1, le=_CHUNK_MAX)):
         empty = {"n": 0, "done": True, "next_after_seq": after_seq}
         if _Response is None:
             return _safe(lambda: events_chunk(_db(), after_seq, limit), empty)
@@ -699,38 +1045,38 @@ def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Cal
         except sqlite3.Error as e:
             return dict(empty, error="store unreadable: %s" % e)
 
-    @router.get("/atlas/event")
-    def atlas_event(seq: int = Q(0, ge=0)):
+    @router.get("/tapestry/log/event")
+    def tapestry_event(seq: int = Q(0, ge=0)):
         return _safe(lambda: event_detail(_db(), seq), {"found": False})
 
-    @router.get("/atlas/session")
-    def atlas_session(session_id: str = Q("", alias="id")):
+    @router.get("/tapestry/log/session")
+    def tapestry_session(session_id: str = Q("", alias="id")):
         return _safe(lambda: session_detail(_db(), session_id), {"found": False})
 
-    @router.get("/atlas/belief")
-    def atlas_belief(belief_id: str = Q("", alias="id")):
+    @router.get("/tapestry/log/belief")
+    def tapestry_belief(belief_id: str = Q("", alias="id")):
         return _safe(lambda: belief_detail(_db(), belief_id), {"found": False})
 
-    @router.get("/atlas/contradictions")
-    def atlas_contradictions(limit: int = Q(100, ge=1, le=500), offset: int = Q(0, ge=0)):
+    @router.get("/tapestry/log/contradictions")
+    def tapestry_contradictions(limit: int = Q(100, ge=1, le=500), offset: int = Q(0, ge=0)):
         return _safe(lambda: _cache.get(("contra", str(_db()), limit, offset), 30,
                                         lambda: contradictions(_db(), limit, offset)),
                      {"total": 0, "items": []})
 
-    @router.get("/atlas/histories")
-    def atlas_histories(limit: int = Q(100, ge=1, le=500)):
+    @router.get("/tapestry/log/histories")
+    def tapestry_histories(limit: int = Q(100, ge=1, le=500)):
         return _safe(lambda: _cache.get(("hist", str(_db()), limit), 60,
                                         lambda: fact_histories(_db(), limit)),
                      {"total": 0, "items": []})
 
-    @router.get("/atlas/duplicates")
-    def atlas_duplicates(limit: int = Q(50, ge=1, le=200)):
+    @router.get("/tapestry/log/duplicates")
+    def tapestry_duplicates(limit: int = Q(50, ge=1, le=200)):
         return _safe(lambda: _cache.get(("dups", str(_db()), limit), 120,
                                         lambda: duplicate_notes(_db(), limit)),
                      {"groups": 0, "redundant": 0, "items": []})
 
-    @router.get("/atlas/lanes")
-    def atlas_lanes():
+    @router.get("/tapestry/log/lanes")
+    def tapestry_lanes():
         try:
             return {"cron_names": cron_job_names(hermes_home())}
         except Exception:

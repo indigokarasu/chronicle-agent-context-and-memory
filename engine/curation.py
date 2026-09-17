@@ -37,6 +37,7 @@ import os
 import urllib.parse
 
 from . import access, sweeps
+from . import entities as ents
 from . import speaker as spk
 from .embeddings import (
     EmbeddingsUnavailable,
@@ -437,15 +438,19 @@ class CurationWorker:
             except ValueError as e:
                 logger.warning("chronicle: dropped fact with bad subject grounding: %s", e)
                 return
+        if kind == "entity":
+            # The same bar the extractor applies, at the boundary that writes the
+            # log: a pronoun or half a sentence is not an entity (engine/entities.py).
+            name = key.get("name") or item.get("body") or ""
+            if not ents.plausible_name(name):
+                logger.warning("chronicle: dropped entity with an implausible name: %r", name[:80])
+                return
         risk = item.get("key", {}).get("risk_tier", "low")
         # Risk-tiered application (§16.4): behavior-changing high-risk → draft + review.
         status = item.get("status", "active")
         if kind == "note" and item.get("key", {}).get("note_type") in ("norm", "procedure"):
             if risk == "high":
                 status = "draft"
-        ext = {"extractor_version": version, "valid_from": ev.get("occurred_at")}
-        if "_entity_id" in item:
-            ext["entity_token"] = item["_entity_id"]
         self.core.capture.append("asserted", {
             "kind": kind, "key": item["key"], "body": item["body"], "domain": domain,
             "confidence": item.get("confidence", 0.8), "source_event": item["source_event"],

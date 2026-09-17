@@ -1,8 +1,10 @@
-// dist/atlas.js — the Atlas memory navigator. Loaded by dist/index.js when the
-// Atlas tab first opens; registers window.__CHRONICLE_ATLAS__ = { Atlas }.
+// The log view: every captured event on its writer's row, with inspectors and
+// lenses. This is PROVENANCE — how a memory arrived — so it is a drill-down
+// from the thing it is about, not the way memory is browsed. main.js opens it
+// from an entity's fact or mention.
 
 import { h, hooks, fetchJSON, API, fmt, relTime } from "../common.js";
-import { injectAtlasCSS } from "./styles.js";
+import { injectTapestryCSS } from "./styles.js";
 import { EventModel, loadEvents, pollEvents, typeStyle } from "./data.js";
 import { createCanvas } from "./canvas.js";
 import { Inspector, Lenses } from "./panels.js";
@@ -11,7 +13,7 @@ const { useState, useEffect, useRef, useCallback } = hooks;
 const POLL_MS = 10000;
 const SUMMARY_MS = 300000;   // the server caches it for 5 minutes too
 
-function Atlas() {
+export function LogView({ focusEvent }) {
   const hostRef = useRef(null);
   const modelRef = useRef(null);
   const canvasRef = useRef(null);
@@ -23,7 +25,7 @@ function Atlas() {
   const [live, setLive] = useState({ ok: false, at: null });
   const [, setTick] = useState(0);
 
-  useEffect(() => { injectAtlasCSS(); }, []);
+  useEffect(() => { injectTapestryCSS(); }, []);
 
   // initial load: summary, lane names, then the whole log in chunks
   useEffect(() => {
@@ -31,9 +33,9 @@ function Atlas() {
     const model = new EventModel();
     modelRef.current = model;
     const abort = { aborted: false };
-    fetchJSON(API + "/atlas/lanes").then((d) => !cancelled && setCronNames(d.cron_names || {}))
+    fetchJSON(API + "/tapestry/log/lanes").then((d) => !cancelled && setCronNames(d.cron_names || {}))
       .catch((e) => console.warn("[chronicle] cron job names unavailable; rows keep their job ids", e));
-    fetchJSON(API + "/atlas/summary").then(async (s) => {
+    fetchJSON(API + "/tapestry/log/summary").then(async (s) => {
       if (cancelled) return;
       if (s.error) throw new Error(s.error);
       setSummary(s);
@@ -82,7 +84,7 @@ function Atlas() {
     };
     const refreshSummary = () => {
       if (document.visibilityState !== "visible") return;
-      fetchJSON(API + "/atlas/summary").then((s) => { if (!s.error) setSummary(s); })
+      fetchJSON(API + "/tapestry/log/summary").then((s) => { if (!s.error) setSummary(s); })
         .catch((e) => console.warn("[chronicle] summary refresh failed", e));
     };
     const a = setInterval(poll, POLL_MS);
@@ -163,4 +165,3 @@ function Atlas() {
         model ? h(Inspector, { sel, model, cronNames, onBelief, onEventSeq, onSession, onLane }) : null)));
 }
 
-window.__CHRONICLE_ATLAS__ = { Atlas };
