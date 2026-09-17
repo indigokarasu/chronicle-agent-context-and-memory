@@ -298,7 +298,8 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
 
     def test_second_identical_fact_still_confirms_and_appends_provenance_no_embedder(self):
         # The provenance-merge fix must not depend on an embedder being present —
-        # only the near-duplicate MERGE path (_calculate_novelty) needs one.
+        # nothing on the merge path reads a vector (_exact_duplicate); only the
+        # novelty score does.
         key = {"entity_id": "user", "predicate_canonical": "city", "attribute": "city",
                "qualifiers_hash": "", "qualifiers": {}, "owner": "default", "domain": "user"}
 
@@ -318,8 +319,8 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
 class TestCrossSubjectMergeIsStructurallyImpossible(unittest.TestCase):
     """The critical defect of the second E5 pass: merge candidates for every
     kind WITHOUT a subject column (episode, reference, procedure) were selected
-    on owner+domain alone, so any two same-kind items above dup_similarity
-    merged — and the second one's content was destroyed. Episodes are emitted
+    on owner+domain alone, so any two same-kind items above the (since deleted)
+    0.95 cosine floor merged — and the second one's content was destroyed. Episodes are emitted
     for every turn over 60 characters, so this was the highest-volume write
     path in the system silently eating unrelated content.
 
@@ -350,8 +351,9 @@ class TestCrossSubjectMergeIsStructurallyImpossible(unittest.TestCase):
         from engine.embeddings import cosine
         emb = self.core.embedder
         sim = cosine(emb.embed(self._T1[:400]), emb.embed(self._T2[:400]))
-        # If the fixture ever drops below the threshold the test proves nothing.
-        self.assertGreaterEqual(sim, 0.95, "fixture must exceed dup_similarity")
+        # The pair must be near-identical as VECTORS, or the test would not show
+        # that closeness alone never merges two different items.
+        self.assertGreaterEqual(sim, 0.95, "fixture must be near-identical by cosine")
 
         self.core.capture.append("observed", {"excerpt": self._T1, "session_id": "sess_A"},
                                  actor="user", owner="default")
@@ -557,11 +559,17 @@ class TestMergeLeavesNoOrphanJustification(unittest.TestCase):
     caller went on to justify the belief_id that was never written — 1 fact row,
     2 justifications, 1 of them pointing at nothing."""
 
+    # A merge is only legal between byte-identical bodies (reducer._exact_duplicate).
+    # The keys differ in qualifiers_hash, so the second write is a NEW key for
+    # _apply_fact_conflict and reaches the E5 merge instead of the re-assertion
+    # path. (This fixture used to merge "skiing in the winter" into "skiing in
+    # the winter months" under a lowered cosine floor: the data loss the exact
+    # rule removes.)
     A = "skiing in the winter"
-    B = "skiing in the winter months"      # cosine(A, B) = 0.894 under HashingEmbedder
+    B = "skiing in the winter"
 
     def setUp(self):
-        self.core, self.home = make_core({"curation": {"dup_similarity": 0.85}})
+        self.core, self.home = make_core()
         self.core.initialize("s1", principal_id="assistant")
 
     def tearDown(self):

@@ -1009,42 +1009,32 @@ class Reducer:
             logger.debug("embedding skipped (%s)", e)
             return None
 
-    def _calculate_novelty(self, query_embedding, kind, key, body, owner, domain):
-        """Score this write's novelty and find its ONE legal merge candidate.
+    def _calculate_novelty(self, query_embedding, kind, owner, domain):
+        """This write's novelty: 1 − max cosine against existing same-KIND vectors.
 
-        Takes the already-computed embedding (see _embed_once) and returns
-        `(novelty, dup_belief_id, dup_similarity)`; `(None, None, None)` when
-        the kind is not stored in a belief table (§E5: "no embedder → store as
-        today" is handled by the caller, which never gets a vector at all).
+        Takes the already-computed embedding (see _embed_once); None when there
+        is no embedding or the kind is not stored in a belief table (§E5: "no
+        embedder → store as today" is handled by the caller).
 
-        Two DIFFERENT questions, deliberately answered by two different scans:
+        The spec's definition verbatim, scoped to owner+domain, so an episode is
+        scored against every episode and a fact against every fact. Scoping it
+        to the same SUBJECT instead — what the first pass did — left it NULL on
+        nearly every write, because the overwhelmingly common case is the first
+        item of its subject. A first-ever item of its kind scores 1.0 (maximally
+        novel), never NULL: NULL means "not computed", and conflating the two
+        makes the column unreadable.
 
-        novelty  — the spec's definition verbatim: 1 − max cosine against
-            existing same-KIND vectors (owner+domain scoped), so an episode is
-            scored against every episode, a fact against every fact. Scoping it
-            to the same SUBJECT instead — what the first pass did — left it NULL
-            on nearly every write, because the overwhelmingly common case is the
-            first item of its subject. A first-ever item of its kind scores 1.0
-            (maximally novel), never NULL: NULL means "not computed", and
-            conflating the two makes the column unreadable.
+        Novelty is a SCORE and only a score. It used to also nominate the
+        near-duplicate merge candidate, which made belief content depend on the
+        embedder; that decision is now `_exact_duplicate`'s, and it never reads
+        a vector.
 
-        dup_belief_id — the nearest neighbour that ALSO matches this item's
-            subject / natural key EXACTLY, restricted in SQL (see _merge_scope).
-            Never a bare owner+domain neighbour: merging discards the incoming
-            body and keeps only its provenance, so a cross-subject merge is
-            silent data loss. Kinds with no natural key never merge at all.
-
-        `dup_similarity` is that candidate's OWN cosine — not `1 − novelty`,
-        which is the global maximum and may belong to a different subject
-        entirely; comparing the global max against the threshold would fire a
-        merge on the strength of an item the merge is not allowed to touch.
-
-        Candidate retrieval goes through store.nearest_memory_vectors (top-K by
-        cosine over every same-kind vector, paged), not a rowid-ordered
-        `LIMIT 100` scan, so behaviour does not silently degrade past 100 items.
+        Neighbours come from store.nearest_memory_vectors (top-K by cosine over
+        every same-kind vector, paged), not a rowid-ordered `LIMIT 100` scan, so
+        the score does not silently degrade past 100 items.
         """
         if not query_embedding or KIND_TABLE.get(kind) not in BELIEF_TABLES:
-            return None, None, None
+            return None
 
         k = NOVELTY_TOP_K
         if self.cfg:
@@ -1057,23 +1047,41 @@ class Reducer:
             neighbours = self.store.nearest_memory_vectors(kind, query_embedding, owner, domain, k)
         except Exception as e:
             logger.debug("novelty scan skipped (%s)", e)
-            return None, None, None
+            return None
         # Clamp at 0: an anti-correlated neighbour is not "more than new".
         top = max(0.0, neighbours[0][1]) if neighbours else 0.0
-        novelty = 1.0 - top
+        return 1.0 - top
 
+    def _exact_duplicate(self, kind, key, body, owner, domain):
+        """The active row this write would duplicate EXACTLY, or None.
+
+        Legal merge target = same kind, owner and domain, the same subject /
+        natural key (_merge_scope, restricted in SQL so a cross-subject row
+        cannot even be returned), and a byte-identical body in the column the
+        belief-text authority names for the kind (BELIEF_VECTOR_SOURCE). Nothing
+        here reads a vector or a threshold, so the decision is the same with the
+        embedder healthy, timed out or absent, and the same on every replay.
+
+        Anything short of identical is kept as its own row. A paraphrase stored
+        twice costs a row; an update merged away costs the update. Kinds with no
+        natural key, and empty bodies, never merge. When legacy duplicates
+        already exist the OLDEST (created_at, then belief_id) is chosen, so the
+        survivor does not depend on rowid order.
+        """
+        spec = BELIEF_VECTOR_SOURCE.get(kind)
         scope = _merge_scope(kind, key, body)
-        if scope is None:
-            return novelty, None, None       # no natural key → never merges
+        if spec is None or scope is None or not body:
+            return None
+        table, body_col = spec[0], spec[1]
         try:
-            same = self.store.nearest_memory_vectors(kind, query_embedding, owner, domain, k,
-                                                     scope[0], scope[1])
+            rows = self.store.query_beliefs(
+                table,
+                "owner=? AND domain=? AND status='active' AND (%s) AND %s=?" % (scope[0], body_col),
+                (owner, domain, *scope[1], body), limit=1, order="created_at, belief_id")
         except Exception as e:
-            logger.debug("duplicate scan skipped (%s)", e)
-            return novelty, None, None
-        if not same:
-            return novelty, None, None
-        return novelty, same[0][0], same[0][1]
+            logger.debug("duplicate lookup skipped (%s)", e)
+            return None
+        return rows[0]["belief_id"] if rows else None
 
     def _append_provenance(self, existing, source_event, source_type, now=None):
         """Append a new provenance entry to an existing belief's provenance JSON.
@@ -1170,29 +1178,33 @@ class Reducer:
         # reducer.belief_vector_text reads back, so deriving the text from them is
         # what makes the write side and every repair side ONE expression. This is the
         # same rule _write_doc2query_proxies already follows for proxy questions.
-        # E5: Calculate novelty and check for near-duplicates (if embedder available)
         text_to_embed = self.vector_text("asserted", {"kind": kind, "key": key, "body": body})
         novelty = None
-        dup_similarity_threshold = (self.cfg.get("curation.dup_similarity", 0.95)
-                                     if self.cfg else 0.95)
-
         write_vec = None
+
+        # E5 duplicate merge: EXACT content, decided before anything is embedded.
+        # A merge keeps the existing row and discards this body, so it is only
+        # legal when this body carries nothing that row lacks. Cosine similarity
+        # cannot tell that: on the production nomic model "Standup is at 9am" ->
+        # "10am" scores 0.9945, "allergic to peanuts" -> "not allergic" 0.9795
+        # and "offsite in Denver" -> "Boston" 0.9547, while a pure paraphrase
+        # scores 0.9948, so the old 0.95 floor silently threw those updates away.
+        # It also made the projection a function of whichever embedder answered:
+        # a timed-out or absent embed skipped the check, so every repeat became a
+        # new active row (22,358 redundant copies of 2,696 directives in one
+        # production scope), and a rebuild under another model merged differently
+        # (I3). A byte-identical body in the same scope depends on the log alone.
+        if kind in _VECTORED_KINDS:
+            dup_id = self._exact_duplicate(kind, key, body, owner, domain)
+            if dup_id:
+                merged_into = self._merge_duplicate(dup_id, _table_for(kind), event,
+                                                    source_event, source_type)
+                if merged_into:
+                    return merged_into
 
         if self.embedder is not None and text_to_embed and kind in _VECTORED_KINDS:
             write_vec = self._embed_once(text_to_embed)
-            novelty, dup_candidate_id, dup_similarity = self._calculate_novelty(
-                write_vec, kind, key, body, owner, domain)
-            # Merge only on the candidate's OWN similarity: `1 - novelty` is the
-            # nearest neighbour of ANY subject, which is exactly the item the
-            # merge is forbidden to touch.
-            if dup_candidate_id and dup_similarity is not None \
-                    and dup_similarity >= dup_similarity_threshold:
-                table = _table_for(kind)
-                if table:
-                    merged_into = self._merge_duplicate(dup_candidate_id, table, event,
-                                                        source_event, source_type)
-                    if merged_into:
-                        return merged_into
+            novelty = self._calculate_novelty(write_vec, kind, owner, domain)
 
         prov = {"source_type": source_type, "source_event": source_event,
                 "extracted_by": "chronicle-v5", "extracted_at": now}
