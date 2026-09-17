@@ -327,13 +327,57 @@ def _authority_text(conn, table, key):
     return "", False
 
 
-def _open_ro(path):
-    """Read-only connection. `mode=ro` is enforced by SQLite itself, so
-    --dry-run cannot write the live store even through a coding mistake."""
-    conn = sqlite3.connect("file:%s?mode=ro" % Path(path).as_posix(), uri=True,
-                           isolation_level=None)
-    conn.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
+def _connect_probed(uri):
+    """A connection that has provably read the file. `connect()` can fail
+    outright (no such directory) or succeed and leave the failure to the first
+    query (a WAL database with no -shm), so both are inside one guarded call."""
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
+        conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error:
+        conn.close()
+        raise
     return conn
+
+
+def _open_ro(path, static=False):
+    """Read-only connection. `mode=ro` is enforced by SQLite itself, so
+    --dry-run cannot write the live store even through a coding mistake.
+
+    Probed before it is returned, and a database that cannot be read REFUSES.
+    `mode=ro` cannot open a WAL-mode database that has no -shm sidecar (it may
+    not create one), and that is exactly what a fresh `.backup` of the live
+    store is: WAL header, no sidecars. The first query fails with "unable to
+    open database file". `_has_table` used to swallow that as "no such table",
+    so --build-manifest on the production copy wrote a 0-row manifest and exited
+    0, and a write-back against it would have reported success having written
+    nothing.
+
+    `static=True` is for the COPY, which nothing else has open. When `mode=ro`
+    fails there and no -wal file holds frames, `immutable=1` reads the file
+    exactly: there is nothing outside the main file to miss. With a non-empty
+    -wal it would silently ignore committed frames and read a stale database,
+    so that case refuses too. Live is never opened immutable: another process
+    writes it."""
+    uri = "file:%s?mode=ro" % Path(path).as_posix()
+    try:
+        return _connect_probed(uri)
+    except sqlite3.Error as e:
+        first = e
+    wal = Path(str(path) + "-wal")
+    wal_frames = wal.exists() and wal.stat().st_size > 0
+    if static and not wal_frames:
+        try:
+            return _connect_probed(uri + "&immutable=1")
+        except sqlite3.Error as e:
+            raise Refused("cannot read %s: %s (read-only), %s (immutable)"
+                          % (path, first, e))
+    raise Refused(
+        "cannot read %s read-only: %s.%s" % (
+            path, first,
+            " Its -wal holds frames an immutable open would ignore; open it read-write "
+            "once so SQLite checkpoints them, then re-run." if static and wal_frames else ""))
 
 
 def _open_rw(path):
@@ -350,8 +394,12 @@ def _has_table(conn, table):
     try:
         return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                             (table,)).fetchone() is not None
-    except sqlite3.Error:
-        return False
+    except sqlite3.Error as e:
+        # NOT "absent". A database that cannot answer this cannot answer
+        # anything, and reading the error as "no such table" is what turned an
+        # unopenable copy into an empty manifest with exit 0.
+        raise Refused("cannot read the schema (%s): the database is unreadable, "
+                      "not empty" % e)
 
 
 def _cols(conn, table):
@@ -375,8 +423,10 @@ def _row_counts(conn, tables):
             continue
         try:
             out[t] = conn.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0]
-        except sqlite3.Error:
-            continue
+        except sqlite3.Error as e:
+            # The table exists; a count that fails is a read failure, and
+            # skipping it would drop the whole table from the manifest.
+            raise Refused("cannot count %s (%s)" % (t, e))
     return out
 
 
@@ -393,9 +443,14 @@ def build_manifest(copy_db, out_path, tables=None, live_db=None, verbose=True):
     src = Path(copy_db).expanduser()
     if not src.exists():
         raise Refused("no database at %s" % src)
-    conn = _open_ro(src)
+    conn = _open_ro(src, static=True)
     try:
         counts = _row_counts(conn, tables)
+        if not sum(counts.values()):
+            raise Refused(
+                "%s holds no vector rows in %s. A manifest of nothing makes the "
+                "write-back a no-op that reports success; this is not the pristine "
+                "copy of a store with vectors." % (src, ", ".join(tables)))
         header = {
             "_manifest": MANIFEST_KIND,
             "version": MANIFEST_VERSION,
@@ -1016,6 +1071,11 @@ def preflight(live, copy, header, manifest_path, tables, active_tag, expect_len,
                 % (t, counts_now[t], counts_then[t]))
         if t in counts_now and t not in counts_then:
             problems.append("%s is present on the copy but absent from the manifest." % t)
+        if t in counts_then and t not in counts_now:
+            # Without this a table the copy lost is walked by nothing below and
+            # its rows are neither applied nor counted as skipped.
+            problems.append("%s is in the manifest (%d rows) but absent from the copy."
+                            % (t, counts_then[t]))
 
     # (3) no copy row is missing a pre-image, and every row the migration CHANGED
     #     carries the geometry live is serving (W5, store-wide).
@@ -1125,11 +1185,18 @@ def writeback(live_db, copy_db, manifest_path=None, dry_run=False,
         active_tag, expect_len = resolve_live_geometry(
             expect_tag, expect_width, cfg=cfg, embedder=embedder)
         header = manifest_header(manifest_path)
+        if not sum((header.get("row_counts") or {}).values()):
+            raise Refused(
+                "manifest %s records 0 rows. There is no pre-image to compare against, "
+                "so this run could only report success over a store it never touched. "
+                "Rebuild it from the pristine copy (an earlier writeback_vectors.py "
+                "wrote empty manifests for WAL copies it could not open)."
+                % manifest_path)
         manifest_sha = hashlib.sha256(
             Path(manifest_path).expanduser().read_bytes()).hexdigest()
 
         live = _open_ro(live_path) if dry_run else _open_rw(live_path)
-        copy = _open_ro(copy_path)
+        copy = _open_ro(copy_path, static=True)
 
         print("live db        : %s" % live_path)
         print("migrated copy  : %s" % copy_path)
