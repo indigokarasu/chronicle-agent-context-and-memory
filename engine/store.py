@@ -15,6 +15,7 @@ import datetime
 import heapq
 import json
 import logging
+import re
 import sqlite3
 import threading
 from collections.abc import Sequence
@@ -3489,11 +3490,30 @@ def _belief_fts_text(table: str, b: dict) -> tuple[str, str]:
     return "", ""
 
 
+# THE word-token definition for every keyword path (FTS queries here; routing,
+# overlap and hint tokens in retrieval.py): runs of Unicode letters and digits,
+# the characters FTS5's unicode61 tokenizer indexes, with an in-word apostrophe
+# kept ("don't") and the typographic one (U+2019) folded to it. The previous
+# ASCII-only `[A-Za-z0-9]+` turned "Zürich" into "rich" and "José" into "Jos",
+# so the keyword arm searched for words nobody wrote, and a Cyrillic or CJK
+# query produced no terms at all.
+_WORD_RX = re.compile(r"[^\W_]+(?:'[^\W_]+)*")
+
+
+def word_tokens(text: str) -> list:
+    """Words in `text`, in order, case preserved. See _WORD_RX."""
+    return _WORD_RX.findall((text or "").replace("\u2019", "'"))
+
+
 def _fts_query(query: str) -> str:
-    """Sanitize a free-text query into a safe FTS5 OR-of-terms match string."""
-    import re
-    terms = re.findall(r"[A-Za-z0-9]+", query or "")
-    terms = [t for t in terms if len(t) > 1]
+    """Sanitize a free-text query into a safe FTS5 OR-of-terms match string.
+
+    Terms are split at apostrophes as well: unicode61 indexes "don't" as "don"
+    and "t", so a quoted "don't" would be a phrase query that happens to work,
+    and splitting keeps every term a bare word. Single ASCII characters are
+    dropped as noise; a single non-ASCII letter (a CJK word) is kept."""
+    terms = [t for w in word_tokens(query) for t in w.split("'")]
+    terms = [t for t in terms if len(t) > 1 or (t and not t.isascii())]
     if not terms:
         return ""
     return " OR ".join(f'"{t}"' for t in terms)
