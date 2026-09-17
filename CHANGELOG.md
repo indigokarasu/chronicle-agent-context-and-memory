@@ -6,6 +6,12 @@ Abstention support gate; chunked capture; degraded-mode embeddings with retry qu
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.0
+
+### Added
+- Stale lock recovery: automated cleanup of orphaned `.db-wal` / `.db-shm` files at startup in `MemoryStore._init_db()` per `spec-ocas-recovery.md`
+- Pointer ingestion: `pointer` column on `events` table for storing skill reference pointers (`weave:person_id`, `scout:subject_id`, `rally:ticker`) instead of duplicating raw payloads; `CaptureEngine.append()` accepts optional `pointer` parameter; schema version 12
+
 ## 5.6.0
 
 ### Ladder 9 fix program (F1 / F2X / F5 / F4) — integration summary
