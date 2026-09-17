@@ -49,6 +49,29 @@ class TestANameIsAProperNoun(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(ent.plausible_name(name))
 
+    def test_a_credential_or_a_pronoun_tag_does_not_disqualify_a_name(self):
+        """What people put after their own name. A contact record carries it
+        verbatim, and the rule used to read "<name>, Ph.D." as a sentence (it
+        ends in a full stop) and "(she/her)" as a word with no capital, so real
+        contacts on the production store could not become entities."""
+        for name in ("Pat Testley, Ph.D.", "Pat Testley, PhD", "Sam Vimes (they/them)",
+                     "Robin Placeholder, M.HCI (she/her)", "Robin Placeholder Jr.",
+                     "Sam Vimes, M.A., Ph.D.", "Pat Testley, Esq."):
+            with self.subTest(name=name):
+                self.assertTrue(ent.plausible_name(name))
+
+    def test_a_credential_alone_is_still_not_a_name(self):
+        """What is left after the suffix comes off has to be a name on its own.
+        ("PhD" and "Jr" with no punctuation are not listed: a bare capitalised
+        token is the same shape as an acronym name like "NVIDIA", and this
+        module does not guess at meaning it cannot see.)"""
+        for name in ("Ph.D.", "(she/her)", ", Esq.", " , "):
+            with self.subTest(name=name):
+                self.assertFalse(ent.plausible_name(name))
+
+    def test_stripping_a_credential_cannot_rescue_a_sentence(self):
+        self.assertFalse(ent.plausible_name("dead end for getting a usable key, Ph.D."))
+
     def test_an_importers_subject_line_is_not_a_name(self):
         self.assertFalse(ent.plausible_name(
             'Ordered 1 item: Clothing | from "Acme Fake Co" | Sun, 6 Sep 2026'))
@@ -103,6 +126,14 @@ class TestKinds(unittest.TestCase):
         self.assertEqual(ent.kind_for("", ("birthday", "email")), ent.PERSON)
         self.assertEqual(ent.kind_for("", ("located_in",)), ent.PLACE)
         self.assertEqual(ent.kind_for("", ("is_a", "value")), "")
+
+    def test_a_contact_known_only_from_the_calendar_is_a_person(self):
+        """`attended_event` is the commonest predicate in the production store
+        (the calendar import) and answered nothing, so a contact whose only
+        trace was an appointment sat under "unclassified"."""
+        for pred in ("attended_event", "had_appointment", "traveling_to"):
+            with self.subTest(predicate=pred):
+                self.assertEqual(ent.kind_for("", (pred,)), ent.PERSON)
 
     def test_the_type_wins_over_the_predicates(self):
         self.assertEqual(ent.kind_for("city", ("birthday",)), ent.PLACE)
