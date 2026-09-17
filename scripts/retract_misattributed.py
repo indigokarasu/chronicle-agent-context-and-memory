@@ -128,11 +128,23 @@ def _channels(provenance) -> tuple:
     return types, events
 
 
-def _observed_ids(events: _Events, belief_id, prov_events, conn) -> list:
+def justification_map(conn) -> dict:
+    """`belief_id -> [supporting event ids]`, in one pass for the same reason
+    `human_events` exists: 112,652 single-row queries is not a plan."""
+    out = collections.defaultdict(list)
+    try:
+        for bid, support in conn.execute(
+                "SELECT belief_id, support FROM justifications WHERE support_kind='event'"):
+            out[bid].append(support)
+    except sqlite3.Error:
+        return {}
+    return out
+
+
+def _observed_ids(events: _Events, belief_id, prov_events, just) -> list:
     """Observed event ids behind a belief: its justifications, plus provenance
     entries (which may name the asserting event rather than the observed one)."""
-    ids = [r[0] for r in conn.execute(
-        "SELECT support FROM justifications WHERE belief_id=? AND support_kind='event'", (belief_id,))]
+    ids = list(just.get(belief_id, ()))
     for eid in prov_events:
         ev = events.get(eid)
         if ev and ev[0] == "asserted":
@@ -149,26 +161,60 @@ def _observed_ids(events: _Events, belief_id, prov_events, conn) -> list:
     return out
 
 
-def _judge(events: _Events, kind, text, observed_ids) -> tuple:
-    """(supported, [why not, per event])."""
+def human_events(conn) -> dict:
+    """`event_id -> whether the user's own words are in it`, for every observed event.
+
+    ONE sequential pass instead of a random read per belief: the beliefs to
+    judge share their supporting events, and on the production store the
+    per-belief reads were 112,652 lookups over a 3 GB file behind a live agent
+    on a CPU-capped box — the scan moved 132 rows in ten minutes.
+
+    A scheduled job's session is answered without parsing its payload at all:
+    its user side is automation by construction (engine/speaker.py), whether the
+    event carries spans or predates them, and 98% of a production store's turns
+    are that. What is left is small enough to read properly."""
+    out = {}
+    for eid, sid, actor, payload in conn.execute(
+            "SELECT event_id, session_id, actor, payload FROM events WHERE type='observed'"):
+        sid = sid or ""
+        if spk.is_automation_session(sid):
+            out[eid] = False
+            continue
+        try:
+            p = json.loads(payload) if isinstance(payload, str) else {}
+        except ValueError:
+            p = {}
+        out[eid] = spk.has_human(spk.attribute_lines(p, session_id=sid, actor=actor or ""))
+    return out
+
+
+def _judge(events: _Events, kind, text, observed_ids, human) -> tuple:
+    """(supported, [why not, per event]).
+
+    `human` is the map from `human_events`; a payload is read only for an event
+    that has the user in it at all, which is where the text has to be checked."""
     why = []
     want = _fold(text)
     for eid in observed_ids:
+        has_human = human.get(eid)
+        if has_human is None:              # not an observed event in this log
+            ev = events.get(eid)
+            if ev is None:
+                why.append("event no longer in the log")
+            else:
+                why.append("support is a %s event" % ev[0])
+            continue
+        if not has_human:
+            why.append("no words by the user")
+            continue
+        if kind == "episode":
+            return True, []
         ev = events.get(eid)
-        if ev is None:
+        if ev is None:                     # deleted between the pass and here
             why.append("event no longer in the log")
             continue
-        etype, sid, actor, payload = ev
-        if etype != "observed":
-            why.append("support is a %s event" % etype)
-            continue
-        lines = spk.attribute_lines(payload, session_id=sid, actor=actor)
-        if not spk.has_human(lines):
-            who = sorted({w for _, w in lines}) or ["nothing"]
-            why.append("no words by the user (%s%s)" % ("/".join(who),
-                                                      ", cron session" if spk.is_automation_session(sid) else ""))
-            continue
-        if kind == "episode" or (want and want in _fold(spk.human_text(lines))):
+        lines = spk.attribute_lines(ev[3], session_id=ev[1], actor=ev[2])
+        if want and want in _fold(spk.human_text(lines)):
             return True, []
         why.append("not in the user's words")
     if not observed_ids:
@@ -181,14 +227,16 @@ def scan(db_path: str):
     conn = _connect_ro(db_path)
     events = _Events(conn)
     try:
+        human = human_events(conn)
+        just = justification_map(conn)
         for table, (kind, col, extra) in TABLES.items():
             cols = ", ".join(("belief_id", col, "owner", "status", "provenance") + extra)
             for row in conn.execute("SELECT %s FROM %s WHERE status IN ('active','draft')" % (cols, table)):
                 types, prov_events = _channels(row["provenance"])
                 if not types or not types <= EXTRACTION_SOURCES:
                     continue  # another channel vouches for it, or provenance is unreadable
-                obs = _observed_ids(events, row["belief_id"], prov_events, conn)
-                supported, why = _judge(events, kind, row[col], obs)
+                obs = _observed_ids(events, row["belief_id"], prov_events, just)
+                supported, why = _judge(events, kind, row[col], obs, human)
                 rec = {"table": table, "kind": kind, "belief_id": row["belief_id"],
                        "owner": row["owner"], "status": row["status"], "text": row[col],
                        "channels": sorted(types), "support": obs}
