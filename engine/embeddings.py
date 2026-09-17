@@ -1067,7 +1067,30 @@ class OpenAICompatEmbedder:
         return [float(x) for x in vec]
 
     def healthcheck(self) -> bool:
-        v = self._embed_raw("ok", timeout=min(self.timeout, 4.0))  # raises if the endpoint/model can't embed
+        """Can this endpoint embed? Raises if not. Sets `dimensions` from the reply.
+
+        Two attempts, and only a TIMEOUT earns the second. The short first
+        attempt bounds startup when a server is DOWN -- a refused connection
+        returns at once whatever the timeout, and so does any HTTP error. A
+        timeout means something else: the port accepted and the server is
+        working, just slower than the short cap. On a loaded host that is the
+        normal case -- measured on the production VPS (2 cores, load ~13):
+        llama.cpp answered in 3.3 s, 5.4 s and 6.8 s. With a flat 4 s cap the
+        healthcheck declared that working server `unreachable` (a timeout is an
+        OSError, which `_outcome_for` files with a closed port), so a config
+        pinned to it sat DEGRADED writing no vectors, although real embeds get
+        `self.timeout` and succeed. The retry uses exactly that request timeout,
+        so the healthcheck can never be stricter than the requests it vouches for.
+        """
+        fast = min(self.timeout, 4.0)
+        try:
+            v = self._embed_raw("ok", timeout=fast)
+        except Exception as e:
+            if self.timeout <= fast or not _is_timeout(e):
+                raise
+            logger.info("Chronicle embeddings: %s healthcheck exceeded %.0fs; retrying once with "
+                        "the %.0fs request timeout (slow, not down)", self.base_url, fast, self.timeout)
+            v = self._embed_raw("ok", timeout=self.timeout)
         self.dimensions = len(v)  # trust the server's real dimensionality
         return True
 
@@ -1432,6 +1455,17 @@ def reset_probe_report() -> None:
     """Clear the last report and re-arm the one-shot warnings (tests/long hosts)."""
     del _LAST_PROBE_REPORT[:]
     _PROBE_WARNED.clear()
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """True when `exc` is a read/connect TIMEOUT, directly or wrapped by urllib.
+
+    `socket.timeout` is its own OSError subclass on Python 3.9 and an alias of
+    TimeoutError from 3.10, so both are named. Deliberately narrower than
+    `_outcome_for`'s "unreachable", which lumps timeouts with refused
+    connections: the healthcheck must tell "slow" from "down"."""
+    kinds = (TimeoutError, socket.timeout)
+    return isinstance(exc, kinds) or isinstance(getattr(exc, "reason", None), kinds)
 
 
 def _outcome_for(exc: BaseException) -> str:
