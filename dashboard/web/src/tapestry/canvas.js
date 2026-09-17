@@ -1,4 +1,4 @@
-// The Atlas canvas: two deck.gl orthographic views on one time axis.
+// The Tapestry canvas: two deck.gl orthographic views on one time axis.
 //
 //   activity  events per time bin, stacked by type; drag across it to zoom to a range
 //   writers   every event as a point, one row per writer (cron job, session,

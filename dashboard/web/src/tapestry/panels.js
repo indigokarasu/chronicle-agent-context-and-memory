@@ -1,5 +1,5 @@
 // Inspector (right column) and lenses (below the canvas). Plain React through
-// the plugin SDK; every value shown comes from an /atlas endpoint.
+// the plugin SDK; every value shown comes from an /tapestry endpoint.
 
 import { h, hooks, C, fetchJSON, API, fmt, when } from "../common.js";
 import { typeStyle, laneLabel } from "./data.js";
@@ -61,7 +61,7 @@ export function Inspector({ sel, model, cronNames, onBelief, onEventSeq, onSessi
 }
 
 function EventInspector({ seq, model, cronNames, onBelief, onEventSeq, onSession, onLane }) {
-  const st = useFetch(API + "/atlas/event?seq=" + seq);
+  const st = useFetch(API + "/tapestry/log/event?seq=" + seq);
   return h(Loading, { state: st }, (e) => {
     const style = typeStyle(e.type);
     const laneIx = model.laneIx.get(e.lane);
@@ -88,7 +88,7 @@ function EventInspector({ seq, model, cronNames, onBelief, onEventSeq, onSession
 }
 
 function SessionInspector({ id, model, cronNames, onBelief, onEventSeq, onLane }) {
-  const st = useFetch(API + "/atlas/session?id=" + encodeURIComponent(id));
+  const st = useFetch(API + "/tapestry/log/session?id=" + encodeURIComponent(id));
   return h(Loading, { state: st }, (s) => {
     const laneIx = model.laneIx.get(s.lane);
     return h("div", null,
@@ -110,7 +110,7 @@ function SessionInspector({ id, model, cronNames, onBelief, onEventSeq, onLane }
 }
 
 function BeliefInspector({ id, onBelief, onEventSeq, onSession }) {
-  const st = useFetch(API + "/atlas/belief?id=" + encodeURIComponent(id));
+  const st = useFetch(API + "/tapestry/log/belief?id=" + encodeURIComponent(id));
   return h(Loading, { state: st }, (b) => h("div", null,
     h("div", { className: "atl-head" },
       h("span", null, (KIND_LABEL[b.kind] || b.kind) + (b.label ? " · " + b.label : "")),
@@ -173,7 +173,7 @@ export function Lenses({ model, onBelief }) {
 }
 
 function ContradictionsLens({ onBelief }) {
-  const st = useFetch(API + "/atlas/contradictions?limit=100");
+  const st = useFetch(API + "/tapestry/log/contradictions?limit=100");
   return h(Loading, { state: st }, (d) => h("div", { className: "atl-lens" },
     h("div", { className: "chr-quiet atl-pad-s" }, fmt(d.total) + " open. Pairs of beliefs the store holds that cannot both be true; newest first."),
     d.items.map((c) => h("div", { key: c.id, className: "atl-pair" },
@@ -181,7 +181,7 @@ function ContradictionsLens({ onBelief }) {
 }
 
 function HistoriesLens({ model, onBelief }) {
-  const st = useFetch(API + "/atlas/histories?limit=100");
+  const st = useFetch(API + "/tapestry/log/histories?limit=100");
   return h(Loading, { state: st }, (d) => {
     const [x0, x1] = model.extentX();
     const span = Math.max(1e-6, x1 - x0);
@@ -207,7 +207,7 @@ function HistoriesLens({ model, onBelief }) {
 }
 
 function DuplicatesLens({ onBelief }) {
-  const st = useFetch(API + "/atlas/duplicates?limit=50");
+  const st = useFetch(API + "/tapestry/log/duplicates?limit=50");
   return h(Loading, { state: st }, (d) => {
     const max = d.items.length ? d.items[0].copies : 1;
     return h("div", { className: "atl-lens" },

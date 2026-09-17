@@ -474,27 +474,27 @@ def get_facts(
 
 
 # --------------------------------------------------------------------------
-# Atlas (memory navigator) routes, from the sibling atlas_api.py.
+# Tapestry (memory navigator) routes, from the sibling tapestry_api.py.
 #
 # Loaded by path for the same reason this file is: the host mounts plugin_api.py
 # with no parent package, so a relative import has nothing to resolve against.
-# A failure here costs the Atlas tab its data, never the rest of the dashboard.
+# A failure here costs the Tapestry tab its data, never the rest of the dashboard.
 # --------------------------------------------------------------------------
 def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 
 
-def _mount_atlas():
+def _mount_tapestry():
     import importlib.util
 
-    path = Path(__file__).resolve().parent / "atlas_api.py"
-    spec = importlib.util.spec_from_file_location("chronicle_dashboard_atlas", str(path))
+    path = Path(__file__).resolve().parent / "tapestry_api.py"
+    spec = importlib.util.spec_from_file_location("chronicle_dashboard_tapestry", str(path))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod.register(router, _get_db_path, _hermes_home, Query)
 
 
 try:
-    _mount_atlas()
+    _mount_tapestry()
 except Exception as _atlas_err:  # pragma: no cover - defensive
-    log.warning("chronicle: Atlas routes unavailable (%s)", _atlas_err)
+    log.warning("chronicle: Tapestry routes unavailable (%s)", _atlas_err)

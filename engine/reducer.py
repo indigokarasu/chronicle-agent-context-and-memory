@@ -16,6 +16,7 @@ import logging
 import re
 
 from . import access
+from . import entities as ents
 from . import doc2query
 from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
@@ -572,6 +573,22 @@ class Reducer:
         confidence = clamp_to_ceiling(raw, trust, cfg=self.cfg)
 
         b_id = compute_belief_id(kind, key, [source_event])
+        if kind == "entity":
+            # An entity IS its token: the id facts reference (`entity_id`) and the
+            # id of the row describing it must be the same, or every entity exists
+            # twice — once with its type and once with the facts hanging off it.
+            # Derived from the name, here in the fold, so nothing about the EVENT
+            # changes: the same log replays to the repaired projection.
+            b_id = ents.entity_token(key.get("name") or body) or b_id
+            # A pronoun or half a sentence is not an entity (engine/entities.py).
+            # The rule lives HERE as well as at the write boundary because the
+            # fold must reproduce the projection from the log alone (I3): the log
+            # already holds years of `asserted` entity events from before the
+            # rule, and a rebuild must not resurrect what they named.
+            if not ents.plausible_name(key.get("name") or body):
+                return
+        if kind == "fact":
+            self._name_entity_from_fact(key, body)
         existing = self._find_existing(kind, key, owner, domain)
 
         if kind == "fact" and existing:
@@ -979,6 +996,27 @@ class Reducer:
                  key.get("entity_type", key.get("type", "")), owner, domain), limit=1)
             return rows[0] if rows else None
         return None
+
+    def _name_entity_from_fact(self, key, body):
+        """An entity row named by another store's id takes the name the log asserts.
+
+        Chronicle references, it does not own (I20): a fact whose subject is a
+        people-store uuid creates an entity row named by that uuid, and a
+        production store held 1,003 of them — unreadable in every listing even
+        though the `name` fact right beside them says "Pat Testley". This is not
+        an inference: it is the name the log already carries for that id, applied
+        to the row, so a rebuild produces it too."""
+        if (key.get("predicate_canonical") or key.get("attribute")) != "name":
+            return
+        entity_id = key.get("entity_id") or ""
+        row = self.store.get_belief("entities", entity_id) if entity_id else None
+        if not row:
+            return
+        current = row.get("name") or entity_id
+        resolved = ents.resolve_name(current, body)
+        if resolved and resolved != current:
+            self.store.update_belief("entities", entity_id, name=resolved,
+                                     normalized_name=resolved.lower())
 
     def _ensure_entity(self, entity_id, name, owner, domain, event):
         if not entity_id:
