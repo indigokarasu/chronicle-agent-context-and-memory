@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.7.1.
+Version: 5.7.2.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -143,6 +143,20 @@ entities, which is why it had no schedule until it was fixed — two different
 people who share a name are the ordinary case, and `merged_into` collapses
 their provenance chains irreversibly. An explicit `merged` event still merges,
 because that event records a decision someone made.
+
+**Memory about the user comes only from the user.** Capture records who said
+each part of a turn (`engine/speaker.py`): the person, a scheduled job or bot, the
+assistant, a tool, or the host itself. The host context decides the user side:
+Hermes' `agent_context` and `platform`, and the turn author. Inside a person's
+message, Hermes' control frames (compaction handoffs, `[System note: ...]`,
+background-process results, the gateway origin header) and Chronicle's own
+recalled `<memory-context>` block count as host text. The spans are stored on
+the event, and extraction takes facts, preferences, standing instructions and
+entity types only from the person's own words. Everything else stays captured
+and searchable, and never becomes memory about the user.
+`scripts/retract_misattributed.py` retracts what earlier builds extracted from
+text the user never wrote. It runs as a dry run with a report unless given
+`--apply`.
 
 ## Installation
 
