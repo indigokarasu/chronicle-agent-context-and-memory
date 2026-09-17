@@ -41,6 +41,23 @@ facts — because the extractor's entity token never reached the fold.
   merely share a NAME are never merged: two people called the same thing are
   the ordinary case, and identity is adjudicated, never inferred.
 
+* **A name may carry what people put after their own name.** Read back from the
+  repaired production store, the rule was refusing real contacts: "<name>,
+  Ph.D." ends in a full stop, so it read as a sentence, and "(she/her)" is a
+  word with no capital in it. A trailing pronoun tag and trailing credentials
+  (Ph.D., M.A., M.HCI, Jr., Esq., III …) now come off before the rule looks at
+  the words, and what is left still has to pass on its own — "dead end for
+  getting a usable key, Ph.D." is still refused, and a credential standing alone
+  is not a name.
+* **A contact known only from the calendar is a person.** `attended_event` is
+  the most common predicate in the production store (366 facts, the calendar
+  import) and answered nothing, so an entity whose only trace was an appointment
+  sat under "unclassified". `attended_event`, `had_appointment` and
+  `traveling_to` now say person — as with every other entry here, because only a
+  person can be the subject of them, not because the name looks like one. The 49
+  rows that carry nothing but a `name` fact stay unclassified: that is what the
+  store knows.
+
 * **A retraction closes the contradictions it settles.** A contradiction is two
   beliefs the store cannot both hold; once one side is retracted there is
   nothing left to reconcile, but the row stayed `open`. The cleanup of 112,652
