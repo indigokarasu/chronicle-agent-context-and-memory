@@ -127,7 +127,7 @@ function Atlas() {
   const onSession = useCallback((id) => select({ kind: "session", id }), [select]);
   const onLane = useCallback((lane) => select({ kind: "lane", lane }), [select]);
 
-  if (error) return h("div", { className: "chr-err" }, "The Atlas could not read the store: " + error);
+  if (error) return h("div", { className: "chr-err" }, "Tapestry could not read the store: " + error);
 
   const model = modelRef.current;
   const b = (summary && summary.beliefs) || {};

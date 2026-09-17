@@ -264,8 +264,8 @@
       useEffect(() => {
         if (!mod) loadAtlas().then(setMod).catch((e) => setErr(e.message));
       }, []);
-      if (err) return h("div", { className: "chr-err" }, "The Atlas could not load: " + err);
-      if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading the Atlas\u2026");
+      if (err) return h("div", { className: "chr-err" }, "Tapestry could not load: " + err);
+      if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading Tapestry\u2026");
       return h(mod.Atlas, null);
     }
     function ChronicleDashboard() {
@@ -294,7 +294,7 @@
           "div",
           { className: "chr-tabs", role: "tablist" },
           h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "overview", onClick: () => choose("overview") }, "Overview"),
-          h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "atlas", onClick: () => choose("atlas") }, "Atlas")
+          h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "atlas", onClick: () => choose("atlas") }, "Tapestry")
         ),
         tab === "atlas" ? h(AtlasTab) : h(Overview)
       );
