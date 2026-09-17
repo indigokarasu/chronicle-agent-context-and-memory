@@ -1702,6 +1702,11 @@ class Reducer:
         else:
             self.store.update_belief_all_tables(b_id, status="retracted")
         self.store.delete_justifications(b_id)
+        # A contradiction is a pair the store cannot both hold; once one side is
+        # retracted there is nothing left to reconcile, and an open row that
+        # names a retracted belief is a question nobody can answer. (A cleanup
+        # of 112,652 beliefs left 1,550 of them behind on a production store.)
+        self.store.resolve_contradictions_for(b_id)
 
     def _cascade(self, b_id, source="", now=""):
         """Revision cascade (§9.3, I5, I24d): retract dependents that lose support.

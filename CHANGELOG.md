@@ -41,6 +41,13 @@ facts — because the extractor's entity token never reached the fold.
   merely share a NAME are never merged: two people called the same thing are
   the ordinary case, and identity is adjudicated, never inferred.
 
+* **A retraction closes the contradictions it settles.** A contradiction is two
+  beliefs the store cannot both hold; once one side is retracted there is
+  nothing left to reconcile, but the row stayed `open`. The cleanup of 112,652
+  beliefs left 1,550 such rows on a production store — a queue of questions
+  nobody can answer. The row is resolved, never deleted: its detail and its date
+  are the record.
+
 **The Tapestry is entity-first.** The memory view was a log: every event on the
 row of whatever wrote it. That is provenance — how a memory arrived — and it is
 now a drill-down reached from a fact or a mention, not the way in.
