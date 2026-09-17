@@ -167,8 +167,8 @@ function main() {
     const [mod, setMod] = useState(window.__CHRONICLE_ATLAS__ || null);
     const [err, setErr] = useState(null);
     useEffect(() => { if (!mod) loadAtlas().then(setMod).catch((e) => setErr(e.message)); }, []);
-    if (err) return h("div", { className: "chr-err" }, "The Atlas could not load: " + err);
-    if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading the Atlas…");
+    if (err) return h("div", { className: "chr-err" }, "Tapestry could not load: " + err);
+    if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading Tapestry…");
     return h(mod.Atlas, null);
   }
 
@@ -180,7 +180,7 @@ function main() {
     return h("div", { className: "chr", style: { padding: "1rem", gap: ".75rem" } },
       h("div", { className: "chr-tabs", role: "tablist" },
         h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "overview", onClick: () => choose("overview") }, "Overview"),
-        h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "atlas", onClick: () => choose("atlas") }, "Atlas")),
+        h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "atlas", onClick: () => choose("atlas") }, "Tapestry")),
       tab === "atlas" ? h(AtlasTab) : h(Overview));
   }
 
