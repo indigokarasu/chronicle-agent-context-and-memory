@@ -145,7 +145,9 @@ _ESCAPES = {
 }
 
 
-def _cjson_str(s: str) -> str:
+def _cjson_str_py(s: str) -> str:
+    """The CJSON string rule, spelled out: the seven short escapes, any other
+    control character as lowercase \\u00xx, everything else raw."""
     parts = ['"']
     for ch in s:
         esc = _ESCAPES.get(ch)
@@ -157,6 +159,16 @@ def _cjson_str(s: str) -> str:
             parts.append(ch)
     parts.append('"')
     return "".join(parts)
+
+
+# The standard library's JSON string encoder applies exactly that rule, in C
+# when available (checked over every code point: identical). Per character in
+# Python it was 12 s of a 17 s compaction on the production box -- every event
+# id and span id hashes the full text.
+try:
+    from json.encoder import encode_basestring as _cjson_str
+except ImportError:  # pragma: no cover
+    _cjson_str = _cjson_str_py
 
 
 def content_hash(data: bytes) -> str:

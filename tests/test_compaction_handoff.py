@@ -187,6 +187,32 @@ class TestToolUnits(_Engine):
         self.assertGreater(written, 100, "setup: a large pass")
         self.assertLess(outer[0], written // 10)
 
+    def test_a_large_tool_result_in_the_head_is_shortened_and_restorable(self):
+        self.eng.update_model("fake-model", 200000)   # roomy: only the cap shortens it
+        big = "SKILL DESCRIPTION for util-fake: " + "flag " * 12000
+        self.assertLess(self.eng._msg_cost({"content": big}), self.eng._target_budget() // 4)
+        msgs = [_msg("system", "sys"), _msg("user", "Fetch the Acme Fake Co spec."),
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "h1", "type": "function", "function": {"name": "skill_view", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "h1", "content": big}]
+        msgs += self._session(20)[2:]
+        out = self.eng.compress(msgs)
+        head_tool = next(m for m in out if m.get("tool_call_id") == "h1")
+        self.assertLess(len(head_tool["content"]), len(big) // 2)
+        sid = re.search(r'chronicle_expand\("(fold_[0-9a-f]{12})"\)', head_tool["content"]).group(1)
+        self.assertEqual(json.loads(self.eng.handle_tool_call("chronicle_expand", {"span_id": sid}))["content"], big)
+        self.assertEqual(_orphans(out), (set(), set()))
+
+    def test_a_small_tool_result_in_the_head_is_untouched(self):
+        self.eng.update_model("fake-model", 6000)
+        msgs = [_msg("system", "sys"), _msg("user", "Fetch the Acme Fake Co spec."),
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "h1", "type": "function", "function": {"name": "skill_view", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "h1", "content": "short spec"}]
+        msgs += self._session(20)[2:]
+        out = self.eng.compress(msgs)
+        self.assertIn(msgs[3], out)
+
     def test_tool_call_arguments_are_counted(self):
         m = {"role": "assistant", "content": "",
              "tool_calls": [{"id": "c", "function": {"name": "write_file",

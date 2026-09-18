@@ -828,6 +828,12 @@ class ChronicleContextEngine(ContextEngine):
             tail_units.insert(0, rest[-1])
             rest = rest[:-1]
         middle_units = rest
+        if is_first_pass:
+            # The head is kept for how the conversation started, not for the
+            # bulk of a tool's output: one 43 KB result in it cost a third of
+            # the budget on every call. Longer results are shortened, archived.
+            cap = max(500, budget // 20)
+            head_units = [[(i, self._cap_tool_result(m, cap)) for i, m in u] for u in head_units]
         head = [p for u in head_units for p in u]
         tail = [p for u in tail_units for p in u]
 
@@ -1569,6 +1575,15 @@ class ChronicleContextEngine(ContextEngine):
                     m = self._mark_clipped(orig, m)
                 kept.append((idx, m))
         return kept, used, dropped
+
+    def _cap_tool_result(self, m, cap: int):
+        """A tool result over `cap` tokens, shortened (archived first, ending
+        with the id that restores it); anything else unchanged."""
+        if m.get("role") != "tool" or self._msg_cost(m) <= cap:
+            return m
+        text = _text(m)
+        clipped = dict(m, content=text[:budget_chars(cap, margin=COMPRESSION_BUDGET)])
+        return self._mark_clipped(m, clipped)
 
     def _mark_clipped(self, orig, clipped):
         """A span shortened for budget: archive the whole of it, and end the

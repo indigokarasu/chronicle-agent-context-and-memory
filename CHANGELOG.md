@@ -57,6 +57,19 @@ engine adopts what an earlier handoff said, ids included. Archive writes are
 batched (one transaction per ~64 messages): a 961-message pass went 1.4 s →
 0.7 s.
 
+**A compaction costs seconds, not tens of them.** Profiled on the production
+box, one real 258-message compaction took 17.3 s, 12 s of it in the canonical
+JSON encoder, which escaped strings one character at a time in Python — and
+every event id and span id hashes the full text. The standard library's C
+string encoder applies exactly the same rule (checked over every code point);
+the same compaction now takes 4.6 s, and every capture is cheaper. The
+protected head no longer keeps a large tool result whole (one 43 KB skill
+description cost a third of the budget on every call): it is shortened,
+archived, and says how to restore it. An archive copy of a turn the memory
+provider already captured is searchable but not embedded — each compaction
+queued one embed job per folded message, duplicating vectors the provider's
+capture already has.
+
 **Excluded sessions stay unembedded.** `embeddings.exclude_session_prefixes`
 stopped the inline embed of an excluded session's turn, but an embed job
 queued before the prefix was excluded (or by an older build) still embedded it

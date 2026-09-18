@@ -382,6 +382,17 @@ def _defers_vectors(event) -> bool:
     return isinstance(raw, str) and any('"%s"' % s in raw for s in _DEFERRED_VECTOR_SOURCES)
 
 
+def is_duplicate_copy(payload) -> bool:
+    """An archive copy of a message the memory provider already captured (the
+    context engine marks those `extract: False`): kept durable and FTS-indexed
+    for chronicle_expand and search, but not embedded -- the provider's capture
+    of the same turn carries the vector, and each compaction queued one embed
+    job per archived message on a host whose embedding server is its
+    bottleneck. Carried in the event, so a rebuild decides the same (I3)."""
+    return (isinstance(payload, dict) and payload.get("extract") is False
+            and payload.get("source_type") == "context_eviction")
+
+
 def _vectors_deferred() -> bool:
     return getattr(_TLS, "defer_vectors", False)
 
@@ -573,7 +584,7 @@ class Reducer:
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = (self.cfg.get("embeddings.exclude_session_prefixes", []) if self.cfg else [])
         sid = event.get("session_id") or ""  # observed events may carry no session_id at all
-        skip_vec = any(sid.startswith(prefix) for prefix in excluded)
+        skip_vec = any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
         if excerpt:
             self.store.fts_index_observed(eid, excerpt)
             if self.embedder is not None and not skip_vec:
