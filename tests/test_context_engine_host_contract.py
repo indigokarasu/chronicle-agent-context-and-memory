@@ -647,5 +647,25 @@ class TestTheHostsMessagesAreNotEdited(unittest.TestCase):
         self.assertFalse(self.eng._is_pinned(target), "a stale hash must not protect other text")
 
 
+class TestNothingToCompressIsSaid(unittest.TestCase):
+    """has_content_to_compress: the host asks it before a manual /compress."""
+
+    def setUp(self):
+        self.eng = ChronicleContextEngine()
+
+    def test_a_short_conversation_has_nothing_to_compress(self):
+        self.assertFalse(self.eng.has_content_to_compress(_conversation(6)))
+
+    def test_a_long_one_does(self):
+        self.assertTrue(self.eng.has_content_to_compress(_conversation(40)))
+
+    def test_a_middle_made_only_of_directives_has_nothing_to_compress(self):
+        msgs = _conversation(3)
+        msgs += [{"role": "user", "content": "You must always use metric units, rule %d." % i}
+                 for i in range(10)]
+        msgs += _conversation(6)[1:]
+        self.assertFalse(self.eng.has_content_to_compress(msgs))
+
+
 if __name__ == "__main__":
     unittest.main()
