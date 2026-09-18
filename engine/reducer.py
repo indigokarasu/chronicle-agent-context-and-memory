@@ -593,6 +593,11 @@ class Reducer:
         # memory is about the user and their world, not the assistant running itself.
         if _is_operational(event, p, excerpt):
             return
+        # A capture that says it is a copy of something already extracted — an
+        # eviction made while the memory provider captured the same turn — is
+        # kept for recall and not extracted a second time.
+        if p.get("extract") is False:
+            return
         self.store.enqueue_curation("extract", {"event_id": eid, "session_id": event.get("session_id")})
 
     def _on_asserted(self, event):
