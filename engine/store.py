@@ -1263,14 +1263,32 @@ class MemoryStore:
             conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
             conn.execute("INSERT INTO observed_fts(event_id, excerpt) VALUES(?,?)", (event_id, excerpt))
 
-    def fts_search_observed(self, query: str, limit: int = 20) -> list[dict]:
-        q = _fts_query(query)
+    def fts_search_observed(self, query: str, limit: int = 20, *, match: str | None = None,
+                            exclude_session_prefixes: tuple = ()) -> list[dict]:
+        """`match` is a ready FTS5 expression (the relevance gate's content
+        words) used instead of sanitizing `query`. `exclude_session_prefixes`
+        drops rows from those sessions IN the query, before the LIMIT: on the
+        production store ~98% of transcript rows are cron runs, and filtering
+        them afterwards meant re-running the whole ranked match to find
+        `limit` rows that were left."""
+        q = match if match is not None else _fts_query(query)
         if not q:
             return []
         try:
-            rows = self._conn().execute(
-                "SELECT event_id, excerpt, rank FROM observed_fts WHERE observed_fts MATCH ? "
-                "ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+            if exclude_session_prefixes:
+                cond = " AND ".join("COALESCE(e.session_id, '') NOT LIKE ? ESCAPE '\\'"
+                                    for _ in exclude_session_prefixes)
+                likes = [p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                         for p in exclude_session_prefixes]
+                rows = self._conn().execute(
+                    "SELECT f.event_id, f.excerpt, f.rank FROM observed_fts f "
+                    "LEFT JOIN events e ON e.event_id = f.event_id "
+                    "WHERE observed_fts MATCH ? AND " + cond + " ORDER BY f.rank LIMIT ?",
+                    (q, *likes, limit)).fetchall()
+            else:
+                rows = self._conn().execute(
+                    "SELECT event_id, excerpt, rank FROM observed_fts WHERE observed_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?", (q, limit)).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
@@ -1281,8 +1299,9 @@ class MemoryStore:
 
     # -- belief FTS (Tier-1, §18.1) ---------------------------------------
 
-    def fts_search_beliefs(self, query: str, limit: int = 20) -> list[dict]:
-        q = _fts_query(query)
+    def fts_search_beliefs(self, query: str, limit: int = 20, *,
+                           match: str | None = None) -> list[dict]:
+        q = match if match is not None else _fts_query(query)
         if not q:
             return []
         try:
@@ -3629,6 +3648,12 @@ _JOBS_INDEX_DDLS = (
     ("CREATE INDEX IF NOT EXISTS idx_jobs_embed_done_target ON curation_jobs("
      "json_extract(payload, '$.target_id')) "
      "WHERE task='embed' AND status IN ('done','failed');"),
+    # Serves directive_rows (`always_inject=1 AND status='active'`), which the
+    # context block runs twice per call. idx_notes_directive covers
+    # always_inject alone, and on the production store the attribution cleanup
+    # left ~30k RETRACTED always-inject notes behind it: 0.4 s a call to find
+    # ten active ones. Two equalities, so the planner prefers this one.
+    ("CREATE INDEX IF NOT EXISTS idx_notes_directive_active ON notes(always_inject, status);"),
     # v5.7.0 review §8. The ONLY index on the referencing side of
     # `depends_on REFERENCES curation_jobs(id)`, and it is a deploy-cost fix, not
     # a query-plan nicety. SQLite verifies an enforced foreign key on every
