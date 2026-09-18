@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.17
+
+**The handoff alternates the way Hermes counts turns.** The handoff's role was
+the opposite of the last row before it, a tool row counting as the
+assistant's side, so after a tool loop — "…tool result, [handoff], the user's
+request" — it came out as a second user message in a row. Hermes places its
+own summary against the roles a strict chat template counts, where tool rows
+and an assistant's tool-call row are exempt; so does the handoff now (after a
+tool loop the last counted turn is the user's request, and the handoff is the
+assistant's).
+
 ## 5.8.16
 
 **The agent's own notes come from the agent's own file.** Every directive in
