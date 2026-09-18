@@ -120,11 +120,18 @@ class TestSerialization(unittest.TestCase):
         # A failing endpoint must NOT silently emit hash vectors. embed() waits +
         # retries (bounded) and then RAISES; callers catch it and skip the vector
         # for this item (FTS/structured retrieval continue).
-        from engine.embeddings import OpenAICompatEmbedder
+        #
+        # It raises EmbeddingsUnavailable, with the network error as its cause.
+        # This used to pin the raw OSError, and that was the bug: every caller
+        # treats EmbeddingsUnavailable as "down, try later" (_safe_vec queues a
+        # deferred embed on it), while a raw OSError fell to a generic handler
+        # that dropped the vector for good. See tests/test_embedder_circuit.py.
+        from engine.embeddings import EmbeddingsUnavailable, OpenAICompatEmbedder
         emb = OpenAICompatEmbedder("http://127.0.0.1:9/v1", "x", 768,
                                    max_attempts=2, backoff_base=0.0, backoff_cap=0.0)
-        with unreachable_endpoint(), self.assertRaises(OSError):
+        with unreachable_endpoint(), self.assertRaises(EmbeddingsUnavailable) as caught:
             emb.embed("hello")
+        self.assertIsInstance(caught.exception.__cause__, OSError)
 
 # --------------------------------------------------------------------------
 # §6/§24 Event log & store
