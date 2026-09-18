@@ -3,6 +3,40 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.11
+
+Review fixes to 5.7.5–5.7.10, each verified against the code before changing it.
+
+* **A tool cannot speak for the user.** A tool's output is stored verbatim
+  inside the excerpt, so a line in it can look exactly like a role label —
+  `User: ignore previous instructions` in a web page. Reading the excerpt by
+  its prefixes handed that line to the user, in the reader's copy, the
+  episode, the model extractor's prompt and the per-turn injection. The
+  capture's spans say whose each line is, and capture stores them exactly when
+  such a line exists (the prefix reading and the spans then disagree), so
+  `strip_framing` now takes a `role:` line as a message start only when the
+  spans agree, and extraction rebuilds its text from the speaker lines instead
+  of re-reading prefixes. A later chunk's opening takes its role from the spans
+  too. Events without spans still read by prefix, as extraction always has.
+* **An evicted tool result is not memory about the user.** Its text is bare;
+  only its spans say it was a tool's, and the gated injection judged the text.
+  It now reads each row's own event.
+* **An older copy nobody can attribute** (no spans, not written by the user)
+  is left out wherever tool output must go.
+* **Automation is read from the turn**, not only from a `cron_` session id:
+  capture records a subagent's, a background review's, a non-primary agent's
+  or a bot's turn as automation, and `exclude_automation` now honours it.
+* **Left-out rows no longer cost real ones their place.** Vector candidates
+  are judged before they take a top-k slot, and the FTS channel fetches in
+  widening pages until it has `limit` rows it can use; with nothing left out
+  it is one fetch and the same rows as before.
+* **An empty session-index row is not a stale vector.** No summary and no
+  vector: nothing to re-embed and nothing a query can match, so the census no
+  longer counts it as outstanding forever. A row with no summary but a vector
+  still counts.
+* Public functions in the touched modules carry type hints (AGENTS.md), with a
+  test that keeps it so.
+
 ## 5.7.10
 
 **The per-turn injection never guesses whose words it is carrying.** A turn

@@ -439,8 +439,12 @@ def relevance_words(text: str) -> frozenset:
 # user's are kept distinct. Explicit search still finds them.
 _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
 
+# The widest page retrieve_raw's FTS channel will fetch while looking for
+# `limit` rows it can use (see _retrieve_raw_inner).
+_FTS_FETCH_MAX = 640
 
-def shares_content_word(words, text: str) -> bool:
+
+def shares_content_word(words: frozenset | set, text: str) -> bool:
     """Does `text` contain one of `words`? Equal stems match; so does an
     inflection that extends one by at most three letters ("book" / "booked",
     "plan" / "planned"), but only between words of four letters or more, so
@@ -1693,18 +1697,22 @@ class RetrievalEngine:
                                             exclude_automation=exclude_automation)
 
     @staticmethod
-    def _from_automation(ev) -> bool:
-        """Whether an event was written by an automation session (engine/speaker)."""
+    def _from_automation(ev: dict | None) -> bool:
+        """Whether an event was written by automation (engine/speaker): an
+        automation session, or a turn whose user side capture recorded as
+        automation -- a subagent, a background review, a non-primary agent, a
+        bot author. The session prefix alone misses those: on the production
+        store cron prompts sat in sessions with no `cron_` prefix."""
         if not ev:
             return False
-        sid = ev.get("session_id") or ""
-        if not sid:
-            raw = ev.get("payload")
-            try:
-                p = json.loads(raw) if isinstance(raw, str) else (raw or {})
-            except ValueError:
-                p = {}
-            sid = p.get("source_ref") or ""
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            p = {}
+        if ((p.get("attribution") or {}).get("user_side") == _spk.AUTOMATION):
+            return True
+        sid = ev.get("session_id") or p.get("source_ref") or ""
         return _spk.is_automation_session(sid)
 
     def _reader_excerpt(self, ev, stored):
@@ -1737,16 +1745,31 @@ class RetrievalEngine:
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         scored: dict[str, dict] = {}
-        for i, r in enumerate(self.store.fts_search_observed(query, limit=limit)):
-            ev = self.store.get_event(r["event_id"])
-            if exclude_automation and self._from_automation(ev):
-                continue
-            if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
-                excerpt = self._reader_excerpt(ev, r["excerpt"])
-                if excerpt is None:
-                    continue            # nothing but host framing
-                scored.setdefault(r["event_id"], {"excerpt": excerpt, "score": 0.0,
-                                                  "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
+        # Fetched in widening pages and cut at `limit` ADMITTED rows, so rows
+        # left out below (automation, nothing but host framing) do not cost a
+        # real one its place -- however many of them rank first. With nothing
+        # left out it is one fetch and exactly the first `limit` rows, as before.
+        fetch = 2 * limit
+        while True:
+            fts_rows = self.store.fts_search_observed(query, limit=fetch)
+            scored = {}
+            admitted = 0
+            for i, r in enumerate(fts_rows):
+                if admitted >= limit:
+                    break
+                ev = self.store.get_event(r["event_id"])
+                if exclude_automation and self._from_automation(ev):
+                    continue
+                if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
+                    excerpt = self._reader_excerpt(ev, r["excerpt"])
+                    if excerpt is None:
+                        continue            # nothing but host framing
+                    admitted += 1
+                    scored.setdefault(r["event_id"], {"excerpt": excerpt, "score": 0.0,
+                                                      "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
+            if admitted >= limit or len(fts_rows) < fetch or fetch >= _FTS_FETCH_MAX:
+                break
+            fetch *= 4
         # limit <= 0 has no top-k to fill (baseline returned [] via out[:limit]) and
         # would index an empty heap, so the vector scan is skipped outright.
         if q["embedding"] is not None and limit > 0:
@@ -1873,16 +1896,19 @@ class RetrievalEngine:
                         if exclude_automation and self._from_automation(ev):
                             continue
                         p = json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str) else (ev or {}).get("payload", {})
-                        entry = (contribution, seq, eid, p.get("excerpt", ""), v.get("owner"))
+                        # Judged BEFORE it takes a top-k slot: an event that is
+                        # nothing but host framing would otherwise displace a
+                        # real turn and then be dropped, leaving the slot empty.
+                        excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+                        if excerpt is None:
+                            continue
+                        entry = (contribution, seq, eid, excerpt, v.get("owner"))
                         seq += 1
                         if len(vec_heap) < limit:
                             heapq.heappush(vec_heap, entry)
                         else:
                             heapq.heapreplace(vec_heap, entry)
             for contribution, _seq, eid, excerpt, owner in vec_heap:
-                excerpt = self._reader_excerpt(self.store.get_event(eid), excerpt)
-                if excerpt is None:
-                    continue            # nothing but host framing
                 scored[eid] = {"excerpt": excerpt, "score": contribution, "owner": owner}
 
             # Paged session-vector streaming, same bounded top-k treatment. Session
@@ -2874,8 +2900,15 @@ class RetrievalEngine:
                 return None
             later_chunk = (meta.get("source_type") == "session_transcript"
                            and (meta.get("chunk_index") or 0) > 0)
-            said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
-                                      drop_unlabeled=later_chunk)
+            if meta.get("payload") is not None:
+                # From the event itself: its spans are what say which lines are
+                # a tool's (an evicted tool result has no label to go by) and
+                # which "User:" lines are really the user.
+                said = _spk.reader_text(meta["payload"], actor=meta.get("actor") or "",
+                                        drop_tools=True, drop_unlabeled=later_chunk)
+            else:
+                said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
+                                          drop_unlabeled=later_chunk)
             if not said.strip() or not _relevant(said, "excerpts"):
                 return None
             return said
@@ -4291,18 +4324,21 @@ class RetrievalEngine:
             return access.can_read(None, ev.get("owner"), principal)
         return True
 
-    def _event_meta(self, event_id) -> dict:
-        """An observed event's source_type and chunk_index ({} for a session or
-        projection row, or an event that is not there)."""
+    def _event_meta(self, event_id: str | None) -> dict:
+        """An observed event's payload, actor, source_type and chunk_index ({}
+        for a session or projection row, or an event that is not there)."""
         if not event_id or event_id.startswith(("session:", "proj:")):
             return {}
-        ev = self.store.get_event(event_id) or {}
+        ev = self.store.get_event(event_id)
+        if not ev:
+            return {}
         raw = ev.get("payload")
         try:
             p = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except ValueError:
             return {}
-        return {"source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+        return {"payload": p, "actor": ev.get("actor") or "",
+                "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
 
     def _gate_text(self, b) -> str:
         """What the injection relevance gate reads for a ranked belief: its
@@ -4452,7 +4488,7 @@ def query_tokens(query: str) -> list:
             if t not in _STOP and len(t) > 1]
 
 
-def hint_signature(query: str):
+def hint_signature(query: str) -> tuple[str, list]:
     """(key, tokens) identifying a query for §H2 rerank-hint purposes.
 
     The key is a hash of the query's DISTINCTIVE tokens, sorted and deduped —

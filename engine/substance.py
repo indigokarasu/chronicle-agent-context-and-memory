@@ -85,7 +85,7 @@ _DATE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
                    r"|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b", re.I)
 
 
-def normalise(value) -> str:
+def normalise(value: object) -> str:
     """The text a rule should look at: bidi marks gone, unicode folded."""
     return unicodedata.normalize("NFKC", str(value or "").translate(_BIDI)).strip()
 
@@ -123,7 +123,7 @@ def _names_anything(text: str, words: list) -> bool:
     return any(w[0].isupper() for w in words[1:])
 
 
-def states_what_happened(value, predicate: str = "") -> bool:
+def states_what_happened(value: object, predicate: str = "") -> bool:
     """Whether this value says WHAT happened, rather than that something did.
 
     Answers True for any predicate that is not an event predicate: the question
@@ -143,7 +143,7 @@ def states_what_happened(value, predicate: str = "") -> bool:
     return _names_anything(text, words)
 
 
-def refusal(value, predicate: str = "") -> str:
+def refusal(value: object, predicate: str = "") -> str:
     """Why this value is not a memory, for a log line. "" when it is one."""
     if states_what_happened(value, predicate):
         return ""

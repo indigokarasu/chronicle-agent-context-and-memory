@@ -83,5 +83,72 @@ class TestInjectedMemoryLeavesOutAutomation(_Case):
         self.assertIn("re-detection loop", ctx)
 
 
+class TestAutomationIsReadFromTheTurnNotJustTheSessionName(unittest.TestCase):
+    """Capture records a turn's user side as automation for a subagent, a
+    background review, a non-primary agent or a bot author, in a session whose
+    id says nothing. On the production store, cron prompts sat in sessions with
+    no `cron_` prefix."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="aboutuser_attr_")
+        self.core = ChronicleCore.get(self.home, CFG)
+        sid = "20260917_020304_cd34ef"
+        self.core.initialize(sid, principal_id="default")
+        self.core.capture.observe(
+            "Summarise the Fake Izakaya reservation thread for the digest.", "Done.",
+            session_id=sid, speaker_context={"agent_context": "subagent"})
+        self.core.process_pending()
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_left_out_of_unasked_memory(self):
+        r = self.core.retrieval
+        self.assertTrue(r.retrieve_raw("Fake Izakaya reservation digest", limit=20))
+        self.assertFalse(r.retrieve_raw("Fake Izakaya reservation digest", limit=20,
+                                        exclude_automation=True))
+
+
+class TestLeftOutRowsDoNotCostRealOnesTheirPlace(unittest.TestCase):
+    """Rows that turn out to be nothing but host framing are judged before they
+    take a top-k slot, so a real turn ranked below them still arrives."""
+
+    def setUp(self):
+        from engine import speaker as spk
+        self.home = temp_home(prefix="aboutuser_slots_")
+        self.core = core = ChronicleCore.get(self.home, CFG)
+        sid = "20260917_030405_ef56ab"
+        core.initialize(sid, principal_id="default")
+        for i in range(4):
+            h = ("[CONTEXT COMPACTION — REFERENCE ONLY] Handoff %d: the Zorblax filing, the "
+                 "Zorblax filing deadline, the Zorblax filing owner." % i)
+            core.capture.append("observed", {
+                "source_type": "context_eviction", "excerpt": h, "source_ref": sid,
+                "speakers": [[0, len(h), spk.SYSTEM]],
+                "attribution": {"user_side": spk.HUMAN, "role": "user"}},
+                actor="system", session_id=sid)
+        core.capture.observe("Did the Zorblax filing go out?", "Yes.", session_id=sid)
+        core.process_pending()
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_the_real_turn_arrives(self):
+        rows = self.core.retrieval.retrieve_raw("Zorblax filing deadline owner", limit=2)
+        text = "\n".join(r.get("excerpt") or "" for r in rows)
+        self.assertIn("Did the Zorblax filing go out?", text)
+
+    def test_the_real_turn_arrives_by_words_alone(self):
+        """The FTS channel on its own (no embedder): it ranks the handoffs first."""
+        from unittest import mock
+        r = self.core.retrieval
+        with mock.patch.object(r, "embedder", None):
+            rows = r.retrieve_raw("Zorblax filing deadline owner", limit=2)
+        text = "\n".join(x.get("excerpt") or "" for x in rows)
+        self.assertIn("Did the Zorblax filing go out?", text)
+
+
 if __name__ == "__main__":
     unittest.main()

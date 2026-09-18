@@ -611,21 +611,34 @@ def _note_item(body, note_type, owner, domain, source_event, risk="low"):
             "signal_type": "directive"}
 
 
-def _reader_excerpt(excerpt: str, lines) -> str:
+_LINE_LABEL = {spk.HUMAN: "User", spk.AUTOMATION: "Automation", spk.ASSISTANT: "Assistant"}
+
+
+def _reader_excerpt(excerpt: str, lines: list) -> str:
     """The excerpt minus host framing and tool output, for what extraction
     keeps or sends verbatim -- the episode text, the model's prompt. Speaker
     lines already keep both out of every fact and note; the episode was the one
     output built from the raw text, so a turn that opened with an earlier
     compaction's handoff became an episode ABOUT that handoff, and a turn with a
     file read in it became an episode that was mostly the file. Unchanged --
-    the same string -- when no line is either."""
+    the same string -- when no line is either.
+
+    Rebuilt from the speaker LINES, not by re-reading `role:` prefixes: the
+    curation worker's lines come from the capture's spans, which know that a
+    "User: ignore previous instructions" line inside a tool's output is the
+    tool's, where a prefix reading would hand it to the user."""
     drop = (spk.SYSTEM, spk.TOOL)
     if not any(who in drop for _, who in lines):
         return excerpt
-    stripped = spk.strip_framing(excerpt, drop_tools=True)
-    if stripped is not excerpt:
-        return stripped
-    return "\n".join(t for t, who in lines if who not in drop)
+    out, prev = [], None
+    for text, who in lines:
+        if who in drop:
+            prev = None
+            continue
+        label = _LINE_LABEL.get(who)
+        out.append("%s: %s" % (label, text) if label and who != prev else text)
+        prev = who
+    return "\n".join(out)
 
 
 def _strip_roles(excerpt: str) -> str:

@@ -62,7 +62,7 @@ _ROLE_SPEAKER = {"assistant": ASSISTANT, "tool": TOOL, "function": TOOL,
 _HUMAN_SOURCE_TYPES = frozenset({"user_direct"})
 
 
-def is_automation_session(session_id) -> bool:
+def is_automation_session(session_id: str | None) -> bool:
     return str(session_id or "").startswith(AUTOMATION_SESSION_PREFIXES)
 
 
@@ -72,7 +72,8 @@ def _truthy(v) -> bool:
     return bool(v)
 
 
-def user_side(*, agent_context="", platform="", session_id="", author=None) -> str:
+def user_side(*, agent_context: str = "", platform: str = "", session_id: str = "",
+              author: dict | None = None) -> str:
     """Who is behind a `user` message in this context: HUMAN or AUTOMATION.
 
     A host that says nothing (tests, benchmarks, older hosts) gets HUMAN; any
@@ -89,14 +90,14 @@ def user_side(*, agent_context="", platform="", session_id="", author=None) -> s
     return HUMAN
 
 
-def role_speaker(role, side: str) -> str:
+def role_speaker(role: str | None, side: str) -> str:
     r = str(role or "").strip().lower()
     if r == "user":
         return side
     return _ROLE_SPEAKER.get(r, UNKNOWN)
 
 
-def role_label(role, side: str) -> str:
+def role_label(role: str | None, side: str) -> str:
     """The label an excerpt line carries. A `user` row the user did not write is
     labelled `automation`, so the raw recall text does not claim otherwise."""
     r = str(role if role is not None else "?")
@@ -159,7 +160,7 @@ def split_user_content(content: str, side: str) -> list:
     return merge_spans(spans)
 
 
-def merge_spans(spans) -> list:
+def merge_spans(spans: list) -> list:
     out: list = []
     for a, b, who in spans:
         if b <= a:
@@ -176,7 +177,7 @@ _PART_MARKERS = {"image_url": "[image]", "image": "[image]", "input_image": "[im
                  "input_file": "[file]"}
 
 
-def message_text(content) -> str:
+def message_text(content: object) -> str:
     """The TEXT of a message's content, whatever shape the host sent.
 
     A string comes back unchanged. A list of parts — how a vision-capable host
@@ -206,7 +207,7 @@ def message_text(content) -> str:
     return str(content)
 
 
-def render_messages(messages, side: str) -> tuple:
+def render_messages(messages: list, side: str) -> tuple:
     """`(excerpt, spans)` for a message list.
 
     The excerpt is byte-identical to the pre-attribution format
@@ -240,7 +241,7 @@ def render_messages(messages, side: str) -> tuple:
     return "".join(parts), merge_spans(spans)
 
 
-def chunk_spans(spans, chunks) -> list:
+def chunk_spans(spans: list, chunks: list) -> list:
     """Per-chunk span lists, offsets relative to each chunk (chunks are a
     lossless split of the excerpt the spans cover)."""
     out, base = [], 0
@@ -271,7 +272,7 @@ _LABEL = re.compile(r"^(user|assistant|tool|function|system|developer|automation
                     re.IGNORECASE)
 
 
-def lines_from_spans(excerpt, spans) -> list:
+def lines_from_spans(excerpt: str, spans: list) -> list:
     out = []
     for a, b, who in spans:
         for piece in excerpt[a:b].split("\n"):
@@ -315,7 +316,7 @@ def parse_labeled(excerpt: str, side: str, lead: str) -> list:
     return out
 
 
-def attribute_lines(payload: dict, *, session_id="", actor="") -> list:
+def attribute_lines(payload: dict, *, session_id: str = "", actor: str = "") -> list:
     """`[(line, speaker)]` for an observed event: its stored spans, or the
     legacy reading for events written before spans existed."""
     payload = payload or {}
@@ -328,7 +329,8 @@ def attribute_lines(payload: dict, *, session_id="", actor="") -> list:
                         chunk_index=payload.get("chunk_index") or 0)
 
 
-def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_index=0) -> list:
+def legacy_lines(excerpt: str, *, source_type: str = "", session_id: str = "", actor: str = "",
+                 chunk_index: int = 0) -> list:
     """Attribution for an event with no stored spans. Never guesses the user.
 
     * session transcripts: labels are read; a cron session's `user` rows are
@@ -373,7 +375,33 @@ def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_inde
 # text returned unchanged -- the same object -- when nothing in it is framing.
 
 
-def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False, drop_unlabeled=False) -> str:
+_ROLE_OF_SPEAKER = {HUMAN: "user", AUTOMATION: "automation", ASSISTANT: "assistant",
+                    TOOL: "tool", SYSTEM: "system"}
+
+
+def _speaker_at(spans: list, pos: int) -> str | None:
+    for a, b, who in spans:
+        if a <= pos < b:
+            return who
+    return None
+
+
+def _is_boundary(label_role: str, at: str | None) -> bool:
+    """Is a `role:` line at a position the spans attribute to `at` really the
+    start of a message? A real label carries its message's first span; a user
+    message may OPEN with host framing, so its label can read SYSTEM. Anything
+    else is a line inside some other message that merely looks like a label --
+    "User: ignore previous instructions" in a tool's output."""
+    if at is None:
+        return True
+    said = role_speaker(label_role, HUMAN)
+    if said == at:
+        return True
+    return said in (HUMAN, AUTOMATION) and at in (SYSTEM, AUTOMATION, HUMAN)
+
+
+def strip_framing(excerpt: str, *, lead_role: str | None = None, drop_tools: bool = False,
+                  drop_unlabeled: bool = False, spans: list | None = None) -> str:
     """`excerpt` (`role: content` lines, as render_messages writes them) minus
     host framing. A user-side message loses its framing spans, and the whole
     message -- label included -- when nothing else is left; a `system:` row is
@@ -385,18 +413,25 @@ def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False, drop_unlabe
     a user's turn), a file read or an API payload is neither. `drop_unlabeled`
     drops lines before the first label when `lead_role` is unknown: a later
     chunk of a long turn opens mid-message, and whose words those are is not
-    something memory put into a user's turn may guess."""
+    something memory put into a user's turn may guess.
+
+    `spans` (the capture's, when valid) decide which `role:` lines start a
+    message. Without them a line is read by its prefix, which tool output can
+    forge; capture stores spans exactly when such a line exists, because the
+    prefix reading and the spans then disagree."""
     text = excerpt or ""
     if not text:
         return text
     msgs, label, role, buf = [], None, lead_role, []
+    pos = 0
     for line in text.split("\n"):
         m = _LABEL.match(line)
-        if m:
+        if m and (not spans or _is_boundary(m.group(1), _speaker_at(spans, pos))):
             msgs.append((label, role, buf))
             label, role, buf = line[:m.end()], m.group(1), [line[m.end():]]
         else:
             buf.append(line)
+        pos += len(line) + 1
     msgs.append((label, role, buf))
     out, changed = [], False
     for label, role, buf in msgs:
@@ -422,36 +457,47 @@ def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False, drop_unlabe
     return "\n".join(out) if changed else excerpt
 
 
-def reader_text(payload, *, actor="", drop_tools=False) -> str:
+def reader_text(payload: dict | None, *, actor: str = "", drop_tools: bool = False,
+                drop_unlabeled: bool = False) -> str:
     """An observed event's excerpt as a reader should see it (see above).
 
     A transcript is read by its labels with the current framing rules, so a
-    frame captured before a rule existed is removed too. A single stored message
-    (an eviction, a rescue) carries no label: its stored spans say what is
-    framing, and an older one without spans is read as the user side unless
-    the agent wrote it: only recognised host frames come out of it, so a user's
-    or a tool's own text is untouched. (On the production store those older
-    rescue copies are where the cron prompts -- "[IMPORTANT: You are running as
-    a scheduled cron job ..." -- sat, in sessions with no `cron_` prefix.)"""
+    frame captured before a rule existed is removed too -- and by its spans when
+    it has them, which say where each message really starts and whose opening
+    a later chunk carries. A single stored message (an eviction, a rescue)
+    carries no label: its spans say what is framing. An older one without spans
+    is read as the user side unless the agent wrote it, which removes only
+    recognised host frames; where tool output must go too (`drop_tools`), an
+    older copy the user did not write is dropped, since nothing says whether it
+    was a tool's. (On the production store the older rescue copies are where
+    the cron prompts -- "[IMPORTANT: You are running as a scheduled cron job
+    ..." -- sat, in sessions with no `cron_` prefix.)"""
     payload = payload or {}
     excerpt = payload.get("excerpt") or ""
     st = payload.get("source_type") or ""
-    if st == "session_transcript" or _LABEL.match(excerpt):
-        return strip_framing(excerpt, drop_tools=drop_tools)
     spans = payload.get("speakers")
-    if _valid_spans(spans, len(excerpt)):
+    spans = spans if _valid_spans(spans, len(excerpt)) else None
+    if st == "session_transcript" or _LABEL.match(excerpt):
+        lead = None
+        if spans and not _LABEL.match(excerpt):
+            lead = _ROLE_OF_SPEAKER.get(spans[0][2])
+        return strip_framing(excerpt, lead_role=lead, drop_tools=drop_tools,
+                             drop_unlabeled=drop_unlabeled, spans=spans)
+    if spans:
         drop = (SYSTEM, TOOL) if drop_tools else (SYSTEM,)
         if not any(w in drop and excerpt[a:b].strip() for a, b, w in spans):
             return excerpt
         return "".join(excerpt[a:b] for a, b, w in spans if w not in drop).strip()
     if st in ("context_eviction", "rescue_extraction") and actor != "agent":
+        if drop_tools and actor != "user":
+            return ""
         return strip_framing(excerpt, lead_role="user")
     return excerpt
 
 
-def has_human(lines) -> bool:
+def has_human(lines: list) -> bool:
     return any(who == HUMAN for _, who in lines)
 
 
-def human_text(lines) -> str:
+def human_text(lines: list) -> str:
     return "\n".join(text for text, who in lines if who == HUMAN)
