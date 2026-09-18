@@ -410,6 +410,41 @@ class TestWithoutAStore(unittest.TestCase):
         self.assertLess(len(out), len(msgs))
 
 
+class TestAStepLineSaysWhatHappened(unittest.TestCase):
+    """A folded tool step is one line: the call's telling argument and the
+    result's error or output -- not the JSON envelope around them."""
+
+    def test_the_call(self):
+        from context import _args_brief
+        self.assertEqual(_args_brief('{"command": "ls /fake", "timeout": 10}', 70), "ls /fake")
+        self.assertEqual(_args_brief('{"path": "/fake/notes.md", "limit": 80}', 70), "/fake/notes.md")
+        self.assertEqual(_args_brief('{"x": 1}', 70), '{"x":1}')
+        self.assertEqual(_args_brief("not json", 70), "not json")
+
+    def test_the_result(self):
+        from context import _result_brief
+        self.assertEqual(_result_brief('{"output": "ok done", "exit_code": 0, "error": null}', 80), "ok done")
+        self.assertEqual(_result_brief('{"output": "bind failed", "exit_code": 1}', 80), "exit 1: bind failed")
+        self.assertEqual(_result_brief('{"success": false, "error": "File not found"}', 80), "error: File not found")
+        self.assertEqual(_result_brief('{"success": false}', 80), "failed")
+        self.assertEqual(_result_brief("plain text result", 80), "plain text result")
+
+    def test_in_the_handoff(self):
+        home = temp_home(prefix="step_")
+        self.addCleanup(shutil.rmtree, home, True)
+        eng = ChronicleContextEngine()
+        eng.on_session_start("s-step", hermes_home=home, principal_id="pat", config=CFG)
+        self.addCleanup(ChronicleCore._instances.pop, eng.core.store.db_path, None)
+        eng._note_folded_unit([
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {
+                "name": "terminal", "arguments": '{"command": "systemctl start zorblax"}'}}]},
+            {"role": "tool", "tool_call_id": "c1",
+             "content": '{"output": "Job for zorblax.service failed", "exit_code": 1, "error": null}'}],
+            ["fold_aaaaaaaaaaaa", "fold_bbbbbbbbbbbb"])
+        self.assertEqual(eng._handoff_steps[-1], "[fold_bbbbbbbbbbbb] called terminal(systemctl start zorblax)"
+                                                " → exit 1: Job for zorblax.service failed")
+
+
 class TestItCanBeInspected(_Engine):
     def test_status_says_what_the_last_pass_did(self):
         self.eng.update_model("fake-model", 3000)

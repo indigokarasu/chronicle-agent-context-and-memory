@@ -174,6 +174,55 @@ def _same_on_wire(a, b) -> bool:
     return all(a.get(k) == b.get(k) for k in _WIRE_KEYS)
 
 
+# What says the most about a tool call, first: the command it ran, the path it
+# read, the query it searched.
+_ARG_KEYS = ("command", "cmd", "path", "file_path", "query", "url", "pattern", "action", "name", "content")
+# ...and about its result: an error first, else its output.
+_RESULT_KEYS = ("output", "stdout", "content", "result", "text", "message", "data")
+
+
+def _loads(text):
+    if isinstance(text, str) and text[:1] in "{[":
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+    return text if isinstance(text, (dict, list)) else None
+
+
+def _args_brief(arguments, width: int) -> str:
+    """A tool call's arguments as one short line: the telling one's value when
+    it has one ("journalctl -xn 50"), not the JSON around it."""
+    d = _loads(arguments)
+    if isinstance(d, dict):
+        key = next((k for k in _ARG_KEYS if isinstance(d.get(k), str) and d[k].strip()), None)
+        if key is not None:
+            return _one_line(d[key], width)
+        return _one_line(json.dumps(d, ensure_ascii=False, separators=(",", ":")), width)
+    return _one_line(arguments if isinstance(arguments, str) else "", width)
+
+
+def _result_brief(text: str, width: int) -> str:
+    """A tool result as one short line: its error if it has one, else its
+    output, and a non-zero exit code -- not the envelope ({"output": "...",
+    "exit_code": 0, "error": null}) that took most of the line."""
+    d = _loads(text)
+    if not isinstance(d, dict):
+        return _one_line(text, width)
+    err = d.get("error")
+    if err:
+        return _one_line("error: %s" % (err if isinstance(err, str) else json.dumps(err, default=str)), width)
+    out = next((d[k] for k in _RESULT_KEYS if d.get(k) not in (None, "", [], {})), None)
+    body = out if isinstance(out, str) else (json.dumps(out, ensure_ascii=False, default=str)
+                                              if out is not None else "")
+    if d.get("success") is False and not body:
+        body = "failed"
+    code = d.get("exit_code")
+    if isinstance(code, int) and code != 0:
+        body = ("exit %d: %s" % (code, body)) if body else "exit %d" % code
+    return _one_line(body or json.dumps(d, ensure_ascii=False, default=str), width)
+
+
 def _tool_units(pairs: list) -> list:
     """Group `(idx, msg)` pairs into units that must be kept or folded together:
     an assistant message that calls tools plus the tool results answering it,
@@ -1092,9 +1141,9 @@ class ChronicleContextEngine(ContextEngine):
             calls = []
             for tc in first.get("tool_calls") or []:
                 fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                calls.append("%s(%s)" % (fn.get("name") or "tool", _one_line(fn.get("arguments") or "", 70)))
+                calls.append("%s(%s)" % (fn.get("name") or "tool", _args_brief(fn.get("arguments"), 70)))
             said = _one_line(_text(first), 120)
-            results = [_one_line(_text(r), 110) for r in msgs[1:]]
+            results = [_result_brief(_text(r), 110) for r in msgs[1:]]
             line = "called " + ", ".join(calls)
             if said:
                 line = _one_line(said, 120) + " — " + line
