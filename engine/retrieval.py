@@ -34,6 +34,7 @@ from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
 from .federated import FederatedChannel
 from .serialize import belief_id as compute_belief_id
 from .store import KIND_TABLE, now_iso, word_tokens
+from .substance import EVENT_PREDICATES as _EVENT_PREDICATES
 from .trust import Calibrator, confidence_summary
 from .vector_index import MAX_K as KNN_MAX_K
 from .vector_index import VectorIndex
@@ -4030,7 +4031,14 @@ class RetrievalEngine:
         d = self.get_directives(principal)
         if d:
             lines.append(d)
-        crit = [c for c in self.store.query_beliefs("facts", "criticality='critical' AND status='active'", (), 5)
+        # In every system prompt, so only what must never be acted against:
+        # safety (an allergy, anaphylaxis, a DNR). "Critical" also covers
+        # medical facts, so they never decay -- on the production store that
+        # put a prescription refill, a lab visit and a past procedure into every
+        # agent's prompt, cron jobs included ("Quest Diagnostics" is critical by
+        # its name). They still surface when a message is about them.
+        crit = [c for c in self.store.query_beliefs(
+                    "facts", "criticality='critical' AND criticality_reason='safety' AND status='active'", (), 5)
                 if self._readable(c, principal, "*", None)]
         if crit:
             lines.append("=== CRITICAL ===")
@@ -4049,6 +4057,10 @@ class RetrievalEngine:
                 if self._readable(r, principal, "*", None)]
         for r in sorted(rows, key=lambda x: -(x.get("confidence") or 0)):
             attr = r.get("attribute") or ""
+            # Who the user is, not what happened to them: an event ("attended
+            # a birthday", "purchased ...") is not a standing attribute.
+            if (r.get("predicate_canonical") or attr) in _EVENT_PREDICATES or attr in _EVENT_PREDICATES:
+                continue
             if attr and attr not in seen and r.get("value"):
                 seen.add(attr)
                 prof.append(f"- {attr}: {r['value']}")
