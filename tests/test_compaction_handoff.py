@@ -362,6 +362,36 @@ class TestWhatIsSent(_Engine):
         self.assertFalse([m for m in short if "api_content" in m])
 
 
+class TestWithoutAStore(unittest.TestCase):
+    """The fallback when the core cannot open: nothing can be archived."""
+
+    def _conv(self):
+        msgs = [_msg("system", "sys"), _msg("user", "Please audit the Zorblax logs for Pat Testley.")]
+        for i in range(12):
+            cid = "c%02d" % i
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": cid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": cid, "content": "log %d" % i})
+            msgs.append(_msg("user", "Now check step %d of the Acme Fake Co rollout." % i))
+        msgs.append(_msg("user", "What failed?"))
+        return msgs
+
+    def test_whole_units_the_newest_turn_and_an_honest_handoff(self):
+        eng = ChronicleContextEngine()               # no core
+        msgs = self._conv()
+        out = eng._heuristic(msgs)
+        self.assertEqual(out[0], msgs[0])
+        self.assertEqual(out[-1], msgs[-1])
+        self.assertEqual(_orphans(out), (set(), set()))
+        h = _handoffs(out)
+        self.assertEqual(len(h), 1)
+        self.assertNotEqual(h[0]["role"], "system")
+        self.assertIn("gone, not archived", h[0]["content"])
+        self.assertNotIn("fold_", h[0]["content"], "no ids: nothing can be restored")
+        self.assertIn("check step 1 of the Acme Fake Co rollout", h[0]["content"])
+        self.assertLess(len(out), len(msgs))
+
+
 class TestItCanBeInspected(_Engine):
     def test_status_says_what_the_last_pass_did(self):
         self.eng.update_model("fake-model", 3000)
