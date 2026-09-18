@@ -3,6 +3,22 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.17
+
+**The gate looks only at the tokens that could match.** 5.7.16's substring
+pre-check barely moved the live profile (`shares_content_word` still 1.5 s of
+a gated prefetch), and the reason was structural: the rows the gate tests are
+the ones FTS matched on these very words, so "does it contain them at all"
+could skip none of them, and the loop then tokenised and stemmed every word of
+each excerpt in Python. `shares_content_word` now finds, with one compiled
+regex, only the tokens that START with a content word's probe letters — under
+`word_tokens`' exact boundaries (an apostrophe joins a token: "o'reilly" is one
+word, "don't" is none, a curly apostrophe counts) — and applies the same rule
+to those. Pinned to the old matcher by an equivalence test over the boundary
+cases and fuzzed locally over 20,000 random texts with no difference; ~4× less
+time on a worst-case excerpt. The session window also hands the gate the
+payload it already read, instead of a second read per turn.
+
 ## 5.7.16
 
 **The relevance gate costs what it saves.** Profiled on the production store

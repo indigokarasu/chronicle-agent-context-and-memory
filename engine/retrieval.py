@@ -466,25 +466,46 @@ _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
 _FTS_FETCH_MAX = 640
 
 
+def _probe(w: str) -> str:
+    """The letters every token matching `w` STARTS with: its first three (an
+    equal stem, a plural or possessive of it, or a prefix relation between
+    words of four letters or more all share them) -- two for a three-letter
+    "-y" word, whose "-ies" plural shares only those ("fly" / "flies")."""
+    return w[:2] if len(w) == 3 and w.endswith("y") else w[:3]
+
+
+@functools.lru_cache(maxsize=512)
+def _probe_rx(probes: tuple):
+    """Tokens that start with one of `probes`, with word_tokens' boundaries: a
+    token starts at a letter or digit not preceded by one, nor by one plus an
+    apostrophe ("o'reilly" is ONE token, so "reilly" does not start inside it)."""
+    alt = "|".join(re.escape(p) for p in sorted(probes, key=len, reverse=True))
+    return re.compile(r"(?<![^\W_])(?<![^\W_]')(?:%s)[^\W_]*(?:'[^\W_]+)*" % alt)
+
+
 def shares_content_word(words: frozenset | set, text: str) -> bool:
     """Does `text` contain one of `words`? Equal stems match; so does an
     inflection that extends one by at most three letters ("book" / "booked",
     "plan" / "planned"), but only between words of four letters or more, so
-    "eat" never matches "eaten" by accident and "art" never matches "party"."""
+    "eat" never matches "eaten" by accident and "art" never matches "party".
+
+    Only the tokens that START with a word's probe letters are looked at,
+    found by one compiled regex over the text -- measured on the production
+    store, tokenising every word of every candidate excerpt in Python was
+    1.5 s of a per-turn prefetch, and the candidates are exactly the excerpts
+    FTS matched on these words, so a cheaper "does it contain them at all"
+    test could not skip any of them."""
     if not words:
         return False
-    # C-speed pre-check. A token that matches a word always contains the
-    # word's first three letters (an equal stem, a plural or possessive of it,
-    # or a prefix relation between words of four letters or more) -- except
-    # that a three-letter "-y" word matches its "-ies" plural ("fly" /
-    # "flies"), which shares only two. Measured on the production store, the
-    # token loop below was 1.6 s of a 4.2 s per-turn prefetch, nearly all of
-    # it on excerpts that contain no content word at all.
-    low = unicodedata.normalize("NFC", text or "").lower()
-    if not any((w[:2] if len(w) == 3 and w.endswith("y") else w[:3]) in low for w in words):
-        return False
+    low = unicodedata.normalize("NFC", text or "").replace("\u2019", "'").lower()
     long_words = [w for w in words if len(w) >= 4]
-    for t in map(_gate_stem, _gate_words(text)):
+    for m in _probe_rx(tuple(sorted({_probe(w) for w in words}))).finditer(low):
+        t = m.group(0)
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+        t = _gate_stem(t)
         if t in words:
             return True
         if len(t) >= 4:
@@ -2421,7 +2442,7 @@ class RetrievalEngine:
                 continue
             date = (ev.get("occurred_at") or "")[:16]
             expanded.append({"excerpt": excerpt, "date": date, "event_id": ev["event_id"],
-                             "seq": ev.get("seq")})
+                             "seq": ev.get("seq"), "payload": p, "actor": ev.get("actor") or ""})
             existing_excerpts.add(excerpt)
             if existing_event_ids is not None:
                 existing_event_ids.add(ev["event_id"])
@@ -2943,9 +2964,14 @@ class RetrievalEngine:
             events were such chunks, stored without spans that could say whose
             words they are."""
             eid = row.get("event_id")
-            if eid not in metas:
-                metas[eid] = self._event_meta(eid)
-            meta = metas[eid]
+            if isinstance(row.get("payload"), dict):     # the session window already read it
+                p = row["payload"]
+                meta = {"payload": p, "actor": row.get("actor") or "",
+                        "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+            else:
+                if eid not in metas:
+                    metas[eid] = self._event_meta(eid)
+                meta = metas[eid]
             if meta.get("source_type") in _AGENT_OWN_SOURCES:
                 gate_drop["excerpts"] += 1
                 return None
