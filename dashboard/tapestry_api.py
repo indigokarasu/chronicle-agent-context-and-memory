@@ -41,6 +41,7 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent.parent)
 if _PLUGIN_ROOT not in _sys.path:
     _sys.path.insert(0, _PLUGIN_ROOT)
 from engine import entities as ents  # noqa: E402
+from engine import substance as sub  # noqa: E402
 
 _BUSY_MS = 5000
 _EXCERPT = 600          # characters of any text returned for display
@@ -684,13 +685,10 @@ def cron_job_names(hermes_home) -> Dict[str, str]:
 
 # Predicates whose FACT is an event: something that happened, at a time. The
 # value is the title the importer wrote; `when` is the fact's valid_from.
-_EVENT_PREDICATES = {
-    "attended_event": "attended", "had_appointment": "appointment",
-    "appointment_at": "appointment", "scheduled_mandatory_appointment": "appointment",
-    "dined_at": "meal", "traveling_to": "travel", "purchased": "purchase",
-    "health_event": "health", "account_security_event": "account",
-    "received_contractor_estimate": "estimate", "received_paid_project_invitation": "invitation",
-}
+# Predicates that assert something HAPPENED. One definition, in the engine:
+# engine/substance.py both groups these as events and requires their values
+# to say what happened.
+_EVENT_PREDICATES = sub.EVENT_PREDICATES
 # Predicates whose VALUE names a place.
 _PLACE_PREDICATES = ("lives_in", "works_in", "located_in", "office_location")
 # Predicates whose VALUE is an idea rather than a thing.
