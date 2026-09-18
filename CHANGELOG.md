@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.15
+
+**Every system prompt carries only what must always be there.** The memory
+provider's static block goes into every agent's system prompt — scheduled
+jobs included — whatever the turn is about. On the production store its
+"CRITICAL" section was the user's medical history (a prescription refill, a
+lab visit, a past procedure: medical facts are critical so they never decay,
+and "Quest Diagnostics" is medical by its name), and its "USER PROFILE" an
+attended birthday. The always-on section now holds safety facts only (an
+allergy, anaphylaxis, a DNR); medical facts still never decay and still
+surface when a message is about them. The profile leaves out events — what
+happened to the user, not who they are.
+
 ## 5.8.14
 
 **An instruction about the task in hand is not a standing one.** A standing
