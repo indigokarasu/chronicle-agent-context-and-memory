@@ -994,6 +994,10 @@ class ChronicleContextEngine(ContextEngine):
             actor="system", session_id=self._session_id)
 
         self.compression_count += 1
+        logger.info("chronicle compaction: session=%s mode=%s messages %d->%d folded=%d "
+                    "used=%d/%d tokens handoff=%d chars",
+                    self._session_id, self.last_pass, len(original), len(result) + (handoff is not None),
+                    len(evicted_span_ids), used, budget, len(handoff or ""))
         self._awaiting_real_usage = True
         self._prune_rearm_tokens = 0     # a compaction starts the trim cycle again
         if handoff is not None:
@@ -1997,6 +2001,20 @@ class ChronicleContextEngine(ContextEngine):
             "retry_due_in_sec": due,
             "retry_budget_spent": (not live and self._init_started and due is None),
             "attempts_this_hour": len(self._attempt_times),
+        }
+        res["compaction"] = {
+            "trigger_tokens": self.threshold_tokens,
+            "target_tokens": self._target_budget() if live else None,
+            "context_length": self.context_length,
+            "protect_first_n": self.protect_first_n,
+            "protect_last_n": self.protect_last_n,
+            "max_messages": self.max_messages,
+            "passes": self.compression_count,
+            "last_pass": self.last_pass,
+            "folded_requests": len(self._handoff_asks),
+            "folded_steps": len(self._handoff_steps),
+            "stated_facts": len(self._checkpoint_lines),
+            "pinned": len(self._pinned_content_hashes),
         }
         if live and self.core:
             res["diagnostics"] = self.core.diagnostics()
