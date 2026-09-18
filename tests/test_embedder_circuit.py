@@ -124,14 +124,51 @@ class TestTheCircuit(unittest.TestCase):
             emb.embed_document("single")
         self.assertEqual(emb._embed_raw.calls, 0)
 
-    def test_after_the_cooldown_it_probes_again(self):
+    def test_after_the_cooldown_it_probes_with_ONE_attempt(self):
+        """Half-open: a single trial, not a fresh retry budget. Every agent turn
+        drains curation jobs before the model is called, so a full budget here
+        was up to a minute of a user's turn spent on a server that was down."""
         emb = _embedder(cooldown=0.05)
         with self.assertRaises(E.EmbeddingsUnavailable):
             emb.embed_document("first")
+        self.assertEqual(emb._embed_raw.calls, 3)
         time.sleep(0.08)
         with self.assertRaises(E.EmbeddingsUnavailable):
             emb.embed_document("probe")
-        self.assertEqual(emb._embed_raw.calls, 6, "past the cooldown it must really try again")
+        self.assertEqual(emb._embed_raw.calls, 4, "past the cooldown: exactly one real try")
+
+    def test_the_cooldown_doubles_while_the_server_stays_down(self):
+        emb = _embedder(cooldown=0.05)
+        lengths = []
+        for _ in range(4):
+            with self.assertRaises(E.EmbeddingsUnavailable):
+                emb.embed_document("x")
+            lengths.append(emb._open_until - time.monotonic())
+            emb._open_until = 0.0            # skip the wait; keep the trip count
+        self.assertEqual(emb._trips, 4)
+        for a, b in zip(lengths, lengths[1:]):
+            self.assertGreater(b, a * 1.5)
+
+    def test_the_cooldown_is_capped(self):
+        emb = _embedder(cooldown=30.0)
+        emb._trips = 50
+        with self.assertRaises(E.EmbeddingsUnavailable):
+            emb.embed_document("x")
+        self.assertLessEqual(emb._open_until - time.monotonic(), emb._CIRCUIT_MAX_COOLDOWN + 1)
+
+    def test_one_success_restores_the_full_budget(self):
+        emb = _embedder(cooldown=0.0)
+        with self.assertRaises(E.EmbeddingsUnavailable):
+            emb.embed_document("down")
+        self.assertEqual(emb._trips, 1)
+        emb._embed_raw = lambda text, timeout: [0.1] * 768
+        emb.embed_document("back")
+        self.assertEqual((emb._trips, emb._open_until), (0, 0.0))
+        failing = _Timeouts()
+        emb._embed_raw = failing
+        with self.assertRaises(E.EmbeddingsUnavailable):
+            emb.embed_document("down again")
+        self.assertEqual(failing.calls, 3, "a fresh outage gets the whole budget again")
 
     def test_a_success_closes_the_circuit(self):
         emb = _embedder()
@@ -162,6 +199,63 @@ class TestTheCircuit(unittest.TestCase):
         for i in range(50):
             emb.embed_document("span %d" % i)
         self.assertEqual(emb._open_until, 0.0)
+
+
+class TestATurnDoesNotWaitOnADownServer(unittest.TestCase):
+    """Every agent turn drains curation jobs before the model is called
+    (on_turn_start -> core.tick). With the embedding server down and embed jobs
+    queued, what does a turn pay? It used to be a full retry budget each time
+    the cooldown lapsed — about a minute of a user's turn."""
+
+    def setUp(self):
+        import shutil as _sh
+        from _tmp_support import temp_home
+        from engine.core import ChronicleCore
+        self.home = temp_home(prefix="circuit_turn_")
+        self.addCleanup(_sh.rmtree, self.home, ignore_errors=True)
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        self.core.initialize("turn-s1", principal_id="assistant")
+        # REAL captured turns: the embed task re-resolves each job's text from
+        # the store, so a job for an id that does not exist is a no-op.
+        import json as _json
+        ids = [self.core.capture.observe("Pat Testley note %d about the Acme Fake Co offsite." % i,
+                                         "Noted.", session_id="turn-s1") for i in range(12)]
+        self.core.store._conn().execute("DELETE FROM curation_jobs")
+        self.core.store._conn().commit()
+        for eid in ids:
+            ex = _json.loads(self.core.store.get_event(eid)["payload"])["excerpt"]
+            self.core.store.enqueue_embed_job(eid, "observed", ex)
+        self.emb = _embedder(cooldown=0.05)
+        self.core.embedder = self.emb
+
+    def test_a_turn_costs_at_most_one_budget(self):
+        self.core.tick()                         # first outage: the full budget, once
+        self.assertEqual(self.emb._embed_raw.calls, 3, "one budget for the whole turn, not one per job")
+
+    def test_the_next_turn_does_not_touch_the_server_at_all(self):
+        """Two layers protect it: the breaker, and the queue backing off every
+        job it deferred."""
+        self.core.tick()
+        first = self.emb._embed_raw.calls
+        self.core.tick()
+        self.assertEqual(self.emb._embed_raw.calls, first)
+
+    def test_once_both_backoffs_lapse_a_turn_makes_one_try(self):
+        self.core.tick()
+        first = self.emb._embed_raw.calls
+        c = self.core.store._conn()
+        c.execute("UPDATE curation_jobs SET run_after=NULL WHERE task='embed'")   # job backoff over
+        c.commit()
+        time.sleep(0.08)                                                           # circuit cooldown over
+        self.core.tick()
+        self.assertEqual(self.emb._embed_raw.calls - first, 1, "half-open: exactly one real try")
+
+    def test_the_jobs_stay_queued_for_when_it_is_back(self):
+        self.core.tick()
+        c = self.core.store._conn()
+        failed = c.execute("SELECT COUNT(*) FROM curation_jobs WHERE task='embed' "
+                           "AND status='failed'").fetchone()[0]
+        self.assertEqual(failed, 0, "an outage defers vectors, it does not give up on them")
 
 
 if __name__ == "__main__":
