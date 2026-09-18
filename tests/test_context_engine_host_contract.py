@@ -518,11 +518,21 @@ class TestOldToolOutputIsTrimmedWithoutAModel(unittest.TestCase):
         out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
         self.assertEqual(out[-1]["content"], self.BIG)
 
-    def test_a_directive_in_tool_output_is_protected(self):
-        pinned = "You must always use metric units. " + ("y" * 6000)
+    def test_a_pinned_tool_result_is_protected(self):
+        pinned = "Pat Testley's unit preferences, verbatim. " + ("y" * 6000)
         msgs = self._conv([pinned, self.BIG, self.BIG + "b", self.BIG + "c"])
+        target = next(m for m in msgs if m.get("content") == pinned)
+        self.eng._pinned_content_hashes.add(self.eng._compute_content_hash(target))
         out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
         self.assertIn(pinned, [m["content"] for m in out])
+
+    def test_must_in_tool_output_is_not_a_directive(self):
+        """The keywords count in the user's own words only (5.8.0): a log line
+        saying "you must restart" pinned ordinary tool output in the window."""
+        noisy = "WARN you must always restart the Zorblax daemon. " + ("y" * 6000)
+        msgs = self._conv([noisy, self.BIG, self.BIG + "b", self.BIG + "c"])
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertNotIn(noisy, [m["content"] for m in out])
 
     def test_a_trim_too_small_to_pay_for_the_cache_break_is_not_made(self):
         msgs = self._conv(["z" * 2100])

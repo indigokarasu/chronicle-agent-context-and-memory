@@ -95,62 +95,51 @@ class CutPointStabilityTests(unittest.TestCase):
                               "compress() must still honor the R2 budget guarantee while doing so")
 
     def test_repeated_compression_never_shrinks_or_reorders_the_settled_prefix(self):
-        """Multiple compression passes in a row, each adding more growth,
-        must keep extending the same stable prefix -- not just survive one
-        growth step.
+        """Multiple compression passes in a row, each adding more growth.
 
-        Structural prefix-equality alone is not enough to catch the R5
-        regression this guards against: once cumulative locked-prefix size
-        reached the budget (by round 2-3 under this exact fixture), every
-        later pass used to clip ALL new head/tail/system content down to an
-        EMPTY string via the protected-content-clip path -- not the I17
-        durable-eviction path -- while still counting each span as "kept".
-        `result[:common] == prev_result[:common]` still held (the blanked
-        spans were reproduced faithfully, blank-for-blank, as a stable
-        prefix on every subsequent round), so a check of structure alone
-        passes "for the wrong reason". Every round below also asserts no
-        message in the live output has been silently reduced to empty
-        content -- the actual symptom of the regression -- and that the
-        message count converges to a stable bound instead of growing
-        forever while quietly destroying data.
+        A pass that EXTENDS must reproduce the settled prefix byte for byte
+        (R5): the provider's prompt cache keeps it. But a settled prefix only
+        grows, and the old version of this test pinned what happened once it
+        filled the budget: every later pass folded ALL new content -- the
+        protected latest turns included -- so the message count "converged"
+        on a window frozen in the past that never showed the model a new
+        message. Now such a pass REBASES instead (context.py step 0): earlier
+        handoffs and everything after the head are re-decided, and one handoff
+        stands for what was folded. So the invariants are:
+          * no message is silently blanked (the original R5 regression);
+          * every pass stays within the R2 budget;
+          * the newest message is ALWAYS in the window;
+          * the head is always first;
+          * an extending pass keeps the previous output as its prefix.
         """
+        from engine.embeddings import COMPRESSION_BUDGET, estimate_tokens
         self.eng.update_model("test-model", context_length=2250)  # budget = 1237
         # A10b units restatement: 3000 x 3 = 9000 = 2250 x 4.
         pad = "padding " * 30
         messages = [_msg("system", "sys"), _msg("user", "head 0"), _msg("user", "head 1")]
         prev_result = None
-        msgcounts = []
+        modes = []
         for round_ in range(6):
             growth = [_msg("assistant", "ROUND%d-%d %s" % (round_, i, pad)) for i in range(8)]
             messages = (list(prev_result) if prev_result is not None else messages) + growth
             result = self.eng.compress(messages, focus_topic=None)
+            modes.append(self.eng.last_pass)
 
-            # No span in the live output may have been silently blanked --
-            # every message that survives into `result` must still carry
-            # real content (R5 regression: a protected/locked span used to
-            # come back present-but-empty instead of durably evicted).
             blanked = [i for i, m in enumerate(result) if not (m.get("content") or "").strip()]
             self.assertEqual(blanked, [],
-                              "round %d: %d message(s) in the compressed output have been silently "
-                              "reduced to empty content instead of being durably evicted (R5 "
-                              "protected-content-clip regression) -- positions %r"
-                              % (round_, len(blanked), blanked))
-
-            if prev_result is not None:
-                common = min(len(prev_result), len(result))
-                self.assertEqual(result[:common], prev_result[:common],
-                                  "round %d: an earlier settled prefix was rewritten instead of "
-                                  "extended (R5 append-only violation)" % round_)
-            msgcounts.append(len(result))
+                              "round %d: message(s) silently reduced to empty content instead of "
+                              "durably folded -- positions %r" % (round_, blanked))
+            used = sum(estimate_tokens(m.get("content") or "", margin=COMPRESSION_BUDGET)
+                       for m in result)
+            self.assertLessEqual(used, self.eng._target_budget(), "round %d over budget" % round_)
+            self.assertEqual(result[-1]["content"], growth[-1]["content"],
+                             "round %d: the newest message is not in the window" % round_)
+            self.assertEqual([m["content"] for m in result[:3]], ["sys", "head 0", "head 1"])
+            if prev_result is not None and self.eng.last_pass == "extend":
+                self.assertEqual(result[:len(prev_result)], prev_result,
+                                  "round %d: an extending pass rewrote the settled prefix" % round_)
             prev_result = result
-
-        # The window must converge to a stable bound under sustained real
-        # eviction pressure -- not grow every round forever. (Pre-fix, it
-        # both grew unbounded AND lost data simultaneously: growth alone,
-        # with no data-loss check, cannot tell the two apart.)
-        self.assertEqual(msgcounts[-1], msgcounts[-2],
-                          "message count should have converged to a stable window by the last two "
-                          "rounds, not still be growing every pass: %r" % msgcounts)
+        self.assertIn("extend", modes, "the fixture never exercised an extending pass: %r" % modes)
 
     # -- no system-role hoist --------------------------------------------------
 

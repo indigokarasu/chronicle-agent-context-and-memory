@@ -3,6 +3,67 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.0
+
+**Compaction leaves one handoff, keeps tool calls whole, and follows the
+operator's settings.** Read against Hermes' own compaction path and replayed
+over real sessions, the context engine had six problems:
+
+* **It ignored the operator's policy.** The host never hands a plugin engine
+  its `compression:` settings, so Chronicle compacted at 75% of the window down
+  to 55% while the profile says `threshold: 0.5, target_ratio: 0.15,
+  protect_first_n: 3, protect_last_n: 20`; and because the host calls
+  `update_model()` before `on_session_start()`, even Chronicle's own
+  `context_engine.*` settings never applied. The engine now reads the host's
+  section (explicit Chronicle settings still win): HIGH is `threshold`, LOW is
+  twice `threshold × target_ratio`, and the protected head/tail come from the
+  host.
+* **It ignored the message limit.** The gateway also compacts at
+  `hygiene_hard_message_limit` messages whatever the tokens, and when that
+  compaction makes no progress it cuts the model's input to the newest `limit`
+  messages every turn — head and all, no handoff. Chronicle, under its token
+  budget, returned the transcript unchanged. A pass over the limit now folds
+  down to half of it.
+* **Injected blocks were `system` messages after the latest turn.** Hermes'
+  Anthropic converter makes the LAST system message the system parameter, so
+  `[Checkpoint:]`, `[Relevant memory:]`, `[Entity working set]` and the
+  pressure warning could replace the agent's own system prompt. All of it now
+  rides in ONE message, `[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle
+  folded …`, in a conversation role that alternates with the turn before it,
+  where the folded turns were: the user's folded requests verbatim (newest
+  first), one line per folded step (`called read_file(…) → …`), the facts
+  stated in them, memory recalled for the focus and the host's
+  `memory_context` (which was dropped), and the ids of whatever did not fit.
+  Each section gets a share of the room; identical turns are listed once.
+* **Fold stubs orphaned tool results.** Each folded message left `[FOLD id
+  digest]` in its role but without `tool_calls`/`tool_call_id`, so the host's
+  sanitizer deleted or faked the paired results, and the stub said nothing. An
+  assistant call and its results are now kept or folded together, and the
+  handoff names each step by its first result (every empty-content call used
+  to hash to the same id).
+* **When the protected spans alone were over budget, the newest turn was
+  dropped** — the fit ran head first. Now: system, the newest unit, the rest
+  of the tail newest first, then the head; a span shortened to fit is archived
+  first and ends with the `chronicle_expand` id that restores it.
+* **"never / always / must" pinned tool output.** The keywords counted in any
+  message; they now count in the user's own words only (pins are unchanged),
+  and the checkpoint digest is fed only the user's words.
+
+A pass normally EXTENDS the settled prefix byte for byte (earlier handoffs
+included) so the provider's prompt cache holds; once that prefix is most of
+the budget, or over the message limit, it REBASES: earlier handoffs and pre-5.8
+artifacts come out and one consolidated handoff replaces them. A restarted
+engine adopts what an earlier handoff said, ids included. Archive writes are
+batched (one transaction per ~64 messages): a 961-message pass went 1.4 s →
+0.7 s.
+
+**Excluded sessions stay unembedded.** `embeddings.exclude_session_prefixes`
+stopped the inline embed of an excluded session's turn, but an embed job
+queued before the prefix was excluded (or by an older build) still embedded it
+from the curation queue. The job now checks the event's session too. On the
+production box ~98% of what the embedding server embedded was cron
+transcripts, which never become the user's memory.
+
 ## 5.7.17
 
 **The gate looks only at the tokens that could match.** 5.7.16's substring

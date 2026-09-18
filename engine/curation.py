@@ -777,6 +777,15 @@ class CurationWorker:
             return not (want_len and existing_len and existing_len != want_len)
 
         if kind == "observed":
+            # The same exclusion the write path applies (§27
+            # embeddings.exclude_session_prefixes): a job queued before the
+            # prefix was excluded, or by an older build, must not embed it now.
+            excluded = tuple(self.cfg.get("embeddings.exclude_session_prefixes", []) or ())
+            if excluded:
+                row = self.store._conn().execute(
+                    "SELECT session_id FROM events WHERE event_id=?", (target,)).fetchone()
+                if row and (row[0] or "").startswith(excluded):
+                    return
             if _already_current(self.store.get_observed_vector_model(target),
                                 self.store.get_observed_vector_len(target)):
                 return  # Vector exists, model matches AND width is right: no-op
