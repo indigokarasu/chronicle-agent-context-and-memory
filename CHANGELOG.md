@@ -3,6 +3,47 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.5
+
+**The memory put into a turn is about that turn.** The provider's `prefetch`
+injects up to 1,200 tokens of memory into every user message, unasked. Probed
+on the production store, it was mostly other things:
+
+* **Scheduled jobs' own runs.** 7,817 of the 7,924 indexed sessions were cron
+  runs, and "what's on my calendar this week?" opened with one job's operational
+  narrative and another's raw tool JSON, served as memory about the user.
+  Anything injected unasked (prefetch, and the context engine's rehydration)
+  now leaves out automation sessions on every raw channel — FTS, event vectors
+  and session vectors — by the same rule `engine/speaker.py` applies to capture.
+  An explicit search still sees them; the agent may be asking about its own work.
+* **Whatever ranked highest, relevant or not.** Every turn got the full
+  ~4,800-char block. Ranked retrieval always returns something (FTS ORs every
+  word of the message; a vector channel has a nearest neighbour for any query),
+  and the session window then filled the rest of the budget with the other
+  turns of whichever session matched. `get_context(relevance_gate=True)`, which
+  prefetch now passes, keeps an item only if it shares a content word with the
+  message:
+  - content words are the message's words minus English function words and
+    chat filler ("thanks", "still", "sounds good"); plurals, possessives and
+    short inflections match ("restaurants"/"restaurant", "book"/"booked");
+  - a message with none ("ok thanks") gets nothing, and retrieval is not run —
+    prefetch runs on every turn and live retrieval takes seconds;
+  - a fact is also matched by the name of the entity it is about, since it
+    renders as `attribute: value`;
+  - a whole-session excerpt only nominates its session; the session's turns
+    then arrive one at a time, each gated, so one matching turn no longer
+    carries every unrelated one with it;
+  - the tail (directives, contradictions, critical facts, federated rows) is
+    gated too — those reach every turn through the system prompt already —
+    and a directive already on the page as a `[NOTE]` is not repeated.
+
+  Deliberately lexical: an item related only by embedding similarity stays out
+  of the unasked block and is found the moment the agent searches. Explicit
+  retrieval — the agent's search tool, rehydration, benchmarks — never sets the
+  flag and is byte-for-byte unchanged. `retrieval.prefetch_relevance_gate`
+  (default true) turns it off. `last_context_debug["relevance_gate"]` reports
+  the message's words and how many beliefs, excerpts and tail lines it left out.
+
 ## 5.7.4
 
 **Chronicle is actually the context engine.** It had been configured as Hermes's

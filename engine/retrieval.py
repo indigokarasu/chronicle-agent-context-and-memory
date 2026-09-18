@@ -348,6 +348,106 @@ def _parse_time_window(text, now=None):
 # session transcript mentions them, so covering them proves nothing (§18.4).
 _GENERIC = {"user", "name", "time", "day", "week", "thing", "info"}
 
+# -- The relevance gate for memory injected UNASKED ---------------------------
+# get_context(relevance_gate=True) is what the provider's per-turn prefetch
+# uses. Measured on the production store after automation sessions were already
+# excluded: every turn got the full ~4,800-char block whether or not anything
+# in memory was about the message -- "what's on my calendar this week" came
+# back with an unrelated chat, a hotel confirmation and a list of contact
+# names. Ranked retrieval always returns SOMETHING (FTS ORs every word of the
+# message, and a vector channel has a nearest neighbour for any query), so for
+# an injection nobody asked for, "ranked" is not "relevant".
+#
+# The rule: an injected item must share a content word with the message. The
+# message's content words are its query tokens minus the filler below -- the
+# usual English function words plus conversational filler ("thanks", "still",
+# "check") that appears in every transcript and so ties anything to anything.
+# A message with none ("thanks!", "ok do it") gets no injection at all.
+# Deliberately lexical: an item related only by embedding similarity is left
+# out of the unasked block and is still found the moment the agent searches.
+# The explicit paths (the agent's own search tool, the context engine's
+# rehydration, every benchmark) never set the flag and are unchanged.
+_GATE_FILLER = frozenset({
+    "able", "about", "above", "absolutely", "actually", "after", "again", "against",
+    "ahead", "all", "already", "alright", "also", "always", "and", "another", "any",
+    "anybody", "anyone", "anything", "anyway", "appreciate", "are", "ask", "asked",
+    "awesome", "back", "bad", "basically", "because", "been", "before", "being",
+    "below", "best", "better", "between", "big", "both", "but", "came", "can",
+    "check", "cheers", "come", "continue", "cool", "could", "course", "definitely",
+    "did", "does", "doing", "done", "down", "during", "each", "either", "else",
+    "enough", "even", "ever", "every", "everyone", "everything", "exactly", "fair",
+    "few", "find", "fine", "first", "fix", "for", "found", "from", "further",
+    "gave", "get", "gets", "getting", "give", "goes", "going", "gone", "gonna",
+    "good", "got", "gotcha", "great", "had", "has", "have", "having", "hello",
+    "help", "her", "here", "hers", "herself", "hey", "him", "himself", "his", "hmm",
+    "how", "instead", "into", "its", "itself", "just", "keep", "kept", "knew",
+    "know", "last", "later", "let", "lets", "like", "little", "look", "lot", "lots",
+    "made", "make", "many", "maybe", "mean", "might", "month", "more", "most",
+    "much", "must", "myself", "need", "needed", "neither", "never", "new", "next",
+    "nice", "nope", "nor", "not", "nothing", "now", "off", "okay", "old", "once",
+    "one", "only", "other", "our", "ours", "ourselves", "out", "over", "own",
+    "perfect", "please", "probably", "proceed", "put", "really", "remember",
+    "right", "said", "same", "saw", "say", "see", "seen", "shall", "she", "should",
+    "show", "some", "someone", "something", "soon", "sound", "sounds", "still",
+    "stop", "stuff", "such", "sure", "take", "tell", "than", "thank", "thanks",
+    "that", "the", "their", "theirs", "them", "themselves", "then", "there",
+    "these", "they", "thing", "things", "think", "this", "those", "though",
+    "thought", "through", "today", "told", "tomorrow", "tonight", "too", "took",
+    "totally", "tried", "try", "two", "under", "understood", "until", "use", "used",
+    "very", "wait", "wanna", "want", "wanted", "was", "way", "well", "went", "were",
+    "what", "whatever", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "wonderful", "worked", "works", "would", "wrong", "yeah",
+    "year", "yep", "yes", "yesterday", "you", "your", "yours", "yourself",
+    "yourselves", "yup",
+})
+
+
+def _gate_stem(tok: str) -> str:
+    """Fold the plural/possessive forms a message and a memory disagree on
+    ("restaurants" / "restaurant", "Robin's" / "Robin")."""
+    if len(tok) > 4 and tok.endswith("ies"):
+        return tok[:-3] + "y"
+    if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+        return tok[:-1]
+    return tok
+
+
+def _gate_words(text: str):
+    """Lowercased word tokens; a negated contraction ("don't") is no word at
+    all, any other ("Robin's", "what's") is the part before the apostrophe."""
+    for t in word_tokens((text or "").lower()):
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+        yield t
+
+
+def relevance_words(text: str) -> frozenset:
+    """The message's content words (stemmed) for the injection relevance gate.
+    Stop/filler words are tested BEFORE stemming -- stemmed, "this" is "thi"."""
+    return frozenset(
+        _gate_stem(t) for t in _gate_words(text)
+        if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER)
+
+
+def shares_content_word(words, text: str) -> bool:
+    """Does `text` contain one of `words`? Equal stems match; so does an
+    inflection that extends one by at most three letters ("book" / "booked",
+    "plan" / "planned"), but only between words of four letters or more, so
+    "eat" never matches "eaten" by accident and "art" never matches "party"."""
+    if not words:
+        return False
+    long_words = [w for w in words if len(w) >= 4]
+    for t in map(_gate_stem, _gate_words(text)):
+        if t in words:
+            return True
+        if len(t) >= 4:
+            for w in long_words:
+                if abs(len(t) - len(w)) <= 3 and (t.startswith(w) or w.startswith(t)):
+                    return True
+    return False
+
 # §r6: the most topic-gated standing notes get_context will append from leftover
 # budget. Bounds the tail on a store where a broad focus token ("work") matches
 # dozens of norm notes; the char budget is the other, harder stop.
@@ -2029,7 +2129,7 @@ class RetrievalEngine:
     # -- context assembly (§18.5) -----------------------------------------
 
     def _pref_pack_fill(self, groups, parts, emitted_headers, seen_excerpts,
-                        remaining_chars, *, principal, route):
+                        remaining_chars, *, principal, route, keep=None):
         """F5 preference packing's fill: every USER turn first, assistant halves last.
 
         Replaces BOTH of get_context's normal fill phases on the preference
@@ -2067,6 +2167,9 @@ class RetrievalEngine:
                     continue
                 expanded = self._expand_session_window(
                     g["sid"], principal, seen_excerpts, limit=max_events)
+                if keep is not None:
+                    # the injection relevance gate (get_context passes it)
+                    expanded = [x for x in expanded if keep(x.get("excerpt") or "")]
                 if not expanded:
                     continue
                 sessions_expanded += 1
@@ -2594,7 +2697,8 @@ class RetrievalEngine:
         return _clamp_cfg_float(self.cfg, "context.precision_margin", 0.0, 0.0, 1.0)
 
     def get_context(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
-                    principal=None, epistemic=None, now=None, exclude_automation=False) -> str:
+                    principal=None, epistemic=None, now=None, exclude_automation=False,
+                    relevance_gate=False) -> str:
         """Assemble a reader-facing context block (§18). Wrapper for the A0c
         wrong-dimension scope; the body is `_get_context_inner`, and the count
         lands in `last_context_debug["vectors_skipped_wrong_dim"]`."""
@@ -2602,7 +2706,8 @@ class RetrievalEngine:
             out = self._get_context_inner(hint, token_budget=token_budget,
                                           include_directives=include_directives, purpose=purpose,
                                           principal=principal, epistemic=epistemic, now=now,
-                                          exclude_automation=exclude_automation)
+                                          exclude_automation=exclude_automation,
+                                          relevance_gate=relevance_gate)
             if isinstance(self.last_context_debug, dict):
                 # exact count, not the bounded identity sample -- see answer()
                 self.last_context_debug["vectors_skipped_wrong_dim"] = \
@@ -2610,7 +2715,8 @@ class RetrievalEngine:
             return out
 
     def _get_context_inner(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
-                           principal=None, epistemic=None, now=None, exclude_automation=False) -> str:
+                           principal=None, epistemic=None, now=None, exclude_automation=False,
+                           relevance_gate=False) -> str:
         """Assemble a reader-facing context block for `hint` (§18).
 
         §L8 r1 priority rule, enforced STRUCTURALLY, not by convention: raw
@@ -2689,6 +2795,45 @@ class RetrievalEngine:
         max_directives = _clamp_cfg(self.cfg, "context.max_directives", 5, 0, 500)
         parts: list[str] = []
 
+        # The injection relevance gate (see `_GATE_FILLER`). None = off, and
+        # then every helper below is the identity: explicit callers are
+        # byte-for-byte what they were. On, every evidence line and every tail
+        # line must share a content word with `hint`; a hint with no content
+        # words gets nothing, and the retrieval work is not even started.
+        gate = relevance_words(hint) if relevance_gate else None
+        gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
+
+        def _relevant(text, kind):
+            if gate is None or shares_content_word(gate, text):
+                return True
+            gate_drop[kind] += 1
+            return False
+
+        def _raw(limit):
+            rows = self.retrieve_raw(hint, limit=limit, principal=principal, now=now,
+                                     exclude_automation=exclude_automation)
+            if gate is None:
+                return rows
+            kept = []
+            for r in rows:
+                if not _relevant(r.get("excerpt") or "", "excerpts"):
+                    continue
+                if (r.get("event_id") or "").startswith("session:"):
+                    # A session-channel row's excerpt is the WHOLE session: one
+                    # matching turn would carry every unrelated one with it. It
+                    # nominates the session; the session window below then
+                    # contributes that session's turns one by one, each gated.
+                    r = dict(r, excerpt="")
+                kept.append(r)
+            return kept
+
+        if gate is not None and not gate:
+            self.last_context_debug = {
+                "route": None, "precision": False, "pref_pack": False, "breadth_floor": None,
+                "token_budget": budget_tokens, "used_tokens": 0,
+                "relevance_gate": {"words": [], **gate_drop}}
+            return self._emit("", max_chars, budget_tokens)
+
         # E9 (§18.2): route the hint through nearest-centroid classification.
         # "factual" (no embedder, routing disabled, or simply the nearest
         # match) takes none of the branches below and reproduces today's
@@ -2759,8 +2904,7 @@ class RetrievalEngine:
         if (precision_on and route == "factual"
                 and self._raw_route(route_info.get("scores") or {}) == "factual"
                 and self.embedder is not None):
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now,
-                                          exclude_automation=exclude_automation)
+            raw_probe = _raw(20)
             precision_order = self._precision_order(raw_probe)
             precision = self._precision_decision(precision_order)
         if precision:
@@ -2819,8 +2963,7 @@ class RetrievalEngine:
             route == "preference"
             and (self.cfg.get("context.preference_packing", True) if self.cfg else True))
         if pref_pack:
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now,
-                                          exclude_automation=exclude_automation)
+            raw_probe = _raw(20)
             pref_pack = bool(raw_probe)
         if pref_pack:
             budget_tokens = min(budget_tokens,
@@ -2851,6 +2994,10 @@ class RetrievalEngine:
             "token_budget": budget_tokens,
             "used_tokens": 0,          # rewritten at every return point below
         }
+        if gate is not None:
+            # the same dict object, so the counts below land here as they grow
+            self.last_context_debug["relevance_gate"] = gate_drop
+            gate_drop["words"] = sorted(gate)
 
         # -- EVIDENCE FIRST (r1) ---------------------------------------------
         # Tier-1: ranked beliefs fused across fts/vector/structured/graph
@@ -2873,6 +3020,8 @@ class RetrievalEngine:
         tier1_chars = 0
         for b in ([] if precision or pref_pack else
                   self.search(hint, limit=10, purpose=purpose, principal=principal, now=now)):
+            if gate is not None and not _relevant(self._gate_text(b), "beliefs"):
+                continue
             ann = epistemic.annotate(b, principal) if epistemic else ""
             line = self._render(b) + (f"  ({ann})" if ann else "")
             # Ladder 9 E4 (§issue-8): a matched fact with recorded supersede
@@ -2959,9 +3108,7 @@ class RetrievalEngine:
             # at None, so the reused rows are exactly the rows this call would
             # have fetched. None whenever neither feature is eligible, and then
             # this is exactly the call that was always here.
-            for raw in (raw_probe if raw_probe is not None else
-                        self.retrieve_raw(hint, limit=raw_limit, principal=principal, now=now,
-                                          exclude_automation=exclude_automation)):
+            for raw in (raw_probe if raw_probe is not None else _raw(raw_limit)):
                 excerpt = (raw.get("excerpt") or "").strip()
                 eid = raw.get("event_id") or ""
                 if not excerpt and not eid.startswith("session:"):
@@ -3213,6 +3360,9 @@ class RetrievalEngine:
                         # acceptance bar is byte-identity with a tree that has
                         # no E12 in it at all.
                         existing_event_ids=seen_event_ids if precision else None)
+                    if gate is not None:
+                        expanded = [x for x in expanded
+                                    if _relevant(x.get("excerpt") or "", "excerpts")]
                     if not expanded:
                         continue
                     sessions_expanded += 1
@@ -3293,7 +3443,8 @@ class RetrievalEngine:
             if pref_pack:
                 remaining_chars = self._pref_pack_fill(
                     groups, parts, emitted_headers, seen_excerpts, remaining_chars,
-                    principal=principal, route=route)
+                    principal=principal, route=route,
+                    keep=None if gate is None else (lambda t: _relevant(t, "excerpts")))
                 ctx = "\n".join(_dedupe(parts))
 
         # E12: everything below this line is the "and nothing else" precision
@@ -3350,6 +3501,11 @@ class RetrievalEngine:
                 body = d.get("body")
                 if not body:
                     continue
+                # Gated: a standing directive already reaches every turn through
+                # the system prompt (static_block); repeated here only when it
+                # is about this message and not already on the page as a [NOTE].
+                if gate is not None and (body in ctx or not _relevant(body, "tail")):
+                    continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
                     break
@@ -3359,6 +3515,8 @@ class RetrievalEngine:
 
         for c in self.open_contradictions(3, principal):
             line = f"[CONTRADICTION] {c.get('detail','') or c.get('belief_a','')}"
+            if gate is not None and not _relevant(line, "tail"):
+                continue
             if not _fits(line):
                 break
             parts.append(line)
@@ -3369,6 +3527,8 @@ class RetrievalEngine:
             if not self._readable(c, principal, purpose, None):
                 continue
             line = f"[CRITICAL] {c.get('attribute','')}: {c['value']}"
+            if gate is not None and not _relevant(line, "tail"):
+                continue
             if not _fits(line):
                 break
             parts.append(line)
@@ -3382,7 +3542,9 @@ class RetrievalEngine:
         # space nothing else claimed (§r1 priority rule: evidence first).
         used_chars = len(ctx)
         if used_chars < max_chars:
-            for e in self._graph_seeds(self._tokens(hint))[:3]:
+            seed_tokens = self._tokens(hint) if gate is None else [
+                t for t in self._tokens(hint) if shares_content_word(gate, t)]
+            for e in self._graph_seeds(seed_tokens)[:3]:
                 for d in self.store.query_beliefs(
                         "notes", "note_type='belief' AND subject=? AND status='active'",
                         (f"digest:{e}",), 1):
@@ -3409,6 +3571,8 @@ class RetrievalEngine:
                 added = 0
                 for hit in self.federated.query(focus, principal, self.active_principal):
                     line = "[FEDERATED %s] %s" % (hit["provider"], hit["block"])
+                    if gate is not None and not _relevant(line, "tail"):
+                        continue
                     if remaining_chars - len(line) - 1 <= 0:
                         break
                     parts.append(line)
@@ -3459,6 +3623,8 @@ class RetrievalEngine:
                     continue
                 low = body.lower()
                 if not any(t in low for t in focus):
+                    continue
+                if gate is not None and not _relevant(body, "tail"):
                     continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
@@ -4046,6 +4212,18 @@ class RetrievalEngine:
         if ev:
             return access.can_read(None, ev.get("owner"), principal)
         return True
+
+    def _gate_text(self, b) -> str:
+        """What the injection relevance gate reads for a ranked belief: its
+        attribute and value, plus the NAME of the entity a fact is about -- a
+        fact renders as `attribute: value`, so "what does Robin like" would
+        otherwise never match Robin's own facts."""
+        text = "{} {}".format(b.get("attribute") or "", b.get("value") or "")
+        eid = b.get("entity_id")
+        if eid and eid != "user":
+            ent = self.store.get_belief("entities", eid) or {}
+            text += " {} {}".format(ent.get("name") or "", ent.get("aliases") or "")
+        return text
 
     def _render(self, b):
         """The ONE reader-facing render of a ranked belief (A16).
