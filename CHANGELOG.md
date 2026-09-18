@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.16
+
+**The agent's own notes come from the agent's own file.** Every directive in
+the production static block was a copy of something the agent wrote with its
+memory tool — and Hermes' built-in memory already puts the agent's CURRENT
+memory file into the same system prompt. Chronicle's copies were older: one
+read "never answer from a assumed location (e", cut off mid-sentence by an
+earlier extractor, while the agent's file had since rewritten it. When the
+host injects the agent's memory itself (`memory.memory_enabled`), the static
+block leaves those copies out; outside Hermes, or with built-in memory off,
+Chronicle's copy is the only one and stays. The user's own directives are
+always included.
+
 ## 5.8.15
 
 **Every system prompt carries only what must always be there.** The memory

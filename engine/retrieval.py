@@ -514,6 +514,14 @@ def relevance_fts_match(text: str) -> str:
 # user's are kept distinct. Explicit search still finds them.
 _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
 
+
+def _belief_source(row) -> str:
+    """A belief row's provenance source_type ("" when unreadable)."""
+    try:
+        return (json.loads(row.get("provenance") or "{}") or {}).get("source_type") or ""
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
 # The widest page retrieve_raw's FTS channel will fetch while looking for
 # `limit` rows it can use (see _retrieve_raw_inner).
 _FTS_FETCH_MAX = 640
@@ -4020,15 +4028,22 @@ class RetrievalEngine:
                 if self._ref_readable(c.get("belief_a"), principal)
                 and self._ref_readable(c.get("belief_b"), principal)]
 
-    def get_directives(self, principal=None) -> str:
+    def get_directives(self, principal=None, include_agent_own: bool = True) -> str:
         ds = self.directive_rows(principal, 50)
+        if not include_agent_own:
+            ds = [d for d in ds if _belief_source(d) not in _AGENT_OWN_SOURCES]
         if not ds:
             return ""
         return "\n".join(["=== CHRONICLE DIRECTIVES ==="] + [f"- {d['body']}" for d in ds if d.get("body")])
 
-    def static_block(self, principal: str) -> str:
+    def static_block(self, principal: str, include_agent_own: bool = True) -> str:
+        """The block for every system prompt. `include_agent_own=False` leaves
+        out the notes the agent wrote with its own memory tool: a host that
+        injects the agent's memory file itself (Hermes' built-in memory) has
+        the CURRENT version -- on the production store Chronicle's copies were
+        older and one was cut off mid-sentence."""
         lines = []
-        d = self.get_directives(principal)
+        d = self.get_directives(principal, include_agent_own=include_agent_own)
         if d:
             lines.append(d)
         # In every system prompt, so only what must never be acted against:
