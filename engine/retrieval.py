@@ -2202,8 +2202,10 @@ class RetrievalEngine:
                 expanded = self._expand_session_window(
                     g["sid"], principal, seen_excerpts, limit=max_events)
                 if keep is not None:
-                    # the injection relevance gate (get_context passes it)
-                    expanded = [x for x in expanded if keep(x.get("excerpt") or "")]
+                    # the injection relevance gate (get_context passes it): the
+                    # text to carry, or None to leave the turn out
+                    expanded = [dict(x, excerpt=said) for x in expanded
+                                for said in (keep(x.get("excerpt")),) if said is not None]
                 if not expanded:
                     continue
                 sessions_expanded += 1
@@ -2843,6 +2845,16 @@ class RetrievalEngine:
             gate_drop[kind] += 1
             return False
 
+        def _said(text):
+            """A raw excerpt as the gated injection carries it: what was said
+            -- not a tool's output, which is not memory about the user (a file
+            read that mentions "calendar" is not about the user's calendar) --
+            or None when nothing relevant is left."""
+            said = _spk.strip_framing(text or "", drop_tools=True)
+            if not said.strip() or not _relevant(said, "excerpts"):
+                return None
+            return said
+
         def _raw(limit):
             rows = self.retrieve_raw(hint, limit=limit, principal=principal, now=now,
                                      exclude_automation=exclude_automation)
@@ -2850,8 +2862,11 @@ class RetrievalEngine:
                 return rows
             kept = []
             for r in rows:
-                if not _relevant(r.get("excerpt") or "", "excerpts"):
+                said = _said(r.get("excerpt"))
+                if said is None:
                     continue
+                if said is not r.get("excerpt"):
+                    r = dict(r, excerpt=said)
                 if (r.get("event_id") or "").startswith("session:"):
                     # A session-channel row's excerpt is the WHOLE session: one
                     # matching turn would carry every unrelated one with it. It
@@ -3395,8 +3410,8 @@ class RetrievalEngine:
                         # no E12 in it at all.
                         existing_event_ids=seen_event_ids if precision else None)
                     if gate is not None:
-                        expanded = [x for x in expanded
-                                    if _relevant(x.get("excerpt") or "", "excerpts")]
+                        expanded = [dict(x, excerpt=said) for x in expanded
+                                    for said in (_said(x.get("excerpt")),) if said is not None]
                     if not expanded:
                         continue
                     sessions_expanded += 1
@@ -3478,7 +3493,7 @@ class RetrievalEngine:
                 remaining_chars = self._pref_pack_fill(
                     groups, parts, emitted_headers, seen_excerpts, remaining_chars,
                     principal=principal, route=route,
-                    keep=None if gate is None else (lambda t: _relevant(t, "excerpts")))
+                    keep=None if gate is None else _said)
                 ctx = "\n".join(_dedupe(parts))
 
         # E12: everything below this line is the "and nothing else" precision

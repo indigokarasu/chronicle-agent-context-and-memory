@@ -612,18 +612,20 @@ def _note_item(body, note_type, owner, domain, source_event, risk="low"):
 
 
 def _reader_excerpt(excerpt: str, lines) -> str:
-    """The excerpt minus host framing, for what extraction keeps or sends
-    verbatim -- the episode text, the model's prompt. Speaker lines already keep
-    framing out of every fact and note; the episode was the one output built
-    from the raw text, so a turn that opened with an earlier compaction's
-    handoff became an episode ABOUT that handoff, and the model was asked to
-    summarise it. Unchanged -- the same string -- when no line is framing."""
-    if not any(who == spk.SYSTEM for _, who in lines):
+    """The excerpt minus host framing and tool output, for what extraction
+    keeps or sends verbatim -- the episode text, the model's prompt. Speaker
+    lines already keep both out of every fact and note; the episode was the one
+    output built from the raw text, so a turn that opened with an earlier
+    compaction's handoff became an episode ABOUT that handoff, and a turn with a
+    file read in it became an episode that was mostly the file. Unchanged --
+    the same string -- when no line is either."""
+    drop = (spk.SYSTEM, spk.TOOL)
+    if not any(who in drop for _, who in lines):
         return excerpt
-    stripped = spk.strip_framing(excerpt)
+    stripped = spk.strip_framing(excerpt, drop_tools=True)
     if stripped is not excerpt:
         return stripped
-    return "\n".join(t for t, who in lines if who != spk.SYSTEM)
+    return "\n".join(t for t, who in lines if who not in drop)
 
 
 def _strip_roles(excerpt: str) -> str:

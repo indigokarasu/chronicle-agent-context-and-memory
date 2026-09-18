@@ -373,12 +373,16 @@ def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_inde
 # text returned unchanged -- the same object -- when nothing in it is framing.
 
 
-def strip_framing(excerpt: str, *, lead_role=None) -> str:
+def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False) -> str:
     """`excerpt` (`role: content` lines, as render_messages writes them) minus
     host framing. A user-side message loses its framing spans, and the whole
     message -- label included -- when nothing else is left; a `system:` row is
     framing by definition. Lines before the first label (a continuation chunk)
-    belong to `lead_role`, and are left alone when it is unknown."""
+    belong to `lead_role`, and are left alone when it is unknown.
+
+    `drop_tools` also drops `tool:` rows: for text that stands for what the
+    user and the agent SAID (an episode, a session summary, the memory put into
+    a user's turn), a file read or an API payload is neither."""
     text = excerpt or ""
     if not text:
         return text
@@ -397,7 +401,7 @@ def strip_framing(excerpt: str, *, lead_role=None) -> str:
             continue
         body = "\n".join(buf)
         who = role_speaker(role, HUMAN) if role else UNKNOWN
-        if who == SYSTEM:
+        if who == SYSTEM or (drop_tools and who == TOOL):
             changed = True
             continue
         if who in (HUMAN, AUTOMATION):
@@ -412,7 +416,7 @@ def strip_framing(excerpt: str, *, lead_role=None) -> str:
     return "\n".join(out) if changed else excerpt
 
 
-def reader_text(payload, *, actor="") -> str:
+def reader_text(payload, *, actor="", drop_tools=False) -> str:
     """An observed event's excerpt as a reader should see it (see above).
 
     A transcript is read by its labels with the current framing rules, so a
@@ -423,12 +427,13 @@ def reader_text(payload, *, actor="") -> str:
     excerpt = payload.get("excerpt") or ""
     st = payload.get("source_type") or ""
     if st == "session_transcript" or _LABEL.match(excerpt):
-        return strip_framing(excerpt)
+        return strip_framing(excerpt, drop_tools=drop_tools)
     spans = payload.get("speakers")
     if _valid_spans(spans, len(excerpt)):
-        if not any(w == SYSTEM and excerpt[a:b].strip() for a, b, w in spans):
+        drop = (SYSTEM, TOOL) if drop_tools else (SYSTEM,)
+        if not any(w in drop and excerpt[a:b].strip() for a, b, w in spans):
             return excerpt
-        return "".join(excerpt[a:b] for a, b, w in spans if w != SYSTEM).strip()
+        return "".join(excerpt[a:b] for a, b, w in spans if w not in drop).strip()
     if st == "context_eviction" and actor == "user":
         return strip_framing(excerpt, lead_role="user")
     return excerpt
