@@ -449,5 +449,89 @@ class TestCronNames(unittest.TestCase):
         self.assertEqual(A.cron_job_names(d), {"abc123def456": "Acme Fake Co digest"})
 
 
+class TestAMergedPersonIsOnePerson(unittest.TestCase):
+    """One person, one line. A production store held its principal twice —
+    `user` with 366 facts and the people store's uuid for them with 273 — and
+    the read model listed both, because nothing here looked at
+    `entities.merged_into`.
+
+    The uuid-keyed row is written directly, which is how the production store
+    holds it: those rows predate the naming rules and `clean_entities.py` later
+    gave them the name the log already carried. This is a test of the READ
+    model, not of how the row was created.
+    """
+
+    OTHER = "5734393e-cc34-5920-a7a8-09951cf2ce0c"
+
+    def setUp(self):
+        self.home = temp_home(prefix="tapestry-merge-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        self.core.initialize(CHAT, principal_id="assistant")
+        self.core.capture.observe("I moved house last spring.", "Noted.", session_id=CHAT)
+        self.core.process_pending()
+        src = [r[0] for r in self.core.store._conn().execute(
+            "SELECT event_id FROM events WHERE type='observed' ORDER BY seq")][0]
+        _fact(self.core, "user", "had_appointment", "Dentist — 2026-03-10", "user", 0.9, CHAT, src)
+        _fact(self.core, self.OTHER, "purchased", "Shipped: 1 Drugstore item", "user", 0.9, CHAT, src)
+        conn = self.core.store._conn()
+        for bid, name in (("user", "user"), (self.OTHER, "Pat Testley")):
+            conn.execute("INSERT OR REPLACE INTO entities(belief_id, name, normalized_name, "
+                         "aliases, type, domain, owner) "
+                         "VALUES(?,?,?,'[]','','user','default')",
+                         (bid, name, name.lower()))
+        conn.commit()
+        self.db = self.core.store.db_path
+
+    def _merge(self, frm=None, into="user"):
+        self.core.capture.append("merged", {"from_entity": frm or self.OTHER, "into_entity": into},
+                                 actor="user", owner="default")
+        self.core.process_pending()
+
+    def test_before_the_merge_they_are_two(self):
+        ids = {i["id"] for i in A.entity_index(self.db)["items"]}
+        self.assertIn("user", ids)
+        self.assertIn(self.OTHER, ids)
+
+    def test_the_merged_row_stops_being_its_own_line_and_its_facts_move(self):
+        before = {i["id"]: i for i in A.entity_index(self.db)["items"]}["user"]["facts"]
+        self._merge()
+        idx = A.entity_index(self.db)
+        items = {i["id"]: i for i in idx["items"]}
+        self.assertNotIn(self.OTHER, items, "a merged row must not be listed as a second person")
+        self.assertGreater(items["user"]["facts"], before, "its facts belong to the survivor now")
+        self.assertEqual(sum(idx["kinds"].values()), len(idx["items"]))
+
+    def test_opening_the_merged_id_answers_with_the_person_they_are_now(self):
+        self._merge()
+        d = A.entity_detail(self.db, self.OTHER)
+        self.assertEqual(d["id"], "user")
+        self.assertEqual(d["name"], "You")
+        values = [f["value"] for f in d["current"]]
+        self.assertTrue(any("Dentist" in v for v in values), values)
+        self.assertTrue(any("Drugstore" in v for v in values), values)
+
+    def test_the_people_store_record_survives_the_merge(self):
+        """`user` is Chronicle's own name for the principal and is in no other
+        store, so the profile has to be found through the id that was merged."""
+        self._merge()
+        people = {self.OTHER: {"name": "Pat Testley", "is_company": 0, "city": "San Francisco"}}
+        d = A.entity_detail(self.db, "user", people=people)
+        self.assertEqual(d.get("people_store", {}).get("city"), "San Francisco")
+
+    def test_an_unmerged_person_is_two_again(self):
+        self._merge()
+        self.core.capture.append("unmerged", {"from_entity": self.OTHER},
+                                 actor="user", owner="default")
+        self.core.process_pending()
+        ids = {i["id"] for i in A.entity_index(self.db)["items"]}
+        self.assertIn(self.OTHER, ids)
+
+    def test_a_merge_cycle_does_not_hang(self):
+        self._merge()
+        self._merge(frm="user", into=self.OTHER)
+        A.entity_index(self.db)          # must return rather than loop forever
+
+
 if __name__ == "__main__":
     unittest.main()
