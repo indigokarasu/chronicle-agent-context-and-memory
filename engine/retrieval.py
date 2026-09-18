@@ -1698,6 +1698,31 @@ class RetrievalEngine:
             sid = p.get("source_ref") or ""
         return _spk.is_automation_session(sid)
 
+    def _reader_excerpt(self, ev, stored):
+        """What a reader is handed for observed event `ev`: its excerpt with the
+        host framing taken out (speaker.reader_text) -- an earlier compaction's
+        handoff, a system note, Chronicle's own <memory-context> injection. The
+        stored text still carries them byte-for-byte, because the event id is a
+        hash of it; spans mark them, and extraction has always skipped them, but
+        recall used to serve them back as conversation.
+
+        `stored` is the text the channel already holds (the FTS row, the payload
+        excerpt) and is returned AS IS whenever nothing in the event is framing,
+        so every excerpt without framing is byte-identical to before. None means
+        the event was nothing but framing: the caller leaves it out."""
+        if not ev:
+            return stored
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            return stored
+        base = p.get("excerpt") or ""
+        text = _spk.reader_text(p, actor=ev.get("actor") or "")
+        if text == base:
+            return stored
+        return text if text.strip() else None
+
     def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
                             exclude_automation=False):
         principal = principal or self.active_principal
@@ -1708,7 +1733,10 @@ class RetrievalEngine:
             if exclude_automation and self._from_automation(ev):
                 continue
             if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
-                scored.setdefault(r["event_id"], {"excerpt": r["excerpt"], "score": 0.0,
+                excerpt = self._reader_excerpt(ev, r["excerpt"])
+                if excerpt is None:
+                    continue            # nothing but host framing
+                scored.setdefault(r["event_id"], {"excerpt": excerpt, "score": 0.0,
                                                   "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
         # limit <= 0 has no top-k to fill (baseline returned [] via out[:limit]) and
         # would index an empty heap, so the vector scan is skipped outright.
@@ -1843,6 +1871,9 @@ class RetrievalEngine:
                         else:
                             heapq.heapreplace(vec_heap, entry)
             for contribution, _seq, eid, excerpt, owner in vec_heap:
+                excerpt = self._reader_excerpt(self.store.get_event(eid), excerpt)
+                if excerpt is None:
+                    continue            # nothing but host framing
                 scored[eid] = {"excerpt": excerpt, "score": contribution, "owner": owner}
 
             # Paged session-vector streaming, same bounded top-k treatment. Session
@@ -1918,7 +1949,10 @@ class RetrievalEngine:
                         continue
                     p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) \
                         else (ev["payload"] or {})
-                    scored[eid] = {"excerpt": p.get("excerpt", ""), "score": contribution,
+                    excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+                    if excerpt is None:
+                        continue        # nothing but host framing
+                    scored[eid] = {"excerpt": excerpt, "score": contribution,
                                    "owner": ev["owner"]}
         # Temporal channel (§18.6): a query naming a date/month/year reranks the
         # survivors by whether they OCCURRED then. Post-heap on ≤2·limit rows, so
@@ -2294,7 +2328,7 @@ class RetrievalEngine:
             if existing_event_ids is not None and ev["event_id"] in existing_event_ids:
                 continue
             p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
-            excerpt = (p.get("excerpt") or "").strip()
+            excerpt = (self._reader_excerpt(ev, p.get("excerpt") or "") or "").strip()
             if not excerpt or excerpt in existing_excerpts:
                 continue
             date = (ev.get("occurred_at") or "")[:16]

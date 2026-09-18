@@ -288,9 +288,9 @@ class HeuristicExtractor(Extractor):
                 lines=None):
         items: list[dict] = []
         ambiguous = False
-        text = _strip_roles(excerpt)
         seen: set = set()
         lines = _role_lines(excerpt) if lines is None else lines
+        text = _strip_roles(_reader_excerpt(excerpt, lines))
 
         def add(item):
             key = item.get("key") or {}
@@ -611,6 +611,21 @@ def _note_item(body, note_type, owner, domain, source_event, risk="low"):
             "signal_type": "directive"}
 
 
+def _reader_excerpt(excerpt: str, lines) -> str:
+    """The excerpt minus host framing, for what extraction keeps or sends
+    verbatim -- the episode text, the model's prompt. Speaker lines already keep
+    framing out of every fact and note; the episode was the one output built
+    from the raw text, so a turn that opened with an earlier compaction's
+    handoff became an episode ABOUT that handoff, and the model was asked to
+    summarise it. Unchanged -- the same string -- when no line is framing."""
+    if not any(who == spk.SYSTEM for _, who in lines):
+        return excerpt
+    stripped = spk.strip_framing(excerpt)
+    if stripped is not excerpt:
+        return stripped
+    return "\n".join(t for t, who in lines if who != spk.SYSTEM)
+
+
 def _strip_roles(excerpt: str) -> str:
     return re.sub(r"^(User|Assistant|system|user|assistant):\s*", "", excerpt or "", flags=re.MULTILINE)
 
@@ -719,7 +734,7 @@ class LLMExtractor(Extractor):
         said = _grounding_text(spk.human_text(lines))
         try:
             import json as _json
-            reply = self._chat(_LLM_PROMPT + (excerpt or "")[:4000])
+            reply = self._chat(_LLM_PROMPT + _reader_excerpt(excerpt, lines)[:4000])
             m = re.search(r"\{.*\}", reply, re.DOTALL)      # tolerate fenced/prefixed replies
             parsed = _json.loads(m.group(0) if m else reply)
             items: list[dict] = []

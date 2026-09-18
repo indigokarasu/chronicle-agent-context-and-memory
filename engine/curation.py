@@ -975,11 +975,27 @@ class CurationWorker:
         if any(sid.startswith(prefix) for prefix in excluded):
             return
         events = self.store.get_events_by_session(sid)
-        obs = []  # (event_id, excerpt) for every observed event, in session order
+        obs = []         # (event_id, text) for every observed event, in session order
+        transcript = []  # the same, for the session's transcript captures only
         for ev in events:
             if ev["type"] == "observed":
                 p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
-                obs.append((ev["event_id"], p.get("excerpt", "")))
+                # The reader's copy, not the stored bytes (speaker.reader_text).
+                # Built from the stored text, 24 of the 107 interactive session
+                # summaries on the production store carried a "[CONTEXT
+                # COMPACTION — REFERENCE ONLY]" handoff into the session vector.
+                text = spk.reader_text(p, actor=ev.get("actor") or "")
+                if not text.strip():
+                    continue
+                obs.append((ev["event_id"], text))
+                if p.get("source_type") == "session_transcript":
+                    transcript.append((ev["event_id"], text))
+        # A session the provider captured is its transcript. The compressor's
+        # eviction copies and the rescue copies repeat messages the transcript
+        # already holds, and were what carried the handoffs in; they stand in
+        # only for a session with no transcript at all.
+        if transcript:
+            obs = transcript
         if not obs:
             return
         owner = events[0]["owner"] if events else "default"
