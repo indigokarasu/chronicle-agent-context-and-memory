@@ -3,6 +3,25 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.12
+
+**An episode is something the user says happened.** The heuristic extractor
+made an episode of every user message over 60 characters. Run over the
+user's sixty most recent real messages, that rule made 17 episodes, and every
+one was a request to the agent or a question: "Just work through all of them
+one by one…", "Come up with a way to ensure backups…", "Would any of this
+help SIFT? <url>". A sentence now counts only when it does not ask (a "?", or
+an opening such as "can", "what" or "did"), does not speak to the agent
+("you", "please"), and does not open — after a filler word or two — with a
+command; the episode is those sentences. Same sixty messages: 17 → 0 such
+episodes, while "My sister moved to Riverton last week. Can you remind me to
+call her?" still keeps its first sentence.
+
+**A reply quote is the host's.** When the user replies to a message, the
+gateway quotes it — usually the agent's own — as `[Replying to: "…"]` ahead
+of what the user wrote, over as many lines as it has. That quote was read as
+the user's words. It is host framing now (no stored memory came from one).
+
 ## 5.8.11
 
 **A folded tool step says what happened.** Each folded tool step is one line
