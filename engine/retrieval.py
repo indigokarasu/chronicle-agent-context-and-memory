@@ -434,6 +434,43 @@ def relevance_words(text: str) -> frozenset:
         if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER)
 
 
+# The most content words a gated (per-turn) search looks for. A scheduled
+# job's prompt runs to hundreds: on the production store one 4,400-character
+# cron prompt (210 content words, 234 prefix terms) took 42-84 s -- far past
+# the host's 8 s prefetch timeout, and while that call was stuck the host
+# skipped Chronicle for every turn, the user's included -- and matched nearly
+# everything anyway.
+_GATE_MAX_WORDS = 24
+
+
+def gate_focus(text: str, limit: int = _GATE_MAX_WORDS) -> str:
+    """`text` itself when it has at most `limit` content words; otherwise its
+    `limit` most telling ones -- said most often, capitalised (a name), longest,
+    then first -- joined by spaces, for the gated search to use in its place."""
+    count: dict = {}
+    first: dict = {}
+    named: set = set()
+    for i, raw in enumerate(word_tokens(text or "")):
+        t = raw.lower()
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+            raw = raw.split("'", 1)[0]
+        if len(t) < 3 or t in _STOP or t in _GENERIC or t in _GATE_FILLER:
+            continue
+        stem = _gate_stem(t)
+        count[stem] = count.get(stem, 0) + 1
+        first.setdefault(stem, (i, t))
+        if i > 0 and raw[:1].isupper():
+            named.add(stem)
+    if len(count) <= limit:
+        return text
+    ranked = sorted(count, key=lambda w: (-(count[w] + (2 if w in named else 0)),
+                                          -min(len(w), 12), first[w][0]))
+    return " ".join(first[w][1] for w in ranked[:limit])
+
+
 def relevance_fts_match(text: str) -> str:
     """The FTS5 expression for the injection gate: the message's content words
     -- as written and as `_gate_stem` folds them -- each a PREFIX term, OR'd.
@@ -2943,6 +2980,8 @@ class RetrievalEngine:
         # byte-for-byte what they were. On, every evidence line and every tail
         # line must share a content word with `hint`; a hint with no content
         # words gets nothing, and the retrieval work is not even started.
+        if relevance_gate:
+            hint = gate_focus(hint)          # a long prompt: its most telling words
         gate = relevance_words(hint) if relevance_gate else None
         gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
 

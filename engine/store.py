@@ -618,6 +618,10 @@ class MemoryStore:
             self._migrate(conn)
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('projection_seq','0')")
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('head_event_id','')")
+            # observed_user_fts is complete from birth on a new store; an older
+            # one keeps using the filtered main index until a backfill says so.
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('observed_user_fts_ready', "
+                         "CASE WHEN EXISTS(SELECT 1 FROM observed_fts) THEN '0' ELSE '1' END)")
             # Seed the monotonic event_seq counter (used by append_event's atomic
             # UPDATE...RETURNING). Omitting this left fresh DBs with no event_seq row,
             # so the first append_event crashed with "NoneType is not subscriptable".
@@ -1258,10 +1262,33 @@ class MemoryStore:
 
     # -- raw FTS (§8.6) — keyed by event_id so forbidden can delete --------
 
-    def fts_index_observed(self, event_id: str, excerpt: str):
+    def fts_index_observed(self, event_id: str, excerpt: str, *, user: bool = False):
+        """Index an observed event's text -- once: the reducer reaches here only
+        for a newly appended event or, in a rebuild, after the index was
+        emptied. The DELETE this used to run first matched on an UNINDEXED
+        column, i.e. read the whole index (67k rows, 0.2 s on the production
+        box) on every capture. `user` also puts it in the index of the user's
+        own conversations, which the per-turn search reads (see
+        fts_search_observed)."""
         with self.transaction() as conn:
-            conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
             conn.execute("INSERT INTO observed_fts(event_id, excerpt) VALUES(?,?)", (event_id, excerpt))
+            if user:
+                conn.execute("INSERT INTO observed_user_fts(event_id, excerpt) VALUES(?,?)",
+                             (event_id, excerpt))
+
+    # The session prefixes observed_user_fts leaves out (engine/speaker's
+    # AUTOMATION_SESSION_PREFIXES; the store does not import the speaker model).
+    USER_FTS_EXCLUDES = ("cron_",)
+
+    def user_fts_ready(self) -> bool:
+        """Does observed_user_fts hold every user-side row? A new store is born
+        complete; an upgraded one is until a backfill says so (meta)."""
+        try:
+            row = self._conn().execute(
+                "SELECT value FROM meta WHERE key='observed_user_fts_ready'").fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return bool(row and row[0] == "1")
 
     def fts_search_observed(self, query: str, limit: int = 20, *, match: str | None = None,
                             exclude_session_prefixes: tuple = ()) -> list[dict]:
@@ -1275,6 +1302,15 @@ class MemoryStore:
         if not q:
             return []
         try:
+            if exclude_session_prefixes and tuple(exclude_session_prefixes) == self.USER_FTS_EXCLUDES \
+                    and self.user_fts_ready():
+                # The user's own conversations are ~2% of the transcript rows
+                # on the production store; ranking the other 98% only to drop
+                # them was most of a per-turn search.
+                rows = self._conn().execute(
+                    "SELECT event_id, excerpt, rank FROM observed_user_fts "
+                    "WHERE observed_user_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+                return [dict(r) for r in rows]
             if exclude_session_prefixes:
                 cond = " AND ".join("COALESCE(e.session_id, '') NOT LIKE ? ESCAPE '\\'"
                                     for _ in exclude_session_prefixes)
@@ -1296,6 +1332,7 @@ class MemoryStore:
     def fts_delete_observed(self, event_id: str):
         with self.transaction() as conn:
             conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
+            conn.execute("DELETE FROM observed_user_fts WHERE event_id=?", (event_id,))
 
     # -- belief FTS (Tier-1, §18.1) ---------------------------------------
 
@@ -2109,7 +2146,23 @@ class MemoryStore:
                 [belief[c] for c in cols])
             kind, text = _belief_fts_text(table, belief)
             if kind:
-                self._fts_index_belief(conn, belief["belief_id"], kind, text)
+                if belief.get("status") in _INACTIVE_STATUSES:
+                    conn.execute("DELETE FROM belief_fts WHERE belief_id=?", (belief["belief_id"],))
+                else:
+                    self._fts_index_belief(conn, belief["belief_id"], kind, text)
+
+    def _belief_fts_follow_status(self, conn, table: str, belief_id: str, status):
+        """Only a belief search can return is in belief_fts. On the production
+        store 97,790 of its 101,188 rows were retracted beliefs, ranked on every
+        search and then thrown away."""
+        if status in _INACTIVE_STATUSES:
+            conn.execute("DELETE FROM belief_fts WHERE belief_id=?", (belief_id,))
+        elif status is not None:
+            row = conn.execute(f"SELECT * FROM {table} WHERE belief_id=?", (belief_id,)).fetchone()
+            if row is not None:
+                kind, text = _belief_fts_text(table, dict(row))
+                if kind:
+                    self._fts_index_belief(conn, belief_id, kind, text)
 
     def update_belief(self, table: str, belief_id: str, **fields):
         if not fields:
@@ -2118,6 +2171,8 @@ class MemoryStore:
             sets = ",".join(f"{k}=?" for k in fields)
             conn.execute(f"UPDATE {table} SET {sets} WHERE belief_id=?",
                          [*fields.values(), belief_id])
+            if "status" in fields:
+                self._belief_fts_follow_status(conn, table, belief_id, fields["status"])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
             self.delete_query_proxy_vectors(belief_id)
@@ -2132,8 +2187,10 @@ class MemoryStore:
         with self.transaction() as conn:
             for t in BELIEF_TABLES:
                 if all(_has_col(conn, t, k) for k in fields):
-                    conn.execute(f"UPDATE {t} SET {sets} WHERE belief_id=?",
-                                 [*fields.values(), belief_id])
+                    cur = conn.execute(f"UPDATE {t} SET {sets} WHERE belief_id=?",
+                                       [*fields.values(), belief_id])
+                    if cur.rowcount and "status" in fields:
+                        self._belief_fts_follow_status(conn, t, belief_id, fields["status"])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
             self.delete_query_proxy_vectors(belief_id)
@@ -3490,7 +3547,10 @@ class MemoryStore:
             for t in PROJECTION_TABLES:
                 conn.execute(f"DELETE FROM {t}")
             conn.execute("DELETE FROM observed_fts")
+            conn.execute("DELETE FROM observed_user_fts")
             conn.execute("DELETE FROM belief_fts")
+            # The replay that follows indexes every user-side row again.
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('observed_user_fts_ready','1')")
             if self.vector_index:
                 try:
                     self.vector_index.prune_observed_vectors(conn, set())  # keep nothing -- full rebuild
@@ -4035,6 +4095,7 @@ CREATE TABLE IF NOT EXISTS extractions (
     UNIQUE(observed_event, extractor_version));
 
 CREATE VIRTUAL TABLE IF NOT EXISTS observed_fts USING fts5(event_id UNINDEXED, excerpt);
+CREATE VIRTUAL TABLE IF NOT EXISTS observed_user_fts USING fts5(event_id UNINDEXED, excerpt);
 CREATE VIRTUAL TABLE IF NOT EXISTS belief_fts USING fts5(belief_id UNINDEXED, kind UNINDEXED, text);
 
 CREATE TABLE IF NOT EXISTS observed_vectors (
