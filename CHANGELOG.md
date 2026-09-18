@@ -3,6 +3,21 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.15
+
+**The per-turn prefetch makes no embedding call.** Measured on the production
+store with the embedder live, three gated per-turn blocks came out the same
+line for line with and without the vector channels — the gate keeps only
+items that share a content word with the message, and FTS already finds
+those — at 7.4 / 4.1 / 1.1 s with vectors and 2.0 / 2.5 / 0.2 s without. The
+difference was a request to a CPU-bound embedding server inside the user's
+turn (plus scanning every stored vector). The gated path is now lexical:
+`retrieve_raw` / `search` take `lexical_only`, `query_understanding` takes
+`embed`, and route classification — which embeds the message too — is
+skipped for the default route. Explicit retrieval embeds exactly as before.
+
+"remind" joins the chat filler ("remind me where I work …").
+
 ## 5.7.14
 
 **The per-turn prefetch asks the store only for what it can use.** Profiled on
