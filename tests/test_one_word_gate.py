@@ -9,8 +9,10 @@ refunds that were "issued", "every 10 mins" two contacts named Min, "set it
 up" a model-switching chat. Each item's STORED vector says what the words
 cannot: the plainly unrelated scored 0.32-0.64 against the message, the
 plainly related 0.66-0.75 (a few loosely related fell on both sides).
-So a one-word match is kept only when the item's vector is near the message's;
-without a vector, or an embedder that can answer in time, the word rule stands.
+So a one-word match is kept only when the item's vector is near the message's.
+A short item with no vector of this model is embedded on the spot (a few per
+turn); a long one, or an embedder that cannot answer in time, keeps the word
+rule.
 
 Fixtures use obviously fake values; vectors are hand-placed.
 """
@@ -24,6 +26,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from _tmp_support import temp_home
 
+from unittest import mock
+
+from engine import retrieval as R
 from engine.core import ChronicleCore
 from engine.embeddings import pack
 
@@ -55,7 +60,8 @@ class FakeServer:
         self.calls.append((list(texts), timeout))
         if self.fail:
             raise TimeoutError("busy")
-        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+        return [[1.0, 0.0, 0.0, 0.0] if t.startswith("search_query: ")
+                else NEAR if "Zorblax" in t else FAR for t in texts]
 
     def embed(self, *_a, **_k):
         raise AssertionError("the gated path embeds nothing but the query, and only raw")
@@ -76,7 +82,9 @@ class TestOneWordMatches(unittest.TestCase):
                 ("two_words", "note", "the system health check runs nightly for Acme Fake Co"),
                 ("no_vector", "insurance", "health insurance card for Robin Placeholder"),
                 ("other_model", "gym", "health club membership at SunFake 9000 Gym"),
-                ("short_vector", "clinic", "health clinic hours for Izakaya Nonesuch staff")):
+                ("short_vector", "clinic", "health clinic hours for Izakaya Nonesuch staff"),
+                ("near_unembedded", "pager", "Zorblax health pager rota starts Monday"),
+                ("long_unembedded", "diary", "health diary: " + "Glimmerfen walking notes, " * 12)):
             core.capture.append("asserted", {
                 "kind": "fact",
                 "key": {"entity_id": "user", "predicate_canonical": attribute, "attribute": attribute,
@@ -125,17 +133,17 @@ class TestOneWordMatches(unittest.TestCase):
             _floor(self.core, "auto")
 
     def test_the_fixture_matches_every_fact_on_its_words(self):
-        """With no floor, the word rule alone takes all five -- otherwise the
+        """With no floor, the word rule alone takes them all -- otherwise the
         tests below prove nothing."""
         out, _ = self.ctx(floor=None)
-        for word in ("Zorbaxol", "Zorblax", "Acme Fake Co", "Robin Placeholder", "SunFake 9000",
-                     "Izakaya Nonesuch", "tomato", "status page"):
+        for word in ("Zorbaxol", "dashboard", "Acme Fake Co", "Robin Placeholder", "SunFake 9000",
+                     "Izakaya Nonesuch", "tomato", "status page", "pager rota", "Glimmerfen"):
             self.assertIn(word, out)
 
     def test_a_coincidence_is_dropped_a_match_in_meaning_kept(self):
         out, _ = self.ctx()
         self.assertNotIn("Zorbaxol", out)
-        self.assertIn("Zorblax", out)
+        self.assertIn("dashboard", out)
         one = self.core.retrieval.last_context_debug["relevance_gate"]["one_word"]
         self.assertIn(("health", False), {(d["word"], d["kept"]) for d in one})
         self.assertIn(("health", True), {(d["word"], d["kept"]) for d in one})
@@ -145,23 +153,41 @@ class TestOneWordMatches(unittest.TestCase):
         self.assertNotIn("tomato", out)
         self.assertIn("status page", out)
 
-    def test_a_vector_of_another_length_keeps_the_word_rule(self):
-        self.assertIn("Izakaya Nonesuch", self.ctx()[0])
-
     def test_two_shared_words_need_no_vector_check(self):
         self.assertIn("Acme Fake Co", self.ctx()[0])
 
-    def test_no_vector_or_another_models_vector_keeps_the_word_rule(self):
-        out, _ = self.ctx()
-        self.assertIn("Robin Placeholder", out)
-        self.assertIn("SunFake 9000", out)
+    def test_a_short_item_with_no_usable_vector_is_embedded_now(self):
+        """No vector, another model's, or another length: embedded on the spot."""
+        with mock.patch.object(R, "_GATE_EMBED_ITEMS", 10):
+            out, server = self.ctx()
+        for gone in ("Robin Placeholder", "SunFake 9000", "Izakaya Nonesuch"):
+            self.assertNotIn(gone, out)
+        self.assertIn("pager rota", out)
+        docs = [t for texts, _ in server.calls for t in texts if t.startswith("search_document: ")]
+        self.assertEqual(len(docs), 4, docs)
+
+    def test_a_long_item_with_no_vector_keeps_the_word_rule(self):
+        self.assertIn("Glimmerfen", self.ctx()[0])
+
+    def test_a_few_items_per_turn_are_embedded_the_rest_keep_the_word_rule(self):
+        out, server = self.ctx()
+        docs = [t for texts, _ in server.calls for t in texts if t.startswith("search_document: ")]
+        self.assertEqual(len(docs), R._GATE_EMBED_ITEMS)
+        kept = sum(w in out for w in ("Robin Placeholder", "SunFake 9000", "Izakaya Nonesuch", "pager rota"))
+        self.assertEqual(kept, 2)       # one unembedded by the cap, and the near one
+
+    def test_the_turn_budget_bounds_every_request(self):
+        with mock.patch.object(R, "_GATE_EMBED_BUDGET", 0.0):
+            out, server = self.ctx()
+        self.assertEqual(server.calls, [])
+        self.assertIn("Zorbaxol", out)
 
     def test_the_query_is_embedded_once_raw_and_prefixed(self):
         _out, server = self.ctx()
-        self.assertEqual(len(server.calls), 1)
-        (texts, timeout), = server.calls
-        self.assertEqual(texts, ["search_query: " + QUERY])
-        self.assertLessEqual(timeout, 2.0)
+        queries = [(texts, t) for texts, t in server.calls if texts[0].startswith("search_query: ")]
+        self.assertEqual(queries[0][0], ["search_query: " + QUERY])
+        self.assertEqual(len(queries), 1)
+        self.assertTrue(all(len(texts) == 1 and t <= R._GATE_EMBED_TIMEOUT for texts, t in server.calls))
 
     def test_a_longer_message_needs_two_words_and_embeds_nothing(self):
         _out, server = self.ctx("Is the Zorblax server health dashboard still at the Riverton office?")
@@ -169,7 +195,7 @@ class TestOneWordMatches(unittest.TestCase):
 
     def test_an_embedder_that_fails_keeps_the_word_rule(self):
         out, server = self.ctx(server=FakeServer(fail=True))
-        self.assertEqual(len(server.calls), 1)
+        self.assertEqual(len(server.calls), 1)          # the query; nothing more is tried
         self.assertIn("Zorbaxol", out)
 
     def test_an_open_breaker_is_not_asked(self):
@@ -192,13 +218,13 @@ class TestOneWordMatches(unittest.TestCase):
         server.model = "acme-fake-embedder-2"
         out, _ = self.ctx(server=server, floor=0.5)
         self.assertNotIn("Zorbaxol", out)
-        self.assertIn("Zorblax", out)
+        self.assertIn("dashboard", out)
 
     def test_hashing_is_never_asked(self):
         r = self.core.retrieval
         _floor(self.core, 0.5)
         try:
-            self.assertIsNone(r._gate_query_vector(QUERY))
+            self.assertIsNone(r._gate_vector(QUERY, True, 1.0))
             out = r.get_context(QUERY, token_budget=1200, principal="default",
                                 exclude_automation=True, relevance_gate=True)
         finally:
