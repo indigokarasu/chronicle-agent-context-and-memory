@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from itertools import zip_longest
 
 from . import access
+from . import speaker as _spk
 from .config import DEFAULTS, check_abstain_gate
 from . import embeddings as _embeddings
 from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
@@ -1566,18 +1567,46 @@ class RetrievalEngine:
         except (TypeError, ValueError):
             return None
 
-    def retrieve_raw(self, query, *, limit=20, principal=None, now=None):
+    def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False):
         """Raw observed/session/projection tier. Wrapper for the A0c scope; the
-        body is `_retrieve_raw_inner`."""
-        with self._query_diagnostics():
-            return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now)
+        body is `_retrieve_raw_inner`.
 
-    def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None):
+        `exclude_automation`: leave out everything from an automation session
+        (a scheduled job's own run). Set by the callers that inject memory into
+        the user's conversation unasked — the provider's per-turn prefetch and
+        the context engine's rehydration — and left off for an explicit search,
+        where the agent may be asking about its own work. On the production
+        store 7,817 of 7,924 indexed sessions were cron runs, and the per-turn
+        block was serving their tool JSON and operational narratives as memory
+        about the user."""
+        with self._query_diagnostics():
+            return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now,
+                                            exclude_automation=exclude_automation)
+
+    @staticmethod
+    def _from_automation(ev) -> bool:
+        """Whether an event was written by an automation session (engine/speaker)."""
+        if not ev:
+            return False
+        sid = ev.get("session_id") or ""
+        if not sid:
+            raw = ev.get("payload")
+            try:
+                p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except ValueError:
+                p = {}
+            sid = p.get("source_ref") or ""
+        return _spk.is_automation_session(sid)
+
+    def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
+                            exclude_automation=False):
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         scored: dict[str, dict] = {}
         for i, r in enumerate(self.store.fts_search_observed(query, limit=limit)):
             ev = self.store.get_event(r["event_id"])
+            if exclude_automation and self._from_automation(ev):
+                continue
             if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
                 scored.setdefault(r["event_id"], {"excerpt": r["excerpt"], "score": 0.0,
                                                   "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
@@ -1704,6 +1733,8 @@ class RetrievalEngine:
                         if len(vec_heap) >= limit and contribution <= vec_heap[0][0]:
                             continue  # can't displace the current floor; skip the event fetch
                         ev = self.store.get_event(eid)
+                        if exclude_automation and self._from_automation(ev):
+                            continue
                         p = json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str) else (ev or {}).get("payload", {})
                         entry = (contribution, seq, eid, p.get("excerpt", ""), v.get("owner"))
                         seq += 1
@@ -1724,6 +1755,8 @@ class RetrievalEngine:
                     batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4):
                 for s in batch:
                     if not s.get("embedding"):
+                        continue
+                    if exclude_automation and _spk.is_automation_session(s.get("session_id")):
                         continue
                     sim = cosine(q["embedding"], unpack(s["embedding"]))
                     if sim <= 0.15 or not access.can_read(access.DEFAULT_ACL, s.get("owner"), principal):
@@ -2561,14 +2594,15 @@ class RetrievalEngine:
         return _clamp_cfg_float(self.cfg, "context.precision_margin", 0.0, 0.0, 1.0)
 
     def get_context(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
-                    principal=None, epistemic=None, now=None) -> str:
+                    principal=None, epistemic=None, now=None, exclude_automation=False) -> str:
         """Assemble a reader-facing context block (§18). Wrapper for the A0c
         wrong-dimension scope; the body is `_get_context_inner`, and the count
         lands in `last_context_debug["vectors_skipped_wrong_dim"]`."""
         with self._query_diagnostics():
             out = self._get_context_inner(hint, token_budget=token_budget,
                                           include_directives=include_directives, purpose=purpose,
-                                          principal=principal, epistemic=epistemic, now=now)
+                                          principal=principal, epistemic=epistemic, now=now,
+                                          exclude_automation=exclude_automation)
             if isinstance(self.last_context_debug, dict):
                 # exact count, not the bounded identity sample -- see answer()
                 self.last_context_debug["vectors_skipped_wrong_dim"] = \
@@ -2576,7 +2610,7 @@ class RetrievalEngine:
             return out
 
     def _get_context_inner(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
-                           principal=None, epistemic=None, now=None) -> str:
+                           principal=None, epistemic=None, now=None, exclude_automation=False) -> str:
         """Assemble a reader-facing context block for `hint` (§18).
 
         §L8 r1 priority rule, enforced STRUCTURALLY, not by convention: raw
@@ -2725,7 +2759,8 @@ class RetrievalEngine:
         if (precision_on and route == "factual"
                 and self._raw_route(route_info.get("scores") or {}) == "factual"
                 and self.embedder is not None):
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now)
+            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now,
+                                          exclude_automation=exclude_automation)
             precision_order = self._precision_order(raw_probe)
             precision = self._precision_decision(precision_order)
         if precision:
@@ -2784,7 +2819,8 @@ class RetrievalEngine:
             route == "preference"
             and (self.cfg.get("context.preference_packing", True) if self.cfg else True))
         if pref_pack:
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now)
+            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now,
+                                          exclude_automation=exclude_automation)
             pref_pack = bool(raw_probe)
         if pref_pack:
             budget_tokens = min(budget_tokens,
@@ -2924,7 +2960,8 @@ class RetrievalEngine:
             # have fetched. None whenever neither feature is eligible, and then
             # this is exactly the call that was always here.
             for raw in (raw_probe if raw_probe is not None else
-                        self.retrieve_raw(hint, limit=raw_limit, principal=principal, now=now)):
+                        self.retrieve_raw(hint, limit=raw_limit, principal=principal, now=now,
+                                          exclude_automation=exclude_automation)):
                 excerpt = (raw.get("excerpt") or "").strip()
                 eid = raw.get("event_id") or ""
                 if not excerpt and not eid.startswith("session:"):

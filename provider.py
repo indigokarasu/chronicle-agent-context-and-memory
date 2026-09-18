@@ -499,9 +499,12 @@ class ChronicleMemoryProvider(MemoryProvider):
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
             return ""
+        # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
+        # nothing from a scheduled job's own runs (engine/speaker).
         return self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
-            principal=self._principal_id, epistemic=self.core.epistemic)
+            principal=self._principal_id, epistemic=self.core.epistemic,
+            exclude_automation=True)
 
     def system_prompt_block(self) -> str:
         return self.core.retrieval.static_block(self._principal_id) if self.core else ""
