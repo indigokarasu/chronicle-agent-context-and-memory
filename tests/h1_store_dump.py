@@ -208,11 +208,17 @@ def run_flow(home: str) -> str:
 
     _freeze_clock()
     prov = ChronicleMemoryProvider()
-    # embeddings.model is the ONLY override: a networked embedder would make the
-    # run non-deterministic (and this must work offline). Everything else — and
-    # host_model.piggyback in particular — is left at DEFAULTS.
+    # Two overrides, both for determinism. embeddings.model: a networked
+    # embedder would make the run non-deterministic (and this must work
+    # offline). curation.drain.background: a host drains on a background thread
+    # by default (5.7.13), which changes WHEN jobs run, not what they write --
+    # but the dump includes the job queue, and the base tree drains on the
+    # calling thread, so the two are compared that way. (The base tree ignores
+    # the key.) Everything else -- host_model.piggyback in particular -- is left
+    # at DEFAULTS.
     prov.initialize("s-h1-probe", hermes_home=home, principal_id="assistant",
-                    config={"embeddings": {"model": "hashing"}})
+                    config={"embeddings": {"model": "hashing"},
+                            "curation": {"drain": {"background": False}}})
     for user, assistant in TURNS:
         # The H1 attach hook, on the default path. The base tree has no such
         # method; the H1 tree has one that must return "" without touching the

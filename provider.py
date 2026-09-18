@@ -147,6 +147,10 @@ class ChronicleMemoryProvider(MemoryProvider):
         hermes_home = hermes_home or str(Path.home() / ".hermes")
         self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
+        # Hermes calls on_turn_start inside the user's turn: curation runs beside
+        # it, not in it (curation.drain.background).
+        if self.core.cfg.get("curation.drain.background", True):
+            self.core.drain_in_background()
         self._session_id = session_id
         self._principal_id = principal_id
         # Who is on the user side of this agent (engine/speaker.py). Hermes sends

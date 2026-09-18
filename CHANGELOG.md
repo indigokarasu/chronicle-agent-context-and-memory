@@ -3,6 +3,30 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.13
+
+**A turn does not wait for the embedding server.** Measured on the production
+VPS after the 5.7.12 restart: the local embedding server runs at ~50% CPU all
+day and a 200-word embed takes ~7 s, against a 10 s request timeout.
+
+* **A timeout is not retried.** The endpoint is on-host by policy, so a timeout
+  means the server is busy — and a client timeout does not cancel its work:
+  each retry queued another copy behind the request still running. One failing
+  embed spent ~60 s (5 attempts × 10 s + backoff) growing the queue it was
+  waiting on. A timeout now trips the breaker at once and the vector is
+  deferred. Other transient errors keep the retry budget.
+* **Work off the critical path may take as long as the server needs.** The
+  deferred embed job and the session summary pass `embeddings.background_timeout`
+  (default 120 s) instead of the live timeout: a long excerpt timed out on every
+  attempt, and 676 embed jobs failed permanently that way in six days.
+* **Curation runs beside the turn, not in it.** Hermes calls `on_turn_start`
+  synchronously, before the model, and it drained a slice of the curation queue
+  — embed jobs included — inside the user's turn. A host (the provider, the
+  context engine) now moves that slice onto one background thread per core
+  (`curation.drain.background`, default true); kicks arriving during a pass are
+  coalesced into one more pass, and a failing job does not stop the worker. A
+  core used directly still drains where it is called.
+
 ## 5.7.12
 
 * **Chronicle's own compaction output is host framing.** The checkpoint
