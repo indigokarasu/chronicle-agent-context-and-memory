@@ -67,6 +67,7 @@ class ChronicleCore:
         access.configure_topology(self.cfg.get("principals"))
         self.has_memory_provider = False
         self.has_context_engine = False
+        self._startup_recovered = False   # on_startup_recovery: once per process
         self.active_principal = "default"
 
         db_path = self.cfg.get("db_path") or str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
@@ -242,10 +243,27 @@ class ChronicleCore:
             return False
 
     def on_startup_recovery(self):
+        """Crash recovery (I13): once per PROCESS, and bounded.
+
+        initialize() runs on every session start — every conversation and every
+        cron agent run on a gateway — and this used to run all of it each time,
+        ending in process_pending(): a synchronous drain of up to 1,000 queued
+        jobs before the session could begin. The queue holds embed jobs, and on a
+        CPU-throttled host whose embedding server times out that was minutes per
+        session start (measured: 320 s and 830 s for one engine init against the
+        production store).
+
+        Recovery is bookkeeping about a previous process, so it happens once per
+        core. The drain that follows is one ordinary turn's slice
+        (curation.drain.per_turn); every later turn drains another, which is the
+        path the rest of the queue already takes."""
+        if self._startup_recovered:
+            return
+        self._startup_recovered = True
         # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
         if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
             self.reaper.startup_recovery()
-        self.process_pending()         # drain crash-recovered extraction (I13)
+        self.curation.drain()          # one turn's slice of crash-recovered extraction (I13)
 
     def start_sources(self):
         if self.cfg.get("sources.ocas_journals.enabled") in (True, "auto"):

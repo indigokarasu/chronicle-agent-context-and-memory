@@ -365,5 +365,46 @@ class TestWithTheMemoryProviderLiveNothingIsCapturedTwice(unittest.TestCase):
             self.assertTrue(extracted, "standalone evictions must still be extracted")
 
 
+class TestASessionStartDoesNotWorkTheQueue(unittest.TestCase):
+    """initialize() runs on every session start — every conversation and every
+    cron agent run on a gateway — and ran crash recovery each time, ending in a
+    synchronous drain of up to 1,000 queued jobs. Measured on the production
+    store: 320 s and 830 s for one engine init. Recovery is about a previous
+    process: once per core, and one turn's slice of draining."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="ce_start_")
+        self.core = ChronicleCore.get(self.home, CFG)
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_recovery_runs_once_per_process(self):
+        calls = []
+        self.core.reaper.startup_recovery = lambda *a, **k: calls.append(1)
+        for i in range(5):
+            self.core.initialize("s%d" % i)
+        self.assertEqual(calls, [1])
+
+    def test_a_session_start_drains_at_most_one_turns_slice(self):
+        for i in range(200):
+            self.core.store.enqueue_curation("session_summarize", {"session_id": "q%d" % i})
+        drained = []
+        real = self.core.curation.drain
+        self.core.curation.drain = lambda max_jobs=None: drained.append(max_jobs) or real(max_jobs)
+        self.core.initialize("first")
+        self.core.initialize("second")
+        self.assertEqual(drained, [None], "one bounded drain, on the first start only")
+
+    def test_the_explicit_full_drain_is_untouched(self):
+        """process_pending() is what tests and scripts call to work the whole
+        queue; only startup stops calling it."""
+        self.core.initialize("s")
+        self.core.capture.observe("My name is Pat Testley.", "ok", session_id="s")
+        self.core.process_pending()
+        self.assertTrue(self.core.store.query_beliefs("facts", "status='active'"))
+
+
 if __name__ == "__main__":
     unittest.main()
