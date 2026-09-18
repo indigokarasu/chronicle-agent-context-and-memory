@@ -519,9 +519,15 @@ _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
 # match must reach, per embedding model (canonical id), measured on the
 # production store's real messages. A model not listed gets no floor.
 _ONE_WORD_FLOOR = {"nomic-embed-text": 0.65}
-# A per-turn query embed is one request, inside the user's turn: no retries,
-# never trips the embedder's breaker, and gives up after this long.
+# A gate embed is one request inside the user's turn: no retries, never trips
+# the embedder's breaker, gives up after _GATE_EMBED_TIMEOUT, and all of one
+# turn's together stop at _GATE_EMBED_BUDGET seconds. An item with no stored
+# vector is embedded on the spot only when short (a CPU embedder took ~0.45 s
+# for 300 characters), and at most _GATE_EMBED_ITEMS of them per turn.
 _GATE_EMBED_TIMEOUT = 1.0
+_GATE_EMBED_BUDGET = 1.5
+_GATE_EMBED_ITEM_CHARS = 240
+_GATE_EMBED_ITEMS = 3
 
 
 def _belief_source(row) -> str:
@@ -3065,20 +3071,42 @@ class RetrievalEngine:
 
         floor = self._one_word_floor() if gate is not None else None
         query_vec: list = []                 # embedded on first need, at most once
+        embeds = {"deadline": None, "items": 0, "made": {}}   # made: this turn's, by item
+
+        def _embed(text, as_query):
+            """One gate request, inside this turn's shared time budget."""
+            now = _time_monotonic()
+            if embeds["deadline"] is None:
+                embeds["deadline"] = now + _GATE_EMBED_BUDGET
+            left = embeds["deadline"] - now
+            if left <= 0.05:
+                return None
+            return self._gate_vector(text, as_query, min(_GATE_EMBED_TIMEOUT, left))
 
         def _close_enough(ref, word, text):
-            """A ONE-word match: kept when the item's stored vector is near the
-            message's (see retrieval.prefetch_min_similarity). Without a floor,
-            a query vector or a vector of the item's own, the lexical rule
-            stands alone."""
-            if floor is None or ref is None:
+            """A ONE-word match: kept when the item is near the message in
+            meaning (see retrieval.prefetch_min_similarity) -- its stored vector,
+            or, for a short item with none of this model, its text embedded now
+            (a few per turn). Without a floor, a query vector or either of those,
+            the lexical rule stands alone."""
+            if floor is None:
                 return True
             if not query_vec:
-                query_vec.append(self._gate_query_vector(hint))
-            vec = self._gate_stored_vector(ref) if query_vec[0] else None
-            if not vec or len(vec) != len(query_vec[0]):
+                query_vec.append(_embed(hint, True))
+            q = query_vec[0]
+            vec = self._gate_stored_vector(ref) if q else None
+            key = ref if ref and ref[1] else text
+            if q and (not vec or len(vec) != len(q)):
+                vec = embeds["made"].get(key)
+                if vec is None and len(text) <= _GATE_EMBED_ITEM_CHARS and embeds["items"] < _GATE_EMBED_ITEMS:
+                    embeds["items"] += 1
+                    vec = embeds["made"][key] = _embed(text, False)
+            if not vec or len(vec) != len(q or ()):
+                gate_drop.setdefault("one_word", []).append(
+                    {"word": word, "similarity": None, "kept": True, "text": text[:80],
+                     "why": "no vector" if q else "no query vector"})
                 return True
-            sim = cosine(query_vec[0], vec)
+            sim = cosine(q, vec)
             gate_drop.setdefault("one_word", []).append(
                 {"word": word, "similarity": round(sim, 3), "kept": sim >= floor, "text": text[:80]})
             return sim >= floor
@@ -3980,7 +4008,7 @@ class RetrievalEngine:
                 low = body.lower()
                 if not any(t in low for t in focus):
                     continue
-                if gate is not None and not _relevant(body, "tail"):
+                if gate is not None and not _relevant(body, "tail", ("belief", d.get("belief_id"), "note")):
                     continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
@@ -4615,20 +4643,22 @@ class RetrievalEngine:
         except (TypeError, ValueError):
             return None
 
-    def _gate_query_vector(self, text):
-        """The message's vector for the one-word check, or None. One request
-        with a short timeout: this runs inside the user's turn, so it neither
-        retries nor trips the embedder's breaker (that would stop background
-        embedding too), and it is skipped while the breaker is already open."""
+    def _gate_vector(self, text, as_query, timeout):
+        """A vector for the one-word check, or None. One request with a short
+        timeout: this runs inside the user's turn, so it neither retries nor
+        trips the embedder's breaker (that would stop background embedding
+        too), and it is skipped while the breaker is already open."""
         emb = self.embedder
         raw = getattr(emb, "_embed_raw_batch", None)
         if raw is None or getattr(emb, "_open_until", 0.0) > _time_monotonic():
             return None
-        prefix = "search_query: " if getattr(emb, "use_task_prefixes", False) else ""
+        prefix = ""
+        if getattr(emb, "use_task_prefixes", False):
+            prefix = "search_query: " if as_query else "search_document: "
         try:
-            vec = raw([prefix + (text or "")[:2000]], _GATE_EMBED_TIMEOUT)[0]
+            vec = raw([prefix + (text or "")[:2000]], timeout)[0]
         except Exception as e:  # noqa: BLE001 -- no vector: the lexical rule alone
-            logger.debug("gate query embed skipped: %s", e)
+            logger.debug("gate embed skipped: %s", e)
             return None
         return vec or None
 

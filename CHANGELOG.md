@@ -3,6 +3,21 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.20
+
+**An item with no vector to compare is embedded on the spot, if short.**
+5.8.19's check needs the item's stored vector; entities have none, and a few
+facts and the newest turns are not embedded yet, so their one-word matches
+passed unchecked. Live that was "address and fix all the issues" bringing an
+entity named "Issue-closing" and "…would return nothing?" an Amazon return
+receipt. A short item (240 characters or less) with no vector of this model
+is now embedded on the spot. That's at most three per turn, all of a turn's
+gate requests within 1.5 s, and a long one keeps the word rule. The second
+directive path (topic notes) now carries the note's id, so a directive is
+checked on either path. Over 400 real messages: 59 one-word matches, 55
+dropped, 4 kept (0.66–0.75); a turn's recall took 0.08 s at the median and
+0.60 s at the slowest.
+
 ## 5.8.19
 
 **A short message's one shared word must also be near it in meaning.** A
