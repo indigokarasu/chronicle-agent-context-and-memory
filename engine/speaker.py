@@ -373,7 +373,7 @@ def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_inde
 # text returned unchanged -- the same object -- when nothing in it is framing.
 
 
-def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False) -> str:
+def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False, drop_unlabeled=False) -> str:
     """`excerpt` (`role: content` lines, as render_messages writes them) minus
     host framing. A user-side message loses its framing spans, and the whole
     message -- label included -- when nothing else is left; a `system:` row is
@@ -382,7 +382,10 @@ def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False) -> str:
 
     `drop_tools` also drops `tool:` rows: for text that stands for what the
     user and the agent SAID (an episode, a session summary, the memory put into
-    a user's turn), a file read or an API payload is neither."""
+    a user's turn), a file read or an API payload is neither. `drop_unlabeled`
+    drops lines before the first label when `lead_role` is unknown: a later
+    chunk of a long turn opens mid-message, and whose words those are is not
+    something memory put into a user's turn may guess."""
     text = excerpt or ""
     if not text:
         return text
@@ -400,6 +403,9 @@ def strip_framing(excerpt: str, *, lead_role=None, drop_tools=False) -> str:
         if label is None and not buf:
             continue
         body = "\n".join(buf)
+        if label is None and role is None and drop_unlabeled:
+            changed = changed or bool(body.strip())
+            continue
         who = role_speaker(role, HUMAN) if role else UNKNOWN
         if who == SYSTEM or (drop_tools and who == TOOL):
             changed = True

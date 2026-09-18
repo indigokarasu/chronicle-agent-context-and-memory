@@ -3,6 +3,22 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.10
+
+**The per-turn injection never guesses whose words it is carrying.** A turn
+longer than one stored chunk (4,000 chars) is split at message boundaries when
+it can be; one message longer than a chunk — in practice a tool's output — is
+split inside it, and the next chunk opens mid-message with no role label. On
+the production store 473 of the 651 interactive transcript events are later
+chunks, all written without the speaker spans that would say whose text opens
+them. The gated injection now leaves out that unlabelled opening of a later
+chunk; the chunk's labelled messages still arrive, and a single stored message
+whose spans do say whose it is (the compressor's copy of a user message) is
+injected as before.
+
+The gated helper now works on the row rather than its text, so the
+agent-memory rule of 5.7.8 applies on every gated path, not only the first.
+
 ## 5.7.9
 
 **Older rescue copies lose their host frames too.** A dry run of the

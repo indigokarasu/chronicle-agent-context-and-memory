@@ -17,6 +17,7 @@ context engine's rehydration, benchmarks) never sets the flag.
 Fixtures use obviously fake values.
 """
 
+import json
 import shutil
 import sys
 import unittest
@@ -34,6 +35,11 @@ CFG = {"embeddings": {"model": "hashing"}}
 CHAT = "20260917_010203_ab12cd"
 CHAT2 = "20260916_090000_ef34ab"
 CHAT3 = "20260915_070000_9f8e7d"
+CHAT4 = "20260914_060000_1a2b3c"
+# A tool result longer than one stored chunk: its tail -- with a word nothing
+# else says -- opens a later chunk, with no label to say whose text it is.
+LONG_TOOL = " ".join("Row %d of the export is unremarkable." % i for i in range(160)) + \
+    " The last row names Quibblewick as the owner."
 TOOL_OUT = '{"content": "41|  \\"notes\\": \\"Quibbleton calendar sync, no changes made\\""}'
 
 IZAKAYA = "I booked dinner at Izakaya Nonesuch in Riverton for Friday."
@@ -88,11 +94,26 @@ class _Case(unittest.TestCase):
             {"role": "assistant", "content": "Reading the dates."},
             {"role": "tool", "content": '{"rows": "Quibbleton due-date export"}'},
             {"role": "assistant", "content": "Added them."}])
+        core.initialize(CHAT4, principal_id="default")
+        core.capture.observe("Export the Friday tracker rows please.", "Done with the Friday tracker.",
+                             session_id=CHAT4, messages=[
+            {"role": "user", "content": "Export the Friday tracker rows please."},
+            {"role": "assistant", "content": "Exporting."},
+            {"role": "tool", "content": LONG_TOOL},
+            {"role": "assistant", "content": "Done with the Friday tracker."}])
+        # The compressor's durable copy of one of the user's own messages: a
+        # single message, no label, spans saying it is the user's.
+        said = "I moved the Glimmerfen planning meeting to Thursday."
+        core.capture.append("observed", {
+            "source_type": "context_eviction", "excerpt": said, "source_ref": CHAT,
+            "speakers": [[0, len(said), "human"]],
+            "attribution": {"user_side": "human", "role": "user"}},
+            actor="user", session_id=CHAT)
         # The agent's own memory tool, mirrored by on_memory_write.
         core.capture.agent_explicit(
             "add", "memory", "Izakaya Nonesuch dispatch loop: re-assert the verifier, "
             "action none, advance the gate on the Izakaya Nonesuch thread.")
-        for sid in (CHAT, CHAT2, CHAT3):
+        for sid in (CHAT, CHAT2, CHAT3, CHAT4):
             core.capture.finalize_session(sid, "clean_exit")
         core.process_pending()
         cls.prov = ChronicleMemoryProvider()
@@ -138,7 +159,9 @@ class TestTheInjection(_Case):
     def test_the_fixture_puts_the_noise_in_reach(self):
         """Ungated, the SunFake chat and the unrelated tail DO reach the block --
         otherwise the tests below prove nothing."""
-        ctx = self.ctx("Is the Izakaya Nonesuch booking still on?", gate=False)
+        ctx = self.core.retrieval.get_context("Is the Izakaya Nonesuch booking still on?",
+                                              token_budget=6000, principal="default",
+                                              exclude_automation=True)
         self.assertIn("Izakaya Nonesuch", ctx)
         self.assertIn("SunFake 9000", ctx)
         self.assertIn("penicillin", ctx)
@@ -205,8 +228,8 @@ class TestTheInjection(_Case):
         groups = [{"sid": CHAT3, "date": "", "excerpts": [], "tails": []}]
         parts: list = []
 
-        def keep(t):
-            said = spk.strip_framing(t or "", drop_tools=True)
+        def keep(row):
+            said = spk.strip_framing(row.get("excerpt") or "", drop_tools=True)
             return said if said.strip() else None
         r._pref_pack_fill(groups, parts, {}, set(), 6000, principal="default",
                           route="preference", keep=keep)
@@ -225,6 +248,28 @@ class TestTheInjection(_Case):
         self.assertIn("blue folder", ctx)
         self.assertEqual(ctx.count("[DIRECTIVE] Always file"), 0 if "[NOTE] Always file" in ctx
                          else 1)   # once on the page, not once per tier
+
+    def test_the_fixture_splits_the_long_turn(self):
+        chunks = [json.loads(e["payload"]) for e in self.core.store.get_events_by_session(CHAT4)
+                  if e["type"] == "observed"]
+        later = [c for c in chunks if (c.get("chunk_index") or 0) > 0
+                 and "Quibblewick" in c["excerpt"]]
+        self.assertTrue(later)
+        self.assertFalse(later[0]["excerpt"].lstrip().lower().startswith(("tool:", "user:",
+                                                                         "assistant:")))
+
+    def test_a_later_chunk_does_not_open_with_words_nobody_can_attribute(self):
+        q = "Quibblewick owner"
+        self.assertIn("Quibblewick", self.ctx(q, gate=False))
+        self.assertNotIn("Quibblewick", self.prov.prefetch(q))
+
+    def test_a_single_stored_message_of_the_users_is_injected(self):
+        """Unlabelled is not the same as unattributable: a copy of one message
+        says whose it is."""
+        self.assertIn("Glimmerfen planning meeting", self.prov.prefetch("the Glimmerfen meeting"))
+
+    def test_a_later_chunk_keeps_its_labelled_messages(self):
+        self.assertIn("Done with the Friday tracker", self.prov.prefetch("the Friday tracker"))
 
     def test_the_agents_own_memory_is_not_memory_about_the_user(self):
         """Hermes puts the agent's current memory into every system prompt
