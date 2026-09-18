@@ -121,20 +121,26 @@ _NORM_REFUSE = re.compile(
 # speaks to the agent ("you", "please"), or opens -- after a filler word or
 # two -- with a verb in the imperative.
 _ADDRESSES_AGENT = re.compile(r"\b(?:you|your|yours|you're|you've|you'll|please|pls)\b", re.IGNORECASE)
-_LEAD_FILLER = re.compile(r"^(?:(?:just|now|also|ok|okay|so|then|and|but|first|next|pls|please|go ahead and)[\s,]+)+",
-                          re.IGNORECASE)
-_IMPERATIVE_VERBS = frozenset("""add archive build cancel change check clean clear come compare configure
-connect continue convert copy create delete deploy disable do don't dont download draft email enable ensure
-explain export fetch figure find finish fix forward generate get give go grab help ignore import install
-integrate keep kill let's lets list look make merge move mute open pause post prioritize pull push put read
-reboot reject remind remove rename replace reply rerun reset restart restore resume retry revert review run
-save schedule search see send set share show spread start stop summarize summarise sync take tell test text
-try turn unblock uninstall update upgrade upload use verify wait walk work write""".split())
+_LEAD_FILLER = re.compile(r"^(?:(?:just|now|also|ok|okay|so|then|and|but|first|next|pls|please|go ahead and"
+                          r"|yes|yeah|yep|no|nope|great|cool|perfect|thanks)[\s,.!]+)+", re.IGNORECASE)
+_IMPERATIVE_VERBS = frozenset("""add archive build cancel change check clean clear come compare configure connect continue convert
+copy create delete deploy disable do don't dont download draft email enable ensure explain export
+fetch figure find finish fix forward generate get give go grab help ignore import install integrate
+keep kill let's lets list look make merge move mute open pause post prioritize proceed pull push put
+read reboot reject remind remove rename replace reply rerun reset restart restore resume retry
+revert review run save schedule search see send set share show spread start stop summarise summarize
+sync take tell test text trigger try turn unblock uninstall update upgrade upload use verify wait
+walk work write""".split())
+# A command can follow a clause: "Once everything is backed up, trigger ...".
+_CLAUSE_FIRST = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soon as)\b[^,]{0,120},\s*",
+                           re.IGNORECASE)
 # A question need not end in "?": "Can the scheduler be spread out so it never
 # uses 30% at once".
+# Only an auxiliary opens one that way: "when", "what" and the like open
+# narrative too ("When we got to Riverton, ...") and are left to the "?".
 _QUESTION_OPENER = re.compile(
-    r"^(?:can|could|would|will|should|shall|is|are|was|were|do|does|did|have|has|what|why|how|when|where"
-    r"|who|whom|which|whose)\b", re.IGNORECASE)
+    r"^(?:can|could|would|will|should|shall|is|are|was|were|do|does|did|have|has)\s+"
+    r"(?:the|a|an|this|that|these|those|it|there|we|i|my|our|any|all|each|every|[A-Z])", re.IGNORECASE)
 
 
 def _narrative(texts) -> str:
@@ -146,7 +152,9 @@ def _narrative(texts) -> str:
             if not s or s.endswith("?") or _ADDRESSES_AGENT.search(s):
                 continue
             lead = _LEAD_FILLER.sub("", s)
-            first = lead.split(maxsplit=1)
+            m = _CLAUSE_FIRST.match(lead)          # "once it is backed up, trigger ..."
+            main = lead[m.end():] if m else lead
+            first = main.split(maxsplit=1)
             if first and first[0].lower().strip(",.:;!") in _IMPERATIVE_VERBS:
                 continue
             if _QUESTION_OPENER.match(lead):

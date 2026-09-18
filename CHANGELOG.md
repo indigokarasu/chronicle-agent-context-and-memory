@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.13
+
+**The episode rule, tightened where it leaked and loosened where it lost.**
+Over 195 real messages 5.8.12 still made episodes of "Then proceed with the
+plex option…" and "Yes, and once everything is backed up, run genie again"
+(a command after "yes" or a leading clause), and would have dropped a story
+that opens like a question ("When we got to Riverton, …"). A command is now
+found after an affirmation or a leading "once/when/if …," clause; a question
+without its "?" is recognised only by an auxiliary opening ("can the…", "is
+there…", "did the…"), not by "when" or "what", which open narrative too.
+
 ## 5.8.12
 
 **An episode is something the user says happened.** The heuristic extractor
