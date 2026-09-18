@@ -63,7 +63,9 @@ class TestTheFastMatcherIsTheSameMatcher(unittest.TestCase):
     VOCAB = ["fly", "flies", "city", "cities", "company", "companies", "dog", "dogs", "eat",
              "eaten", "art", "party", "artist", "book", "booked", "booking", "plan", "planned",
              "planet", "restaurant", "restaurants", "robin", "robin's", "zu\u0308rich",
-             "z\u00fcrich", "bus", "gas", "pies", "cry", "cries", "tracker", "hawaii", "don't"]
+             "z\u00fcrich", "bus", "gas", "pies", "cry", "cries", "tracker", "hawaii", "don't",
+             "reilly", "o'reilly", "'reilly", "rock'n'roll", "roll", "robin\u2019s", "foo_bar",
+             "bar", "BOOKED", "Hawaii's", "x2024", "2024", "don", "Don", "doesn't", "does", "don\u2019t"]
 
     def test_every_pair(self):
         from engine.retrieval import relevance_words, shares_content_word
