@@ -308,6 +308,38 @@ class TestLenses(_TapestryCase):
         self.assertEqual(len(works), 1)
         self.assertEqual([v["value"] for v in works[0]["versions"]], ["Acme Fake Co", "Globex Fake Inc"])
 
+    def test_a_history_reads_forwards_when_the_clock_ties(self):
+        """Two versions written in the same millisecond: the replaced one comes
+        first. (The tie-break used to be the belief id, a hash, which made
+        test_fact_histories fail about one run in eight.)"""
+        import sqlite3 as _sq
+        c = _sq.connect(self.db)
+        was = c.execute("SELECT belief_id, created_at FROM facts "
+                        "WHERE predicate_canonical='works_at'").fetchall()
+        c.execute("UPDATE facts SET created_at='2026-09-01T00:00:00.000Z' "
+                  "WHERE predicate_canonical='works_at'")
+        c.commit()
+        try:
+            h = A.fact_histories(self.db)
+            works = [i for i in h["items"] if i["predicate"] == "works_at"]
+            self.assertEqual([v["value"] for v in works[0]["versions"]],
+                             ["Acme Fake Co", "Globex Fake Inc"])
+        finally:                          # the class shares this store
+            c.executemany("UPDATE facts SET created_at=? WHERE belief_id=?",
+                          [(at, bid) for bid, at in was])
+            c.commit()
+            c.close()
+
+    def test_a_tie_is_broken_by_what_replaced_what_not_by_the_id(self):
+        """Ids chosen so that id order is the WRONG order: belief ids differ on
+        every build, so the store-level test above only catches this on the
+        builds whose hashes happen to fall the wrong way."""
+        at = "2026-09-01T00:00:00.000Z"
+        rows = [("b_aaa", "Globex Fake Inc", "active", at, None, None, None),
+                ("b_zzz", "Acme Fake Co", "superseded", at, None, None, "b_aaa")]
+        self.assertEqual([r[1] for r in A._in_supersession_order(rows)],
+                         ["Acme Fake Co", "Globex Fake Inc"])
+
     def test_duplicate_notes(self):
         d = A.duplicate_notes(self.db)
         self.assertEqual((d["groups"], d["redundant"]), (1, 1))

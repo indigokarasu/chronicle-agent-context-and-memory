@@ -122,12 +122,19 @@ _WHOLE_MESSAGE_FRAMES = (
     "[System:", "[System note:", "[SYSTEM]", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT:",
     "[Runtime note:", "[Your active task list", "[Planning state preserved",
     "[ASYNC DELEGATION", "Cronjob Response:",
+) + (
+    # Chronicle's OWN compaction output (context.py): the checkpoint digest,
+    # recalled memory and the entity working set. It is injected as `system`
+    # rows, which are framing already; listed here so a host that folds them
+    # into a user row cannot turn Chronicle's summary into the user's words.
+    "[Checkpoint:", "[Relevant memory:", "[Entity working set]",
 )
 
 _INLINE_FRAMES = re.compile(
     r"^\[(?:System note:|System:|Runtime note:|SYSTEM\]).*?(?:\][ \t]*(?=\n|\Z)|\Z)"
     r"|^(?:\[(?:IMPORTANT:|CONTEXT COMPACTION|CONTEXT SUMMARY\]|PRIOR CONTEXT|Your active task list"
-    r"|Planning state preserved|ASYNC DELEGATION)|Cronjob Response:).*\Z"
+    r"|Planning state preserved|ASYNC DELEGATION|Checkpoint:|Relevant memory:|Entity working set\])"
+    r"|Cronjob Response:).*\Z"
     r"|<memory-context>.*?(?:</memory-context>|\Z)"
     r"|<(system-reminder|command-message|command-name|command-args|local-command-caveat"
     r"|local-command-stderr|local-command-stdout|task-notification|ide_opened_file"

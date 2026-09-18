@@ -3,6 +3,22 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.12
+
+* **Chronicle's own compaction output is host framing.** The checkpoint
+  digest (`[Checkpoint: …]`), recalled memory (`[Relevant memory: …]`) and the
+  entity working set are injected as `system` rows, which speaker attribution
+  already treats as framing. They are now also recognised inside a user row,
+  so a host that folds system messages into the user's turn cannot make
+  Chronicle's own summary read as the user's words.
+* **A fact's history reads forwards when two versions share a timestamp.**
+  Versions were ordered by `created_at`, then by belief id — a hash — and a
+  correction written in the same millisecond as the fact it corrects is
+  routine, so a history could read backwards. A version now precedes the one
+  that replaced it. This was the intermittent `test_fact_histories` failure
+  (about one run in eight): belief ids differ on every build, so the tie
+  resolved differently from run to run.
+
 ## 5.7.11
 
 Review fixes to 5.7.5–5.7.10, each verified against the code before changing it.
