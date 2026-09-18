@@ -299,5 +299,71 @@ class TestRescueHappensOncePerMessage(unittest.TestCase):
         self.assertNotIn("only-the-twin", self.eng._rescued_hashes)
 
 
+class TestWithTheMemoryProviderLiveNothingIsCapturedTwice(unittest.TestCase):
+    """With the memory provider live on the same core, sync_turn captured every
+    turn when it ended and extraction runs from that capture. The context engine
+    used to capture and extract the same turns again — rescue (19,089 notes on
+    the production store) and re-extracted evictions (4,955 notes), every one of
+    them retracted by the attribution cleanup."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="ce_dup_")
+        self.eng = ChronicleContextEngine()
+        self.eng.on_session_start("dup-s1", hermes_home=self.home, principal_id="pat",
+                                  config=CFG)
+        self.eng.update_model("test-model", context_length=1500)
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _count(self, where):
+        c = self.eng.core.store._conn()
+        return c.execute("SELECT COUNT(*) FROM events WHERE " + where).fetchone()[0]
+
+    def _extract_jobs_for_evictions(self):
+        import json as _json
+        c = self.eng.core.store._conn()
+        evicted = {r[0] for r in c.execute(
+            "SELECT event_id FROM events WHERE type='observed' AND "
+            "json_extract(payload,'$.source_type')='context_eviction'")}
+        queued = {_json.loads(r[0]).get("event_id") for r in c.execute(
+            "SELECT payload FROM curation_jobs WHERE task='extract'")}
+        return evicted, evicted & queued
+
+    def test_rescue_writes_nothing(self):
+        self.eng.core.has_memory_provider = True
+        self.eng.compress(TestNothingCompressWritesWaitsOnTheEmbedder._important(60))
+        self.assertEqual(self._count("json_extract(payload,'$.source_type')='rescue_extraction'"), 0)
+
+    def test_an_eviction_is_durable_but_not_extracted_again(self):
+        self.eng.core.has_memory_provider = True
+        self.eng.compress(_conversation(80))
+        evicted, extracted = self._extract_jobs_for_evictions()
+        self.assertTrue(evicted, "evicted spans must still be durable")
+        self.assertEqual(extracted, set())
+
+    def test_the_decision_travels_in_the_event_so_a_rebuild_repeats_it(self):
+        self.eng.core.has_memory_provider = True
+        self.eng.compress(_conversation(80))
+        c = self.eng.core.store._conn()
+        c.execute("DELETE FROM curation_jobs WHERE task='extract'")
+        c.commit()
+        self.eng.core.has_memory_provider = False      # the flag is gone on replay...
+        self.eng.core.reducer.rebuild()
+        _, extracted = self._extract_jobs_for_evictions()
+        self.assertEqual(extracted, set(), "...and the log still says: do not extract")
+
+    def test_standalone_keeps_its_own_capture(self):
+        """No provider: rescue and eviction are the only capture there is."""
+        self.assertFalse(self.eng.core.has_memory_provider)
+        self.eng.compress(TestNothingCompressWritesWaitsOnTheEmbedder._important(60))
+        self.assertGreater(
+            self._count("json_extract(payload,'$.source_type')='rescue_extraction'"), 0)
+        evicted, extracted = self._extract_jobs_for_evictions()
+        if evicted:
+            self.assertTrue(extracted, "standalone evictions must still be extracted")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2652,8 +2652,10 @@ class MemoryStore:
             if dup is not None:
                 return None
             # Check for done/failed job with same payload and re-arm it
-            old_job = conn.execute("SELECT id FROM curation_jobs WHERE task='embed' AND "
-                                   "status IN ('done','failed') AND payload=?", (payload,)).fetchone()
+            old_job = conn.execute(
+                "SELECT id FROM curation_jobs WHERE task='embed' AND status IN ('done','failed') "
+                "AND json_extract(payload, '$.target_id')=? AND payload=?",
+                (target_id, payload)).fetchone()
             if old_job is not None:
                 # Re-arm: reset to pending with attempts=0 and run_after=NULL
                 conn.execute("UPDATE curation_jobs SET status='pending', attempts=0, run_after=NULL, "
@@ -3614,6 +3616,19 @@ _JOBS_INDEX_DDLS = (
     # A7. Serves prune_curation_jobs' age cutoff over terminal rows.
     ("CREATE INDEX IF NOT EXISTS idx_jobs_terminal ON curation_jobs(finished_at, id) "
     "WHERE status IN ('done','failed');"),
+    # Serves enqueue_embed_job's RE-ARM probe ("is there a finished job for this
+    # same work?"). idx_jobs_dedupe is partial on pending/running, so that probe
+    # had no index and walked every terminal row comparing payload TEXT. Measured
+    # on a production store that retention had never pruned (182,230 job rows,
+    # 31,299 finished embeds): about a second per enqueue, and compress() queues
+    # one per span it writes — 90 enqueues, 97 s, inside one compaction.
+    # Keyed on the target id rather than the payload itself: an embed payload
+    # carries the full text, so indexing it would copy kilobytes a row; the
+    # target id is ~70 bytes and all but unique, and the query still compares the
+    # whole payload after the index narrows it.
+    ("CREATE INDEX IF NOT EXISTS idx_jobs_embed_done_target ON curation_jobs("
+     "json_extract(payload, '$.target_id')) "
+     "WHERE task='embed' AND status IN ('done','failed');"),
     # v5.7.0 review §8. The ONLY index on the referencing side of
     # `depends_on REFERENCES curation_jobs(id)`, and it is a deploy-cost fix, not
     # a query-plan nicety. SQLite verifies an enforced foreign key on every
