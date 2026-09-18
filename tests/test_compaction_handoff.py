@@ -445,6 +445,29 @@ class TestAStepLineSaysWhatHappened(unittest.TestCase):
                                                 " → exit 1: Job for zorblax.service failed")
 
 
+class TestTheHandoffAlternates(unittest.TestCase):
+    """As Hermes places its own summary: against the roles a strict chat
+    template counts (tool rows and tool-call rows are exempt), the message
+    before first, then the one after."""
+
+    def role(self, before, after):
+        return ChronicleContextEngine._handoff_role(before + after, len(before))
+
+    def test_the_cases(self):
+        S = {"role": "system", "content": "s"}
+        U = {"role": "user", "content": "u"}
+        A = {"role": "assistant", "content": "a"}
+        C = {"role": "assistant", "content": "", "tool_calls": [{"id": "x"}]}
+        T = {"role": "tool", "tool_call_id": "x", "content": "r"}
+        self.assertEqual(self.role([S], [U]), "user", "the first visible message is the user's")
+        self.assertEqual(self.role([S, U], [A]), "assistant")
+        self.assertEqual(self.role([S, U, A], [U]), "user")
+        self.assertEqual(self.role([S, U, C, T], [U]), "assistant",
+                         "after a tool loop the last visible turn is the user's")
+        self.assertEqual(self.role([S, U, A], [A]), "user")
+        self.assertEqual(self.role([S, U], [U]), "assistant")
+
+
 class TestItCanBeInspected(_Engine):
     def test_status_says_what_the_last_pass_did(self):
         self.eng.update_model("fake-model", 3000)
