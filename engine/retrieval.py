@@ -14,12 +14,14 @@ derivation, it abstains (I8) rather than fabricates.
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 import hashlib
 import heapq
 import json
 import logging
 import math
 import re
+import unicodedata
 from contextlib import contextmanager
 from itertools import zip_longest
 
@@ -402,6 +404,7 @@ _GATE_FILLER = frozenset({
 })
 
 
+@functools.lru_cache(maxsize=65536)
 def _gate_stem(tok: str) -> str:
     """Fold the plural/possessive forms a message and a memory disagree on
     ("restaurants" / "restaurant", "Robin's" / "Robin")."""
@@ -469,6 +472,16 @@ def shares_content_word(words: frozenset | set, text: str) -> bool:
     "plan" / "planned"), but only between words of four letters or more, so
     "eat" never matches "eaten" by accident and "art" never matches "party"."""
     if not words:
+        return False
+    # C-speed pre-check. A token that matches a word always contains the
+    # word's first three letters (an equal stem, a plural or possessive of it,
+    # or a prefix relation between words of four letters or more) -- except
+    # that a three-letter "-y" word matches its "-ies" plural ("fly" /
+    # "flies"), which shares only two. Measured on the production store, the
+    # token loop below was 1.6 s of a 4.2 s per-turn prefetch, nearly all of
+    # it on excerpts that contain no content word at all.
+    low = unicodedata.normalize("NFC", text or "").lower()
+    if not any((w[:2] if len(w) == 3 and w.endswith("y") else w[:3]) in low for w in words):
         return False
     long_words = [w for w in words if len(w) >= 4]
     for t in map(_gate_stem, _gate_words(text)):
@@ -1161,6 +1174,12 @@ class RetrievalEngine:
                       fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
         q = self.query_understanding(query, embed=not lexical_only)
+        if fts_match is not None:
+            # The injection gate's search: the structured channel scans facts
+            # once per token (an unindexable LIKE) and the graph channel seeds
+            # entities by token, so both take the message's content words only
+            # -- "which" is not worth a scan of the facts table, or an entity.
+            q = dict(q, tokens=[t for t in q["tokens"] if relevance_words(t)])
         ranked: dict[str, dict] = {}
         # R12: entities carry no vector of their own (names are not semantic
         # content, §R12), so a purely SEMANTIC entity match can only ever surface

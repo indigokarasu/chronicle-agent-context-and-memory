@@ -3,6 +3,24 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.16
+
+**The relevance gate costs what it saves.** Profiled on the production store
+after 5.7.15, the gated per-turn prefetch still spent 1.6 s of 4.2 s (under the
+profiler) in `shares_content_word` — tokenising and stemming every word of up
+to ~50 excerpts of up to 4,000 characters in Python, nearly all of them
+excerpts with no content word in them at all — and 0.5 s in the structured
+channel's per-token `LIKE` scans of the facts table, "which" included.
+
+* A C-speed substring pre-check answers "no" for text that cannot match: a
+  matching token always contains its word's first three letters (two for a
+  three-letter "-y" word, whose "-ies" plural shares only those), under the
+  same NFC normalisation the tokeniser applies. `_gate_stem` is cached. An
+  equivalence test pins the fast matcher to the old one over plurals,
+  "-ies" words, possessives, short words and decomposed Unicode.
+* The gated search's structured and graph channels take the message's
+  content words only.
+
 ## 5.7.15
 
 **The per-turn prefetch makes no embedding call.** Measured on the production
