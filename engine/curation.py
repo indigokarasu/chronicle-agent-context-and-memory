@@ -51,6 +51,7 @@ from .embeddings import (
 )
 from .reducer import (
     belief_vector_text,
+    is_duplicate_copy,
     observed_vector_text,
     projection_vector_text,
     session_vector_text,
@@ -780,11 +781,18 @@ class CurationWorker:
             # The same exclusion the write path applies (§27
             # embeddings.exclude_session_prefixes): a job queued before the
             # prefix was excluded, or by an older build, must not embed it now.
+            # Nor an archive copy of a turn the provider already embedded.
             excluded = tuple(self.cfg.get("embeddings.exclude_session_prefixes", []) or ())
-            if excluded:
-                row = self.store._conn().execute(
-                    "SELECT session_id FROM events WHERE event_id=?", (target,)).fetchone()
-                if row and (row[0] or "").startswith(excluded):
+            row = self.store._conn().execute(
+                "SELECT session_id, payload FROM events WHERE event_id=?", (target,)).fetchone()
+            if row is not None:
+                if excluded and (row[0] or "").startswith(excluded):
+                    return
+                try:
+                    ev_payload = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                except ValueError:
+                    ev_payload = None
+                if is_duplicate_copy(ev_payload):
                     return
             if _already_current(self.store.get_observed_vector_model(target),
                                 self.store.get_observed_vector_len(target)):
