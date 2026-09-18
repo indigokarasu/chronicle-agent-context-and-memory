@@ -301,6 +301,35 @@ class TestNothingTwice(_Engine):
         self.assertNotIn("[episode]", h)
 
 
+class TestTheHostsPersistenceMarker(_Engine):
+    """Hermes writes compress() output into the rotated child session and skips
+    rows already stamped `_db_persisted`; its own compressor sweeps the marker
+    off its output, and stamps committed rows itself afterwards."""
+
+    def _stamped(self, n=30):
+        self.eng.update_model("fake-model", 3000)
+        msgs = [_msg("system", "sys")] + [_msg("user" if i % 2 == 0 else "assistant",
+                                               "chatter %d " % i + "q" * 500) for i in range(n)]
+        for m in msgs:
+            m["_db_persisted"] = True
+        return msgs
+
+    def test_no_marker_leaves_a_compaction(self):
+        msgs = self._stamped()
+        out = self.eng.compress(msgs)
+        self.assertFalse([m for m in out if "_db_persisted" in m])
+        self.assertTrue(all(m.get("_db_persisted") for m in msgs), "the host's dicts are not edited")
+
+    def test_a_prefix_the_host_stamped_still_matches(self):
+        out = self.eng.compress(self._stamped())
+        for m in out:
+            m["_db_persisted"] = True               # the host's post-commit stamp
+        # reloaded from state.db: no marker yet, and a host sidecar key
+        rebuilt = [dict({k: v for k, v in m.items() if k != "_db_persisted"}, _api_content=None)
+                   for m in out]
+        self.assertEqual(self.eng._match_locked_prefix(rebuilt), len(out))
+
+
 class TestAfterARestart(_Engine):
     def test_a_fresh_engine_keeps_what_the_earlier_handoff_said(self):
         self.eng.update_model("fake-model", 3000)

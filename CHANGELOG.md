@@ -3,6 +3,20 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.5
+
+**The host's bookkeeping stays the host's.** A compaction returned the host's
+own message dicts for the turns it kept, `_db_persisted` marker and all.
+Hermes' invariant is that no assembled compaction output carries that marker
+(its own compressor sweeps it off; a leaked one makes a rotation flush skip
+the row) and it stamps committed rows itself; its current child-session
+insert writes every row, so this keeps the invariant rather than fixing an
+observed loss. Kept messages now come back as unmarked copies (the host's
+dicts are never edited). The settled prefix is also compared on what the
+model sees — role, content, tool calls — so a transcript reloaded from
+state.db, stamped or carrying a sidecar key, still extends instead of
+rebasing and breaking the prompt cache.
+
 ## 5.8.4
 
 **The gate asks what the user said.** A past conversation excerpt went into

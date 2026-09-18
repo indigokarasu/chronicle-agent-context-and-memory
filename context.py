@@ -128,6 +128,29 @@ _FOLD_REF = re.compile(r"\[(fold_[0-9a-f]{12})\]")
 _BARE_FOLD = re.compile(r"^\[fold_[0-9a-f]{12}\]$")
 
 
+_PERSISTED_MARKER = "_db_persisted"      # Hermes agent.context_compressor._DB_PERSISTED_MARKER
+_WIRE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
+
+
+def _unmarked(m):
+    """`m` without the host's persistence marker (a copy only when it has one)."""
+    if isinstance(m, dict) and _PERSISTED_MARKER in m:
+        m = dict(m)
+        m.pop(_PERSISTED_MARKER, None)
+    return m
+
+
+def _same_on_wire(a, b) -> bool:
+    """The same message as the model sees it. The host stamps bookkeeping
+    keys onto its dicts (the persistence marker after a commit, sidecars on a
+    resume), and a settled prefix must not stop matching over one."""
+    if a is b:
+        return True
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return a == b
+    return all(a.get(k) == b.get(k) for k in _WIRE_KEYS)
+
+
 def _tool_units(pairs: list) -> list:
     """Group `(idx, msg)` pairs into units that must be kept or folded together:
     an assistant message that calls tools plus the tool results answering it,
@@ -979,6 +1002,13 @@ class ChronicleContextEngine(ContextEngine):
             pos = self._handoff_position(result, head) if rebase else len(locked)
             result = result[:pos] + [{"role": self._handoff_role(result, pos),
                                       "content": handoff}] + result[pos:]
+        # Hermes' persistence marker must not leave a compaction: the host's
+        # invariant is that no assembled message carries it (a leaked one makes
+        # a rotation flush skip the row), its own compressor sweeps it off its
+        # output, and it stamps the committed rows itself afterwards. (Its
+        # child-session insert writes every row today, so this is the
+        # invariant kept, not a loss observed.)
+        result = [_unmarked(m) for m in result]
         # §R5: lock in everything just decided, the handoff with it -- the next
         # pass extends this output byte for byte, or rebases it whole.
         self._locked_prefix = result
@@ -1230,7 +1260,7 @@ class ChronicleContextEngine(ContextEngine):
         locked = self._locked_prefix
         n = min(len(locked), len(messages))
         k = 0
-        while k < n and messages[k] == locked[k]:
+        while k < n and _same_on_wire(messages[k], locked[k]):
             k += 1
         return k
 
