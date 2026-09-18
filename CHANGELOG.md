@@ -3,6 +3,20 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.4
+
+**The gate asks what the user said.** A past conversation excerpt went into
+the user's turn when ANY line of it shared a content word with the message —
+and the assistant's own briefings and status reports share a word with almost
+anything. Once 5.8.2 stopped retracted beliefs from crowding the ranking, such
+replies filled the block: on the production store "remind me where I work and
+what my role is" drew 2,952 characters of calendar briefing and MCP status.
+The gate now asks the USER's words in the excerpt; the excerpt is still shown
+whole, the reply being context for what the user said. Measured on the
+production store: 2,952 → 156, 4,784 → 1,599 (the same facts, without the
+reply-only excerpts), 1,187 → 277 characters. A chunk that is only the
+assistant's reply no longer reaches the turn; explicit search still finds it.
+
 ## 5.8.3
 
 **An episode about the user is what the user said.** A transcript episode was
