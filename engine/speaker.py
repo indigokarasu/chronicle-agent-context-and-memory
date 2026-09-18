@@ -359,6 +359,81 @@ def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_inde
     return [(ln, UNKNOWN) for ln in (excerpt or "").split("\n") if ln.strip()]
 
 
+# -- the excerpt a READER sees ------------------------------------------------
+#
+# Capture stores an excerpt byte-for-byte (its event id depends on it) and marks
+# the host framing inside it with spans, so extraction never mistakes a
+# compaction handoff or a system note for the user. Retrieval, though, handed
+# the stored text to a reader as it was: a recalled turn could open with
+# "[CONTEXT COMPACTION — REFERENCE ONLY] ...", i.e. an earlier compaction's
+# summary served back as conversation, and a session summary built from those
+# excerpts carried it into the session vector (24 of the 107 interactive
+# sessions on the production store). These give the reader's copy: framing
+# gone, every role label that still has words under it kept, and the stored
+# text returned unchanged -- the same object -- when nothing in it is framing.
+
+
+def strip_framing(excerpt: str, *, lead_role=None) -> str:
+    """`excerpt` (`role: content` lines, as render_messages writes them) minus
+    host framing. A user-side message loses its framing spans, and the whole
+    message -- label included -- when nothing else is left; a `system:` row is
+    framing by definition. Lines before the first label (a continuation chunk)
+    belong to `lead_role`, and are left alone when it is unknown."""
+    text = excerpt or ""
+    if not text:
+        return text
+    msgs, label, role, buf = [], None, lead_role, []
+    for line in text.split("\n"):
+        m = _LABEL.match(line)
+        if m:
+            msgs.append((label, role, buf))
+            label, role, buf = line[:m.end()], m.group(1), [line[m.end():]]
+        else:
+            buf.append(line)
+    msgs.append((label, role, buf))
+    out, changed = [], False
+    for label, role, buf in msgs:
+        if label is None and not buf:
+            continue
+        body = "\n".join(buf)
+        who = role_speaker(role, HUMAN) if role else UNKNOWN
+        if who == SYSTEM:
+            changed = True
+            continue
+        if who in (HUMAN, AUTOMATION):
+            kept = "".join(body[a:b] for a, b, w in split_user_content(body, who) if w != SYSTEM)
+            if kept != body:
+                changed = True
+                kept = re.sub(r"\n{3,}", "\n\n", kept).strip("\n")
+                if not kept.strip():
+                    continue
+                body = kept
+        out.append((label or "") + body)
+    return "\n".join(out) if changed else excerpt
+
+
+def reader_text(payload, *, actor="") -> str:
+    """An observed event's excerpt as a reader should see it (see above).
+
+    A transcript is read by its labels with the current framing rules, so a
+    frame captured before a rule existed is removed too. A single stored message
+    (an eviction, a rescue) carries no label: its stored spans say what is
+    framing, and an older one without spans is read by its actor."""
+    payload = payload or {}
+    excerpt = payload.get("excerpt") or ""
+    st = payload.get("source_type") or ""
+    if st == "session_transcript" or _LABEL.match(excerpt):
+        return strip_framing(excerpt)
+    spans = payload.get("speakers")
+    if _valid_spans(spans, len(excerpt)):
+        if not any(w == SYSTEM and excerpt[a:b].strip() for a, b, w in spans):
+            return excerpt
+        return "".join(excerpt[a:b] for a, b, w in spans if w != SYSTEM).strip()
+    if st == "context_eviction" and actor == "user":
+        return strip_framing(excerpt, lead_role="user")
+    return excerpt
+
+
 def has_human(lines) -> bool:
     return any(who == HUMAN for _, who in lines)
 
