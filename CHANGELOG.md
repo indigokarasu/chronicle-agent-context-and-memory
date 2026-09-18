@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.6
+
+**A compaction can be inspected.** `chronicle_context_status` reported only
+whether the engine was live; it now also carries the compaction policy in
+force (trigger and target tokens, protected head/tail, the host's message
+limit), how many passes ran, whether the last one extended or rebased, and
+what the handoff is carrying (folded requests and steps, stated facts, pins).
+Each pass also writes one INFO line (`chronicle compaction: session=… mode=…
+messages N->M folded=… used=…/… tokens handoff=… chars`), which the gateway's
+log keeps where the store's audit event is not easy to reach.
+
 ## 5.8.5
 
 **The host's bookkeeping stays the host's.** A compaction returned the host's

@@ -330,6 +330,20 @@ class TestTheHostsPersistenceMarker(_Engine):
         self.assertEqual(self.eng._match_locked_prefix(rebuilt), len(out))
 
 
+class TestItCanBeInspected(_Engine):
+    def test_status_says_what_the_last_pass_did(self):
+        self.eng.update_model("fake-model", 3000)
+        msgs = [_msg("system", "sys")] + [_msg("user" if i % 2 == 0 else "assistant",
+                                               "chatter %d " % i + "q" * 500) for i in range(30)]
+        with self.assertLogs("chronicle", level="INFO") as logs:
+            self.eng.compress(msgs)
+        c = self.eng.context_status()["compaction"]
+        self.assertEqual((c["passes"], c["last_pass"]), (1, "rebase"))
+        self.assertEqual(c["trigger_tokens"], self.eng.threshold_tokens)
+        self.assertGreater(c["folded_requests"] + c["folded_steps"], 0)
+        self.assertTrue(any("chronicle compaction:" in line for line in logs.output))
+
+
 class TestAfterARestart(_Engine):
     def test_a_fresh_engine_keeps_what_the_earlier_handoff_said(self):
         self.eng.update_model("fake-model", 3000)
