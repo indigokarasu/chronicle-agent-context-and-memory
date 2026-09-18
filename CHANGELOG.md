@@ -3,6 +3,73 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.2
+
+**Memory about the user comes only from the user.** Chronicle was built to keep
+the agent's memory and memory about the user distinct, and capture never did.
+Extraction read every line not labelled `Assistant:` as the user's. On a
+production snapshot that turned cron prompts, tool output, compression rescue,
+context eviction, Hermes' control frames and Chronicle's own recalled context
+into memory about the user:
+
+* 98% of captured turns (40,841 of 41,492) came from cron sessions, whose `user`
+  row is the job's prompt;
+* 30,018 active notes, nearly all always-injected "directives", plus 14,664
+  drafts; about 330 came from the user's own sessions, and those were almost all
+  assistant or tool text too;
+* facts such as the user's name being the agent's own name ("Indigo", from its
+  identity file) and the user's email being a broker's support address (from a
+  cron report).
+
+What changed:
+
+* **Capture records who said what.** `engine/speaker.py` decides the user side
+  of a turn from the host: `agent_context` other than `primary`, platform `cron`
+  (and batch, flush, subagent), a `cron_` session, or a bot turn author
+  (`sync_turn` now accepts Hermes' `turn_author`) mean automation, not a person.
+  Each message's role is kept: `tool` rows were not a role before, so tool output
+  inherited whoever spoke last. Inside a person's message, Hermes' control frames
+  (compaction handoffs, `[System note: ...]`, background-process results, the
+  gateway origin header, the steer wrapper's markers) and the `<memory-context>`
+  block of recalled memory are host text, wherever they start. The result is
+  stored on the event as `speakers` spans over the excerpt plus `attribution`,
+  so no later reader re-guesses from line prefixes, which tool output can forge.
+  A turn from automation is labelled `Automation:` in its excerpt rather than
+  `User:`. Rescue (both plugins) and context eviction record the role too.
+* **Extraction reads only the person's words.** Facts about the user, emails,
+  preferences, standing instructions and "X is a Y" entity typing come only from
+  human spans. The reducer does not queue extraction for an event with none, and
+  the curation worker skips (and records) jobs queued before the upgrade. Rescue
+  writes a draft note only from the user's own words. The LLM extractor keeps a
+  user fact or directive only if it appears in them. The piggyback enrichment
+  skips turns with no person in them. Skill journals are recorded as automation.
+* **Events written before this release are read conservatively.** Transcript
+  labels are honoured, a `cron_` session's `user` rows are automation, an
+  unlabelled continuation chunk and role-less rescue text are nobody's, and an
+  event's `actor` is trusted only when it has no source type.
+  A plain turn with no host context keeps its old payload and event id.
+* **Measured.** LongMemEval oracle turn-level union recall 70.6% / 88.3% /
+  93.0% / 96.3% at k=1/3/5/10, from 68.2 / 87.6 / 93.6 / 96.0; abstention
+  unchanged at 3/17. `ctx_eval` answers 46/58 at a 1500-token budget, one fewer
+  than before, and 50/58 and 52/58 at 4000 and 12000, unchanged. The corpus
+  labels its turns `user`, so on it the new rules mostly change the "X is a Y"
+  typing; the production effect is the 112,652 beliefs below.
+* **`scripts/retract_misattributed.py`** retracts beliefs whose every channel is
+  transcript extraction and whose supporting events never show the user saying
+  them (a fact's value or note's body must appear in the user's words; an episode
+  needs a turn with any). Dry run with a JSONL report by default; `--apply`
+  appends `retracted` events through the reducer, so the log keeps the original
+  assertions. A `retracted` event may now carry a batch of ids (`belief_ids`,
+  grouped by owner, `--batch`, default 250): a cleanup is one decision, and
+  112,652 separate events would put that many transactions, reduces and
+  git-mirror rows through a live agent's write path. A replay of either shape
+  reaches the same projection. On the production snapshot it selects 112,652 beliefs:
+  67,614 active episodes, 30,008 active and 14,664 draft notes, and 366 facts
+  (36 about the user, 330 `is_a` entity types). It keeps the 50
+  transcript-derived beliefs that are in the user's words, and everything with any other channel (calendar, email and
+  people imports, tool calls, explicit memory writes). Raw captured turns are
+  untouched and remain searchable.
+
 ## 5.7.1
 
 Three fixes from an audit of other agent-memory systems (Hindsight, Graphiti,
