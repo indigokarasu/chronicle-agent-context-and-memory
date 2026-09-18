@@ -715,7 +715,11 @@ class TestDisabledMatchesPreH1TreeExactly(unittest.TestCase):
     # Enumerated, not pattern-matched: a list that grows silently is how this
     # test would stop meaning anything. Adding to it is a deliberate act that
     # says "upstream changed default capture again, and we looked at it".
-    UPSTREAM_CAPTURE_ADDITIONS = ("meta\t[\"profile_summary:",)
+    # observed_user_fts (5.8.2) is a second FTS index over the same observed
+    # rows -- the user's own conversations, read by the per-turn search -- and
+    # its ready flag: derived, additive, and nothing the base wrote changes.
+    UPSTREAM_CAPTURE_ADDITIONS = ("meta\t[\"profile_summary:", "meta\t[\"observed_user_fts_ready\"",
+                                  "observed_user_fts")
 
     def _assert_only_upstreams_known_capture_additions(self, base_dump, ours_dump):
         """Byte-identical, EXCEPT for upstream's known capture additions.
