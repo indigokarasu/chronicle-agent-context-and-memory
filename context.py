@@ -929,7 +929,8 @@ class ChronicleContextEngine(ContextEngine):
             if body_budget <= 0:
                 continue
             ctx = self.core.retrieval.get_context(hint, token_budget=body_budget,
-                                                  include_directives=False, principal=self._principal_id)
+                                                  include_directives=False, principal=self._principal_id,
+                                                  exclude_automation=True)
             if not ctx:
                 continue
             content = header + ctx
