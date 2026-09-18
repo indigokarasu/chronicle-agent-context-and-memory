@@ -1074,12 +1074,18 @@ class ChronicleContextEngine(ContextEngine):
 
     @staticmethod
     def _handoff_role(result, pos) -> str:
-        """The handoff's role at `pos`: "user" when it opens the conversation
-        (Anthropic requires it) or follows the assistant; "assistant" after a
-        user turn. Tool rows answer the assistant's call, so they count as the
-        assistant's side."""
-        prev = next((m.get("role") for m in reversed(result[:pos])
-                     if m.get("role") in ("user", "assistant", "tool")), None)
+        """The handoff's role at `pos`: the opposite of the last turn a strict
+        chat template counts, as Hermes places its own summary
+        (context_compressor._summary_placement) -- tool rows and an
+        assistant's tool-call row are exempt, so after a tool loop the last
+        counted turn is the user's request. "user" when nothing precedes it
+        (Anthropic requires the first message to be the user's)."""
+        def visible(m):
+            role = m.get("role")
+            if role == "tool" or (role == "assistant" and m.get("tool_calls")):
+                return None
+            return role if role in ("user", "assistant") else None
+        prev = next((r for r in map(visible, reversed(result[:pos])) if r), None)
         return "assistant" if prev == "user" else "user"
 
     def _msg_cost(self, m) -> int:
