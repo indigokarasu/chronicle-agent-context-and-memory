@@ -500,11 +500,14 @@ class ChronicleMemoryProvider(MemoryProvider):
         if not self.core:
             return ""
         # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
-        # nothing from a scheduled job's own runs (engine/speaker).
+        # nothing from a scheduled job's own runs (engine/speaker) -- and only
+        # what is about THIS message: an item must share a content word with
+        # it, and a message with none ("thanks") gets nothing.
         return self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
             principal=self._principal_id, epistemic=self.core.epistemic,
-            exclude_automation=True)
+            exclude_automation=True,
+            relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)))
 
     def system_prompt_block(self) -> str:
         return self.core.retrieval.static_block(self._principal_id) if self.core else ""

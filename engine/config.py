@@ -597,6 +597,11 @@ DEFAULTS: dict[str, Any] = {
         # unaffected, today's plain score-order top-N.
         "mmr_lambda": 0.7,
         "prefetch_budget": 1200,
+        # The per-turn injection's relevance gate (retrieval._GATE_FILLER):
+        # an item goes into the user's turn unasked only if it shares a
+        # content word with the message. false = the pre-5.7.5 behaviour,
+        # which fills the whole budget with the nearest items whatever they are.
+        "prefetch_relevance_gate": True,
         # A12 DELETED this key and A13 KEPT it with a dormant declaration. Both
         # for the same measured reason -- its only consumer would have been
         # provider.queue_prefetch, whose body was `pass` (A13 removed that dead
