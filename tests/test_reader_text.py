@@ -105,6 +105,48 @@ class TestExtraction(unittest.TestCase):
         self.assertNotIn("CONTEXT COMPACTION", sent[0])
 
 
+FILE_READ = ('{"content": "41|  \\"notes\\": \\"Zorblax calendar sync, no changes made\\",\\n'
+             '42|  \\"resolution\\": \\"passed\\""}')
+TOOL_TURN = ("User: Can you check whether the Zorblax filing deadline moved?\n"
+             "Assistant: Checking the tracker file.\n"
+             "tool: %s\n"
+             "Assistant: The Zorblax deadline is still Friday." % FILE_READ)
+
+
+class TestToolOutputIsNotWhatWasSaid(unittest.TestCase):
+    def test_left_in_by_default(self):
+        self.assertIs(spk.strip_framing(TOOL_TURN), TOOL_TURN)
+
+    def test_dropped_on_request_label_and_body(self):
+        said = spk.strip_framing(TOOL_TURN, drop_tools=True)
+        self.assertNotIn("calendar sync", said)
+        self.assertNotIn("tool:", said)
+        self.assertIn("Assistant: The Zorblax deadline is still Friday.", said)
+
+    def test_a_stored_tool_span_is_dropped_on_request(self):
+        msg = "Result: " + FILE_READ
+        p = {"source_type": "context_eviction", "excerpt": msg,
+             "speakers": [[0, len(msg), spk.TOOL]]}
+        self.assertIs(spk.reader_text(p, actor="agent"), msg)
+        self.assertEqual(spk.reader_text(p, actor="agent", drop_tools=True), "")
+
+    def test_an_episode_is_not_the_file_it_read(self):
+        from engine.extraction import HeuristicExtractor
+        (ep,) = [i for i in HeuristicExtractor().extract(TOOL_TURN, source_event="ev1").items
+                 if i["kind"] == "episode"]
+        self.assertNotIn("calendar sync", ep["body"])
+        self.assertIn("deadline is still Friday", ep["body"])
+
+    def test_the_model_is_not_sent_the_file(self):
+        from engine.extraction import LLMExtractor
+        x = LLMExtractor("http://127.0.0.1:9", "fake-model")
+        sent = []
+        x._chat = lambda prompt: (sent.append(prompt), "{}")[1]
+        x.extract(TOOL_TURN, source_event="ev1")
+        self.assertNotIn("calendar sync", sent[0])
+        self.assertIn("deadline is still Friday", sent[0])
+
+
 class _Store(unittest.TestCase):
     def setUp(self):
         self.home = temp_home(prefix="readertext_")
@@ -168,6 +210,22 @@ class TestRecall(_Store):
         row = self.core.store.get_session_vector(CHAT) or {}
         self.assertIn("Zorblax filing go out", row.get("summary") or "")
         self.assertNotIn("CONTEXT COMPACTION", row.get("summary") or "")
+
+    def test_the_session_summary_is_not_tool_output(self):
+        sid = "20260917_121212_cc22dd"
+        self.core.initialize(sid, principal_id="default")
+        self.core.capture.observe("Can you check whether the Zorblax filing deadline moved?",
+                                  "The Zorblax deadline is still Friday.", session_id=sid,
+                                  messages=[
+            {"role": "user", "content": "Can you check whether the Zorblax filing deadline moved?"},
+            {"role": "assistant", "content": "Checking the tracker file."},
+            {"role": "tool", "content": FILE_READ},
+            {"role": "assistant", "content": "The Zorblax deadline is still Friday."}])
+        self.core.capture.finalize_session(sid, "clean_exit")
+        self.core.process_pending()
+        summary = (self.core.store.get_session_vector(sid) or {}).get("summary") or ""
+        self.assertIn("deadline is still Friday", summary)
+        self.assertNotIn("calendar sync", summary)
 
     def test_the_session_summary_is_the_transcript_not_its_copies(self):
         summary = (self.core.store.get_session_vector(CHAT) or {}).get("summary") or ""

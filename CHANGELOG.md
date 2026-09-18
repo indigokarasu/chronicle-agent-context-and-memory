@@ -3,6 +3,28 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.7
+
+**A tool's output is not memory about the user.** Probed on the production
+store after 5.7.5, the gated per-turn block for "what's on my calendar this
+week?" was a line-numbered file read that happened to contain the word
+"calendar", and episodes carried browser results and exit codes. Speaker
+attribution has always kept tool output out of facts and notes; three other
+outputs still took it in whole:
+
+* **The per-turn injection** judges and carries each turn without its `tool:`
+  rows, so a turn is injected for what the user and the agent said in it, and a
+  turn whose only match was inside a tool's output is left out. Explicit recall
+  and the context engine's rehydration are unchanged: there the agent may be
+  asking about its own work.
+* **Episodes** and the model-based extractor's prompt leave tool rows out, as
+  they already leave out host framing; a turn without tool output produces
+  exactly the episode it did before.
+* **Session summaries** leave tool rows out, so a session's vector stands for
+  the conversation rather than for the largest payload in it.
+
+`speaker.strip_framing(..., drop_tools=True)` / `reader_text(..., drop_tools=True)`.
+
 ## 5.7.6
 
 **Recall serves what was said, not the host's framing around it.** Capture

@@ -980,11 +980,13 @@ class CurationWorker:
         for ev in events:
             if ev["type"] == "observed":
                 p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
-                # The reader's copy, not the stored bytes (speaker.reader_text).
-                # Built from the stored text, 24 of the 107 interactive session
-                # summaries on the production store carried a "[CONTEXT
-                # COMPACTION — REFERENCE ONLY]" handoff into the session vector.
-                text = spk.reader_text(p, actor=ev.get("actor") or "")
+                # The reader's copy, not the stored bytes (speaker.reader_text),
+                # and without tool output: a session is summarised by what was
+                # said in it. Built from the stored text, 24 of the 107
+                # interactive session summaries on the production store carried
+                # a "[CONTEXT COMPACTION — REFERENCE ONLY]" handoff into the
+                # session vector, and many more a tool's raw JSON.
+                text = spk.reader_text(p, actor=ev.get("actor") or "", drop_tools=True)
                 if not text.strip():
                     continue
                 obs.append((ev["event_id"], text))

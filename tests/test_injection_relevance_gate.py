@@ -33,6 +33,8 @@ from provider import ChronicleMemoryProvider
 CFG = {"embeddings": {"model": "hashing"}}
 CHAT = "20260917_010203_ab12cd"
 CHAT2 = "20260916_090000_ef34ab"
+CHAT3 = "20260915_070000_9f8e7d"
+TOOL_OUT = '{"content": "41|  \\"notes\\": \\"Quibbleton calendar sync, no changes made\\""}'
 
 IZAKAYA = "I booked dinner at Izakaya Nonesuch in Riverton for Friday."
 SOLAR = [
@@ -71,7 +73,22 @@ class _Case(unittest.TestCase):
             "body": "tonkotsu ramen", "confidence": 0.9, "source_event": "x",
             "source_type": "user_direct", "domain": "user"},
             actor="user", owner="default", trust_level=4)
-        for sid in (CHAT, CHAT2):
+        # "calendar" appears in this session ONLY inside a tool's output.
+        core.initialize(CHAT3, principal_id="default")
+        core.capture.observe("Please tidy the tracker file for me.", "Done, tidied it.",
+                             session_id=CHAT3, messages=[
+            {"role": "user", "content": "Please tidy the tracker file for me."},
+            {"role": "assistant", "content": "Reading it first."},
+            {"role": "tool", "content": TOOL_OUT},
+            {"role": "assistant", "content": "Done, tidied it."}])
+        # A relevant turn WITH tool output in it: the words go in, the output not.
+        core.capture.observe("Also add the tracker due dates for Friday.", "Added them.",
+                             session_id=CHAT3, messages=[
+            {"role": "user", "content": "Also add the tracker due dates for Friday."},
+            {"role": "assistant", "content": "Reading the dates."},
+            {"role": "tool", "content": '{"rows": "Quibbleton due-date export"}'},
+            {"role": "assistant", "content": "Added them."}])
+        for sid in (CHAT, CHAT2, CHAT3):
             core.capture.finalize_session(sid, "clean_exit")
         core.process_pending()
         cls.prov = ChronicleMemoryProvider()
@@ -148,6 +165,50 @@ class TestTheInjection(_Case):
     def test_nothing_on_the_subject_gets_nothing(self):
         self.assertNotEqual(self.ctx("what's on my calendar this week?", gate=False), "")
         self.assertEqual(self.prov.prefetch("what's on my calendar this week?"), "")
+
+    def test_a_tools_output_is_not_memory_about_the_user(self):
+        """Explicit recall still finds the tool's output -- the agent may be
+        asking about its own work -- but it is not put into the user's turn."""
+        q = "Quibbleton calendar sync"
+        self.assertIn("Quibbleton calendar", self.ctx(q, gate=False))
+        self.assertNotIn("Quibbleton calendar", self.prov.prefetch(q))
+
+    def test_a_turn_keeps_its_words_and_loses_its_tool_output(self):
+        ctx = self.prov.prefetch("add the tracker due dates")
+        self.assertIn("tracker due dates", ctx)
+        self.assertNotIn("Quibbleton", ctx)
+
+    def test_the_session_window_carries_the_gated_text(self):
+        """Phase 1 finds only the first turn; the session window brings the
+        second, and it arrives without its tool output."""
+        from unittest import mock
+        r = self.core.retrieval
+        real = r.retrieve_raw
+
+        def first_turn_only(*a, **k):
+            return [x for x in real(*a, **k) if "tidy the tracker" in (x.get("excerpt") or "")]
+        with mock.patch.object(r, "retrieve_raw", side_effect=first_turn_only):
+            ctx = self.prov.prefetch("the tracker due dates")
+        self.assertIn("tidy the tracker", ctx)
+        self.assertIn("tracker due dates", ctx)      # arrived through the window
+        self.assertNotIn("Quibbleton", ctx)
+
+    def test_preference_packing_carries_the_gated_text(self):
+        """_pref_pack_fill widens a group with its session's other turns; under
+        the gate each turn arrives as the gate's text, not the stored one."""
+        from engine import speaker as spk
+        r = self.core.retrieval
+        groups = [{"sid": CHAT3, "date": "", "excerpts": [], "tails": []}]
+        parts: list = []
+
+        def keep(t):
+            said = spk.strip_framing(t or "", drop_tools=True)
+            return said if said.strip() else None
+        r._pref_pack_fill(groups, parts, {}, set(), 6000, principal="default",
+                          route="preference", keep=keep)
+        text = "\n".join(parts)
+        self.assertIn("tidy the tracker", text)
+        self.assertNotIn("Quibbleton", text)
 
     def test_a_fact_is_found_by_the_name_of_who_it_is_about(self):
         """A fact renders `favorite_food: tonkotsu ramen`; the NAME is what the
