@@ -192,7 +192,7 @@ _cache = _TTLCache()
 _SUMMARY_KINDS = ("fact", "note")
 
 
-def summary(db_path) -> dict:
+def summary(db_path: str) -> dict:
     """The numbers the Tapestry header shows, and only those: event count and
     extent, fact and note counts by status, open contradictions."""
     conn = _connect(db_path)
@@ -224,7 +224,7 @@ def summary(db_path) -> dict:
         conn.close()
 
 
-def events_chunk(db_path, after_seq: int = 0, limit: int = _CHUNK_MAX) -> dict:
+def events_chunk(db_path: str, after_seq: int = 0, limit: int = _CHUNK_MAX) -> dict:
     """Events with seq > after_seq, oldest first, as delta-encoded columns.
 
     `dseq[i]` / `dt[i]` are differences from the previous event (the first from
@@ -282,7 +282,7 @@ _chunk_cache: Dict[tuple, bytes] = {}
 _chunk_lock = threading.Lock()
 
 
-def events_json(db_path, after_seq: int = 0, limit: int = _CHUNK_MAX) -> bytes:
+def events_json(db_path: str, after_seq: int = 0, limit: int = _CHUNK_MAX) -> bytes:
     """`events_chunk` serialized, with FULL chunks cached as bytes.
 
     The log is append-only, so a chunk that did not reach the end of it (`done`
@@ -353,7 +353,7 @@ def _belief_rows(conn, belief_ids: List[str]) -> List[dict]:
     return out
 
 
-def event_detail(db_path, seq: int) -> dict:
+def event_detail(db_path: str, seq: int) -> dict:
     conn = _connect(db_path)
     try:
         r = conn.execute(
@@ -386,7 +386,7 @@ def event_detail(db_path, seq: int) -> dict:
         conn.close()
 
 
-def session_detail(db_path, session_id: str) -> dict:
+def session_detail(db_path: str, session_id: str) -> dict:
     """One writer's session: its summary, its turns in order, and the beliefs
     those turns justify."""
     conn = _connect(db_path)
@@ -519,7 +519,7 @@ _BELIEF_FIELDS = ("status", "confidence", "trust_level", "created_at", "last_see
                   "domain", "owner", "salience", "criticality")
 
 
-def belief_detail(db_path, belief_id: str) -> dict:
+def belief_detail(db_path: str, belief_id: str) -> dict:
     """A belief with everything that explains it: the events that justify it,
     what it replaced and what replaced it, what contradicts it, and how many
     identical active copies exist."""
@@ -555,7 +555,7 @@ def belief_detail(db_path, belief_id: str) -> dict:
         conn.close()
 
 
-def contradictions(db_path, limit: int = 100, offset: int = 0, status: str = "open") -> dict:
+def contradictions(db_path: str, limit: int = 100, offset: int = 0, status: str = "open") -> dict:
     limit = max(1, min(int(limit), 500))
     conn = _connect(db_path)
     try:
@@ -579,7 +579,7 @@ def contradictions(db_path, limit: int = 100, offset: int = 0, status: str = "op
         conn.close()
 
 
-def fact_histories(db_path, limit: int = 100) -> dict:
+def fact_histories(db_path: str, limit: int = 100) -> dict:
     """Facts that were replaced, grouped into their value histories: every
     version of an (entity, predicate) in order, with when each held."""
     limit = max(1, min(int(limit), 500))
@@ -620,7 +620,7 @@ def fact_histories(db_path, limit: int = 100) -> dict:
         conn.close()
 
 
-def duplicate_notes(db_path, limit: int = 50) -> dict:
+def duplicate_notes(db_path: str, limit: int = 50) -> dict:
     """Groups of ACTIVE notes with byte-identical bodies under one owner and
     subject — the rows the exact-content merge folds together from now on, but
     that a store written before it still holds."""
@@ -645,7 +645,7 @@ def duplicate_notes(db_path, limit: int = 50) -> dict:
         conn.close()
 
 
-def cron_job_names(hermes_home) -> Dict[str, str]:
+def cron_job_names(hermes_home: str | Path) -> Dict[str, str]:
     """{job_id: name} from Hermes' cron job registry, if one is readable.
 
     Best-effort labelling only: a missing or unfamiliar file returns {} and the
@@ -704,7 +704,7 @@ _ENTITY_INDEX_MAX = 4000
 _PEOPLE_STORE_PATHS = ("commons/db/ocas-weave/weave.sqlite", "commons/db/weave/weave.sqlite")
 
 
-def people_store(home) -> Dict[str, dict]:
+def people_store(home: str | Path) -> Dict[str, dict]:
     """`{id: {name, is_company, occupation, org, city}}` from the people store.
 
     `is_company` is NULL for a row nobody has reviewed, and stays None here: on
@@ -806,7 +806,8 @@ def _merge_map(conn) -> Dict[str, str]:
     return out
 
 
-def entity_index(db_path, limit: int = _ENTITY_INDEX_MAX, people: Dict[str, dict] = None) -> dict:
+def entity_index(db_path: str, limit: int = _ENTITY_INDEX_MAX,
+                 people: Optional[Dict[str, dict]] = None) -> dict:
     """Every entity memory holds, with its kind, its size and its span.
 
     Two origins, both labelled: rows in `entities`, and events derived from the
@@ -929,7 +930,7 @@ def _link_participants(events: List[dict], name_of: Dict[str, str]) -> None:
             ev["participants"] = hits[:8]
 
 
-def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> dict:
+def entity_detail(db_path: str, entity_id: str, people: Optional[Dict[str, dict]] = None) -> dict:
     """One entity: what memory says about it now, what it used to say, the
     events it appears in, and where every part of that came from."""
     conn = _connect(db_path)
@@ -985,7 +986,7 @@ def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> di
         conn.close()
 
 
-def mentions(conn, name: str, limit: int = _MENTION_MAX) -> List[dict]:
+def mentions(conn: sqlite3.Connection, name: str, limit: int = _MENTION_MAX) -> List[dict]:
     """Captured turns that name this entity, with who was speaking in them.
 
     The excerpt is what was captured; `speakers` is what capture recorded about
@@ -1025,8 +1026,8 @@ def _excerpt_around(text: str, needle: str, width: int = 320) -> str:
     return ("…" if start else "") + text[start:start + width]
 
 
-def register(router, get_db_path: Callable[[], Optional[Path]], hermes_home: Callable[[], Path],
-             query: Callable = None):
+def register(router: Any, get_db_path: Callable[[], Optional[Path]], hermes_home: Callable[[], Path],
+             query: Optional[Callable] = None) -> None:
     """Bind the data functions to `router` under /tapestry/log/…"""
     Q = query or (lambda default=None, **_k: default)
 

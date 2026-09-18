@@ -109,6 +109,14 @@ class _Case(unittest.TestCase):
             "speakers": [[0, len(said), "human"]],
             "attribution": {"user_side": "human", "role": "user"}},
             actor="user", session_id=CHAT)
+        # The compressor's copy of an evicted TOOL result: bare text, and only
+        # its spans say it was a tool's.
+        out = "Quibblequartz export: 14 rows written to the tracker."
+        core.capture.append("observed", {
+            "source_type": "context_eviction", "excerpt": out, "source_ref": CHAT,
+            "speakers": [[0, len(out), "tool"]],
+            "attribution": {"user_side": "human", "role": "tool"}},
+            actor="agent", session_id=CHAT)
         # The agent's own memory tool, mirrored by on_memory_write.
         core.capture.agent_explicit(
             "add", "memory", "Izakaya Nonesuch dispatch loop: re-assert the verifier, "
@@ -267,6 +275,11 @@ class TestTheInjection(_Case):
         """Unlabelled is not the same as unattributable: a copy of one message
         says whose it is."""
         self.assertIn("Glimmerfen planning meeting", self.prov.prefetch("the Glimmerfen meeting"))
+
+    def test_an_evicted_tool_result_is_not_memory_about_the_user(self):
+        q = "Quibblequartz export"
+        self.assertIn("Quibblequartz", self.ctx(q, gate=False))
+        self.assertNotIn("Quibblequartz", self.prov.prefetch(q))
 
     def test_a_later_chunk_keeps_its_labelled_messages(self):
         self.assertIn("Done with the Friday tracker", self.prov.prefetch("the Friday tracker"))
