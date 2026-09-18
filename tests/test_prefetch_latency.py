@@ -40,20 +40,70 @@ class TestTheMatchIsTheContentWords(unittest.TestCase):
         self.assertEqual(relevance_fts_match("ok thanks, sounds good"), "")
 
 
+def _reference_inflects(a, b):
+    """The inflection rule spelled out again, independently of the engine."""
+    if a == b:
+        return True
+    s, lng = sorted((a, b), key=len)
+    if len(s) < 4:
+        return False
+    endings = {"s", "es", "ed", "d", "ing", "er", "ers"}
+    if lng.startswith(s):
+        rest = lng[len(s):]
+        return rest in endings or (rest[:1] == s[-1] and rest[1:] in {"ed", "ing", "er", "ers"})
+    if s[-1] == "e" and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in {"ing", "ed", "er", "ers"}
+    if s[-1] == "y" and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in {"ied", "ies", "ier", "iest"}
+    return False
+
+
 def _reference_shares(words, text):
-    """shares_content_word as it was before the substring pre-check."""
+    """shares_content_word without the probe regex: every token, every word."""
     from engine.retrieval import _gate_stem, _gate_words
     if not words:
         return False
-    long_words = [w for w in words if len(w) >= 4]
     for t in map(_gate_stem, _gate_words(text)):
         if t in words:
             return True
-        if len(t) >= 4:
-            for w in long_words:
-                if abs(len(t) - len(w)) <= 3 and (t.startswith(w) or w.startswith(t)):
-                    return True
+        if len(t) >= 4 and any(_reference_inflects(t, w) for w in words):
+            return True
     return False
+
+
+class TestInflectionsNotPrefixes(unittest.TestCase):
+    """5.8.9: any extension of up to three letters used to count, so "repo"
+    matched "report", "rich" "Richard" and "access" "accessories"."""
+
+    def test_what_is_one_word(self):
+        from engine.retrieval import relevance_words, shares_content_word
+        for q, t in (("book", "booked it"), ("plan", "we planned"), ("city", "two cities"),
+                     ("bake", "baking bread"), ("happy", "happier now"), ("worker", "the work"),
+                     ("update", "it updated"), ("restaurants", "a restaurant")):
+            with self.subTest(q=q, t=t):
+                self.assertTrue(shares_content_word(relevance_words(q), t))
+
+    def test_what_is_not(self):
+        from engine.retrieval import relevance_words, shares_content_word
+        for q, t in (("repos", "earnings report"), ("access", "wireless accessories"),
+                     ("spec", "Mary Specht"), ("rich", "Richard"), ("healthy", "a health event"),
+                     ("work", "workflow")):
+            with self.subTest(q=q, t=t):
+                self.assertFalse(shares_content_word(relevance_words(q), t))
+
+    def test_urls_and_short_numbers_are_not_words(self):
+        from engine.retrieval import relevance_words
+        self.assertEqual(relevance_words("see https://www.fake-news.com/2026/09/zorblax in 2026"),
+                         frozenset())
+        self.assertIn("48291", relevance_words("order 48291"))
+
+
+class TestAShortMessageNeedsOneWordALongOneTwo(unittest.TestCase):
+    def test_the_threshold(self):
+        from engine.retrieval import gate_needs, relevance_words
+        self.assertEqual(gate_needs(relevance_words("which izakaya in Riverton?")), 1)
+        self.assertEqual(gate_needs(relevance_words(
+            "does the backup need to fire every hour, or could you build a diff hourly")), 2)
 
 
 class TestTheFastMatcherIsTheSameMatcher(unittest.TestCase):
@@ -86,7 +136,7 @@ def _long_prompt():
     """A scheduled job's prompt: a couple of hundred distinct words, with the
     one that matters (a name) said a few times."""
     filler = " ".join("step%03d-%s" % (i, "abcdefghij"[i % 10] * (3 + i % 5)) for i in range(220))
-    return ("Run the Zorblax nightly audit. " + filler +
+    return ("Run the Zorblax nightly audit for Riverton. " + filler +
             " Report Zorblax anomalies to the owner. Check the Zorblax rota.")
 
 
@@ -172,6 +222,17 @@ class TestTheGatedPath(_Store):
         self.assertIn("booked two restaurants", ctx)
         for call in spy.call_args_list:
             self.assertLessEqual(call.kwargs["match"].count(" OR ") + 1, 48)
+
+    def test_a_long_message_needs_two_shared_words(self):
+        r = self.core.retrieval
+
+        def ctx(q):
+            return r.get_context(q, token_budget=1200, principal="default",
+                                 exclude_automation=True, relevance_gate=True)
+        one = "please double check the nightly Zorblax export totals before lunch today"
+        two = "please double check the nightly Zorblax export totals for Riverton today"
+        self.assertNotIn("booked two restaurants", ctx(one))
+        self.assertIn("booked two restaurants", ctx(two))
 
     def test_the_belief_channel_asks_for_the_content_words_too(self):
         r = self.core.retrieval

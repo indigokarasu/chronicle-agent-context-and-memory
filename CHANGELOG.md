@@ -3,6 +3,29 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.9
+
+**The gate matches words, not prefixes, and a long message needs two.**
+Sampled on fourteen real messages against the production store, most of the
+per-turn block was a coincidence of letters: any extension of up to three
+letters counted as the same word, so "repos" drew "earnings report", "rich"
+Richard, "access" accessories and "spec" a person named Specht; a pasted URL
+contributed "https", "com" and its year; and in a long message a single
+shared word — "fire every hour" and "SF Fire Credit Union", "suite" and every
+street address with a Suite B — was enough. Now:
+
+* two words are one only as an inflection: an ending (s, es, ed, d, ing, er,
+  ers), a doubled consonant (plan/planned), a dropped "e" (bake/baking) or
+  "y" as "i" (happy/happier);
+* URLs and numbers of four digits or fewer are not content words;
+* a message with more than three content words needs two of them in an
+  item.
+
+Same fourteen messages: 22,100 → 9,200 characters injected; seven of them
+now get nothing, where everything they got was such a match. (The threshold
+also had to get its own name: `need` is reused further down the function for
+character budgets, and the closure read the later value.)
+
 ## 5.8.8
 
 **Without its store, a compaction still keeps tool calls whole and says what
