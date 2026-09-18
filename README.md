@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.18.
+Version: 5.8.19.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -156,11 +156,16 @@ When the context engine is selected, Hermes hands it compaction: it calls the en
 The memory provider's per-turn recall is memory about the user and about the
 message just sent: an item must share a content word with it — as written or
 inflected (book/booked, city/cities), not merely as a prefix — and a message
-with more than three content words needs two of them in an item. Only the
-user's own words in a past exchange are asked; URLs, short numbers, host
-framing, tool output and the agent's own memory writes never count. A scheduled
-job's turn gets none (`retrieval.prefetch_automation`). Explicit search,
-`chronicle_answer` and the context engine's recall are not gated.
+with more than three content words needs two of them in an item. A shorter
+message's single shared word is often a coincidence ("system health check" and
+a prescription's `health_event`), so such a match must also be near the
+message in meaning: the item's stored vector against the message's, one quick
+request to the embedder (`retrieval.prefetch_min_similarity`; measured per
+model, 0.65 for nomic-embed-text). Only the user's own words in a past
+exchange are asked; URLs, short numbers, host framing, tool output and the
+agent's own memory writes never count. A scheduled job's turn gets none
+(`retrieval.prefetch_automation`). Explicit search, `chronicle_answer` and the
+context engine's recall are not gated.
 
 **Maintenance runs on those hooks, not on cron.** There is no daemon, no timer
 and no background thread: on a hook call the `Scheduler` (`engine/scheduler.py`)
