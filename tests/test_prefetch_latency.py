@@ -82,6 +82,33 @@ class TestTheFastMatcherIsTheSameMatcher(unittest.TestCase):
         self.assertTrue(shares_content_word(relevance_words("z\u00fcrich"), "in zu\u0308rich"))
 
 
+def _long_prompt():
+    """A scheduled job's prompt: a couple of hundred distinct words, with the
+    one that matters (a name) said a few times."""
+    filler = " ".join("step%03d-%s" % (i, "abcdefghij"[i % 10] * (3 + i % 5)) for i in range(220))
+    return ("Run the Zorblax nightly audit. " + filler +
+            " Report Zorblax anomalies to the owner. Check the Zorblax rota.")
+
+
+class TestALongPromptIsFocused(unittest.TestCase):
+    def test_a_short_message_is_itself(self):
+        from engine.retrieval import gate_focus
+        msg = "which restaurants did I book in Hawaii?"
+        self.assertEqual(gate_focus(msg), msg)
+
+    def test_a_long_prompt_keeps_its_most_telling_words(self):
+        from engine.retrieval import gate_focus, relevance_words
+        focus = gate_focus(_long_prompt())
+        self.assertLessEqual(len(relevance_words(focus)), 24)
+        self.assertIn("zorblax", relevance_words(focus))
+
+    def test_a_name_said_once_outranks_long_filler(self):
+        from engine.retrieval import gate_focus, relevance_words
+        filler = " ".join("verification%03dstep" % i for i in range(200))
+        focus = gate_focus("Summarise the queue, then ping Robin about it. " + filler)
+        self.assertIn("robin", relevance_words(focus))
+
+
 class _Store(unittest.TestCase):
     def setUp(self):
         self.home = temp_home(prefix="latency_")
@@ -136,6 +163,15 @@ class TestTheGatedPath(_Store):
         self.assertIn('"restaurant"*', kw["match"])
         self.assertNotIn('"which"', kw["match"])
         self.assertEqual(kw["exclude_session_prefixes"], ("cron_",))
+
+    def test_a_long_prompt_asks_a_bounded_query_and_still_finds_the_name(self):
+        r = self.core.retrieval
+        with self._spy() as spy:
+            ctx = r.get_context(_long_prompt(), token_budget=1200, principal="default",
+                                exclude_automation=True, relevance_gate=True)
+        self.assertIn("booked two restaurants", ctx)
+        for call in spy.call_args_list:
+            self.assertLessEqual(call.kwargs["match"].count(" OR ") + 1, 48)
 
     def test_the_belief_channel_asks_for_the_content_words_too(self):
         r = self.core.retrieval

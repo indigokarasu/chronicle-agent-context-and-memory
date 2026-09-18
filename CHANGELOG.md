@@ -3,6 +3,29 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.2
+
+**The per-turn search reads what it can return.** Profiled on the production
+store, a scheduled job's prompt (4,400 characters, 210 content words) made the
+gated per-turn search take 42-84 s — far past Hermes' 8 s prefetch timeout,
+and while that call was stuck the host skipped Chronicle for every turn, the
+user's own included. Three causes, all fixed:
+
+* The gated search asked for every content word, as prefix terms (234 of
+  them). It now asks for the message's 24 most telling words — said most
+  often, capitalised, longest — when it has more; a short message is
+  unchanged.
+* `belief_fts` held 101,188 rows, 97,790 of them retracted beliefs ranked on
+  every search and then thrown away. A belief now leaves the index when it
+  stops being searchable, and returns if it is reactivated.
+* The observed index is ~98% cron transcripts, which the per-turn search
+  ranked and then filtered out. The user's own conversations now have their
+  own index (`observed_user_fts`), read once it is known complete: a new store
+  is born complete; an upgraded one waits for `deploy570/repair_fts_582.py`.
+
+Also: indexing an observed event no longer runs a DELETE on an unindexed
+column first — a scan of the whole index on every capture.
+
 ## 5.8.1
 
 **A host notice is not the user.** Hermes' turn-liveness watchdog writes its

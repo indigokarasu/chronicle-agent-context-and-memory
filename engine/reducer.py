@@ -586,7 +586,7 @@ class Reducer:
         sid = event.get("session_id") or ""  # observed events may carry no session_id at all
         skip_vec = any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
         if excerpt:
-            self.store.fts_index_observed(eid, excerpt)
+            self.store.fts_index_observed(eid, excerpt, user=not spk.is_automation_session(sid))
             if self.embedder is not None and not skip_vec:
                 blob = self._safe_vec(excerpt, target_id=eid, kind="observed")
                 if blob is not None:
