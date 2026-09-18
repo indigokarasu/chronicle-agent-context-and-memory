@@ -3,6 +3,92 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.4
+
+**Chronicle is actually the context engine.** It had been configured as Hermes's
+context engine and had never once compressed a conversation. The host gives
+every agent its own `copy.deepcopy()` of the registered engine; the copy raised
+"cannot pickle '_thread.lock' object" on the engine's retry lock, and the host
+fell back to its built-in compressor for that agent — 38 times in one day on
+the production gateway, with one WARNING each that nothing read. That fallback
+was pinned to a provider with no API key, which the user saw as "Shortening the
+conversation history failed". Reproduced with the host's own selection code
+before the fix (configured, registered, and `None` for every agent); after it,
+the same code selects Chronicle.
+
+* **`__deepcopy__`.** A copy SHARES the core — the process-wide store, its
+  connections and vector index; duplicating that per agent is the shape of the
+  ~850 MB/min leak the last time this engine ran — gets a FRESH lock, and copies
+  the per-agent budget state the host copies to keep agents apart.
+* **The rest of the host contract**, checked method by method against Hermes's
+  `ContextEngine`: `on_session_reset` (the default zeroes counters only; the old
+  conversation's locked prefix, digest, pins, focus and rescue record now go too);
+  `should_defer_preflight_to_real_usage` with the host's own rules (a rough
+  estimate taken right after a compaction waits for real usage instead of
+  compacting a request that already fits); `prune_tool_results_only`; and
+  `has_content_to_compress`. Every hook that carries state is implemented; the
+  four left on the default would duplicate what the memory provider does.
+* **Old tool output is trimmed again.** Hermes calls `prune_tool_results_only`
+  on a lower trigger than full compaction; a plugin engine inherits a no-op, so
+  switching engines had quietly stopped it. The host's two safe passes: a result
+  identical to a later one becomes a pointer, a large old one keeps its head and
+  tail and says how much went. Committed only when it saves enough to be worth
+  breaking the provider's prompt cache, then not again until the context
+  regrows. `context_engine.prune_tool_results`.
+
+**Turning it on exposed what it would have done to a turn.** Measured against a
+copy of the production store with the real, CPU-throttled embedding server:
+
+* **One compaction made 150 inline embed calls** — 60 rescued observations, 30
+  rescued notes at three embeds each, and the evictions — every one a timeout on
+  a five-attempt budget. It never finished its first pass. Writes made from
+  inside `compress()` (`context_eviction`, `rescue_extraction`) now take the path
+  a degraded embedder already takes: text durable and full-text indexed at once,
+  vectors queued. Keyed on each event's own `source_type`, so a rebuild makes the
+  same decision (I3).
+* **A timeout dropped the vector for good.** The embedder's retry loop re-raised
+  the raw `socket.timeout`; every caller treats `EmbeddingsUnavailable` as "down,
+  try later" (`_safe_vec` queues a deferred embed on it), and a raw timeout fell
+  to a generic handler that logged at DEBUG — while the warning printed just
+  before promised "embed retried on the next operation". It now raises
+  `EmbeddingsUnavailable`, and a circuit breaker stops a down server costing
+  every call: calls inside the cooldown fail at once, a half-open trial is ONE
+  attempt, and the cooldown doubles on consecutive trips (to 10 minutes). Every
+  agent turn drains curation jobs before the model is called, so this is what a
+  turn pays while the server is down: one budget for the first outage, then
+  nothing, then one try.
+* **Queueing a deferred embed scanned every finished job.** No index served the
+  re-arm probe: 0.375 s per enqueue on a 182,230-row job table, one per span a
+  compaction writes. A partial index on the job's target id: 97 s of one
+  compaction became 2 s.
+* **Every turn was captured three times.** With the memory provider live on the
+  same core, `sync_turn` captured each turn when it ended; before a compaction the
+  provider rescued it again (because the engine never went live, the provider
+  thought it owned compression), the engine rescued it a third time, and every
+  eviction was queued for extraction once more. On the production store rescue
+  drafted 19,089 notes and evictions 4,955 — the attribution cleanup retracted
+  every one. With both halves live neither rescues, and an eviction carries
+  `extract: false`; each standalone mode keeps its own capture. Rescue also runs
+  once per message per conversation now, not once per compaction pass.
+* **A session start worked the job queue.** `initialize()` runs on every session
+  start and ran crash recovery each time, ending in a synchronous drain of up to
+  1,000 jobs. One engine init took 320, 592 and 830 s. Recovery is about a
+  previous process: once per core, and one turn's slice of draining.
+* **A photo crashed compaction**, and the capture path stored it as the Python
+  repr of its parts list — the photo's full base64 in the event log.
+  `speaker.message_text` is one rule for the text of a message: a string
+  unchanged, a parts list its text plus `[image]`-style markers. Capture is
+  byte-identical for strings and `None`. One fixture photo: 50,000 characters
+  became 61.
+* **The host's messages were being edited.** The pin check cached its hash as
+  `m["_content_hash"]` on the host's own message dicts — a private key in what the
+  host sends the model, and stale once the host rewrote that content.
+
+On the production store copy: the first compaction of a sixty-message
+conversation 19 s (it never finished before), each one after ~5 s, RSS ~36 MB
+with the real core live; engine init 213 s once per process instead of up to
+830 s on every session start.
+
 ## 5.7.3
 
 **Memory is organised by what it is about.** An entity was whatever text had
