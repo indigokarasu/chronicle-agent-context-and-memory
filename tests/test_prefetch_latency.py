@@ -40,6 +40,46 @@ class TestTheMatchIsTheContentWords(unittest.TestCase):
         self.assertEqual(relevance_fts_match("ok thanks, sounds good"), "")
 
 
+def _reference_shares(words, text):
+    """shares_content_word as it was before the substring pre-check."""
+    from engine.retrieval import _gate_stem, _gate_words
+    if not words:
+        return False
+    long_words = [w for w in words if len(w) >= 4]
+    for t in map(_gate_stem, _gate_words(text)):
+        if t in words:
+            return True
+        if len(t) >= 4:
+            for w in long_words:
+                if abs(len(t) - len(w)) <= 3 and (t.startswith(w) or w.startswith(t)):
+                    return True
+    return False
+
+
+class TestTheFastMatcherIsTheSameMatcher(unittest.TestCase):
+    """The pre-check only skips work: over every pair below it answers exactly
+    what the token loop alone answers."""
+
+    VOCAB = ["fly", "flies", "city", "cities", "company", "companies", "dog", "dogs", "eat",
+             "eaten", "art", "party", "artist", "book", "booked", "booking", "plan", "planned",
+             "planet", "restaurant", "restaurants", "robin", "robin's", "zu\u0308rich",
+             "z\u00fcrich", "bus", "gas", "pies", "cry", "cries", "tracker", "hawaii", "don't"]
+
+    def test_every_pair(self):
+        from engine.retrieval import relevance_words, shares_content_word
+        for q in self.VOCAB:
+            words = relevance_words(q)
+            for t in self.VOCAB + ["the %s list" % v for v in self.VOCAB]:
+                with self.subTest(q=q, t=t):
+                    self.assertEqual(shares_content_word(words, t), _reference_shares(words, t))
+
+    def test_the_cases_the_probe_had_to_allow_for(self):
+        from engine.retrieval import relevance_words, shares_content_word
+        self.assertTrue(shares_content_word(relevance_words("fly"), "the flies"))
+        self.assertTrue(shares_content_word(relevance_words("city"), "two cities"))
+        self.assertTrue(shares_content_word(relevance_words("z\u00fcrich"), "in zu\u0308rich"))
+
+
 class _Store(unittest.TestCase):
     def setUp(self):
         self.home = temp_home(prefix="latency_")
@@ -129,6 +169,18 @@ class TestTheGatedPath(_Store):
             r.get_context("which restaurants did we book?", token_budget=1200,
                           principal="default")
         self.assertGreater(spy.call_count, 0)
+
+    def test_the_structured_scan_is_the_content_words(self):
+        r = self.core.retrieval
+        with mock.patch.object(self.core.store, "query_beliefs",
+                               wraps=self.core.store.query_beliefs) as spy:
+            r.get_context("which restaurants did we book for the Zorblax trip?",
+                          token_budget=1200, principal="default",
+                          exclude_automation=True, relevance_gate=True)
+        likes = [a for c in spy.call_args_list for a in (c.args[2] if len(c.args) > 2 else ())
+                 if isinstance(a, str) and a.startswith("%")]
+        self.assertTrue(likes, "the structured channel ran no scan at all")
+        self.assertNotIn("%which%", likes)
 
     def test_explicit_retrieval_asks_the_ordinary_query(self):
         r = self.core.retrieval
