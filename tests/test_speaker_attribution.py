@@ -243,6 +243,21 @@ class TestMessagesInAPersonsSession(_ProviderCase):
         self.assertEqual(self.user_memory(),
                          ([], ["Never send email on my behalf without asking."]))
 
+    def test_the_stall_watchdogs_abort_is_the_hosts(self):
+        """agent/turn_liveness writes its abort into the transcript as a plain
+        user row; the replay found it in compaction handoffs as the user's."""
+        from engine import speaker as spk
+        notice = "Turn made no progress for 613s; aborting to release the session."
+        self.assertEqual(spk.split_user_content(notice, spk.HUMAN), [(0, len(notice), spk.SYSTEM)])
+        asked = "Why did the turn made no progress for 5s happen?"
+        self.assertEqual(spk.split_user_content(asked, spk.HUMAN), [(0, len(asked), spk.HUMAN)])
+        self.turn(notice)
+        self.assertEqual(self.user_memory(), ([], []))
+        self.turn("Never send email on my behalf without asking.\n\n"
+                  "Turn made no progress for 602s; aborting to release the session.")
+        self.assertEqual(self.user_memory(),
+                         ([], ["Never send email on my behalf without asking."]))
+
     def test_a_steer_carries_the_users_own_words(self):
         msg = ("[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at "
                "this position; not tool output and not a new delivery when replayed from "
