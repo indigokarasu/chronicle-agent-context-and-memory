@@ -65,6 +65,14 @@ class TestTheReadersCopy(unittest.TestCase):
                     "speakers": [[0, len(HANDOFF), spk.SYSTEM]]}
         self.assertEqual(spk.reader_text(span_all, actor="system"), "")
 
+    def test_an_older_rescue_copy_loses_its_host_frame(self):
+        cron = ("[IMPORTANT: You are running as a scheduled cron job. Deliver the "
+                "Zorblax digest to the home channel.]")
+        legacy = {"source_type": "rescue_extraction", "excerpt": cron}
+        self.assertEqual(spk.reader_text(legacy, actor="user"), "")
+        self.assertEqual(spk.reader_text(legacy, actor="system"), "")
+        self.assertIs(spk.reader_text(legacy, actor="agent"), cron)   # the agent's words
+
     def test_an_older_eviction_is_read_by_its_actor(self):
         self.assertEqual(spk.reader_text({"source_type": "context_eviction", "excerpt": HANDOFF},
                                          actor="user"), "")
@@ -226,6 +234,24 @@ class TestRecall(_Store):
         summary = (self.core.store.get_session_vector(sid) or {}).get("summary") or ""
         self.assertIn("deadline is still Friday", summary)
         self.assertNotIn("calendar sync", summary)
+
+    def test_a_session_of_nothing_but_framing_keeps_an_empty_row(self):
+        """Its old row was built from the frames; rebuilt, nothing is left, so
+        the row is emptied (not deleted: the backfill would re-queue it)."""
+        sid = "20260826_050505_dd33ee"
+        cron = ("[IMPORTANT: You are running as a scheduled cron job. Deliver the "
+                "Zorblax digest to the home channel.]")
+        self.core.initialize(sid, principal_id="default")
+        self.core.capture.append("observed", {"source_type": "rescue_extraction",
+                                              "excerpt": cron, "source_ref": sid},
+                                 actor="user", session_id=sid)
+        self.core.store.add_session_vector(sid, cron, b"\x00" * 8, "default",
+                                           "2026-08-26T05:05:05", model="old-model")
+        self.core.curation._task_session_summarize({"session_id": sid})
+        row = self.core.store.get_session_vector(sid)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["summary"], "")
+        self.assertEqual(row["embedding"], b"")
 
     def test_the_session_summary_is_the_transcript_not_its_copies(self):
         summary = (self.core.store.get_session_vector(CHAT) or {}).get("summary") or ""
