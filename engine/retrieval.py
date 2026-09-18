@@ -387,11 +387,11 @@ _GATE_FILLER = frozenset({
     "nice", "nope", "nor", "not", "nothing", "now", "off", "okay", "old", "once",
     "one", "only", "other", "our", "ours", "ourselves", "out", "over", "own",
     "perfect", "please", "probably", "proceed", "put", "really", "remember",
-    "right", "said", "same", "saw", "say", "see", "seen", "shall", "she", "should",
-    "show", "some", "someone", "something", "soon", "sound", "sounds", "still",
-    "stop", "stuff", "such", "sure", "take", "tell", "than", "thank", "thanks",
-    "that", "the", "their", "theirs", "them", "themselves", "then", "there",
-    "these", "they", "thing", "things", "think", "this", "those", "though",
+    "remind", "right", "said", "same", "saw", "say", "see", "seen", "shall", "she",
+    "should", "show", "some", "someone", "something", "soon", "sound", "sounds",
+    "still", "stop", "stuff", "such", "sure", "take", "tell", "than", "thank",
+    "thanks", "that", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "these", "they", "thing", "things", "think", "this", "those", "though",
     "thought", "through", "today", "told", "tomorrow", "tonight", "too", "took",
     "totally", "tried", "try", "two", "under", "understood", "until", "use", "used",
     "very", "wait", "wanna", "want", "wanted", "was", "way", "well", "went", "were",
@@ -830,7 +830,7 @@ class RetrievalEngine:
         calls focus (§18.4): long enough to discriminate, and not generic."""
         return [t for t in self._tokens(query) if len(t) > 3 and t not in _GENERIC]
 
-    def query_understanding(self, query: str) -> dict:
+    def query_understanding(self, query: str, *, embed: bool = True) -> dict:
         # F1: THE EXPANSION IS AN ORDERED LIST, NOT A SET, because a few lines
         # below it is `" ".join(...)`-ed into the text handed to the embedder.
         #
@@ -868,7 +868,7 @@ class RetrievalEngine:
                     seen.add(syn)
                     expansions.append(syn)
         emb = None
-        if self.embedder is not None:
+        if embed and self.embedder is not None:
             # embed_query() is the E1 query-side path (prepends "search_query: "
             # for prefix models). Duck-typed embedders that predate E1 expose
             # only embed(); calling the missing method would raise, get swallowed
@@ -1148,18 +1148,19 @@ class RetrievalEngine:
                 self._wrong_dim_seen[(channel, ident)] = len(rows[i]["embedding"]) // 4
 
     def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
-               fts_match=None):
+               fts_match=None, lexical_only=False):
         """Fused FTS + vector + graph + structured search (§18). Thin wrapper:
         the body is `_search_inner`; this opens the A0c wrong-dimension scope so
         one top-level query reports one number across every channel."""
         with self._query_diagnostics():
             return self._search_inner(query, limit=limit, domain=domain, purpose=purpose,
-                                      principal=principal, now=now, fts_match=fts_match)
+                                      principal=principal, now=now, fts_match=fts_match,
+                                      lexical_only=lexical_only)
 
     def _search_inner(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
-                      fts_match=None):
+                      fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
-        q = self.query_understanding(query)
+        q = self.query_understanding(query, embed=not lexical_only)
         ranked: dict[str, dict] = {}
         # R12: entities carry no vector of their own (names are not semantic
         # content, §R12), so a purely SEMANTIC entity match can only ever surface
@@ -1703,7 +1704,7 @@ class RetrievalEngine:
             return None
 
     def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False,
-                     fts_match=None):
+                     fts_match=None, lexical_only=False):
         """Raw observed/session/projection tier. Wrapper for the A0c scope; the
         body is `_retrieve_raw_inner`.
 
@@ -1718,7 +1719,7 @@ class RetrievalEngine:
         with self._query_diagnostics():
             return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now,
                                             exclude_automation=exclude_automation,
-                                            fts_match=fts_match)
+                                            fts_match=fts_match, lexical_only=lexical_only)
 
     @staticmethod
     def _from_automation(ev: dict | None) -> bool:
@@ -1765,9 +1766,9 @@ class RetrievalEngine:
         return text if text.strip() else None
 
     def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
-                            exclude_automation=False, fts_match=None):
+                            exclude_automation=False, fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
-        q = self.query_understanding(query)
+        q = self.query_understanding(query, embed=not lexical_only)
         scored: dict[str, dict] = {}
         # Fetched in widening pages and cut at `limit` ADMITTED rows, so rows
         # left out below (automation, nothing but host framing) do not cost a
@@ -2947,10 +2948,18 @@ class RetrievalEngine:
         # The gate keeps only rows that share a content word, so FTS is asked
         # for exactly those (relevance_fts_match); None = the ordinary query.
         fts_match = relevance_fts_match(hint) if gate else None
+        # ...and it runs no embedding at all. Measured on the production store
+        # with the embedder live: the same three gated blocks, line for line,
+        # with and without the vector channels -- the gate keeps only items that
+        # share a content word, and FTS already finds those -- at 7.4 / 4.1 /
+        # 1.1 s with vectors and 2.0 / 2.5 / 0.2 s without. The query embed is a
+        # request to a CPU-bound server inside the user's turn.
+        lexical = gate is not None
 
         def _raw(limit):
             rows = self.retrieve_raw(hint, limit=limit, principal=principal, now=now,
-                                     exclude_automation=exclude_automation, fts_match=fts_match)
+                                     exclude_automation=exclude_automation, fts_match=fts_match,
+                                     lexical_only=lexical)
             if gate is None:
                 return rows
             kept = []
@@ -2980,7 +2989,11 @@ class RetrievalEngine:
         # "factual" (no embedder, routing disabled, or simply the nearest
         # match) takes none of the branches below and reproduces today's
         # get_context byte-for-byte -- the acceptance bar for this task.
-        route_info = self.classify_route(hint, now=now)
+        # The gated per-turn path is LEXICAL (see `lexical` below): routing
+        # embeds the message to find its nearest centroid, so it is skipped and
+        # the default route taken -- the per-turn block is short and plain.
+        route_info = ({"route": "factual", "scores": {}} if gate is not None
+                      else self.classify_route(hint, now=now))
         route = route_info["route"]
 
         # -- E12 PRECISION PACKING (§issue-8) ---------------------------------
@@ -3045,7 +3058,7 @@ class RetrievalEngine:
         precision_order = None
         if (precision_on and route == "factual"
                 and self._raw_route(route_info.get("scores") or {}) == "factual"
-                and self.embedder is not None):
+                and self.embedder is not None and gate is None):
             raw_probe = _raw(20)
             precision_order = self._precision_order(raw_probe)
             precision = self._precision_decision(precision_order)
@@ -3162,7 +3175,7 @@ class RetrievalEngine:
         tier1_chars = 0
         for b in ([] if precision or pref_pack else
                   self.search(hint, limit=10, purpose=purpose, principal=principal, now=now,
-                              fts_match=fts_match)):
+                              fts_match=fts_match, lexical_only=lexical)):
             if gate is not None:
                 if b.get("source_type") in _AGENT_OWN_SOURCES:
                     gate_drop["beliefs"] += 1

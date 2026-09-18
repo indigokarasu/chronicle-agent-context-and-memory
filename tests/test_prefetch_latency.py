@@ -104,6 +104,32 @@ class TestTheGatedPath(_Store):
                           exclude_automation=True, relevance_gate=True)
         self.assertIn('"zorblax"*', spy.call_args.kwargs["match"])
 
+    def test_the_turn_makes_no_embedding_call(self):
+        """The per-turn path is lexical: no query embed, no route classification
+        (which embeds the message too). Measured live, the vector channels
+        changed no line of a gated block and cost 1-5 s a turn."""
+        r = self.core.retrieval
+        # Counted, not raised: query_understanding swallows an embedder error
+        # (the vector channel just drops out), so a raising stub proves nothing.
+        emb = mock.Mock(return_value=[0.0] * 8)
+        route = mock.Mock(side_effect=AssertionError("routed inside the turn"))
+        with mock.patch.object(r.embedder, "embed_query", emb), \
+                mock.patch.object(r.embedder, "embed", emb), \
+                mock.patch.object(r, "classify_route", route):
+            ctx = r.get_context("which restaurants did we book for the Zorblax trip?",
+                                token_budget=1200, principal="default",
+                                exclude_automation=True, relevance_gate=True)
+        self.assertIn("booked two restaurants", ctx)
+        self.assertEqual(emb.call_count, 0, "embedded inside the turn")
+
+    def test_explicit_retrieval_still_embeds(self):
+        r = self.core.retrieval
+        with mock.patch.object(self.core.embedder, "embed_query",
+                               wraps=self.core.embedder.embed_query) as spy:
+            r.get_context("which restaurants did we book?", token_budget=1200,
+                          principal="default")
+        self.assertGreater(spy.call_count, 0)
+
     def test_explicit_retrieval_asks_the_ordinary_query(self):
         r = self.core.retrieval
         with self._spy() as spy:
