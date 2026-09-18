@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.10
+
+**The user's newest request is always kept.** In a long tool loop the request
+the agent is working on sits further back than the protected tail (twenty
+messages of calls and results), and a compaction could fold it — leaving it
+only as a line in the handoff, which tells the model to answer "the latest
+user message after this note". Hermes' own user-turn guarantee does not fire
+while the protected head still holds an older request. Replayed over six real
+sessions it happened in one pass of eleven; driving a compaction through
+Hermes' own `_compress_context` showed the same. The newest real user message
+is now kept verbatim, after the handoff, whenever the tail does not already
+hold one.
+
 ## 5.8.9
 
 **The gate matches words, not prefixes, and a long message needs two.**

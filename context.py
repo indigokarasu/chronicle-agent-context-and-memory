@@ -855,6 +855,17 @@ class ChronicleContextEngine(ContextEngine):
         head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
         tail = [(i, fitted_content[i]) for i, _m in tail if i in fitted_content]
         never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
+        # The user's newest request is the task in hand: in a long tool loop it
+        # sits further back than the protected tail, and folded it survived only
+        # as a line in the handoff -- which tells the model to answer "the latest
+        # user message after this note". (Replayed: one pass in eleven. The
+        # host's own user-turn guarantee does not fire while the head still
+        # holds an older request.)
+        if not any(self._human_texts([m]) for _i, m in tail):
+            newest = next((u for u in reversed(middle_units)
+                           if any(self._human_texts([m]) for _i, m in u)), None)
+            if newest is not None and newest not in never_units:
+                never_units.append(newest)
         never_flat = [p for u in never_units for p in u]
         never_budget = max(0, fresh_budget - used_req - reserve)
         fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget)
