@@ -261,11 +261,17 @@ class CheckpointDigestTests(unittest.TestCase):
         digest = self.eng.get_checkpoint_digest()
         self.assertIn("works_at", digest)
 
-        checkpoint_spans = [m for m in out if m.get("role") == "system"
-                            and (m.get("content") or "").startswith("[Checkpoint:")]
-        self.assertTrue(checkpoint_spans,
-                         "expected a [Checkpoint: ...] system span injected into the window "
-                         "given ~%d tokens of slack under the %d budget" % (item_cost, budget))
+        # 5.8: the digest rides in the ONE compaction handoff, in a conversation
+        # role -- a `system` span after the latest turn became the entire system
+        # prompt on Hermes' Anthropic transport (the last system message wins).
+        handoffs = [m for m in out if (m.get("content") or "").startswith(
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle folded")]
+        self.assertEqual(len(handoffs), 1, "expected one handoff given ~%d tokens of slack under "
+                         "the %d budget" % (item_cost, budget))
+        self.assertIn("Stated in the folded turns:", handoffs[0]["content"])
+        self.assertIn("works_at", handoffs[0]["content"])
+        self.assertNotEqual(handoffs[0]["role"], "system")
+        self.assertFalse([m for m in out if (m.get("content") or "").startswith("[Checkpoint:")])
 
         total = sum(estimate_tokens(m.get("content")) for m in out)
         self.assertLessEqual(total, budget,
