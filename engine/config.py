@@ -610,6 +610,16 @@ DEFAULTS: dict[str, Any] = {
         # content word with the message. false = the pre-5.7.5 behaviour,
         # which fills the whole budget with the nearest items whatever they are.
         "prefetch_relevance_gate": True,
+        # A message with three content words or fewer passes the gate on ONE
+        # shared word -- and one word is a coincidence as often as not
+        # ("system health check" -> a prescription refill's `health_event`,
+        # "fix all the issues" -> "refund issued", "every 10 mins" -> a contact
+        # named Min). Such a one-word match is kept only when the item's STORED
+        # vector is at least this close (cosine) to the message's. "auto" = the
+        # floor measured for the embedding model (none known -> no check); a
+        # number = that floor; null = off. No query vector, or an item with no
+        # vector of this model, keeps the lexical rule alone.
+        "prefetch_min_similarity": "auto",
         # A scheduled job's turn (a cron_ session, or an automation platform)
         # gets no per-turn recall: nobody asked, the "message" is the job's own
         # prompt, and on the production box those turns were ~98% of all turns

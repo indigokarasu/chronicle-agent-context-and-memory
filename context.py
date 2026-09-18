@@ -941,7 +941,7 @@ class ChronicleContextEngine(ContextEngine):
             scored.append((score, pos))
         scored.sort(key=lambda pair: pair[0], reverse=True)  # best first; ties keep order
         kept_units = set()
-        n_kept = len(locked) + len(fresh_system) + len(head) + len(tail) + len(kept_never) + 1
+        n_kept = len(locked) + len(fresh_system) + len(head) + len(tail) + len(request) + len(kept_never) + 1
         for _score, pos in scored:
             cost = sum(self._msg_cost(m) for _i, m in middle_units[pos])
             size = len(middle_units[pos])
@@ -1262,11 +1262,12 @@ class ChronicleContextEngine(ContextEngine):
 
         # Last, name by id as many of the rest as still fit, newest first.
         for key, *_ in spec:
-            shown_ids = {m.group(1) for e in chosen[key] for m in [_FOLD_REF.match(e)] if m}
+            seen = {m.group(1) for e in chosen[key] for m in [_FOLD_REF.match(e)] if m}
             rest = []
-            for e in reversed(pools[key]):
+            for e in reversed(pools[key]):       # pools grow all session: a set, not `in rest`
                 m = _FOLD_REF.match(e)
-                if m and m.group(1) not in shown_ids and m.group(1) not in rest:
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
                     rest.append(m.group(1))
             for fid in rest:
                 ids[key].append(fid)

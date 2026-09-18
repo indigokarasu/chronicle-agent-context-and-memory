@@ -24,6 +24,7 @@ import re
 import unicodedata
 from contextlib import contextmanager
 from itertools import zip_longest
+from time import monotonic as _time_monotonic
 
 from . import access
 from . import speaker as _spk
@@ -513,6 +514,14 @@ def relevance_fts_match(text: str) -> str:
 # turn -- memory about the USER -- leaves them out: the agent's memory and the
 # user's are kept distinct. Explicit search still finds them.
 _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
+
+# retrieval.prefetch_min_similarity "auto": the cosine floor a ONE-word gate
+# match must reach, per embedding model (canonical id), measured on the
+# production store's real messages. A model not listed gets no floor.
+_ONE_WORD_FLOOR = {"nomic-embed-text": 0.65}
+# A per-turn query embed is one request, inside the user's turn: no retries,
+# never trips the embedder's breaker, and gives up after this long.
+_GATE_EMBED_TIMEOUT = 1.0
 
 
 def _belief_source(row) -> str:
@@ -3054,8 +3063,31 @@ class RetrievalEngine:
         # closure reads the variable, not the value it had here.)
         gate_need = gate_needs(gate) if gate is not None else 0
 
-        def _relevant(text, kind):
-            if gate is None or len(shared_content_words(gate, text)) >= gate_need:
+        floor = self._one_word_floor() if gate is not None else None
+        query_vec: list = []                 # embedded on first need, at most once
+
+        def _close_enough(ref, word, text):
+            """A ONE-word match: kept when the item's stored vector is near the
+            message's (see retrieval.prefetch_min_similarity). Without a floor,
+            a query vector or a vector of the item's own, the lexical rule
+            stands alone."""
+            if floor is None or ref is None:
+                return True
+            if not query_vec:
+                query_vec.append(self._gate_query_vector(hint))
+            vec = self._gate_stored_vector(ref) if query_vec[0] else None
+            if not vec or len(vec) != len(query_vec[0]):
+                return True
+            sim = cosine(query_vec[0], vec)
+            gate_drop.setdefault("one_word", []).append(
+                {"word": word, "similarity": round(sim, 3), "kept": sim >= floor, "text": text[:80]})
+            return sim >= floor
+
+        def _relevant(text, kind, ref=None):
+            if gate is None:
+                return True
+            shared = shared_content_words(gate, text)
+            if len(shared) >= gate_need and (len(shared) > 1 or _close_enough(ref, next(iter(shared)), text)):
                 return True
             gate_drop[kind] += 1
             return False
@@ -3094,7 +3126,7 @@ class RetrievalEngine:
             else:
                 said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
                                           drop_unlabeled=later_chunk)
-            if not said.strip() or not _relevant(_users_part(said, meta), "excerpts"):
+            if not said.strip() or not _relevant(_users_part(said, meta), "excerpts", ("event", eid)):
                 return None
             return said
 
@@ -3343,7 +3375,7 @@ class RetrievalEngine:
                 if b.get("source_type") in _AGENT_OWN_SOURCES:
                     gate_drop["beliefs"] += 1
                     continue
-                if not _relevant(self._gate_text(b), "beliefs"):
+                if not _relevant(self._gate_text(b), "beliefs", ("belief", b.get("belief_id"), b.get("kind"))):
                     continue
             ann = epistemic.annotate(b, principal) if epistemic else ""
             line = self._render(b) + (f"  ({ann})" if ann else "")
@@ -3827,7 +3859,8 @@ class RetrievalEngine:
                 # Gated: a standing directive already reaches every turn through
                 # the system prompt (static_block); repeated here only when it
                 # is about this message and not already on the page as a [NOTE].
-                if gate is not None and (body in ctx or not _relevant(body, "tail")):
+                if gate is not None and (body in ctx or not _relevant(body, "tail",
+                                                                     ("belief", d.get("belief_id"), "note"))):
                     continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
@@ -3850,7 +3883,7 @@ class RetrievalEngine:
             if not self._readable(c, principal, purpose, None):
                 continue
             line = f"[CRITICAL] {c.get('attribute','')}: {c['value']}"
-            if gate is not None and not _relevant(line, "tail"):
+            if gate is not None and not _relevant(line, "tail", ("belief", c.get("belief_id"), "fact")):
                 continue
             if not _fits(line):
                 break
@@ -4569,6 +4602,51 @@ class RetrievalEngine:
             return {}
         return {"payload": p, "actor": ev.get("actor") or "",
                 "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+
+    def _one_word_floor(self):
+        """retrieval.prefetch_min_similarity resolved: a float, or None (off)."""
+        v = self.cfg.get("retrieval.prefetch_min_similarity", "auto") if self.cfg else "auto"
+        if v == "auto":
+            if self.embedder is None:
+                return None
+            v = _ONE_WORD_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _gate_query_vector(self, text):
+        """The message's vector for the one-word check, or None. One request
+        with a short timeout: this runs inside the user's turn, so it neither
+        retries nor trips the embedder's breaker (that would stop background
+        embedding too), and it is skipped while the breaker is already open."""
+        emb = self.embedder
+        raw = getattr(emb, "_embed_raw_batch", None)
+        if raw is None or getattr(emb, "_open_until", 0.0) > _time_monotonic():
+            return None
+        prefix = "search_query: " if getattr(emb, "use_task_prefixes", False) else ""
+        try:
+            vec = raw([prefix + (text or "")[:2000]], _GATE_EMBED_TIMEOUT)[0]
+        except Exception as e:  # noqa: BLE001 -- no vector: the lexical rule alone
+            logger.debug("gate query embed skipped: %s", e)
+            return None
+        return vec or None
+
+    def _gate_stored_vector(self, ref):
+        """The stored vector for ("belief", id, kind) or ("event", id), when it
+        was made by the embedder in use; else None."""
+        if not ref or not ref[1]:
+            return None
+        if ref[0] == "belief":
+            row = self.store._conn().execute(
+                "SELECT embedding, model FROM memory_vectors WHERE belief_id=? AND kind=?",
+                (ref[1], ref[2] or "")).fetchone()
+        else:
+            row = self.store._conn().execute(
+                "SELECT embedding, model FROM observed_vectors WHERE event_id=?", (ref[1],)).fetchone()
+        if not row or row[1] != _embeddings.embedder_model_tag(self.embedder):
+            return None
+        return unpack(row[0])
 
     def _gate_text(self, b) -> str:
         """What the injection relevance gate reads for a ranked belief: its
