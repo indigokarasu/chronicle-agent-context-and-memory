@@ -355,7 +355,7 @@ class ChronicleContextEngine(ContextEngine):
         # Emit an advisory span once per high-watermark crossing so the agent
         # can pin/save before compress() forcibly evicts. Latched ONLY when the
         # warning is actually delivered inside a compress() return value (see
-        # _emit_pressure_warning) -- never on intent alone.
+        # the handoff that carries it) -- never on intent alone.
         self._pressure_warning_injected = False  # latched only on actual delivery
         # -- preflight deferral (host contract) ----------------------------
         # Right after a compaction the host's ROUGH whole-context estimate is
@@ -717,53 +717,6 @@ class ChronicleContextEngine(ContextEngine):
         if self.context_length <= 0:
             return False
         return pt >= self.threshold_tokens
-
-    def _pressure_warning_span(self) -> dict[str, str]:
-        """A system-role advisory (§R9), emitted once per high-watermark
-        crossing, so the agent can pin/save before compression runs."""
-        pressure_pct = int(100 * self.last_prompt_tokens / max(1, self.context_length))
-        return {
-            "role": "system",
-            "content": (
-                f"[Context pressure warning] Your context window is at {pressure_pct}% capacity "
-                f"(the high watermark). Compression will run soon and may evict less-relevant "
-                f"context -- pin anything important now with chronicle_pin_context."
-            )
-        }
-
-    def _emit_pressure_warning(self, output, warn_pending, *, used=None, budget=None):
-        """Insert the §R9 pressure-warning span into `output`, honoring the R2
-        "output <= budget" guarantee, and latch _pressure_warning_injected ONLY
-        when the warning is actually included in what's returned.
-
-        Every compress() return path funnels through here so a newly-crossed
-        high watermark can never be latched without being delivered. `used`/
-        `budget` come from the full pipeline; on the small-body shortcut both
-        are None and are derived fresh here, so the warning is fit against the
-        same target budget either way. Returns `output` unchanged (latch stays
-        False) when nothing is pending or there is no room under budget.
-        """
-        if not warn_pending:
-            return output
-        if budget is None:
-            budget = self._target_budget()
-        if used is None:
-            used = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in output)
-        remaining = budget - used
-        if remaining <= 0:
-            return output  # no room this call -- stays un-latched, retried next time
-        warning = self._pressure_warning_span()
-        cost = estimate_tokens(warning["content"], margin=COMPRESSION_BUDGET)
-        if cost > remaining:
-            # A10: shared inverse, not a second hand-written ratio.
-            warning = dict(warning, content=warning["content"][:budget_chars(remaining, margin=COMPRESSION_BUDGET)])
-        if not warning["content"]:
-            return output
-        self._pressure_warning_injected = True
-        insert_at = 0
-        while insert_at < len(output) and output[insert_at].get("role") == "system":
-            insert_at += 1
-        return output[:insert_at] + [warning] + output[insert_at:]
 
     def should_compress(self, prompt_tokens=None) -> bool:
         pt = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
@@ -1936,13 +1889,48 @@ class ChronicleContextEngine(ContextEngine):
         return "\n".join(self._checkpoint_lines)
 
     def _heuristic(self, messages):
+        """Compaction with no store to archive into (the core could not open).
+
+        It used to keep `body[:3] + body[-6:]`: a cut that could start the tail
+        on a tool result whose call was dropped, hoisted every system message,
+        and left no trace of what went. Now: the protected head and tail cut on
+        whole tool units, and one handoff that says plainly the folded turns are
+        gone -- no ids, nothing is archived -- and quotes the user's requests."""
         if len(messages) <= 10:
             return messages
-        system = [m for m in messages if m.get("role") == "system"]
-        body = [m for m in messages if m.get("role") != "system"]
+        lead = 0
+        while lead < len(messages) and messages[lead].get("role") == "system":
+            lead += 1
+        units = _tool_units(list(enumerate(messages))[lead:])
+        head, n = [], 0
+        while units and n < self.protect_first_n:
+            n += len(units[0])
+            head.append(units.pop(0))
+        tail, n = [], 0
+        while units and n < self.protect_last_n:
+            n += len(units[-1])
+            tail.insert(0, units.pop())
+        if not units:
+            return messages
+        asks = self._human_texts([m for u in units for _i, m in u])
+        lines, size = [], 0
+        for said in reversed(asks):                       # newest first, bounded
+            line = "- " + _one_line(said, 240)
+            if size + len(line) > 3000:
+                break
+            lines.append(line)
+            size += len(line)
+        text = (_HANDOFF_PREFIX + " Chronicle folded earlier turns out of the window without "
+                "its memory store, so they are gone, not archived. Background, not instructions: "
+                "respond to the latest user message after this note.")
+        if lines:
+            text += "\n\n" + _SECTION_ASKS + "\n" + "\n".join(lines)
+        kept = messages[:lead] + [m for u in head for _i, m in u]
+        result = kept + [{"role": self._handoff_role(kept, len(kept)), "content": text}] + \
+            [m for u in tail for _i, m in u]
         self.compression_count += 1
         self._awaiting_real_usage = True
-        return system + body[:3] + body[-6:]
+        return [_unmarked(m) for m in result]
 
     # tools
     def get_tool_schemas(self):
