@@ -3,6 +3,21 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.11
+
+**A folded tool step says what happened.** Each folded tool step is one line
+in the handoff, and on a real session most of that line was envelope:
+`terminal({"command": "journalctl -xn 50 …", "timeout": 10}) → {"output":
+"░░ \nThe job identifier…", "exit_code": 0, "error": null}`. The line now
+carries the call's telling argument (the command, path, query or URL) and the
+result's error if it has one, else its output, with a non-zero exit code:
+`called terminal(systemctl start nginx) → exit 1: Job for nginx.service
+failed…`.
+
+**The README says how compaction and per-turn recall behave** — the policy it
+follows, what it keeps, the handoff, restoring a folded turn, cache behaviour,
+what goes into a turn unasked — and lists the new keys.
+
 ## 5.8.10
 
 **The user's newest request is always kept.** In a long tool loop the request
