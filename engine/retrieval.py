@@ -415,10 +415,27 @@ def _gate_stem(tok: str) -> str:
     return tok
 
 
+# A URL's pieces ("https", "com", a path's year) are nobody's content words:
+# pasted into a message, they matched half the store.
+_URL_RX = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
+def _strip_urls(text: str) -> str:
+    return _URL_RX.sub(" ", text or "")
+
+
+def _is_content(t: str) -> bool:
+    """A content word: three letters or more, not stop/generic/filler, and
+    not a short number -- a year or a count matches every dated item."""
+    return (len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER
+            and not (t.isdigit() and len(t) <= 4))
+
+
 def _gate_words(text: str):
-    """Lowercased word tokens; a negated contraction ("don't") is no word at
-    all, any other ("Robin's", "what's") is the part before the apostrophe."""
-    for t in word_tokens((text or "").lower()):
+    """Lowercased word tokens outside URLs; a negated contraction ("don't") is
+    no word at all, any other ("Robin's", "what's") is the part before the
+    apostrophe."""
+    for t in word_tokens(_strip_urls(text).lower()):
         if "'" in t:
             if t.endswith("n't"):
                 continue
@@ -429,9 +446,7 @@ def _gate_words(text: str):
 def relevance_words(text: str) -> frozenset:
     """The message's content words (stemmed) for the injection relevance gate.
     Stop/filler words are tested BEFORE stemming -- stemmed, "this" is "thi"."""
-    return frozenset(
-        _gate_stem(t) for t in _gate_words(text)
-        if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER)
+    return frozenset(_gate_stem(t) for t in _gate_words(text) if _is_content(t))
 
 
 # The most content words a gated (per-turn) search looks for. A scheduled
@@ -450,14 +465,14 @@ def gate_focus(text: str, limit: int = _GATE_MAX_WORDS) -> str:
     count: dict = {}
     first: dict = {}
     named: set = set()
-    for i, raw in enumerate(word_tokens(text or "")):
+    for i, raw in enumerate(word_tokens(_strip_urls(text))):
         t = raw.lower()
         if "'" in t:
             if t.endswith("n't"):
                 continue
             t = t.split("'", 1)[0]
             raw = raw.split("'", 1)[0]
-        if len(t) < 3 or t in _STOP or t in _GENERIC or t in _GATE_FILLER:
+        if not _is_content(t):
             continue
         stem = _gate_stem(t)
         count[stem] = count.get(stem, 0) + 1
@@ -484,7 +499,7 @@ def relevance_fts_match(text: str) -> str:
     has no content words (the gate then runs no retrieval at all)."""
     terms: set = set()
     for t in _gate_words(text):
-        if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER:
+        if _is_content(t):
             terms.add(t)
             terms.add(_gate_stem(t))
     return " OR ".join('"%s"*' % t for t in sorted(terms) if '"' not in t)
@@ -520,22 +535,47 @@ def _probe_rx(probes: tuple):
     return re.compile(r"(?<![^\W_])(?<![^\W_]')(?:%s)[^\W_]*(?:'[^\W_]+)*" % alt)
 
 
-def shares_content_word(words: frozenset | set, text: str) -> bool:
-    """Does `text` contain one of `words`? Equal stems match; so does an
-    inflection that extends one by at most three letters ("book" / "booked",
-    "plan" / "planned"), but only between words of four letters or more, so
-    "eat" never matches "eaten" by accident and "art" never matches "party".
+_INFLECTIONS = ("s", "es", "ed", "d", "ing", "er", "ers")
+
+
+def _inflects(a: str, b: str) -> bool:
+    """Are two (stemmed) words one word inflected? Equal; or the longer is the
+    shorter plus an ending ("book"/"booked", "work"/"worker"), with a doubled
+    consonant ("plan"/"planned"), a dropped "e" ("make"/"making") or "y" as
+    "i" ("happy"/"happier") -- between words of four letters or more. Any
+    extension of up to three letters used to count, so "repo" matched
+    "report", "rich" "Richard" and "access" "accessories"."""
+    if a == b:
+        return True
+    s, lng = (a, b) if len(a) <= len(b) else (b, a)
+    if len(s) < 4:
+        return False
+    if lng.startswith(s):
+        suf = lng[len(s):]
+        return suf in _INFLECTIONS or (len(suf) >= 3 and suf[0] == s[-1]
+                                       and suf[1:] in ("ed", "ing", "er", "ers"))
+    if s.endswith("e") and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in ("ing", "ed", "er", "ers")
+    if s.endswith("y") and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in ("ied", "ies", "ier", "iest")
+    return False
+
+
+def shared_content_words(words: frozenset | set, text: str) -> set:
+    """Which of `words` does `text` contain -- as written or inflected (see
+    _inflects), outside URLs?
 
     Only the tokens that START with a word's probe letters are looked at,
     found by one compiled regex over the text -- measured on the production
     store, tokenising every word of every candidate excerpt in Python was
     1.5 s of a per-turn prefetch, and the candidates are exactly the excerpts
     FTS matched on these words, so a cheaper "does it contain them at all"
-    test could not skip any of them."""
+    test could not skip any of them. Every inflection of a word starts with
+    its probe letters."""
     if not words:
-        return False
-    low = unicodedata.normalize("NFC", text or "").replace("\u2019", "'").lower()
-    long_words = [w for w in words if len(w) >= 4]
+        return set()
+    low = unicodedata.normalize("NFC", _strip_urls(text)).replace("\u2019", "'").lower()
+    found: set = set()
     for m in _probe_rx(tuple(sorted({_probe(w) for w in words}))).finditer(low):
         t = m.group(0)
         if "'" in t:
@@ -544,12 +584,28 @@ def shares_content_word(words: frozenset | set, text: str) -> bool:
             t = t.split("'", 1)[0]
         t = _gate_stem(t)
         if t in words:
-            return True
+            found.add(t)
+            continue
         if len(t) >= 4:
-            for w in long_words:
-                if abs(len(t) - len(w)) <= 3 and (t.startswith(w) or w.startswith(t)):
-                    return True
-    return False
+            for w in words:
+                if w not in found and _inflects(t, w):
+                    found.add(w)
+    return found
+
+
+def shares_content_word(words: frozenset | set, text: str) -> bool:
+    """Does `text` contain one of `words` (see shared_content_words)?"""
+    return bool(shared_content_words(words, text))
+
+
+def gate_needs(words: frozenset | set | None) -> int:
+    """How many of the message's content words an item must share to go into
+    the turn: one for a short message; two once it has more than three, where
+    a single shared word is weak evidence -- on the production store "fire
+    every hour" drew "SF Fire Credit Union" and "suite" every street address
+    with a "Suite B"."""
+    return 1 if len(words or ()) <= 3 else 2
+
 
 # §r6: the most topic-gated standing notes get_context will append from leftover
 # budget. Bounds the tail on a store where a broad focus token ("work") matches
@@ -2985,8 +3041,12 @@ class RetrievalEngine:
         gate = relevance_words(hint) if relevance_gate else None
         gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
 
+        # (Its own name: `need` is reused below for character budgets, and a
+        # closure reads the variable, not the value it had here.)
+        gate_need = gate_needs(gate) if gate is not None else 0
+
         def _relevant(text, kind):
-            if gate is None or shares_content_word(gate, text):
+            if gate is None or len(shared_content_words(gate, text)) >= gate_need:
                 return True
             gate_drop[kind] += 1
             return False
