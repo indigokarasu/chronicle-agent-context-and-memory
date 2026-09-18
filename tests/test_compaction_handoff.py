@@ -330,6 +330,38 @@ class TestTheHostsPersistenceMarker(_Engine):
         self.assertEqual(self.eng._match_locked_prefix(rebuilt), len(out))
 
 
+class TestWhatIsSent(_Engine):
+    """Hermes replays a user/assistant row's `api_content` sidecar -- the turn's
+    text plus the recall block stamped onto it -- in place of `content`."""
+
+    STAMP = "\n\n<memory-context>" + "recalled Zorblax line " * 200 + "</memory-context>"
+
+    def _turn(self, i, text):
+        return {"role": "user" if i % 2 == 0 else "assistant", "content": text,
+                "api_content": text + self.STAMP}
+
+    def test_the_sidecar_is_what_is_charged(self):
+        m = self._turn(0, "Book the Izakaya Nonesuch.")
+        self.assertGreater(self.eng._msg_cost(m), self.eng._msg_cost({"role": "user", "content": m["content"]}) * 10)
+
+    def test_the_recall_block_goes_before_the_users_words(self):
+        self.eng.update_model("fake-model", 4000)
+        msgs = [_msg("system", "sys")] + [self._turn(i, "turn %d about the Robin Placeholder rota" % i)
+                                           for i in range(16)]
+        out = self.eng.compress(msgs)
+        self.assertEqual(out[-1]["content"], msgs[-1]["content"], "the newest words kept whole")
+        self.assertLessEqual(sum(self.eng._msg_cost(m) for m in out), self.eng._target_budget())
+        self.assertTrue(any("api_content" not in m for m in out[1:] if m.get("role") != "system"))
+
+    def test_a_shortened_message_keeps_no_sidecar(self):
+        self.eng.update_model("fake-model", 1500)
+        msgs = [_msg("system", "sys")] + [self._turn(i, "turn %d " % i + "w" * 700) for i in range(16)]
+        out = self.eng.compress(msgs)
+        short = [m for m in out if "[shortened; chronicle_expand(" in (m.get("content") or "")]
+        self.assertTrue(short, "setup: something was shortened")
+        self.assertFalse([m for m in short if "api_content" in m])
+
+
 class TestItCanBeInspected(_Engine):
     def test_status_says_what_the_last_pass_did(self):
         self.eng.update_model("fake-model", 3000)
