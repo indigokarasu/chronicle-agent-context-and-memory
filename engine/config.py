@@ -388,7 +388,15 @@ DEFAULTS: dict[str, Any] = {
                    "allow_remote": False,
                    "exclude_session_prefixes": [], "max_input_tokens": 2048, "overflow": "truncate",
                    "task_prefixes": "auto",
-                   "doc2query": {"beliefs": True, "excerpts": False}},
+                   "doc2query": {"beliefs": True, "excerpts": False},
+                   # Seconds one embed request may take OFF the critical path:
+                   # the deferred embed job and a session summary. The request
+                   # timeout the live paths use is short so a turn never waits
+                   # on a busy server; a background job has nobody waiting, and
+                   # on a CPU-bound host a long excerpt needs more than that
+                   # (measured: ~7 s for 200 words on the production VPS).
+                   # Clamped to [10, 600] (engine/curation.py).
+                   "background_timeout": 120},
     # A12: `bruteforce_ceiling` was declared here and read by nothing. There is
     # exactly one index backend (engine/vector_index.py brute force); a ceiling
     # past which a nonexistent ANN backend takes over is not a knob, it is a
@@ -1027,7 +1035,15 @@ DEFAULTS: dict[str, Any] = {
                  "drain": {"per_turn": 16,
                            "share_write_path": 0.5,
                            "share_embed": 0.3,
-                           "share_maintenance": 0.2},
+                           "share_maintenance": 0.2,
+                           # Run the per-turn slice on ONE background thread
+                           # per core instead of inside the turn. Hermes calls
+                           # on_turn_start synchronously before the model, and
+                           # an embed job on a busy server could hold a user's
+                           # turn for the whole request timeout. Applies when a
+                           # host drives the core (provider / context engine);
+                           # a core used directly drains where it is called.
+                           "background": True},
 
                  # -- job leases (§A7) -------------------------------------
                  # A claimed job is marked 'running' with a started_at stamp.

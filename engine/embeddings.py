@@ -11,6 +11,7 @@ Vectors serialize to a compact little-endian float32 blob (no numpy needed).
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import logging
 import math
@@ -1161,15 +1162,23 @@ class OpenAICompatEmbedder:
         # Auth/credential errors will not fix themselves by waiting; do not retry.
         return getattr(exc, "code", None) in (401, 403)
 
-    def _embed_with_retry(self, text: str) -> list[float]:
+    def _embed_with_retry(self, text: str, timeout: float | None = None) -> list[float]:
         """The original single-call retry loop, now reusable per-chunk so
         chunk_mean can retry each chunk independently without duplicating the
-        backoff/terminal-error contract."""
+        backoff/terminal-error contract.
+
+        A TIMEOUT is not retried here. This endpoint is on-host by policy, so a
+        timeout means the server is busy, not that a packet was lost -- and a
+        client timeout does not cancel the server's work: every retry queued
+        another copy of the request behind the one still running. Measured on
+        the production VPS, one failing embed spent ~60 s (5 attempts x 10 s +
+        backoff) growing the queue it was waiting on. It now trips the breaker
+        at once, and the caller defers the vector (EmbeddingsUnavailable)."""
         self._circuit_check()
         attempt = 0
         while True:
             try:
-                vec = self._embed_raw(text, timeout=self.timeout)
+                vec = self._embed_raw(text, timeout=timeout or self.timeout)
                 self._circuit_reset()
                 return vec
             except Exception as e:
@@ -1178,7 +1187,7 @@ class OpenAICompatEmbedder:
                     logger.error("Chronicle embeddings: %s auth error (%s) -- terminal, not retrying",
                                  self.base_url, e)
                     raise
-                if attempt >= self._attempt_budget():
+                if _is_timeout(e) or attempt >= self._attempt_budget():
                     raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 wait = wait * (0.5 + random.random() * 0.5)  # 50-100% jitter
@@ -1187,7 +1196,7 @@ class OpenAICompatEmbedder:
                 if wait > 0:
                     time.sleep(wait)
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str, timeout: float | None = None) -> list[float]:
         """Embed `text`, clamped to max_input_tokens before it ever reaches the
         wire (§27 embeddings.max_input_tokens/.overflow). This is the fix for
         the nemotron->nomic overflow incident: the model's real context is
@@ -1200,14 +1209,17 @@ class OpenAICompatEmbedder:
         resulting vectors are L2-normalized and averaged, then the mean is
         re-normalized to unit length -- a real (if lossy) representation of
         the whole input, not just its first slice.
+
+        `timeout` overrides the request timeout for this call (per HTTP call);
+        the background embed job passes `embeddings.background_timeout`.
         """
         text = text or ""
         if estimate_tokens(text, margin=EMBED_INPUT) <= self.max_input_tokens:
-            return self._embed_with_retry(text)
+            return self._embed_with_retry(text, timeout)
         chunks = _split_for_cap(text, self.max_input_tokens)
         if self.overflow == "chunk_mean":
-            return _mean_normalize([self._embed_with_retry(c) for c in chunks])
-        return self._embed_with_retry(chunks[0])   # truncate: one call, first chunk only
+            return _mean_normalize([self._embed_with_retry(c, timeout) for c in chunks])
+        return self._embed_with_retry(chunks[0], timeout)   # truncate: one call, first chunk only
 
     def _embed_raw_batch(self, texts: list[str], timeout: float) -> list[list[float]]:
         import json as _json
@@ -1244,7 +1256,7 @@ class OpenAICompatEmbedder:
                 attempt += 1
                 if self._is_terminal(e):
                     raise
-                if attempt >= self._attempt_budget():
+                if _is_timeout(e) or attempt >= self._attempt_budget():   # see _embed_with_retry
                     raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 time.sleep(wait * (0.5 + random.random() * 0.5))
@@ -1297,11 +1309,11 @@ class OpenAICompatEmbedder:
             query = "search_query: " + (query or "")
         return self.embed(query)
 
-    def embed_document(self, document: str) -> list[float]:
+    def embed_document(self, document: str, timeout: float | None = None) -> list[float]:
         """Embed a document with optional task prefix."""
         if self.use_task_prefixes:
             document = "search_document: " + (document or "")
-        return self.embed(document)
+        return self.embed(document, timeout)
 
     def model_tag(self) -> str:
         """Canonical identity + the E1 `[prefixed]` marker (A0).
@@ -1535,6 +1547,26 @@ def _is_timeout(exc: BaseException) -> bool:
     return isinstance(exc, kinds) or isinstance(getattr(exc, "reason", None), kinds)
 
 
+def embed_document_patiently(emb: Embedder, text: str, timeout: float | None) -> list[float]:
+    """`emb.embed_document(text)` with a per-call request timeout when the
+    embedder takes one (the HTTP client does; hashing and duck-typed test
+    embedders do not, and are called as before). For work off the critical
+    path -- the deferred embed job, a session summary -- where the right
+    timeout is "as long as the loaded server needs", not the interactive one:
+    on the production VPS a 200-word embed took ~7 s against a 10 s request
+    timeout, so a long excerpt timed out on every attempt and its job never
+    succeeded (676 jobs failed that way in six days)."""
+    fn = emb.embed_document
+    if timeout:
+        try:
+            takes = "timeout" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            takes = False
+        if takes:
+            return fn(text, timeout=timeout)
+    return fn(text)
+
+
 def _outcome_for(exc: BaseException) -> str:
     """Classify a probe failure. Only "nothing is listening here" is quiet.
 
@@ -1766,10 +1798,10 @@ class DegradedEmbedder:
             return self._live.embed_query(query)
         raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
 
-    def embed_document(self, document: str) -> list[float]:
+    def embed_document(self, document: str, timeout: float | None = None) -> list[float]:
         """Delegate to live backend or raise if unavailable."""
         if self._live is not None:
-            return self._live.embed_document(document)
+            return embed_document_patiently(self._live, document, timeout)
         raise EmbeddingsUnavailable("no embedding backend reachable (degraded mode)")
 
     def model_tag(self) -> str:

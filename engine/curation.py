@@ -42,6 +42,7 @@ from . import speaker as spk
 from .embeddings import (
     EmbeddingsUnavailable,
     cosine,
+    embed_document_patiently,
     embedder_model_tag,
     expected_blob_len,
     is_usable_model_tag,
@@ -711,6 +712,14 @@ class CurationWorker:
                     report["processed"], version, report["remaining"])
         return report
 
+    def _background_timeout(self) -> float:
+        """`embeddings.background_timeout`, clamped to [10, 600] seconds."""
+        try:
+            t = float(self.cfg.get("embeddings.background_timeout", 120) if self.cfg else 120)
+        except (TypeError, ValueError):
+            t = 120.0
+        return max(10.0, min(600.0, t))
+
     def _task_embed(self, payload):
         """Deferred vector write (§24.4): the backend was unreachable when this
         event/belief was reduced, so the work was queued instead of hashed.
@@ -826,7 +835,7 @@ class CurationWorker:
         if recheck is not None:
             recheck()
         try:
-            blob = pack(emb.embed_document(text))
+            blob = pack(embed_document_patiently(emb, text, self._background_timeout()))
         except EmbeddingsUnavailable as e:
             raise JobDeferred(str(e))
         except Exception as e:
@@ -1036,7 +1045,8 @@ class CurationWorker:
         model_name = None
         if self.core.embedder is not None:
             try:
-                vec = pack(self.core.embedder.embed_document(summary))
+                vec = pack(embed_document_patiently(self.core.embedder, summary,
+                                                    self._background_timeout()))
                 # A0e: stamped ONLY on the success path, and only through the
                 # single choke point every other vector table goes through. A tag
                 # written next to a failed embed would claim a geometry for bytes
