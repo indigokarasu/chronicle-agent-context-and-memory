@@ -132,6 +132,29 @@ _PERSISTED_MARKER = "_db_persisted"      # Hermes agent.context_compressor._DB_P
 _WIRE_KEYS = ("role", "content", "tool_calls", "tool_call_id", "name")
 
 
+def _wire_text(m) -> str:
+    """What the model is sent for `m`: Hermes replays a user/assistant row's
+    `api_content` sidecar (the turn's text plus the recall block stamped onto
+    it) in place of `content`."""
+    side = m.get("api_content") if isinstance(m, dict) else None
+    if isinstance(side, str) and side and m.get("role") in ("user", "assistant"):
+        return side
+    return _text(m)
+
+
+def _wire_cost(m) -> int:
+    """Token cost of `m` as sent: its wire text and its tool-call arguments."""
+    return estimate_tokens(_wire_text(m), margin=COMPRESSION_BUDGET) + _calls_cost(m)
+
+
+def _without_sidecar(m):
+    """`m` without its api_content sidecar (a copy only when it has one)."""
+    if isinstance(m, dict) and "api_content" in m:
+        m = dict(m)
+        m.pop("api_content", None)
+    return m
+
+
 def _unmarked(m):
     """`m` without the host's persistence marker (a copy only when it has one)."""
     if isinstance(m, dict) and _PERSISTED_MARKER in m:
@@ -1049,7 +1072,7 @@ class ChronicleContextEngine(ContextEngine):
     def _msg_cost(self, m) -> int:
         """Token cost of a message as sent: its text AND its tool-call
         arguments, which _text() alone leaves out."""
-        return estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) + _calls_cost(m)
+        return _wire_cost(m)
 
     def _handoff_reserve(self, budget: int) -> int:
         """Room kept back for the handoff before the scored middle is admitted:
@@ -1572,11 +1595,18 @@ class ChronicleContextEngine(ContextEngine):
         kept, dropped, used = [], [], 0
         for idx, m in items:
             content = _text(m)
-            cost = estimate_tokens(content, margin=COMPRESSION_BUDGET) + _calls_cost(m)
+            cost = _wire_cost(m)
             remaining = budget - used
             if cost <= remaining:
                 kept.append((idx, m))
                 used += cost
+                continue
+            bare = _without_sidecar(m)
+            if bare is not m and _wire_cost(bare) <= remaining:
+                # What goes first is the recall block stamped onto that turn
+                # (Hermes' api_content sidecar), not the user's own words.
+                kept.append((idx, bare))
+                used += _wire_cost(bare)
                 continue
             if remaining <= 0:
                 dropped.append((idx, m))
@@ -1589,7 +1619,9 @@ class ChronicleContextEngine(ContextEngine):
             # test_compression_fidelity asserts these bytes.
             clipped = content[:budget_chars(max(0, remaining - _calls_cost(m)),
                                             margin=COMPRESSION_BUDGET)]
-            kept.append((idx, dict(m, content=clipped) if clipped != content else m))
+            # A shortened message loses its sidecar too: replayed, the sidecar
+            # would send the whole original again.
+            kept.append((idx, _without_sidecar(dict(m, content=clipped)) if clipped != content else m))
             used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET) + _calls_cost(m)
         return kept, used, dropped
 
@@ -1629,6 +1661,7 @@ class ChronicleContextEngine(ContextEngine):
         span_id, _digest, _stub = self._fold(orig, self._ensure_durable(orig))
         note = " …[shortened; chronicle_expand(\"%s\") restores it]" % span_id
         text = clipped.get("content") or ""
+        clipped = _without_sidecar(clipped)
         if len(text) <= len(note):
             return clipped
         return dict(clipped, content=text[:len(text) - len(note)] + note)

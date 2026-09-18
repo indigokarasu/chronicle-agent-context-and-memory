@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.7
+
+**The budget counts what is sent.** Hermes stamps each user turn's recall
+block into an `api_content` sidecar and replays that sidecar, not `content`,
+on every later call; its own compressor charges the sidecar. Chronicle
+charged `content`, so every kept turn's recall block (up to 4,800 characters
+before 5.8.4) went uncounted. It is charged now; when the protected spans do
+not fit, a turn's stale recall block is the first thing to go, before any of
+the user's words; and a shortened message loses its sidecar too (replayed,
+the sidecar would have sent the whole original again).
+
 ## 5.8.6
 
 **A compaction can be inspected.** `chronicle_context_status` reported only
