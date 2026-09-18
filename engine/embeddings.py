@@ -1058,6 +1058,7 @@ class OpenAICompatEmbedder:
         # Circuit breaker: see _circuit_trip.
         self.circuit_cooldown = max(0.0, float(circuit_cooldown))
         self._open_until = 0.0
+        self._trips = 0          # consecutive trips since the last success
 
     # -- circuit breaker ------------------------------------------------------
     # Every call used to start from a fresh retry budget with no memory that the
@@ -1084,16 +1085,33 @@ class OpenAICompatEmbedder:
                 "%s is presumed down after repeated failures; next attempt in %.0fs"
                 % (_redact(self.base_url), left))
 
+    # A HALF-OPEN trial is one attempt, and the cooldown doubles on every
+    # consecutive trip (to _CIRCUIT_MAX_COOLDOWN), resetting on the first
+    # success. The first version gave the post-cooldown call a FULL retry budget
+    # with a flat 30 s cooldown. Every agent turn drains curation jobs before
+    # the model is called (core.tick from on_turn_start), and the work between
+    # two embed jobs outlasted 30 s — so on a throttled host each turn could
+    # still spend a whole five-attempt cycle (~60 s) waiting on a server that was
+    # down. Now: at most one request timeout per probe, and probes that thin out
+    # the longer the server stays down.
+    _CIRCUIT_MAX_COOLDOWN = 600.0
+
+    def _attempt_budget(self) -> int:
+        return 1 if self._trips else self.max_attempts
+
     def _circuit_trip(self, attempts: int, exc: Exception) -> "EmbeddingsUnavailable":
-        self._open_until = time.monotonic() + self.circuit_cooldown
-        logger.error("Chronicle embeddings: %s failed after %d attempts (%s); vector deferred to "
-                     "the curation queue, FTS retrieval continues; calls fail fast for %.0fs",
-                     _redact(self.base_url), attempts, exc, self.circuit_cooldown)
-        return EmbeddingsUnavailable("%s unavailable after %d attempts: %s"
+        self._trips += 1
+        cooldown = min(self._CIRCUIT_MAX_COOLDOWN, self.circuit_cooldown * (2 ** (self._trips - 1)))
+        self._open_until = time.monotonic() + cooldown
+        logger.error("Chronicle embeddings: %s failed after %d attempt(s) (%s); vector deferred to "
+                     "the curation queue, FTS retrieval continues; calls fail fast for %.0fs "
+                     "(trip %d)", _redact(self.base_url), attempts, exc, cooldown, self._trips)
+        return EmbeddingsUnavailable("%s unavailable after %d attempt(s): %s"
                                      % (_redact(self.base_url), attempts, exc))
 
     def _circuit_reset(self):
         self._open_until = 0.0
+        self._trips = 0
 
     def _embed_raw(self, text: str, timeout: float) -> list[float]:
         import json as _json
@@ -1160,7 +1178,7 @@ class OpenAICompatEmbedder:
                     logger.error("Chronicle embeddings: %s auth error (%s) -- terminal, not retrying",
                                  self.base_url, e)
                     raise
-                if attempt >= self.max_attempts:
+                if attempt >= self._attempt_budget():
                     raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 wait = wait * (0.5 + random.random() * 0.5)  # 50-100% jitter
@@ -1226,7 +1244,7 @@ class OpenAICompatEmbedder:
                 attempt += 1
                 if self._is_terminal(e):
                     raise
-                if attempt >= self.max_attempts:
+                if attempt >= self._attempt_budget():
                     raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 time.sleep(wait * (0.5 + random.random() * 0.5))
