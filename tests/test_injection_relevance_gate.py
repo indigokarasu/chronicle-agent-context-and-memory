@@ -282,7 +282,17 @@ class TestTheInjection(_Case):
         self.assertNotIn("Quibblequartz", self.prov.prefetch(q))
 
     def test_a_later_chunk_keeps_its_labelled_messages(self):
-        self.assertIn("Done with the Friday tracker", self.prov.prefetch("the Friday tracker"))
+        self.assertIn("Export the Friday tracker rows please.", self.prov.prefetch("the Friday tracker"))
+
+    def test_the_gate_asks_what_the_user_said(self):
+        """5.8.3: an excerpt goes in when the USER's words in it share a content
+        word with the message; a chunk that is only the assistant's reply ("Done
+        with the Friday tracker.") does not. On the production store the
+        assistant's briefings and status reports filled the block for questions
+        they had nothing to do with. Explicit search still finds them."""
+        ctx = self.prov.prefetch("the Friday tracker")
+        self.assertNotIn("Done with the Friday tracker", ctx)
+        self.assertIn("Done with the Friday tracker", self.ctx("the Friday tracker", gate=False))
 
     def test_the_agents_own_memory_is_not_memory_about_the_user(self):
         """Hermes puts the agent's current memory into every system prompt

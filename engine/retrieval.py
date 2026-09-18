@@ -3025,9 +3025,19 @@ class RetrievalEngine:
             else:
                 said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
                                           drop_unlabeled=later_chunk)
-            if not said.strip() or not _relevant(said, "excerpts"):
+            if not said.strip() or not _relevant(_users_part(said, meta), "excerpts"):
                 return None
             return said
+
+        def _users_part(said, meta):
+            """What the USER said in an excerpt: the gate asks it, not the
+            assistant's replies. A briefing or a status report shares a word
+            with almost anything, and on the production store such replies
+            filled the block for a question they had nothing to do with. The
+            excerpt is still shown whole -- the reply is context for what the
+            user said. An unlabelled excerpt is one message, whoever wrote it."""
+            lead = _spk.HUMAN if (meta.get("actor") or "") == "user" else _spk.UNKNOWN
+            return _spk.human_text(_spk.parse_labeled(said, _spk.HUMAN, lead))
 
         # The gate keeps only rows that share a content word, so FTS is asked
         # for exactly those (relevance_fts_match); None = the ordinary query.
