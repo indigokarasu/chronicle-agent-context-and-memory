@@ -998,9 +998,17 @@ class CurationWorker:
         # only for a session with no transcript at all.
         if transcript:
             obs = transcript
-        if not obs:
-            return
         owner = events[0]["owner"] if events else "default"
+        if not obs:
+            # Nothing in the session is conversation (every event was host
+            # framing: a cron prompt, a skill-invocation frame). Its row, if an
+            # earlier summarizer wrote one from those frames, is replaced by an
+            # empty one: nothing to find it by, and a row, so the backfill sweep
+            # does not re-queue it. The stale-vector heal skips empty summaries.
+            if events and self.store.get_session_vector(sid):
+                self.store.add_session_vector(sid, "", b"", owner,
+                                              events[0].get("occurred_at", now_iso()), model=None)
+            return
 
         # §E6: open a new episode wherever consecutive event embeddings show a
         # topic shift, then emit one summary line per episode instead of one

@@ -422,7 +422,11 @@ def reader_text(payload, *, actor="", drop_tools=False) -> str:
     A transcript is read by its labels with the current framing rules, so a
     frame captured before a rule existed is removed too. A single stored message
     (an eviction, a rescue) carries no label: its stored spans say what is
-    framing, and an older one without spans is read by its actor."""
+    framing, and an older one without spans is read as the user side unless
+    the agent wrote it: only recognised host frames come out of it, so a user's
+    or a tool's own text is untouched. (On the production store those older
+    rescue copies are where the cron prompts -- "[IMPORTANT: You are running as
+    a scheduled cron job ..." -- sat, in sessions with no `cron_` prefix.)"""
     payload = payload or {}
     excerpt = payload.get("excerpt") or ""
     st = payload.get("source_type") or ""
@@ -434,7 +438,7 @@ def reader_text(payload, *, actor="", drop_tools=False) -> str:
         if not any(w in drop and excerpt[a:b].strip() for a, b, w in spans):
             return excerpt
         return "".join(excerpt[a:b] for a, b, w in spans if w not in drop).strip()
-    if st == "context_eviction" and actor == "user":
+    if st in ("context_eviction", "rescue_extraction") and actor != "agent":
         return strip_framing(excerpt, lead_role="user")
     return excerpt
 
