@@ -69,5 +69,52 @@ class TestTheStaticBlock(unittest.TestCase):
         self.assertNotIn("SunFake 9000", block)
 
 
+class TestTheAgentsOwnDirectives(unittest.TestCase):
+    """The agent's memory-tool writes are mirrored into Chronicle; a host that
+    injects the agent's memory file itself has the current version."""
+
+    def setUp(self):
+        from provider import ChronicleMemoryProvider
+        self.home = temp_home(prefix="static_agent_")
+        self.p = ChronicleMemoryProvider()
+        self.p.initialize("s-static-agent", hermes_home=self.home, principal_id=P,
+                          config={"embeddings": {"model": "hashing"}})
+        core = self.p.core
+        core.capture.append("asserted", {
+            "kind": "note", "key": {"note_type": "norm", "subject": "directive"},
+            "body": "Always sign Zorblax reports as the assistant.", "confidence": 0.9,
+            "source_event": "tool", "source_type": "agent_memory_write"}, actor="agent", trust_level=3)
+        core.capture.append("asserted", {
+            "kind": "note", "key": {"note_type": "norm", "subject": "directive"},
+            "body": "Never book the Izakaya Nonesuch without asking me.", "confidence": 0.9,
+            "source_event": "turn", "source_type": "user_direct"}, actor="user", trust_level=3)
+        core.process_pending()
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.p.core.store.db_path, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _with_host(self, memory_enabled):
+        import types
+        from unittest import mock
+        fake = types.ModuleType("hermes_cli.config")
+        fake.load_config = lambda: {"memory": {"memory_enabled": memory_enabled}}
+        return mock.patch.dict(sys.modules, {"hermes_cli": types.ModuleType("hermes_cli"),
+                                             "hermes_cli.config": fake})
+
+    def test_left_out_when_the_host_injects_the_agents_memory(self):
+        with self._with_host(True):
+            block = self.p.system_prompt_block()
+        self.assertIn("Izakaya Nonesuch", block)
+        self.assertNotIn("Zorblax reports", block)
+
+    def test_kept_when_the_host_does_not(self):
+        with self._with_host(False):
+            self.assertIn("Zorblax reports", self.p.system_prompt_block())
+
+    def test_kept_outside_hermes(self):
+        self.assertIn("Zorblax reports", self.p.system_prompt_block())
+
+
 if __name__ == "__main__":
     unittest.main()
