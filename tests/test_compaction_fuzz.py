@@ -126,5 +126,52 @@ class TestCompressNeverFails(unittest.TestCase):
         self.assertEqual(failures, [])
 
 
+class TestALongSessionStaysBounded(unittest.TestCase):
+    """Pass after pass under the production policy's shape: each compaction
+    lands at the target, the handoff does not grow with the session, and the
+    newest request survives. (The handoff's pools grow all session; what is
+    rendered must not.)"""
+
+    POLICY = {"threshold": 0.5, "target_ratio": 0.15, "protect_first_n": 3, "protect_last_n": 20,
+              "hygiene_hard_message_limit": 400}
+
+    def test_many_passes(self):
+        rnd = random.Random(7)
+        home = temp_home(prefix="longrun_")
+        try:
+            eng = ChronicleContextEngine()
+            eng._host_compression = lambda: self.POLICY
+            eng.on_session_start("s-longrun", hermes_home=home, principal_id="pat", config=CFG)
+            eng.update_model("fake-model", 40000)
+            target = int(eng.context_length * eng.low_watermark_percent)
+            cost = lambda ms: sum(eng._msg_cost(m) for m in ms)  # noqa: E731
+            msgs, t, hands = [{"role": "system", "content": "sys"}], 0, []
+            while len(hands) < 25:
+                t += 1
+                msgs.append({"role": "user", "content": "turn %d: reconcile the Zorblax ledger %s"
+                             % (t, _text(rnd, rnd.randint(2, 30)))})
+                for s in range(rnd.choice([0, 1, 2, 4])):
+                    cid = "c%d_%d" % (t, s)
+                    msgs.append({"role": "assistant", "content": "", "tool_calls": [{
+                        "id": cid, "type": "function",
+                        "function": {"name": "terminal", "arguments": json.dumps({"command": _text(rnd, 3)})}}]})
+                    msgs.append({"role": "tool", "tool_call_id": cid,
+                                 "content": _text(rnd, rnd.choice([20, 150, 900]))})
+                msgs.append({"role": "assistant", "content": _text(rnd, rnd.randint(5, 60))})
+                if cost(msgs) <= eng.threshold_tokens:
+                    continue
+                request = next(m for m in reversed(msgs) if m["role"] == "user")
+                msgs = eng.compress(list(msgs))
+                self.assertLessEqual(cost(msgs), target, "pass %d over target" % (len(hands) + 1))
+                self.assertTrue(_kept(request, msgs), "pass %d lost the request" % (len(hands) + 1))
+                hands.append(cost([m for m in msgs
+                                   if str(m.get("content") or "").startswith("[CONTEXT COMPACTION")]))
+            self.assertGreater(len(eng._handoff_asks), 100, "setup: the pools grew")
+            self.assertLessEqual(max(hands[5:]), max(hands[:5]) * 1.1, hands)
+        finally:
+            ChronicleCore._instances.pop(home, None)
+            shutil.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,41 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.19
+
+**A short message's one shared word must also be near it in meaning.** A
+message with three content words or fewer passes the per-turn gate on a single
+shared word, and on the production store that word was usually a coincidence.
+Over 250 real messages there were 64 such matches: "system health check"
+brought a prescription refill (its attribute is `health_event`), "address and
+fix all the issues" refunds that were "issued", "why is the gateway restarting
+every 10 mins?" two contacts named Min, "sure get it set up" a model-switching
+chat. The item's stored vector against the message's separates them. Read one
+by one, the plainly unrelated matches scored 0.32–0.64 (nomic-embed-text) and
+the plainly related ones 0.66–0.75. A few loosely related ones — an older
+question about the same tool — fell on both sides. A one-word match is now
+kept only at 0.65 or above (`retrieval.prefetch_min_similarity`, `"auto"` =
+the floor measured for the model, none for an unknown one). The message is
+embedded once, only when a one-word match needs it, in one request with a
+one-second limit that never trips the embedder's breaker. With no vector of
+the item's, or no answer in time, the word rule stands as before. Each
+decision is in `last_context_debug["relevance_gate"]["one_word"]`.
+
+**A long session's compactions no longer slow down pass after pass.** Naming
+the entries the handoff has no room to show compared each one against a list,
+and the lists grow all session. Over 150 compactions of a synthetic 3,000-turn
+session, a pass went from 0.15 s to 0.49 s; it now stays at 0.15–0.2 s, and
+the output is identical. A new test runs 25 compactions and checks that every
+pass lands at the target, the newest request survives, and the handoff does
+not grow.
+
+**A pass over the message count keeps the count.** 5.8.18 moved the user's
+newest request out of the tail into a list of its own, and the count of kept
+messages did not include that list: a pass folding down to half of
+`hygiene_hard_message_limit` kept one message more than half. (5.8.18 was
+released after a gate whose log was stale; the full suite, run properly,
+caught it. The gate now writes its own log.)
+
 ## 5.8.18
 
 **The user's newest request survives a tight budget wherever it sits.** A
