@@ -140,6 +140,9 @@ _INLINE_FRAMES = re.compile(
     r"|local-command-stderr|local-command-stdout|task-notification|ide_opened_file"
     r"|ide_selection)>.*?(?:</\1>|\Z)"
     r"|\[/?OUT-OF-BAND USER MESSAGE[^\]\n]*\]"
+    # agent/turn_liveness: the stall watchdog's abort is written into the
+    # transcript as a plain user row.
+    r"|^Turn made no progress for \d+s; aborting to release the session\.[ \t]*(?=\n|\Z)"
     r"|Gateway message origin \(JSON data[^\n]*(?:\n\{[^\n]*\})?"
     r"(?:\n+Do not guess a reply destination[^\n]*)?",
     re.DOTALL | re.IGNORECASE | re.MULTILINE)

@@ -280,6 +280,27 @@ class TestTheHostsMemoryContext(_Engine):
         self.assertNotIn("Recalled from memory:", _handoffs(out)[0]["content"])
 
 
+class TestNothingTwice(_Engine):
+    def test_the_digest_holds_no_restated_requests(self):
+        long_ask = ("Can the Zorblax scheduler be spread out so that it never uses thirty "
+                    "percent of the CPU at once? I work at Acme Fake Co.")
+        lines = self.eng._digest_lines_for(long_ask)
+        self.assertFalse([x for x in lines if x.startswith("[episode]")], lines)
+
+    def test_a_request_is_not_restated_as_a_stated_fact(self):
+        """The digest turns a long user message into an "[episode]" line; the
+        handoff already quotes the request, so it is listed once."""
+        self.eng.update_model("fake-model", 3000)
+        self.eng._checkpoint_lines = [
+            "[episode] Can the Zorblax scheduler be spread out so it never uses thirty percent",
+            "user.works_at: Acme Fake Co"]
+        msgs = [_msg("system", "sys")] + [_msg("user" if i % 2 == 0 else "assistant",
+                                               "chatter %d " % i + "q" * 500) for i in range(30)]
+        h = _handoffs(self.eng.compress(msgs))[0]["content"]
+        self.assertIn("user.works_at: Acme Fake Co", h)
+        self.assertNotIn("[episode]", h)
+
+
 class TestAfterARestart(_Engine):
     def test_a_fresh_engine_keeps_what_the_earlier_handoff_said(self):
         self.eng.update_model("fake-model", 3000)
@@ -294,7 +315,7 @@ class TestAfterARestart(_Engine):
         fresh.update_model("fake-model", 3000)
         grown = out + [_msg("user" if i % 2 == 0 else "assistant", "later %d " % i + "r" * 500)
                        for i in range(30)]
-        fresh.update_model("fake-model", 9000)     # room to show the older folds too
+        fresh.update_model("fake-model", 20000)    # room to show the older folds too
         again = fresh.compress(grown)
         hs = _handoffs(again)
         self.assertEqual(len(hs), 1, "one consolidated handoff, not a stack of them")
