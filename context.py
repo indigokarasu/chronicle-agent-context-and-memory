@@ -55,6 +55,23 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
 
         estimate_tokens = budget_chars = _no_estimator
 
+try:  # one rule for the TEXT of a message, shared with capture …
+    from .engine.speaker import message_text  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    try:
+        from engine.speaker import message_text
+    except Exception:  # pragma: no cover
+        def message_text(content):
+            return content if isinstance(content, str) else ("" if content is None else str(content))
+
+
+def _text(m) -> str:
+    """A message's text for compaction. Content may be a list of parts (a photo
+    and its caption); read as a string it crashed compress() with
+    `'list' object has no attribute 'strip'`."""
+    return message_text(m.get("content")) if isinstance(m, dict) else ""
+
+
 try:  # content-addressed span ids for FOLD-tier tombstones (§5.2, R4) …
     from .engine.serialize import hash_str  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -194,6 +211,10 @@ class ChronicleContextEngine(ContextEngine):
         # every compaction, cleared by the next real usage figure.
         self._awaiting_real_usage = False
         self._provider_reports_usage = False
+        # Tool-output trim hysteresis: below this many tokens, no trim. A trim
+        # rewrites earlier messages and so breaks the provider's prompt cache;
+        # after one, the context must regrow before the next.
+        self._prune_rearm_tokens = 0
         # -- init resilience state (see _RETRY_* above) ---------------------
         # INVARIANT: `self.core is None` <=> the heuristic fallback is active.
         # Nothing may attach a core it did not finish initializing.
@@ -260,6 +281,7 @@ class ChronicleContextEngine(ContextEngine):
         self._checkpoint_lines = []  # §R7: the rolling digest is scoped to THIS session
         self._pressure_warning_injected = False  # §R9: re-arm for the new session
         self._rescued_hashes = set()  # I14: rescue once per message per conversation
+        self._prune_rearm_tokens = 0  # the tool-output trim cycle starts fresh
         self._try_init()
         # One greppable line per session start. Which half of the plugin is live
         # is exactly what went unnoticed for a whole process life on 2026-08-02,
@@ -423,6 +445,7 @@ class ChronicleContextEngine(ContextEngine):
         self.focus_topic = None
         self._awaiting_real_usage = False
         self._provider_reports_usage = False
+        self._prune_rearm_tokens = 0
 
     def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode=""):
         self.context_length = context_length
@@ -488,7 +511,7 @@ class ChronicleContextEngine(ContextEngine):
         if budget is None:
             budget = self._target_budget()
         if used is None:
-            used = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in output)
+            used = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in output)
         remaining = budget - used
         if remaining <= 0:
             return output  # no room this call -- stays un-latched, retried next time
@@ -609,7 +632,7 @@ class ChronicleContextEngine(ContextEngine):
         # pass's budget check and is never rescored/reclipped again. Only the
         # budget REMAINING after its real token cost is available to whatever
         # this pass freshly decides.
-        used_locked = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in locked)
+        used_locked = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in locked)
         fresh_budget = max(0, budget - used_locked)
 
         # compress() must guarantee output <= budget (§R2). Priority order
@@ -640,7 +663,7 @@ class ChronicleContextEngine(ContextEngine):
 
         kept_pos = {p for p in never_pos if middle[p][0] not in dropped_never_idx}
         for _score, pos in scored:
-            cost = estimate_tokens(middle[pos][1].get("content"), margin=COMPRESSION_BUDGET)
+            cost = estimate_tokens(_text(middle[pos][1]), margin=COMPRESSION_BUDGET)
             if used + cost <= budget:
                 kept_pos.add(pos)
                 used += cost
@@ -665,7 +688,7 @@ class ChronicleContextEngine(ContextEngine):
             chunk_ids = self._ensure_durable(m)
             span_id, _digest, stub = self._fold(m, chunk_ids)
             evicted_span_ids.append(span_id)
-            stub_cost = estimate_tokens(stub.get("content"), margin=COMPRESSION_BUDGET)
+            stub_cost = estimate_tokens(_text(stub), margin=COMPRESSION_BUDGET)
             if used + stub_cost <= budget:
                 middle[pos] = (orig_idx, stub)
                 kept_pos.add(pos)
@@ -737,6 +760,7 @@ class ChronicleContextEngine(ContextEngine):
 
         self.compression_count += 1
         self._awaiting_real_usage = True
+        self._prune_rearm_tokens = 0     # a compaction starts the trim cycle again
         # §R5: lock in everything just decided -- never rescored/reordered again
         # -- EXCEPT the memory injection, which is regenerated fresh every pass
         # and so stays ordinary evictable content on the NEXT call.
@@ -805,7 +829,7 @@ class ChronicleContextEngine(ContextEngine):
         Returns score in [0.0, 1.0].
         """
         w = self.core.cfg.get("context_engine.keep_weights", {}) if self.core else {}
-        content = (m.get("content") or "").lower()
+        content = _text(m).lower()
 
         # Base score from recency (newer messages score higher)
         score = recency_position * w.get("recency", 0.20)
@@ -1066,7 +1090,7 @@ class ChronicleContextEngine(ContextEngine):
         """
         kept, dropped, used = [], [], 0
         for idx, m in items:
-            content = m.get("content") or ""
+            content = _text(m)
             cost = estimate_tokens(content, margin=COMPRESSION_BUDGET)
             remaining = budget - used
             if cost <= remaining:
@@ -1088,14 +1112,19 @@ class ChronicleContextEngine(ContextEngine):
         return kept, used, dropped
 
     def _compute_content_hash(self, m) -> str:
-        """Compute sha256 hash of message content for span-level pinning (R3)."""
-        if isinstance(m, dict) and "_content_hash" in m:
-            return m["_content_hash"]
-        content = (m.get("content") or "").encode("utf-8")
-        h = hashlib.sha256(content).hexdigest()
-        if isinstance(m, dict):
-            m["_content_hash"] = h
-        return h
+        """sha256 of a message's content, for span-level pinning (R3).
+
+        Computed every time, never cached ON the message. It used to be stored
+        as `m["_content_hash"]`, i.e. written into the host's own message dicts:
+        a private key riding along in whatever the host sends the model, and a
+        stale-cache hazard — when the host rewrites a message's content in place
+        (its own tool-result pruning does) the stored hash no longer matched, so
+        a pinned span could lose its protection. A hash of a message costs
+        microseconds."""
+        content = m.get("content") if isinstance(m, dict) else None
+        text = content if isinstance(content, str) else ("" if content is None else
+                                                         json.dumps(content, sort_keys=True, default=str))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def _is_pinned(self, m) -> bool:
         """Check if message is pinned by content hash (R3: span-level protection)."""
@@ -1103,7 +1132,7 @@ class ChronicleContextEngine(ContextEngine):
 
     def _never_evict(self, m) -> bool:
         """R3: never evict directives (never/always/must keywords) or pinned spans."""
-        c = (m.get("content") or "").lower()
+        c = _text(m).lower()
         if any(k in c for k in _NEVER_EVICT_KW):
             return True
         if self._is_pinned(m):
@@ -1136,7 +1165,7 @@ class ChronicleContextEngine(ContextEngine):
         bytes). Each chunk is stamped with the span's content-addressed id (§R6).
         """
         span_id = self._span_id(m)
-        content = m.get("content") or ""
+        content = _text(m)
         if len(content) < 1:
             return []
         # Import the chunker from capture (same as observe() uses)
@@ -1207,7 +1236,7 @@ class ChronicleContextEngine(ContextEngine):
         ordered `chunk_ids` _ensure_durable just wrote; chronicle_expand(span_id)
         re-reads it to rehydrate. Returns (span_id, digest, stub_message).
         """
-        content = m.get("content") or ""
+        content = _text(m)
         role = m.get("role", "system")
         digest = hash_str(content)
         span_id = "fold_" + digest[:12]
@@ -1317,7 +1346,7 @@ class ChronicleContextEngine(ContextEngine):
         """
         new_lines: list[str] = []
         for m in evicted:
-            for line in self._digest_lines_for(m.get("content") or ""):
+            for line in self._digest_lines_for(_text(m)):
                 if line not in self._checkpoint_lines and line not in new_lines:
                     new_lines.append(line)
         if not new_lines:
@@ -1466,6 +1495,92 @@ class ChronicleContextEngine(ContextEngine):
         return st
 
     # status
+    # -- proactive tool-output trim (host: prune_tool_results_only) --------
+    _IDENTICAL = "[identical to a later tool result in this conversation]"
+
+    def _messages_tokens(self, messages) -> int:
+        return sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in messages)
+
+    def prune_tool_results_only(self, messages, current_tokens=None):
+        """Trim old tool output without a model, before a full compaction is due.
+
+        Hermes calls this on a lower trigger than compress() (turn_preflight),
+        and commits the result only when it is a NEW list with a non-zero
+        count. Its built-in compressor implements it; a plugin engine inherits a
+        no-op, so switching the context engine to Chronicle quietly stopped
+        trimming the tool output that fills most of an agent's window. The same
+        two safe passes as the host's:
+
+          1. LOSSLESS. A tool result byte-identical to a LATER one becomes a
+             one-line pointer to it; the newest copy stays whole.
+          2. An old result over `min_chars` keeps its first `keep_head_chars` and
+             last `keep_tail_chars` (a status line and a final result are
+             usually at the ends) and says exactly how much was removed.
+
+        Never touched: anything but role=tool, the protected head and tail, a
+        pinned or directive span (_never_evict), and non-text content. Nothing
+        is lost to memory — the turn was captured whole when it ended.
+
+        A trim rewrites earlier messages, which breaks the provider's prompt
+        cache, so it is committed only when it saves `min_reclaim_tokens`, and
+        after one the context must regrow by a full trigger's worth (the host's
+        own runway rule) before the next. Returns the INPUT list on a no-op.
+        """
+        def cfg(key, default):
+            return self._cfg_percent("prune_tool_results.%s" % key, default)
+        if not cfg("enabled", True) or not self.context_length:
+            return messages, 0
+        trigger = int(self.context_length * float(cfg("at_percent", 0.5)))
+        tokens = current_tokens if current_tokens is not None else self._messages_tokens(messages)
+        if tokens < max(trigger, self._prune_rearm_tokens):
+            return messages, 0
+        n = len(messages)
+        head_n, tail_n = self.protect_first_n, self.protect_last_n
+        if n <= head_n + tail_n + 1:
+            return messages, 0
+        min_chars = int(cfg("min_chars", 2000))
+        keep_head = int(cfg("keep_head_chars", 500))
+        keep_tail = int(cfg("keep_tail_chars", 300))
+
+        out = list(messages)
+        changed = 0
+        # 1) lossless: point an older exact duplicate at the newest copy
+        newest = set()
+        for i in range(n - 1, -1, -1):
+            m = messages[i]
+            c = m.get("content")
+            if m.get("role") != "tool" or not isinstance(c, str) or len(c) < 200:
+                continue
+            key = hashlib.sha256(c.encode("utf-8")).hexdigest()
+            if key not in newest:
+                newest.add(key)
+            elif head_n <= i < n - tail_n and not self._never_evict(m):
+                out[i] = dict(m, content=self._IDENTICAL)
+                changed += 1
+        # 2) keep the ends of a large old result
+        for i in range(head_n, n - tail_n):
+            m = out[i]
+            c = m.get("content")
+            if m.get("role") != "tool" or not isinstance(c, str) or len(c) <= min_chars:
+                continue
+            if self._never_evict(messages[i]):
+                continue
+            removed = len(c) - keep_head - keep_tail
+            if removed <= 0:
+                continue
+            out[i] = dict(m, content="%s\n[... %d characters of this old tool result trimmed ...]\n%s"
+                          % (c[:keep_head], removed, c[-keep_tail:] if keep_tail else ""))
+            changed += 1
+        if not changed:
+            return messages, 0
+        before, after = self._messages_tokens(messages), self._messages_tokens(out)
+        reclaimed = before - after
+        min_reclaim = int(cfg("min_reclaim_tokens", 1500))
+        if reclaimed < min_reclaim:
+            return messages, 0
+        self._prune_rearm_tokens = after + max(reclaimed, trigger, min_reclaim)
+        return out, changed
+
     def should_defer_preflight_to_real_usage(self, rough_tokens) -> bool:
         """Whether a ROUGH over-threshold estimate should wait one request for
         the provider's real count. The host's own semantics, point for point
@@ -1512,7 +1627,7 @@ class ChronicleContextEngine(ContextEngine):
             self.context_length * self._cfg_percent("high_watermark_percent", self.threshold_percent))
         low_tokens = int(self.context_length * self._cfg_percent(
             "low_watermark_percent", self.low_watermark_percent))
-        tokens_now = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in messages)
+        tokens_now = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in messages)
         if tokens_now < low_tokens or tokens_now >= high_tokens:
             return False
 
@@ -1548,7 +1663,7 @@ class ChronicleContextEngine(ContextEngine):
         )
         middle = body[self.protect_first_n:-self.protect_last_n]
         budget = self._target_budget()
-        used = sum(estimate_tokens(m.get("content"), margin=COMPRESSION_BUDGET) for m in protected)
+        used = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in protected)
 
         never_idx, scored = [], []
         total_middle = len(middle)
@@ -1562,7 +1677,7 @@ class ChronicleContextEngine(ContextEngine):
 
         kept_idx = set(never_idx)
         for _score, i in scored:
-            cost = estimate_tokens(middle[i].get("content"), margin=COMPRESSION_BUDGET)
+            cost = estimate_tokens(_text(middle[i]), margin=COMPRESSION_BUDGET)
             if used + cost <= budget:
                 kept_idx.add(i)
                 used += cost
