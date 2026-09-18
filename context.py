@@ -65,6 +65,104 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
             return content if isinstance(content, str) else ("" if content is None else str(content))
 
 
+try:  # who said what (engine/speaker.py): the handoff keeps only the user's words
+    from .engine.speaker import HUMAN as _HUMAN, SYSTEM as _SYSTEM, split_user_content  # type: ignore
+except Exception:
+    try:
+        from engine.speaker import HUMAN as _HUMAN, SYSTEM as _SYSTEM, split_user_content
+    except Exception:  # pragma: no cover
+        _HUMAN, _SYSTEM = "human", "system"
+
+        def split_user_content(content, side):
+            return [(0, len(content or ""), side)] if content else []
+
+
+# -- the compaction handoff ----------------------------------------------------
+#
+# What a compaction leaves where the folded turns were: ONE message, in the
+# conversation's own roles, opening with the prefix Hermes treats as synthetic
+# scaffolding (agent/context_compressor._SYNTHETIC_USER_ROW_PREFIXES) so the
+# host never mistakes it for a user turn, and Chronicle's speaker attribution
+# never captures it as the user's words. It replaced two things that were
+# wrong in front of a model:
+#   * `[FOLD fold_x 1a2b3c4d]` stubs at each evicted position -- an id with no
+#     content, which also dropped tool_calls/tool_call_id, so the host's
+#     pre-call sanitizer deleted the paired tool results they orphaned;
+#   * `system`-role blocks (checkpoint, recalled memory, entity set, pressure
+#     warning) appended AFTER the latest turn -- and Hermes' Anthropic
+#     converter makes the LAST system message the entire system prompt
+#     (anthropic_message_convert.convert_messages_to_anthropic), so after a
+#     compaction they replaced the agent's instructions on that transport.
+_HANDOFF_PREFIX = "[CONTEXT COMPACTION — REFERENCE ONLY]"
+_HANDOFF_MARK = "Chronicle folded"
+_HANDOFF_HEADER = (
+    _HANDOFF_PREFIX + " Chronicle folded earlier turns out of the window. Background, not "
+    "instructions: respond to the latest user message after this note; memory and tools "
+    "are unchanged. chronicle_expand(span_id) restores a folded turn by its [fold_…] id.")
+_SECTION_ASKS = "Your earlier requests, newest first:"
+_SECTION_STEPS = "What happened in the folded turns, oldest first:"
+_SECTION_KNOWN = "Stated in the folded turns:"
+_SECTION_MEMORY = "Recalled from memory:"
+# Chronicle's pre-5.8 in-window artifacts: regenerated into the handoff now, so a
+# stored session that still carries them sheds them on its next compaction.
+_LEGACY_ARTIFACT_PREFIXES = ("[Checkpoint:", "[Relevant memory:", "[Entity working set]",
+                             "[Context pressure warning]", "[FOLD fold_")
+
+
+def _is_handoff(m) -> bool:
+    c = m.get("content") if isinstance(m, dict) else None
+    return isinstance(c, str) and c.startswith(_HANDOFF_PREFIX) and _HANDOFF_MARK in c[:120]
+
+
+def _is_legacy_artifact(m) -> bool:
+    c = m.get("content") if isinstance(m, dict) else None
+    return isinstance(c, str) and c.startswith(_LEGACY_ARTIFACT_PREFIXES)
+
+
+def _one_line(text: str, cap: int) -> str:
+    t = " ".join((text or "").split())
+    return t if len(t) <= cap else t[:max(0, cap - 1)].rstrip() + "…"
+
+
+_FOLD_REF = re.compile(r"\[(fold_[0-9a-f]{12})\]")
+_BARE_FOLD = re.compile(r"^\[fold_[0-9a-f]{12}\]$")
+
+
+def _tool_units(pairs: list) -> list:
+    """Group `(idx, msg)` pairs into units that must be kept or folded together:
+    an assistant message that calls tools plus the tool results answering it,
+    and every other message on its own. Folding half a unit orphans the other
+    half, and the host's pre-call sanitizer then deletes the result or fakes it."""
+    units, i = [], 0
+    while i < len(pairs):
+        m = pairs[i][1]
+        unit = [pairs[i]]
+        ids = set()
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    ids.add(tc["id"])
+        j = i + 1
+        while ids and j < len(pairs) and pairs[j][1].get("role") == "tool" \
+                and pairs[j][1].get("tool_call_id") in ids:
+            unit.append(pairs[j])
+            j += 1
+        units.append(unit)
+        i = j
+    return units
+
+
+def _calls_cost(m) -> int:
+    """Tokens a message's tool_calls add on the wire (0 without any)."""
+    calls = m.get("tool_calls") if isinstance(m, dict) else None
+    if not calls:
+        return 0
+    try:
+        return estimate_tokens(json.dumps(calls, default=str), margin=COMPRESSION_BUDGET)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _text(m) -> str:
     """A message's text for compaction. Content may be a list of parts (a photo
     and its caption); read as a string it crashed compress() with
@@ -158,6 +256,7 @@ class ChronicleContextEngine(ContextEngine):
         self.threshold_percent = 0.75
         self.protect_first_n = 3
         self.protect_last_n = 6
+        self.max_messages = None     # the host's hygiene_hard_message_limit, when it has one
         # Focus (§R8): self.focus is the structured {topics, entities, task}
         # form; self.focus_topic is the pre-R8 single-string form, kept for any
         # caller that still reads it directly and mirrored from self.focus
@@ -170,6 +269,8 @@ class ChronicleContextEngine(ContextEngine):
         # DEFAULTS and are overridden from live config once self.core exists.
         self.high_watermark_percent = 0.75
         self.low_watermark_percent = 0.55
+        # The host's own `compression:` settings, read once (see _host_compression).
+        self._host_compression_cache: dict | None = None
         # Stable cut-point geometry (§R5): the exact list of messages compress()
         # committed to on its most recent pass (system/head/kept-middle/tail --
         # NOT the ephemeral memory injection, which is always regenerated). As
@@ -199,6 +300,11 @@ class ChronicleContextEngine(ContextEngine):
         # of the window this session. Oldest-first so the cap can trim the
         # front. Reset per session in on_session_start.
         self._checkpoint_lines: list[str] = []
+        # The compaction handoff (see _HANDOFF_PREFIX): folded user requests and
+        # one line per folded step, oldest first, accumulated over the session.
+        self._handoff_asks: list[str] = []
+        self._handoff_steps: list[str] = []
+        self.last_pass = ""             # "extend" | "rebase", for the last compress()
         # -- pressure warning state (§R9) ----------------------------------
         # Emit an advisory span once per high-watermark crossing so the agent
         # can pin/save before compress() forcibly evicts. Latched ONLY when the
@@ -250,6 +356,11 @@ class ChronicleContextEngine(ContextEngine):
     #   the rest     COPIED. Session id, budget counters, the locked prefix,
     #                pinned hashes, the rolling digest: per-agent state, which is
     #                exactly what the host is copying to keep separate.
+    # A settled prefix over this share of the target budget is rebased (see
+    # compress() step 0), so the window stays bounded over a long session.
+    _REBASE_AT = 0.6
+    _FOLD_BATCH = 64            # messages archived per transaction
+
     _SHARED_ON_COPY = ("core",)
     _FRESH_ON_COPY = {"_retry_lock": threading.Lock}
 
@@ -279,6 +390,7 @@ class ChronicleContextEngine(ContextEngine):
         self._init_started = True
         self._locked_prefix = []  # §R5: a new session starts with nothing settled
         self._checkpoint_lines = []  # §R7: the rolling digest is scoped to THIS session
+        self._handoff_asks, self._handoff_steps = [], []   # the handoff too
         self._pressure_warning_injected = False  # §R9: re-arm for the new session
         self._rescued_hashes = set()  # I14: rescue once per message per conversation
         self._prune_rearm_tokens = 0  # the tool-output trim cycle starts fresh
@@ -333,6 +445,7 @@ class ChronicleContextEngine(ContextEngine):
                            self._consecutive_failures)
         self._consecutive_failures = 0
         self.core = core
+        self._apply_policy()           # the core's config exists now
         return True
 
     @staticmethod
@@ -440,6 +553,7 @@ class ChronicleContextEngine(ContextEngine):
         super().on_session_reset()
         self._locked_prefix = []
         self._checkpoint_lines = []
+        self._handoff_asks, self._handoff_steps = [], []
         self._pinned_content_hashes = set()
         self._rescued_hashes = set()
         self._pressure_warning_injected = False
@@ -452,11 +566,86 @@ class ChronicleContextEngine(ContextEngine):
     def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode=""):
         self.context_length = context_length
         # HIGH watermark (§R2): the fraction of the window that decides a
-        # compression pass is due. Computed once here, same as before, so
-        # threshold_tokens (read directly by get_status()/the host) can never
-        # disagree with what should_compress() actually tests against.
-        self.threshold_percent = self._cfg_percent("high_watermark_percent", self.threshold_percent)
-        self.threshold_tokens = int(context_length * self.threshold_percent)
+        # compression pass is due. Computed here and again once the core exists
+        # (_apply_policy), so threshold_tokens (read directly by get_status()/
+        # the host) can never disagree with what should_compress() tests.
+        self._apply_policy()
+
+    def _host_compression(self) -> dict:
+        """The host's own `compression:` settings ({} outside Hermes).
+
+        The host never hands its compaction policy to a plugin engine
+        (hermes-agent agent_init: "External engines own compaction policy -- the
+        host threshold ... never reaches the plugin"), so an engine that is to
+        honour the operator's settings has to read them. Before this, Chronicle
+        compacted at 75% of the window and down to 55% whatever the operator
+        configured -- on the production profile `threshold: 0.5, target_ratio:
+        0.15, protect_last_n: 20`, which Hermes' own compressor lands at ~10-15%
+        of the window."""
+        if self._host_compression_cache is None:
+            try:
+                from hermes_cli.config import load_config
+                c = (load_config() or {}).get("compression") or {}
+                self._host_compression_cache = dict(c) if isinstance(c, dict) else {}
+            except Exception:
+                self._host_compression_cache = {}
+        return self._host_compression_cache
+
+    def _apply_policy(self) -> None:
+        """Resolve the watermarks and protected head/tail, in this order: what
+        Chronicle's own config STATES (context_engine.*), then the host's
+        `compression:` settings, then Chronicle's defaults.
+
+        HIGH is the host's `threshold`. LOW -- what a pass compacts DOWN to --
+        is twice `threshold * target_ratio`: Hermes' compressor keeps a verbatim
+        tail of `threshold * target_ratio` of the window plus a summary, and
+        Chronicle's handoff and kept middle stand where that summary stands.
+        Recomputed whenever the model or the core changes: the host calls
+        update_model() BEFORE on_session_start(), so the core's config did not
+        exist yet the first time, and nothing ever re-read it."""
+        cfg = self.core.cfg if self.core else None
+
+        def frac(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            return v if 0.0 < v < 1.0 else None
+
+        def count(v, lo):
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                return None
+            return v if v >= lo else None
+
+        host = self._host_compression()
+        stated_high = frac(cfg.explicit("context_engine.high_watermark_percent")) if cfg else None
+        stated_low = frac(cfg.explicit("context_engine.low_watermark_percent")) if cfg else None
+        host_high, host_ratio = frac(host.get("threshold")), frac(host.get("target_ratio"))
+        default_high = frac(cfg.get("context_engine.high_watermark_percent", 0.75)) if cfg else None
+        default_low = frac(cfg.get("context_engine.low_watermark_percent", 0.55)) if cfg else None
+        high = stated_high or host_high or default_high or self.high_watermark_percent
+        if stated_low:
+            low = stated_low
+        elif host_high and host_ratio:
+            low = max(0.05, 2 * high * host_ratio)
+        else:
+            low = default_low or self.low_watermark_percent
+        self.high_watermark_percent = high
+        self.low_watermark_percent = min(low, 0.9 * high)
+        first, last = count(host.get("protect_first_n"), 0), count(host.get("protect_last_n"), 1)
+        if first is not None:
+            self.protect_first_n = first
+        if last is not None:
+            self.protect_last_n = last
+        # The gateway also compacts on message COUNT (hygiene_hard_message_limit),
+        # whatever the tokens -- and when that compaction makes no progress it
+        # cuts the model's input to the newest `limit` messages, head and all,
+        # with no handoff. So a pass over the count folds down under it too.
+        self.max_messages = count(host.get("hygiene_hard_message_limit"), 20)
+        self.threshold_percent = high
+        self.threshold_tokens = int(self.context_length * high) if self.context_length > 0 else 0
 
     def update_from_response(self, usage):
         if (usage or {}).get("prompt_tokens"):
@@ -554,11 +743,40 @@ class ChronicleContextEngine(ContextEngine):
         if not self.core:
             return self._heuristic(messages)
 
-        # Pressure warning (§R9): whether this call is the one that delivers a
-        # newly-crossed high-watermark warning. NOT latched here -- only
-        # _emit_pressure_warning may set _pressure_warning_injected, and only
-        # once the warning is actually in the returned output. Computed before
-        # the small-body early return below so that path is covered too.
+        original = messages
+        budget = self._target_budget()
+        # 0) EXTEND or REBASE. Normally a pass only folds what arrived since the
+        # last one: everything already settled -- earlier handoffs included --
+        # is reproduced byte for byte (§R5), so the provider's prompt cache
+        # keeps the whole prefix. But a settled prefix only ever grows, and
+        # once it is most of the budget there is nothing left to keep new turns
+        # in. Then (and on a first pass, and after a restart, when this engine
+        # copy has no settled prefix) the pass REBASES: every earlier handoff
+        # and pre-5.8 artifact comes out, everything after the protected head is
+        # fresh again, and ONE consolidated handoff replaces them -- one cache
+        # break, which is what Hermes' own compressor pays on every compaction.
+        locked_len = self._match_locked_prefix(messages)
+        used_locked = sum(self._msg_cost(m) for m in messages[:locked_len])
+        # Over the host's message limit, the pass also folds down to half of it.
+        over_count = bool(self.max_messages) and len(messages) >= self.max_messages
+        count_cap = (max(self.protect_first_n + self.protect_last_n + 2, self.max_messages // 2)
+                     if over_count else None)
+        rebase = (locked_len == 0 or used_locked > self._REBASE_AT * budget
+                  or (count_cap is not None and locked_len > self._REBASE_AT * count_cap))
+        if rebase:
+            prior = [m for m in messages if _is_handoff(m)]
+            if prior and not (self._handoff_asks or self._handoff_steps or self._checkpoint_lines):
+                for h in prior:                      # a restart must not lose earlier folds
+                    self._adopt_handoff(h.get("content") or "")
+            messages = [m for m in messages if not (_is_handoff(m) or _is_legacy_artifact(m))]
+            locked_len, used_locked = 0, 0
+        n_asks, n_steps = len(self._handoff_asks), len(self._handoff_steps)
+        known_before = list(self._checkpoint_lines)
+        self.last_pass = "rebase" if rebase else "extend"
+
+        # Pressure warning (§R9): a compaction runs AT the high watermark, so the
+        # warning cannot come before it; it rides in the handoff instead, as
+        # advice for the next one, and is latched only once delivered.
         warn_pending = self.is_under_pressure() and not self._pressure_warning_injected
 
         # 1) rescue critical/high-salience spans → durable beliefs (I14) —
@@ -577,201 +795,417 @@ class ChronicleContextEngine(ContextEngine):
                                      speaker_context=self._host_context)
             self._rescued_hashes.update(self._rescue_key(m) for m in fresh)
 
-        # 1.5) stable cut-point geometry (§R5): reuse whatever leading run of
-        # `messages` is byte-identical, in order, to what compress() already
-        # committed to last pass. That run is SETTLED -- reproduced verbatim,
-        # never rescored or reordered -- so only the genuinely new tail
-        # (whatever the host appended since) is fresh territory for a
-        # head/tail/score decision.
-        locked_len = self._match_locked_prefix(messages)
+        # 1.5) stable cut-point geometry (§R5): the settled prefix found in step
+        # 0 is reproduced verbatim, never rescored or reordered, so only what
+        # the host appended since is fresh territory.
         locked = list(messages[:locked_len])
         fresh = messages[locked_len:]
         is_first_pass = locked_len == 0
 
         if is_first_pass:
-            # Original short-circuit, preserved for a from-scratch window too
-            # small to bother compressing at all.
             body_only = [m for m in fresh if m.get("role") != "system"]
             if len(body_only) <= self.protect_first_n + self.protect_last_n:
-                return self._emit_pressure_warning(messages, warn_pending)
+                return original
 
         # Index-tag `fresh` so the decided subset can be re-emitted in its
-        # ORIGINAL relative order at the end (§R5: no more "system hoist").
+        # ORIGINAL relative order at the end (§R5: no "system hoist").
         fresh_indexed = list(enumerate(fresh))
         fresh_system = [(i, m) for i, m in fresh_indexed if m.get("role") == "system"]
-        fresh_body = [(i, m) for i, m in fresh_indexed if m.get("role") != "system"]
+        units = _tool_units([(i, m) for i, m in fresh_indexed if m.get("role") != "system"])
 
-        # protect_first_n is a first-pass-only concept: once settled the true
-        # head lives inside `locked`. Later passes only keep a rolling tail
-        # reserve over whatever is newly appended.
+        # Head and tail are counted in MESSAGES but cut on UNIT boundaries, so a
+        # protected tool result never loses the call it answers (or vice versa).
+        head_units, rest = [], units
         if is_first_pass:
-            head, rest = fresh_body[:self.protect_first_n], fresh_body[self.protect_first_n:]
-        else:
-            head, rest = [], fresh_body
+            n = 0
+            while rest and n < self.protect_first_n:
+                n += len(rest[0])
+                head_units.append(rest[0])
+                rest = rest[1:]
+        tail_units, n = [], 0
+        while rest and n < self.protect_last_n:
+            n += len(rest[-1])
+            tail_units.insert(0, rest[-1])
+            rest = rest[:-1]
+        middle_units = rest
+        head = [p for u in head_units for p in u]
+        tail = [p for u in tail_units for p in u]
 
-        if len(rest) <= self.protect_last_n:
-            tail, middle = rest, []
-        else:
-            tail, middle = rest[-self.protect_last_n:], rest[:-self.protect_last_n]
-
-        # 2) two-watermark hysteresis (§R2): admit best-scoring evictable spans,
-        # by REAL per-span token cost, only while there is room under the LOW
-        # watermark. Recency-weighted (§R3): newer middle spans score higher,
-        # so the oldest lose the budget race first.
-        budget = self._target_budget()
-
-        never_pos, scored = [], []
-        total_middle = len(middle)
-        for pos, (_idx, m) in enumerate(middle):
-            if self._never_evict(m):
-                never_pos.append(pos)
-            else:
-                recency_position = pos / max(1, total_middle - 1) if total_middle > 1 else 1.0
-                scored.append((self._keep_score(m, focus, recency_position), pos))
-        scored.sort(key=lambda pair: pair[0], reverse=True)  # best-scoring first; ties keep document order
-
-        # `locked` is SUNK COST (§R5): every byte already survived a previous
-        # pass's budget check and is never rescored/reclipped again. Only the
-        # budget REMAINING after its real token cost is available to whatever
-        # this pass freshly decides.
-        used_locked = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in locked)
+        # 2) two-watermark hysteresis (§R2): admit best-scoring evictable
+        # units, by REAL token cost, only while there is room under the LOW
+        # watermark, after reserving room for the handoff that will stand in
+        # for whatever is folded.
         fresh_budget = max(0, budget - used_locked)
+        needs_fold = over_count or used_locked + sum(self._msg_cost(m) for _i, m in fresh_indexed) > budget
+        reserve = self._handoff_reserve(budget) if needs_fold else 0
 
-        # compress() must guarantee output <= budget (§R2). Priority order
-        # (system, then head, then tail, then never-evict middle) decides who
-        # gets first claim before anything is clipped. A span with SOME room
-        # is shortened; a span with NO room is made durable (I17) and dropped
-        # outright -- never blanked-but-present (§R5).
-        req_fresh = list(fresh_system) + list(head) + list(tail)
-        fitted, used_req, dropped_req = self._fit_within_budget(req_fresh, fresh_budget)
+        # The protected spans themselves may not fit: then the newest turn
+        # wins, then the rest of the tail newest first, then the head -- whole
+        # tool units or none of one -- and a span shortened to fit says so and
+        # stays recoverable.
+        fitted, used_req, dropped_req = self._fit_required(
+            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve))
         fitted_content = dict(fitted)
         fresh_system = [(i, fitted_content[i]) for i, _m in fresh_system if i in fitted_content]
         head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
         tail = [(i, fitted_content[i]) for i, _m in tail if i in fitted_content]
-
-        # never-evict middle spans get whatever's left after system/head/tail.
-        never_budget = max(0, fresh_budget - used_req)
-        fitted_never, used_never, dropped_never = self._fit_within_budget(
-            [middle[p] for p in never_pos], never_budget)
-        fitted_never_content = dict(fitted_never)
-        dropped_never_idx = {idx for idx, _m in dropped_never}
-        middle = list(middle)
-        for p in never_pos:
-            orig_idx, _m = middle[p]
-            if orig_idx in fitted_never_content:
-                middle[p] = (orig_idx, fitted_never_content[orig_idx])
+        never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
+        never_flat = [p for u in never_units for p in u]
+        never_budget = max(0, fresh_budget - used_req - reserve)
+        fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget)
+        kept_never = dict(fitted_never)
 
         used = used_locked + used_req + used_never
-
-        kept_pos = {p for p in never_pos if middle[p][0] not in dropped_never_idx}
+        room = budget - reserve
+        total = len(middle_units)
+        scored = []
+        for pos, u in enumerate(middle_units):
+            if u in never_units:
+                continue
+            recency = pos / max(1, total - 1) if total > 1 else 1.0
+            score = max(self._keep_score(m, focus, recency) for _i, m in u)
+            scored.append((score, pos))
+        scored.sort(key=lambda pair: pair[0], reverse=True)  # best first; ties keep order
+        kept_units = set()
+        n_kept = len(locked) + len(fresh_system) + len(head) + len(tail) + len(kept_never) + 1
         for _score, pos in scored:
-            cost = estimate_tokens(_text(middle[pos][1]), margin=COMPRESSION_BUDGET)
-            if used + cost <= budget:
-                kept_pos.add(pos)
+            cost = sum(self._msg_cost(m) for _i, m in middle_units[pos])
+            size = len(middle_units[pos])
+            if used + cost <= room and (count_cap is None or n_kept + size <= count_cap):
+                kept_units.add(pos)
                 used += cost
-            # else: budget is full -- stays evicted, regardless of score
+                n_kept += size
 
-        # 3) evict ONLY durable spans — make each durable first (I17), then FOLD
-        # (R4): a reversible eviction. Every evicted span gets a byte-exact
-        # durable copy (_ensure_durable, chunked per R11) plus a content-
-        # addressed span_id in a `folded` event pointing at those chunks --
-        # recoverable via chronicle_expand(span_id). Score-evicted middle spans
-        # that still fit the leftover budget leave a one-line tombstone stub AT
-        # THEIR OLD POSITION (best-scoring evictions get first claim on the
-        # stub room). Required/never spans dropped for budget are durably folded
-        # too, but never get a stub (the budget is already spent).
-        score_evicted = [pos for _score, pos in scored if pos not in kept_pos]
-        durable_evicted = []
-        evicted_span_ids: list[str] = []
-        n_stubs = 0
-        for pos in score_evicted:
-            orig_idx, m = middle[pos]
-            durable_evicted.append(m)
-            chunk_ids = self._ensure_durable(m)
-            span_id, _digest, stub = self._fold(m, chunk_ids)
-            evicted_span_ids.append(span_id)
-            stub_cost = estimate_tokens(_text(stub), margin=COMPRESSION_BUDGET)
-            if used + stub_cost <= budget:
-                middle[pos] = (orig_idx, stub)
-                kept_pos.add(pos)
-                used += stub_cost
-                n_stubs += 1
-            # else: no room even for the tombstone -- still durably recoverable
-            # from the log (I17), just not in-window.
-        for _idx, m in list(dropped_req) + list(dropped_never):
-            durable_evicted.append(m)
-            chunk_ids = self._ensure_durable(m)
-            span_id, _digest, _stub = self._fold(m, chunk_ids)
-            evicted_span_ids.append(span_id)
+        # 3) fold every unit that did not fit -- durable first (I17), then a
+        # `folded` event per message (R4, recoverable with chronicle_expand) --
+        # and describe it for the handoff. Required spans dropped for budget
+        # are folded the same way.
+        durable_evicted, evicted_span_ids = [], []
+        folded_units = [middle_units[pos] for pos in range(total)
+                        if pos not in kept_units and middle_units[pos] not in never_units]
+        dropped_units = _tool_units(sorted(list(dropped_req) + list(dropped_never),
+                                           key=lambda pair: pair[0]))
+        # Noted in conversation order: the handoff lists requests newest first.
+        # Written in batches of ~64 messages, each one transaction: a commit per
+        # archived message was most of a large pass's time.
+        batches, size = [[]], 0
+        for u in sorted(folded_units + dropped_units, key=lambda unit: unit[0][0]):
+            if size >= self._FOLD_BATCH:
+                batches.append([])
+                size = 0
+            batches[-1].append(u)
+            size += len(u)
+        for batch in batches:
+            with self.core.store.transaction():
+                for u in batch:
+                    ids = []
+                    for _i, m in u:
+                        if not _text(m):         # a bare call: nothing to restore
+                            ids.append(None)
+                            durable_evicted.append(m)
+                            continue
+                        chunk_ids = self._ensure_durable(m)
+                        span_id, _digest, _stub = self._fold(m, chunk_ids)
+                        ids.append(span_id)
+                        durable_evicted.append(m)
+                    evicted_span_ids.extend(i for i in ids if i)
+                    self._note_folded_unit([m for _i, m in u], ids)
 
-        kept_middle = [middle[p] for p in range(len(middle)) if p in kept_pos]
-
-        # Re-emit the decided subset of `fresh` in its ORIGINAL relative order
-        # (§R5) -- a message's output position is a monotonic function of its
-        # input position, no system-first bucket concatenation.
+        kept_middle = [p for pos, u in enumerate(middle_units) if pos in kept_units for p in u]
+        kept_middle += [(i, kept_never[i]) for i, _m in never_flat if i in kept_never]
         decided = sorted(fresh_system + head + kept_middle + tail, key=lambda pair: pair[0])
         settled = [m for _idx, m in decided]
-
-        # 4) re-retrieve long-term memory toward focus, sized to whatever room
-        # is left under the low watermark. §R8: working-set rehydration pulls
-        # PER FACET -- each topic, the task, and each focus entity's own digest
-        # -- rather than one query against a flattened focus string, so a facet
-        # with no lexical overlap with the others still gets its own shot at
-        # the reinjection budget.
-        injected = []
-        if focus["topics"] or focus["entities"] or focus["task"]:
-            remaining = budget - used
-            inject_budget = self._reinject_budget(remaining)
-            if inject_budget > 0:
-                injected, used = self._rehydrate_working_set(focus, inject_budget, used)
-
-        # 4b) checkpoint digest (§R7) with tiered abstraction selection:
-        # a deterministic, no-model rolling digest of everything compression has
-        # folded out of the window this session. Selects abstract, gist, or verbatim
-        # depending on available token budget.
-        digest_text = self._update_checkpoint_digest(durable_evicted)
-        if digest_text:
-            remaining = budget - used
-            if remaining > 0:
-                # Tiered selection: if remaining budget is tight (< 100 tokens), use abstract level
-                if remaining < 100:
-                    digest_lines = [line.split("\n")[0][:60] for line in self._checkpoint_lines]
-                    digest_text = "\n".join(digest_lines)
-                content = f"[Checkpoint: {digest_text}]"
-                if estimate_tokens(content, margin=COMPRESSION_BUDGET) > remaining:
-                    # A10: shared inverse of estimate_tokens (the digest is
-                    # one synthetic span, so §R7's "always clipped to fit"
-                    # policy stands -- only the constant moves).
-                    content = content[:budget_chars(remaining, margin=COMPRESSION_BUDGET)]
-                if content:
-                    injected.append({"role": "system", "content": content})
-                    used += estimate_tokens(content, margin=COMPRESSION_BUDGET)
-
-        # 5) audit event (§R6/R4): evicted_spans/kept_spans/folded_spans carry
-        # actual span ids (not counts) so the kept/evicted/folded partition of
-        # this window is replayable from the log alone.
         result = locked + settled
+
+        # 4) the handoff: the folded requests, steps and stated facts, plus
+        # memory re-retrieved toward the focus (§R8), in whatever room is left.
+        # The checkpoint digest (§R7) is fed only the USER's words: a regex
+        # extractor handed an assistant's or a tool's text reads it as the user.
+        self._update_checkpoint_digest(
+            [{"role": "user", "content": t} for t in self._human_texts(durable_evicted)])
+        extra = [t for t in [self._host_memory_text(kwargs.get("memory_context"))] if t]
+        if focus["topics"] or focus["entities"] or focus["task"]:
+            inject_budget = self._reinject_budget(max(0, budget - used) // 3)
+            if inject_budget > 0:
+                spans, _ = self._rehydrate_working_set(focus, inject_budget, 0)
+                extra += [sp.get("content") or "" for sp in spans]
+        if rebase:
+            asks, steps, known = self._handoff_asks, self._handoff_steps, self._checkpoint_lines
+        else:
+            asks, steps = self._handoff_asks[n_asks:], self._handoff_steps[n_steps:]
+            known = [line for line in self._checkpoint_lines if line not in known_before]
+        handoff = None
+        if asks or steps or known or extra:
+            warn = None
+            if warn_pending:
+                warn = ("The window was at %d%% of the model's context when this compaction "
+                        "ran; pin anything that must stay verbatim with chronicle_pin_context."
+                        % int(100 * (current_tokens or self.last_prompt_tokens)
+                              / max(1, self.context_length)))
+            text = self._render_handoff(max(0, budget - used), asks, steps, known, extra, warn)
+            if text:
+                handoff = text
+                used += self._msg_cost({"content": text})
+                if warn and warn in text:
+                    self._pressure_warning_injected = True
+
+        # 5) audit event (§R6/R4)
         kept_span_ids = [self._span_id(m) for m in result]
         self.core.capture.append("compressed", {
             "session_id": self._session_id,
             "evicted_spans": evicted_span_ids, "kept_spans": kept_span_ids,
-            "folded_spans": evicted_span_ids, "folded_in_window": n_stubs,
+            "folded_spans": evicted_span_ids, "folded_in_window": 0,
             "evicted_count": len(evicted_span_ids), "retained": len(kept_span_ids),
-            "summary_ref": "", "budget_tokens": budget, "used_tokens": used},
+            "summary_ref": "", "budget_tokens": budget, "used_tokens": used,
+            "handoff_chars": len(handoff or ""), "mode": self.last_pass},
             actor="system", session_id=self._session_id)
 
         self.compression_count += 1
         self._awaiting_real_usage = True
         self._prune_rearm_tokens = 0     # a compaction starts the trim cycle again
-        # §R5: lock in everything just decided -- never rescored/reordered again
-        # -- EXCEPT the memory injection, which is regenerated fresh every pass
-        # and so stays ordinary evictable content on the NEXT call.
+        if handoff is not None:
+            # Where the folded turns were: after the protected head on a rebase,
+            # at the end of the settled prefix when extending.
+            pos = self._handoff_position(result, head) if rebase else len(locked)
+            result = result[:pos] + [{"role": self._handoff_role(result, pos),
+                                      "content": handoff}] + result[pos:]
+        # §R5: lock in everything just decided, the handoff with it -- the next
+        # pass extends this output byte for byte, or rebases it whole.
         self._locked_prefix = result
-        # 6) pressure warning (§R9): counted against `budget`/`used` like
-        # everything else, so a newly-crossed high watermark can never push
-        # compress()'s output over its own budget guarantee (R2).
-        output = result + injected
-        return self._emit_pressure_warning(output, warn_pending, used=used, budget=budget)
+        return result
+
+    # -- handoff state ------------------------------------------------------
+
+    @staticmethod
+    def _handoff_position(result, head) -> int:
+        """Where the handoff goes on a rebase: right after the protected head
+        -- where the folded turns were -- or, when the head itself had to be
+        folded for budget, after the leading system messages, ahead of every
+        turn that was kept."""
+        if head:
+            last = head[-1][1]
+            for i, m in enumerate(result):
+                if m is last:
+                    return i + 1
+        i = 0
+        while i < len(result) and result[i].get("role") == "system":
+            i += 1
+        return i
+
+    @staticmethod
+    def _handoff_role(result, pos) -> str:
+        """The handoff's role at `pos`: "user" when it opens the conversation
+        (Anthropic requires it) or follows the assistant; "assistant" after a
+        user turn. Tool rows answer the assistant's call, so they count as the
+        assistant's side."""
+        prev = next((m.get("role") for m in reversed(result[:pos])
+                     if m.get("role") in ("user", "assistant", "tool")), None)
+        return "assistant" if prev == "user" else "user"
+
+    def _msg_cost(self, m) -> int:
+        """Token cost of a message as sent: its text AND its tool-call
+        arguments, which _text() alone leaves out."""
+        return estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) + _calls_cost(m)
+
+    def _handoff_reserve(self, budget: int) -> int:
+        """Room kept back for the handoff before the scored middle is admitted:
+        a fifth of the target, and at least the header plus a few lines -- but
+        never more than half the target, nor more than 6000 tokens."""
+        floor = self._msg_cost({"content": _HANDOFF_HEADER}) + 64
+        return min(budget // 2, 6000, max(floor, int(budget * 0.2)))
+
+    @staticmethod
+    def _host_memory_text(memory_context) -> str:
+        """What the host's other memory providers said before this compaction
+        (`on_pre_compress`), for the handoff -- run through the host's own
+        redaction and size cap when it is there, capped here when not."""
+        text = (memory_context or "").strip() if isinstance(memory_context, str) else ""
+        if not text:
+            return ""
+        try:
+            from agent.context_engine import sanitize_memory_context
+            return sanitize_memory_context(text)
+        except Exception:
+            return text[:2000]
+
+    @staticmethod
+    def _human_texts(msgs) -> list:
+        """The user's own words in `msgs`: user-role text minus host framing."""
+        out = []
+        for m in msgs:
+            if m.get("role") != "user":
+                continue
+            c = _text(m)
+            said = "".join(c[a:b] for a, b, w in split_user_content(c, _HUMAN) if w == _HUMAN).strip()
+            if said:
+                out.append(said)
+        return out
+
+    def _note_folded_unit(self, msgs, span_ids) -> None:
+        """Record one folded unit for the handoff: a user request verbatim
+        (its framing removed), or one line saying what the step did."""
+        # The unit is named by a span that has content to restore -- a call
+        # with no text of its own hashes like every other one -- preferring
+        # the first result, which is what a later chronicle_expand wants.
+        named = [sid for m, sid in zip(msgs, span_ids) if sid and _text(m)]
+        results = [sid for m, sid in zip(msgs, span_ids) if sid and _text(m) and m.get("role") == "tool"]
+        pick = (results or named or list(span_ids) or [None])[0]
+        ref = "[%s]" % pick if pick else ""
+        if len(msgs) == 1 and msgs[0].get("role") == "user":
+            said = self._human_texts(msgs)
+            if said:
+                self._handoff_asks.append("%s %s" % (ref, said[0]))
+            return
+        first = msgs[0]
+        if first.get("role") == "assistant" and first.get("tool_calls"):
+            calls = []
+            for tc in first.get("tool_calls") or []:
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                calls.append("%s(%s)" % (fn.get("name") or "tool", _one_line(fn.get("arguments") or "", 70)))
+            said = _one_line(_text(first), 120)
+            results = [_one_line(_text(r), 110) for r in msgs[1:]]
+            line = "called " + ", ".join(calls)
+            if said:
+                line = _one_line(said, 120) + " — " + line
+            if results:
+                line += " → " + " | ".join(r for r in results if r)
+            self._handoff_steps.append("%s %s" % (ref, _one_line(line, 360)))
+            return
+        role = first.get("role") or "?"
+        body = _one_line(_text(first), 220)
+        if body:
+            self._handoff_steps.append("%s %s: %s" % (ref, role, body))
+
+    def _render_handoff(self, room: int, asks_in: list, steps_in: list, known_in: list,
+                        extra: list, warn) -> str:
+        """The handoff text within `room` tokens: the header always; then the
+        user's folded requests (newest first), the steps (the most recent that
+        fit, shown oldest first), the stated facts, memory recalled for the
+        focus, and last the ids of whatever there was no room to show.
+
+        Entries are deduplicated (identical turns fold to the same id), and each
+        section gets a share of the room -- requests half, steps three tenths,
+        facts a fifth -- before any may spend what another left unused: a greedy
+        fill let a run of long requests crowd out every stated fact. Recalled
+        memory keeps up to a third of the room. "" when not even the header
+        fits."""
+        header = _HANDOFF_HEADER + ("\n" + warn if warn else "")
+        if self._msg_cost({"content": header}) > room:
+            return ""
+
+        def dedupe(lines):
+            seen, out = set(), []
+            for line in reversed(lines):             # keep the most recent occurrence
+                if line not in seen:
+                    seen.add(line)
+                    out.append(line)
+            return list(reversed(out))
+
+        spec = (("asks", _SECTION_ASKS, 0.5, True, True),     # key, title, share, shorten, newest first
+                ("steps", _SECTION_STEPS, 0.3, False, False),
+                ("known", _SECTION_KNOWN, 0.2, False, False))
+        pools = {k: dedupe(v) for k, v in (("asks", asks_in), ("steps", steps_in), ("known", known_in))}
+        shown = {k: [e for e in pools[k] if not _BARE_FOLD.match(e)] for k in pools}
+        chosen = {k: [] for k in pools}          # oldest first, like the pools
+        memory = [b for b in extra if b]
+        ids = {k: [] for k in pools}             # ids of what is not shown, newest first
+
+        def render(with_memory=None):
+            parts = [header]
+            for key, title, _share, _shorten, newest_first in spec:
+                lines = ["- " + e for e in chosen[key]]
+                if newest_first:
+                    lines.reverse()
+                if ids[key]:
+                    lines.append("- older, not shown: " + " ".join("[%s]" % i for i in ids[key]))
+                if lines:
+                    parts.append("\n".join([title] + lines))
+            for block in (memory if with_memory is None else with_memory):
+                parts.append("\n".join([_SECTION_MEMORY, block]))
+            return "\n\n".join(parts)
+
+        def cost(**kw):
+            return self._msg_cost({"content": render(**kw)})
+
+        # Recalled memory first claims up to a third of the room.
+        kept_memory = []
+        for block in memory:
+            if cost(with_memory=kept_memory + [block]) <= self._msg_cost({"content": header}) + room // 3:
+                kept_memory.append(block)
+        memory_cost = cost(with_memory=kept_memory) - cost(with_memory=[])
+        entry_room = room - memory_cost
+        base = cost(with_memory=[])
+
+        def fill(key, cap, shorten):
+            pool = shown[key]
+            start = len(pool) - len(chosen[key])
+            for line in reversed(pool[:start]):
+                for width in ((1200, 240, 90) if shorten else (400,)):
+                    before = cost(with_memory=[])
+                    chosen[key].insert(0, _one_line(line, width))
+                    delta = cost(with_memory=[]) - before
+                    if delta <= cap:
+                        cap -= delta
+                        break
+                    chosen[key].pop(0)
+                else:
+                    break
+            return cap
+
+        def fill_all(avail):
+            for key in chosen:
+                chosen[key] = []
+            left = sum(fill(key, int(avail * share), shorten) for key, _t, share, shorten, _n in spec)
+            for key, _t, _share, shorten, _n in spec:
+                left = fill(key, left, shorten)
+
+        avail = max(0, entry_room - base)
+        fill_all(avail)
+        if any(len(chosen[k]) < len(shown[k]) for k in chosen):
+            fill_all(int(avail * 0.88))          # something is left out: keep room to name it
+        memory[:] = kept_memory
+
+        # Last, name by id as many of the rest as still fit, newest first.
+        for key, *_ in spec:
+            shown_ids = {m.group(1) for e in chosen[key] for m in [_FOLD_REF.match(e)] if m}
+            rest = []
+            for e in reversed(pools[key]):
+                m = _FOLD_REF.match(e)
+                if m and m.group(1) not in shown_ids and m.group(1) not in rest:
+                    rest.append(m.group(1))
+            for fid in rest:
+                ids[key].append(fid)
+                if cost() > room:
+                    ids[key].pop()
+                    break
+            ids[key].reverse()                   # rendered oldest first
+        return render()
+
+    def _adopt_handoff(self, text: str) -> None:
+        """Carry a handoff this engine copy did not write back into its state
+        (a restarted process, a fresh per-agent copy), so the next one keeps it."""
+        found = {"asks": [], "steps": [], "known": [], None: []}
+        older = {"asks": [], "steps": [], "known": [], None: []}
+        section = None
+        for line in (text or "").splitlines():
+            if line == _SECTION_ASKS:
+                section = "asks"
+            elif line == _SECTION_STEPS:
+                section = "steps"
+            elif line == _SECTION_KNOWN:
+                section = "known"
+            elif line == _SECTION_MEMORY:
+                section = None                     # regenerated per pass, not carried
+            elif line.startswith("- older, not shown:"):
+                # Kept as bare ids: never shown as entries, but still named.
+                older[section] = ["[%s]" % i for i in re.findall(r"fold_[0-9a-f]{12}", line)]
+            elif line.startswith("- ") and section is not None:
+                found[section].append(line[2:])
+        # Stored oldest first: the older ids, then the entries (asks are
+        # rendered newest first).
+        self._handoff_asks.extend(older["asks"] + list(reversed(found["asks"])))
+        self._handoff_steps.extend(older["steps"] + found["steps"])
+        self._checkpoint_lines.extend(found["known"])
 
     def _match_locked_prefix(self, messages) -> int:
         """How many of the leading `messages` are identical, in order, to the
@@ -1054,7 +1488,7 @@ class ChronicleContextEngine(ContextEngine):
         the same knob get_context already honors, so the target is never
         unbounded.
         """
-        low = self._cfg_percent("low_watermark_percent", self.low_watermark_percent)
+        low = self.low_watermark_percent
         if self.context_length > 0:
             return max(1, int(self.context_length * low))
         cfg_default = self.core.cfg.get("context.default_token_budget", 1500)
@@ -1094,7 +1528,7 @@ class ChronicleContextEngine(ContextEngine):
         kept, dropped, used = [], [], 0
         for idx, m in items:
             content = _text(m)
-            cost = estimate_tokens(content, margin=COMPRESSION_BUDGET)
+            cost = estimate_tokens(content, margin=COMPRESSION_BUDGET) + _calls_cost(m)
             remaining = budget - used
             if cost <= remaining:
                 kept.append((idx, m))
@@ -1109,10 +1543,42 @@ class ChronicleContextEngine(ContextEngine):
             # §R5 requires a protected span to be shortened-but-present or
             # durably archived, never blanked-but-present, and
             # test_compression_fidelity asserts these bytes.
-            clipped = content[:budget_chars(remaining, margin=COMPRESSION_BUDGET)]
+            clipped = content[:budget_chars(max(0, remaining - _calls_cost(m)),
+                                            margin=COMPRESSION_BUDGET)]
             kept.append((idx, dict(m, content=clipped) if clipped != content else m))
-            used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET)
+            used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET) + _calls_cost(m)
         return kept, used, dropped
+
+    def _fit_required(self, system, head_units, tail_units, budget):
+        """Fit the spans compress() must not score away -- system messages,
+        the protected head and tail -- into `budget`, most important first:
+        system, the newest unit, the rest of the tail newest first, then the
+        head. A tool unit is kept whole (shortened if need be) or dropped
+        whole, so no call loses its result. A span shortened to fit is made
+        durable and folded first, and ends with the id that restores it.
+        Returns (kept, used, dropped) as _fit_within_budget does."""
+        kept, dropped, used = [], [], 0
+        for unit in [[p] for p in system] + list(reversed(tail_units)) + list(head_units):
+            got, cost, lost = self._fit_within_budget(unit, budget - used)
+            if lost:
+                dropped.extend(unit)
+                continue
+            used += cost
+            for (idx, m), (_i, orig) in zip(got, unit):
+                if m is not orig:
+                    m = self._mark_clipped(orig, m)
+                kept.append((idx, m))
+        return kept, used, dropped
+
+    def _mark_clipped(self, orig, clipped):
+        """A span shortened for budget: archive the whole of it, and end the
+        shortened copy with the id that restores it (same length)."""
+        span_id, _digest, _stub = self._fold(orig, self._ensure_durable(orig))
+        note = " …[shortened; chronicle_expand(\"%s\") restores it]" % span_id
+        text = clipped.get("content") or ""
+        if len(text) <= len(note):
+            return clipped
+        return dict(clipped, content=text[:len(text) - len(note)] + note)
 
     def _compute_content_hash(self, m) -> str:
         """sha256 of a message's content, for span-level pinning (R3).
@@ -1134,13 +1600,14 @@ class ChronicleContextEngine(ContextEngine):
         return self._compute_content_hash(m) in self._pinned_content_hashes
 
     def _never_evict(self, m) -> bool:
-        """R3: never evict directives (never/always/must keywords) or pinned spans."""
-        c = _text(m).lower()
-        if any(k in c for k in _NEVER_EVICT_KW):
-            return True
+        """R3: never evict the USER's directives (never/always/must keywords in
+        their own words) or a pinned span. The keywords used to be matched in
+        any message -- an assistant's "you must restart", a log line saying
+        "never" -- so ordinary tool output was pinned in the window."""
         if self._is_pinned(m):
             return True
-        return False
+        said = " ".join(self._human_texts([m])).lower()
+        return bool(said) and any(k in said for k in _NEVER_EVICT_KW)
 
     @staticmethod
     def _span_id(m) -> str:
@@ -1638,10 +2105,8 @@ class ChronicleContextEngine(ContextEngine):
         if not self.core or self.context_length <= 0:
             return False
 
-        high_tokens = self.threshold_tokens or int(
-            self.context_length * self._cfg_percent("high_watermark_percent", self.threshold_percent))
-        low_tokens = int(self.context_length * self._cfg_percent(
-            "low_watermark_percent", self.low_watermark_percent))
+        high_tokens = self.threshold_tokens or int(self.context_length * self.high_watermark_percent)
+        low_tokens = int(self.context_length * self.low_watermark_percent)   # see _apply_policy
         tokens_now = sum(estimate_tokens(_text(m), margin=COMPRESSION_BUDGET) for m in messages)
         if tokens_now < low_tokens or tokens_now >= high_tokens:
             return False

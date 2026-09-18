@@ -53,6 +53,12 @@ def _body(n: int) -> list[dict]:
 
 # -- _normalize_focus: every call shape -> one shape -------------------------
 
+
+def _handoffs(result):
+    """The compaction handoff(s) in a compress() result: never system-role."""
+    return [m for m in result if m.get("role") != "system"
+            and (m.get("content") or "").startswith("[CONTEXT COMPACTION")]
+
 class TestNormalizeFocus(unittest.TestCase):
     def test_none_is_empty_focus(self):
         self.assertEqual(ChronicleContextEngine._normalize_focus(None),
@@ -220,9 +226,12 @@ class TestWorkingSetRehydration(unittest.TestCase):
             digest = self._seed_user_digest(eng, sid)
             body = _body(10)
             result = eng.compress(body, focus={"entities": ["user"]})
-            joined = "\n".join(m.get("content") or "" for m in result
-                               if m.get("role") == "system" and "[Entity working set]" in (m.get("content") or ""))
-            self.assertTrue(joined, "expected an '[Entity working set]' system span in the compressed output")
+            # 5.8.0: recalled memory rides in the compaction handoff, in a
+            # conversation role (a mid-list system message can displace the
+            # agent's own system prompt on Anthropic's API).
+            joined = "\n".join(m.get("content") or "" for m in _handoffs(result)
+                               if "[Entity working set]" in (m.get("content") or ""))
+            self.assertTrue(joined, "expected the entity working set in the compaction handoff")
             self.assertIn("Acme Fake Co", joined,
                           f"digest body {digest['body']!r} should have joined the working set verbatim")
         finally:
@@ -262,7 +271,7 @@ class TestWorkingSetRehydration(unittest.TestCase):
                 actor="user", session_id=sid)
             body = _body(10)
             result = eng.compress(body, focus={"topics": ["topicalpha"], "task": "topicbeta"})
-            blob = "\n".join(m.get("content") or "" for m in result if m.get("role") == "system")
+            blob = "\n".join(m.get("content") or "" for m in _handoffs(result))
             self.assertIn("MARKER-ALPHA-771", blob, "topics facet did not pull its own memory")
             self.assertIn("MARKER-BETA-992", blob, "task facet did not pull its own memory")
         finally:

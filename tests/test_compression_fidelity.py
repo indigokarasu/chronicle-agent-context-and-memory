@@ -145,13 +145,21 @@ def _patched_home(tag: str):
     return mock.patch("context.Path.home", return_value=tmp_home)
 
 
-def _recover_excerpt(events) -> str:
+def _recover_excerpt(events, starts_with=None) -> str:
     """Reconstruct a durably-stored excerpt from one or more sibling
     context_eviction events. R11 chunks spans over the excerpt cap into
     sibling events ordered by chunk_index; "".join of the chunks in that
     order reproduces the original span byte for byte (same contract as
-    engine.capture._split_excerpt / tests/exercise/accept_r11.py)."""
+    engine.capture._split_excerpt / tests/exercise/accept_r11.py).
+
+    `starts_with` picks one span's siblings (by span_id) when the session
+    archived others too -- 5.8.0 archives a protected span shortened for
+    budget before shortening it."""
     payloads = [json.loads(e["payload"]) for e in events]
+    if starts_with is not None:
+        ids = {p.get("span_id") for p in payloads
+               if p.get("chunk_index", 0) == 0 and p["excerpt"].startswith(starts_with)}
+        payloads = [p for p in payloads if p.get("span_id") in ids]
     payloads.sort(key=lambda p: p.get("chunk_index", 0))
     return "".join(p["excerpt"] for p in payloads)
 
@@ -188,7 +196,7 @@ def test_i17_small_span_byte_exact():
         "setup invariant: plain low-score filler must be evicted from the window"
     evs = _durability_events(eng, sid)
     assert evs, "expected at least one context_eviction durability event for the evicted span"
-    recovered = _recover_excerpt(evs)
+    recovered = _recover_excerpt(evs, starts_with="UNIQUE-SMALL-")
     check("i17_small_span_byte_exact", recovered == target, expect_baseline_fail=False,
           detail=f"recovered {len(recovered)} chars via {len(evs)} event(s), expected {len(target)}")
 
@@ -207,7 +215,7 @@ def test_i17_large_span_byte_exact():
     assert target not in [m.get("content") for m in result]
     evs = _durability_events(eng, sid)
     assert evs, "expected at least one context_eviction durability event for the evicted span"
-    recovered = _recover_excerpt(evs)
+    recovered = _recover_excerpt(evs, starts_with="UNIQUE-LARGE-")
     check("i17_large_span_byte_exact", recovered == target, expect_baseline_fail=False,
           detail=f"recovered {len(recovered)}/{len(target)} chars via {len(evs)} chunk event(s) (R11)")
 
@@ -293,10 +301,15 @@ def test_focus_reinjection_present():
                             actor="user", session_id=sid)
     body = _body(10)
     result = eng.compress(body, focus_topic=topic)
-    injected = [m for m in result if m.get("role") == "system" and marker in (m.get("content") or "")]
+    # 5.8.0: recalled memory rides in the one compaction handoff, in a
+    # conversation role -- a mid-list system message becomes the Anthropic
+    # system parameter and can displace the agent's own system prompt.
+    injected = [m for m in result if m.get("role") != "system"
+                and (m.get("content") or "").startswith("[CONTEXT COMPACTION")
+                and marker in (m.get("content") or "")]
     check("focus_reinjection_present", len(injected) >= 1, expect_baseline_fail=False,
           detail=f"expected a retrieved memory containing {marker!r} re-injected for "
-                 f"focus_topic={topic!r}, found {len(injected)} matching system spans")
+                 f"focus_topic={topic!r}, found {len(injected)} matching handoffs")
 
 
 # -- output fits budget ------------------------------------------------------------
@@ -357,7 +370,9 @@ def test_replay_from_audit_log_has_span_ids():
             + [{"role": "user", "content": "AUDIT-TARGET " + _filler(999)}]
             + [{"role": "assistant", "content": f"TAIL{i} " + big} for i in range(6)])
     result = eng.compress(body)
-    assert "AUDIT-TARGET" not in " ".join(m.get("content") or "" for m in result), \
+    # The handoff quotes a folded request by design (5.8.0); the span itself is gone.
+    assert "AUDIT-TARGET" not in " ".join(m.get("content") or "" for m in result
+                                          if not (m.get("content") or "").startswith("[CONTEXT COMPACTION")), \
         "setup invariant: the scored middle span must be evicted once head/tail exhaust the budget"
     events = eng.core.store.get_events_by_type("compressed")
     assert events, "compress() should emit a 'compressed' audit event"
