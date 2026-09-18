@@ -22,6 +22,7 @@ from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
 from . import sweeps
 from . import speaker as spk
+from . import substance as sub
 from .criticality import classify as classify_criticality
 from .embeddings import EmbeddingsUnavailable, cosine, embedder_model_tag, pack, unpack
 from .serialize import belief_id as compute_belief_id
@@ -588,6 +589,16 @@ class Reducer:
             if not ents.plausible_name(key.get("name") or body):
                 return
         if kind == "fact":
+            # A fact that asserts an EVENT has to say what happened, not that
+            # something did (engine/substance.py). Here as well as at the write
+            # boundary, and for the same reason as the entity rule above: an
+            # importer wrote 159 email subject lines into a production store as
+            # things the user had done, and a rebuild must not bring them back.
+            _pred = key.get("predicate_canonical") or key.get("attribute") or ""
+            if not sub.states_what_happened(body, _pred):
+                logger.info("chronicle: not a memory (%s) — %s",
+                            _pred or "fact", sub.refusal(body, _pred))
+                return
             self._name_entity_from_fact(key, body)
         existing = self._find_existing(kind, key, owner, domain)
 
