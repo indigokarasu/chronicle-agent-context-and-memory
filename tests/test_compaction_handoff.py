@@ -213,6 +213,24 @@ class TestToolUnits(_Engine):
         out = self.eng.compress(msgs)
         self.assertIn(msgs[3], out)
 
+    def test_the_newest_request_is_kept_even_behind_a_long_tool_loop(self):
+        self.eng.update_model("fake-model", 4000)
+        ask = "Now reconcile every Zorblax ledger for Pat Testley and report the drift."
+        msgs = self._session(14)
+        msgs[-1] = _msg("user", ask)                     # the request...
+        for i in range(30):                              # ...then a long tool loop
+            cid = "loop%02d" % i
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": cid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": cid,
+                         "content": "ledger %d: " % i + "balanced row " * 30})
+        out = self.eng.compress(msgs)
+        self.assertIn(ask, [m.get("content") for m in out if m.get("role") == "user"])
+        i_hand = next(i for i, m in enumerate(out) if (m.get("content") or "").startswith(PREFIX))
+        i_ask = next(i for i, m in enumerate(out) if m.get("content") == ask)
+        self.assertLess(i_hand, i_ask, "the request comes after the handoff that points at it")
+        self.assertEqual(_orphans(out), (set(), set()))
+
     def test_tool_call_arguments_are_counted(self):
         m = {"role": "assistant", "content": "",
              "tool_calls": [{"id": "c", "function": {"name": "write_file",
