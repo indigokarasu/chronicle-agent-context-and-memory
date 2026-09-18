@@ -785,6 +785,29 @@ def _people_kind(record) -> tuple:
     return ents.PERSON, "contact (unreviewed)"
 
 
+def _merge_map(conn) -> Dict[str, str]:
+    """`{merged-away id: the id it is now}`, chains followed to the end.
+
+    An adjudicated `merged` event sets `entities.merged_into` (I20: identity is
+    adjudicated, never inferred). Nothing in this read model used to look at it,
+    so a store where one person had been merged still listed them twice — a
+    production store held its principal as both `user` and the people store's
+    uuid for them, 366 facts on one and 273 on the other. A cycle cannot loop
+    here: the
+    walk stops at an id it has already seen."""
+    raw = {r["belief_id"]: r["merged_into"] for r in conn.execute(
+        "SELECT belief_id, merged_into FROM entities "
+        "WHERE merged_into IS NOT NULL AND merged_into <> ''")}
+    out: Dict[str, str] = {}
+    for src in raw:
+        seen, cur = {src}, raw[src]
+        while cur in raw and cur not in seen:
+            seen.add(cur)
+            cur = raw[cur]
+        out[src] = cur
+    return out
+
+
 def entity_index(db_path, limit: int = _ENTITY_INDEX_MAX, people: Dict[str, dict] = None) -> dict:
     """Every entity memory holds, with its kind, its size and its span.
 
@@ -798,6 +821,10 @@ def entity_index(db_path, limit: int = _ENTITY_INDEX_MAX, people: Dict[str, dict
             "       json_extract(provenance, '$.source_type') AS src "
             "FROM facts WHERE status IN ('active','draft')").fetchall()
         rows = conn.execute("SELECT belief_id, name, type, domain FROM entities").fetchall()
+        merged = _merge_map(conn)
+        # A merged-away row is not a second person: its facts count towards the
+        # one it was merged into, and it does not get a line of its own.
+        rows = [r for r in rows if r["belief_id"] not in merged]
 
         preds: Dict[str, set] = {}
         counts: Dict[str, int] = {}
@@ -807,6 +834,7 @@ def entity_index(db_path, limit: int = _ENTITY_INDEX_MAX, people: Dict[str, dict
         derived: Dict[str, dict] = {}
         for f in facts:
             eid = f["entity_id"] or ""
+            eid = merged.get(eid, eid)   # a merged person's facts are that person's
             if eid:
                 preds.setdefault(eid, set()).add(f["predicate_canonical"] or "")
                 counts[eid] = counts.get(eid, 0) + 1
@@ -908,6 +936,11 @@ def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> di
     events it appears in, and where every part of that came from."""
     conn = _connect(db_path)
     try:
+        # Asking for a merged-away id answers with the person they are now, and
+        # the answer carries the facts of every id merged into them.
+        merged = _merge_map(conn)
+        entity_id = merged.get(entity_id, entity_id)
+        ids = [entity_id] + sorted(k for k, v in merged.items() if v == entity_id)
         row = conn.execute("SELECT belief_id, name, type, domain, owner, created_at, last_seen_at "
                            "FROM entities WHERE belief_id=?", (entity_id,)).fetchone()
         facts = [dict(r) for r in conn.execute(
@@ -915,8 +948,9 @@ def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> di
             "       confidence, criticality, occurrence_count, created_at, "
             "       json_extract(provenance, '$.source_type') AS src, "
             "       json_extract(provenance, '$.source_event') AS src_event "
-            "FROM facts WHERE entity_id=? ORDER BY status!='active', predicate_canonical, created_at",
-            (entity_id,))]
+            "FROM facts WHERE entity_id IN (%s) "
+            "ORDER BY status!='active', predicate_canonical, created_at"
+            % ",".join("?" * len(ids)), ids)]
         name = (row["name"] if row else "") or entity_id
         if entity_id == "user":
             name = "You"
@@ -937,7 +971,10 @@ def entity_detail(db_path, entity_id: str, people: Dict[str, dict] = None) -> di
                        and f["status"] in ("active", "draft")],
             "mentions": mentions(conn, name),
         }
-        record = (people or {}).get(entity_id)
+        # The people store's record may hang off a merged-away id — `user` is
+        # Chronicle's own name for the principal and is in no other store, so
+        # without this the profile disappears the moment the two are merged.
+        record = next((r for r in ((people or {}).get(i) for i in ids) if r), None)
         if record:
             kind, subtype = _people_kind(record)
             out["kind"], out["subtype"] = kind, subtype
