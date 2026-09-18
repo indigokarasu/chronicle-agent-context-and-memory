@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.17.
+Version: 5.8.18.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -130,7 +130,8 @@ When the context engine is selected, Hermes hands it compaction: it calls the en
   (even behind a long tool loop), pinned spans and the user's own
   "never/always/must" instructions, then the best-scoring older turns that fit.
   A tool call and its results are kept or folded together, never split. When
-  even the protected spans do not fit, the newest turn wins, a turn's stale
+  even the protected spans do not fit, the newest turn wins, then the user's
+  newest request, then the rest of the tail newest first; a turn's stale
   recall block (Hermes' `api_content` sidecar) goes before the user's words,
   and a span shortened to fit says how to restore it.
 - **What it leaves in their place.** One message where the folded turns were,
