@@ -142,7 +142,7 @@ DECLARED_DORMANT: dict[str, str] = {
 
     # -- epistemic / forgetting ---------------------------------------------
     "epistemic.redundant_window":
-        "no redundancy window is computed; E5 dedupe uses curation.dup_similarity",
+        "no redundancy window is computed; E5 merges only exact duplicates",
     "epistemic.forgot_window":
         "no forgot-window tracking exists",
     "forgetting.confirm_critical":
@@ -965,20 +965,21 @@ DEFAULTS: dict[str, Any] = {
                  # without this line it is a knob nothing can enumerate. Must
                  # equal reducer.NOVELTY_TOP_K; pinned by a test.
                  "novelty_top_k": 25,
-                 # E5 near-duplicate merge floor: at or above this cosine, with
-                 # the same subject, a write MERGES into the existing item
-                 # instead of storing a second copy.
-                 "dup_similarity": 0.95,
+                 # `dup_similarity` (the E5 merge's 0.95 cosine floor) was deleted,
+                 # not declared dormant: the merge is now an exact-content match
+                 # (reducer._exact_duplicate) that reads no threshold. Cosine
+                 # cannot tell an update from a paraphrase -- "9am" -> "10am"
+                 # scored 0.9945 on production nomic, above a true paraphrase --
+                 # so a floor on it promised a safety it could not deliver.
                  # Ladder 9 E4 (§issue-8): cosine floor for "this write looks like
                  # an update of that belief" (nearest same-subject neighbor, or the
                  # global-store neighbor when no same-subject candidate exists).
                  # High on purpose -- a false positive links two unrelated facts
                  # into a misleading "history"; missing a real update only means a
                  # reader sees two separate facts instead of a dated chain, which
-                 # is exactly today's behavior. Strictly BELOW dup_similarity:
-                 # the two form a ladder over the same cosine (0.82 supersede
-                 # candidate, 0.95 merge), so a near-identical re-assertion is
-                 # absorbed by E5 before E4 ever calls it a supersession.
+                 # is exactly today's behavior. An exact re-assertion is absorbed
+                 # by the E5 merge before E4 ever sees it; anything less than
+                 # identical, however close, stays a row this floor can link.
                  "supersede_similarity": 0.82,
                  # §E6: neighbor-cosine floor between consecutive observed-event
                  # embeddings within one session. Absolute, not a rolling

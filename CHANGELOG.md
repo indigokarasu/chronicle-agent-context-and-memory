@@ -3,6 +3,131 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.2
+
+**Memory about the user comes only from the user.** Chronicle was built to keep
+the agent's memory and memory about the user distinct, and capture never did.
+Extraction read every line not labelled `Assistant:` as the user's. On a
+production snapshot that turned cron prompts, tool output, compression rescue,
+context eviction, Hermes' control frames and Chronicle's own recalled context
+into memory about the user:
+
+* 98% of captured turns (40,841 of 41,492) came from cron sessions, whose `user`
+  row is the job's prompt;
+* 30,018 active notes, nearly all always-injected "directives", plus 14,664
+  drafts; about 330 came from the user's own sessions, and those were almost all
+  assistant or tool text too;
+* facts such as the user's name being the agent's own name ("Indigo", from its
+  identity file) and the user's email being a broker's support address (from a
+  cron report).
+
+What changed:
+
+* **Capture records who said what.** `engine/speaker.py` decides the user side
+  of a turn from the host: `agent_context` other than `primary`, platform `cron`
+  (and batch, flush, subagent), a `cron_` session, or a bot turn author
+  (`sync_turn` now accepts Hermes' `turn_author`) mean automation, not a person.
+  Each message's role is kept: `tool` rows were not a role before, so tool output
+  inherited whoever spoke last. Inside a person's message, Hermes' control frames
+  (compaction handoffs, `[System note: ...]`, background-process results, the
+  gateway origin header, the steer wrapper's markers) and the `<memory-context>`
+  block of recalled memory are host text, wherever they start. The result is
+  stored on the event as `speakers` spans over the excerpt plus `attribution`,
+  so no later reader re-guesses from line prefixes, which tool output can forge.
+  A turn from automation is labelled `Automation:` in its excerpt rather than
+  `User:`. Rescue (both plugins) and context eviction record the role too.
+* **Extraction reads only the person's words.** Facts about the user, emails,
+  preferences, standing instructions and "X is a Y" entity typing come only from
+  human spans. The reducer does not queue extraction for an event with none, and
+  the curation worker skips (and records) jobs queued before the upgrade. Rescue
+  writes a draft note only from the user's own words. The LLM extractor keeps a
+  user fact or directive only if it appears in them. The piggyback enrichment
+  skips turns with no person in them. Skill journals are recorded as automation.
+* **Events written before this release are read conservatively.** Transcript
+  labels are honoured, a `cron_` session's `user` rows are automation, an
+  unlabelled continuation chunk and role-less rescue text are nobody's, and an
+  event's `actor` is trusted only when it has no source type.
+  A plain turn with no host context keeps its old payload and event id.
+* **Measured.** LongMemEval oracle turn-level union recall 70.6% / 88.3% /
+  93.0% / 96.3% at k=1/3/5/10, from 68.2 / 87.6 / 93.6 / 96.0; abstention
+  unchanged at 3/17. `ctx_eval` answers 46/58 at a 1500-token budget, one fewer
+  than before, and 50/58 and 52/58 at 4000 and 12000, unchanged. The corpus
+  labels its turns `user`, so on it the new rules mostly change the "X is a Y"
+  typing; the production effect is the 112,652 beliefs below.
+* **`scripts/retract_misattributed.py`** retracts beliefs whose every channel is
+  transcript extraction and whose supporting events never show the user saying
+  them (a fact's value or note's body must appear in the user's words; an episode
+  needs a turn with any). Dry run with a JSONL report by default; `--apply`
+  appends `retracted` events through the reducer, so the log keeps the original
+  assertions. A `retracted` event may now carry a batch of ids (`belief_ids`,
+  grouped by owner, `--batch`, default 250): a cleanup is one decision, and
+  112,652 separate events would put that many transactions, reduces and
+  git-mirror rows through a live agent's write path. A replay of either shape
+  reaches the same projection. On the production snapshot it selects 112,652 beliefs:
+  67,614 active episodes, 30,008 active and 14,664 draft notes, and 366 facts
+  (36 about the user, 330 `is_a` entity types). It keeps the 50
+  transcript-derived beliefs that are in the user's words, and everything with any other channel (calendar, email and
+  people imports, tool calls, explicit memory writes). Raw captured turns are
+  untouched and remain searchable.
+
+## 5.7.1
+
+Three fixes from an audit of other agent-memory systems (Hindsight, Graphiti,
+Mem0, agentmemory, Honcho, OpenViking and others), each checked against the
+production store before it was changed, and a dashboard navigator for memory.
+
+* **Duplicate merge is exact, and no longer eats updates.** The E5 merge folded
+  a new belief into an existing same-subject one at cosine >= 0.95, discarding
+  the new body. On the production nomic model that threshold merges real
+  updates: "Standup is at 9am" -> "10am" scores 0.9945, "allergic to peanuts" ->
+  "not allergic" 0.9795, "offsite in Denver" -> "Boston" 0.9547, while a pure
+  paraphrase scores 0.9948, so no threshold can separate them. The check also
+  ran only when an inline embed succeeded: with the embedder timing out or down,
+  every repeat became a new active row (one production scope holds 25,054
+  active directive notes with 2,696 distinct bodies), and a projection rebuild
+  under a different model merged differently, breaking I3. A merge now requires
+  a byte-identical body in the same owner, domain and natural key (for a fact:
+  entity, predicate and qualifiers, so "work phone" and "home phone" with the
+  same number stay two facts), is decided before anything is embedded, and never
+  reads a vector. `curation.dup_similarity`
+  is deleted. Legacy duplicates stay until a projection rebuild folds them.
+* **Keyword search keeps non-English words.** Every keyword path tokenized with
+  an ASCII-only class while FTS5 indexes Unicode letters, so a query for
+  "Zürich" searched for "rich", "José" became "Jos", and a Cyrillic or CJK
+  question produced no terms at all. Because the focus support gate treats "no
+  distinctive tokens" as nothing to fail on, such questions could never abstain.
+  One word-token definition (`store.word_tokens`, NFC-normalized so a decomposed
+  "Zürich" is one word, as FTS5 indexes it) now serves the FTS query, routing,
+  overlap and hint tokens. On LongMemEval (hashing embedder) context
+  recall is unchanged; turn recall@1 moves by 0.6 points in each tier (belief
+  down, raw up) and union@3 rises 0.3. Porter stemming was measured and
+  rejected: it lost 1-2 questions of context recall.
+* **The dashboard tab has a UI again, and an Atlas.** `dashboard/manifest.json`
+  named `dist/index.js` as its entry, but `dist/` was gitignored and the bundle
+  was deployed by hand, so a deploy from the repo left the tab with nothing to
+  load. The hand-deployed bundle also still POSTed `/process-embeddings`, which
+  A13 renamed. The UI is now built from `dashboard/web/src` into a committed
+  `dashboard/dist`; CI rebuilds it from source and fails on any difference, a
+  test requires every route the UI calls to be declared by `plugin_api.py` and
+  present in the built bundle, and the release zip now ships `atlas_api.py` and
+  `dist/` (it carried only `manifest.json` and `plugin_api.py`). The new **Atlas** view
+  draws every event as a point on its writer's row (cron job, session or
+  background actor) over time, with inspectors that follow an event, run or
+  belief to its sources, replacements, contradictions and identical copies,
+  plus lenses for open contradictions, replaced facts and duplicate notes. It
+  reads through `mode=ro` connections, streams the log as delta-encoded columns
+  (419,490 production events load in about 10 s) and renders with deck.gl,
+  loaded only when the tab opens. Verified against a production snapshot in a
+  local harness (`dashboard/web/harness/`).
+* **`prune_vectors.py --orphans`** removes observed vectors, and their excerpt
+  proxies, with no observed event behind them. No Chronicle code deletes events,
+  but the production log starts at seq 79,993, and 18,394 vectors of events that
+  are gone remain (their FTS rows do not). Another 7,612, written by an older
+  build, are keyed to `asserted` and `signal` events, which have no excerpt.
+  Neither kind can be rendered or re-embedded (they were exactly the 26,006 rows
+  the 5.7.0 vector migration could not repair), and every brute-force scan still
+  pays for them.
+
 ## 5.7.0
 
 The ladder-10 integration: eighteen independent work trees merged into one
