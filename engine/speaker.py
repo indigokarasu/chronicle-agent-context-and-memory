@@ -140,6 +140,11 @@ _INLINE_FRAMES = re.compile(
     r"|local-command-stderr|local-command-stdout|task-notification|ide_opened_file"
     r"|ide_selection)>.*?(?:</\1>|\Z)"
     r"|\[/?OUT-OF-BAND USER MESSAGE[^\]\n]*\]"
+    # gateway/run_inbound: a reply quotes the message replied to -- usually the
+    # agent's own -- ahead of what the user wrote, and the quote may run for
+    # many lines: to the '"]' that ends it before the blank line.
+    r'|^\[Replying to(?: your previous message)?: ".*?"\](?=\n\n|\n?\Z)'
+    r"|^\[Triggering message id: [^\]\n]*\]"
     # agent/turn_liveness: the stall watchdog's abort is written into the
     # transcript as a plain user row.
     r"|^Turn made no progress for \d+s; aborting to release the session\.[ \t]*(?=\n|\Z)"

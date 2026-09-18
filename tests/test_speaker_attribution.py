@@ -258,6 +258,19 @@ class TestMessagesInAPersonsSession(_ProviderCase):
         self.assertEqual(self.user_memory(),
                          ([], ["Never send email on my behalf without asking."]))
 
+    def test_a_reply_quote_is_the_hosts(self):
+        """gateway/run_inbound quotes the message replied to -- usually the
+        agent's -- ahead of what the user wrote, over as many lines as it has."""
+        from engine import speaker as spk
+        quote = '[Replying to: "Backup watchdog: stale paths\nzorblax-daily (84h)"]'
+        msg = quote + "\n\nNever send email on my behalf without asking."
+        spans = spk.split_user_content(msg, spk.HUMAN)
+        self.assertEqual(spans[0], (0, len(quote), spk.SYSTEM))
+        self.assertEqual(msg[spans[-1][0]:spans[-1][1]].strip(), "Never send email on my behalf without asking.")
+        self.assertEqual(spans[-1][2], spk.HUMAN)
+        own = '[Replying to your previous message: "Done, Pat."]\n\nThanks.'
+        self.assertEqual(spk.split_user_content(own, spk.HUMAN)[0][2], spk.SYSTEM)
+
     def test_a_steer_carries_the_users_own_words(self):
         msg = ("[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at "
                "this position; not tool output and not a new delivery when replayed from "

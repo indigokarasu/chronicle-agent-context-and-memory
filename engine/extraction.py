@@ -113,6 +113,48 @@ _NORM_REFUSE = re.compile(
     r"struck|drawn|meant|supposed|able|going\s+to)\b")
 
 
+# An episode is something the user says happened -- not a request to the agent
+# or a question. Sampled on the user's real messages, every episode the old
+# rule (any message over 60 characters) made was one of those: "Just work
+# through all of them one by one", "Come up with a way to ...", "Would any of
+# this help SIFT? <url>". A sentence is dropped when it asks (ends with "?"),
+# speaks to the agent ("you", "please"), or opens -- after a filler word or
+# two -- with a verb in the imperative.
+_ADDRESSES_AGENT = re.compile(r"\b(?:you|your|yours|you're|you've|you'll|please|pls)\b", re.IGNORECASE)
+_LEAD_FILLER = re.compile(r"^(?:(?:just|now|also|ok|okay|so|then|and|but|first|next|pls|please|go ahead and)[\s,]+)+",
+                          re.IGNORECASE)
+_IMPERATIVE_VERBS = frozenset("""add archive build cancel change check clean clear come compare configure
+connect continue convert copy create delete deploy disable do don't dont download draft email enable ensure
+explain export fetch figure find finish fix forward generate get give go grab help ignore import install
+integrate keep kill let's lets list look make merge move mute open pause post prioritize pull push put read
+reboot reject remind remove rename replace reply rerun reset restart restore resume retry revert review run
+save schedule search see send set share show spread start stop summarize summarise sync take tell test text
+try turn unblock uninstall update upgrade upload use verify wait walk work write""".split())
+# A question need not end in "?": "Can the scheduler be spread out so it never
+# uses 30% at once".
+_QUESTION_OPENER = re.compile(
+    r"^(?:can|could|would|will|should|shall|is|are|was|were|do|does|did|have|has|what|why|how|when|where"
+    r"|who|whom|which|whose)\b", re.IGNORECASE)
+
+
+def _narrative(texts) -> str:
+    """The sentences of `texts` that say something happened (see above)."""
+    keep = []
+    for text in texts:
+        for sentence in split_sentences(_URL.sub(" ", text or "")):
+            s = sentence.strip()
+            if not s or s.endswith("?") or _ADDRESSES_AGENT.search(s):
+                continue
+            lead = _LEAD_FILLER.sub("", s)
+            first = lead.split(maxsplit=1)
+            if first and first[0].lower().strip(",.:;!") in _IMPERATIVE_VERBS:
+                continue
+            if _QUESTION_OPENER.match(lead):
+                continue
+            keep.append(s)
+    return " ".join(keep).strip()
+
+
 def is_standing_instruction(text: str) -> bool:
     """True only for imperative / standing-instruction shape (§16.2).
 
@@ -354,11 +396,13 @@ class HeuristicExtractor(Extractor):
                                        "session_transcript", entity_name=subject))
 
         # An episodic summary of the turn with tiered abstraction levels -- of
-        # what the USER said in it. It was built from the whole turn, so the
+        # what the USER said happened (see _narrative): a request to the agent
+        # or a question is not an episode about the user, and every long one
+        # used to become one. It was built from the whole turn, so the
         # assistant's reply ("Great, I will remember that ...", its code, its
         # plan) became part of an episode about the user; on the production
         # store 24 of the 32 active transcript episodes carried it.
-        said = "\n".join(t for t, who in lines if who == spk.HUMAN).strip()
+        said = _narrative(t for t, who in lines if who == spk.HUMAN)
         if len(said) > 60:
             abstract_level = said[:60] + "..."
             gist_level = said[:200] + "..." if len(said) > 200 else said
