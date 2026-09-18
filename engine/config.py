@@ -1262,6 +1262,18 @@ DEFAULTS: dict[str, Any] = {
         # everything compression has folded out this session; oldest lines
         # drop first once a refresh would push it over this.
         "checkpoint_digest_max_tokens": 300,
+        # Proactive tool-output trim — the host's prune_tool_results_only hook.
+        # Hermes calls it on a LOWER trigger than full compaction; its built-in
+        # compressor implements it and a plugin engine inherits a no-op, so
+        # without this, switching to Chronicle silently stopped trimming old
+        # tool output. Deterministic, no model, no embedder. `at_percent` of the
+        # window starts it; `min_reclaim_tokens` is what a trim must save to be
+        # worth breaking the provider's prompt cache; old results over
+        # `min_chars` keep their first `keep_head_chars` and last
+        # `keep_tail_chars`.
+        "prune_tool_results": {"enabled": True, "at_percent": 0.5, "min_chars": 2000,
+                               "keep_head_chars": 500, "keep_tail_chars": 300,
+                               "min_reclaim_tokens": 1500},
     },
 }
 

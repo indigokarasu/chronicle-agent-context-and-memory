@@ -509,5 +509,43 @@ class TestRenderMessages(unittest.TestCase):
         self.assertEqual(spk.merge_spans(rebuilt), spans)
 
 
+class TestTheTextOfAMessage(unittest.TestCase):
+    """message_text: one rule, shared by capture and the context engine, for
+    the text of a message whatever shape the host sent."""
+
+    def test_a_string_is_returned_unchanged(self):
+        for c in ("", "hello", "line one\nline two", "  spaced  "):
+            with self.subTest(c=c):
+                self.assertEqual(spk.message_text(c), c)
+
+    def test_nothing_is_empty(self):
+        self.assertEqual(spk.message_text(None), "")
+
+    def test_a_photo_is_its_caption_and_a_marker_never_its_bytes(self):
+        parts = [{"type": "text", "text": "Look at this."},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]
+        self.assertEqual(spk.message_text(parts), "Look at this.\n[image]")
+
+    def test_other_attachments_get_their_own_marker(self):
+        self.assertEqual(spk.message_text([{"type": "input_audio", "input_audio": {}}]), "[audio]")
+        self.assertEqual(spk.message_text([{"type": "file", "file": {}}]), "[file]")
+        self.assertEqual(spk.message_text([{"type": "something_new"}]), "[attachment]")
+
+    def test_capture_is_byte_identical_for_a_string_and_for_none(self):
+        """Existing event ids depend on the excerpt: only list-shaped content
+        renders differently from before."""
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": None}]
+        excerpt, _ = spk.render_messages(msgs, spk.HUMAN)
+        self.assertEqual(excerpt, "user: hi\nassistant: None")
+
+    def test_capture_renders_a_photo_as_text(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "Look at this."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]}]
+        excerpt, _ = spk.render_messages(msgs, spk.HUMAN)
+        self.assertEqual(excerpt, "user: Look at this.\n[image]")
+        self.assertNotIn("QUJD", excerpt)
+
+
 if __name__ == "__main__":
     unittest.main()

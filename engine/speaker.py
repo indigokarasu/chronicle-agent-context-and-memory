@@ -171,6 +171,41 @@ def merge_spans(spans) -> list:
     return out
 
 
+_PART_MARKERS = {"image_url": "[image]", "image": "[image]", "input_image": "[image]",
+                 "input_audio": "[audio]", "audio": "[audio]", "file": "[file]",
+                 "input_file": "[file]"}
+
+
+def message_text(content) -> str:
+    """The TEXT of a message's content, whatever shape the host sent.
+
+    A string comes back unchanged. A list of parts — how a vision-capable host
+    sends a photo with its caption — becomes its text parts, with a marker such
+    as `[image]` for each non-text part, and never the part itself. The capture
+    path used to render such a message as the Python repr of the list, which
+    wrote the full base64 of every photo into the event log (megabytes per
+    picture, full-text indexed and queued for embedding), and the context
+    engine called `.strip()`/`.lower()` on it and crashed compaction outright."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict):
+                if isinstance(part.get("text"), str):
+                    out.append(part["text"])
+                else:
+                    out.append(_PART_MARKERS.get(str(part.get("type") or ""), "[attachment]"))
+        return "\n".join(x for x in out if x)
+    return str(content)
+
+
 def render_messages(messages, side: str) -> tuple:
     """`(excerpt, spans)` for a message list.
 
@@ -186,7 +221,10 @@ def render_messages(messages, side: str) -> tuple:
             spans.append((pos, pos + 1, spans[-1][2] if spans else SYSTEM))
             pos += 1
         role = m.get("role", "?")
-        content = f"{m.get('content', '')}"
+        raw = m.get('content', '')
+        # Byte-identical for a string or None (existing event ids depend on
+        # it); a parts list is rendered as text, never as its repr.
+        content = message_text(raw) if isinstance(raw, (list, dict)) else f"{raw}"
         label = f"{role_label(role, side)}: "
         who = role_speaker(role, side)
         if who in (HUMAN, AUTOMATION):

@@ -406,5 +406,246 @@ class TestASessionStartDoesNotWorkTheQueue(unittest.TestCase):
         self.assertTrue(self.core.store.query_beliefs("facts", "status='active'"))
 
 
+class TestBothHalvesLiveNothingIsRescued(unittest.TestCase):
+    """The configuration production runs: the memory provider AND the context
+    engine on one core. Before a compaction the host calls the provider's
+    on_pre_compress, then the engine's compress. Each used to rescue — the
+    provider because the engine never went live (every agent's copy failed),
+    the engine on its own account — and between them drafted 19,089 notes on
+    the production store, none kept. Each now defers to the other, because
+    sync_turn already captured every turn."""
+
+    def setUp(self):
+        from provider import ChronicleMemoryProvider
+        self.home = temp_home(prefix="ce_both_")
+        self.prov = ChronicleMemoryProvider()
+        self.prov.initialize("both-s1", hermes_home=self.home, principal_id="pat", config=CFG)
+        self.eng = ChronicleContextEngine()
+        self.eng.on_session_start("both-s1", hermes_home=self.home, principal_id="pat", config=CFG)
+        self.eng.update_model("test-model", context_length=1500)
+        self.assertIs(self.prov.core, self.eng.core, "one process, one core")
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _rescued(self):
+        c = self.eng.core.store._conn()
+        return c.execute("SELECT COUNT(*) FROM events WHERE "
+                         "json_extract(payload,'$.source_type')='rescue_extraction'").fetchone()[0]
+
+    def test_the_host_sequence_rescues_nothing(self):
+        msgs = TestNothingCompressWritesWaitsOnTheEmbedder._important(40)
+        self.prov.on_pre_compress(msgs)          # what the host calls first
+        self.eng.compress(msgs)                  # then this
+        self.assertEqual(self._rescued(), 0)
+
+    def test_each_flag_is_set_by_its_own_half(self):
+        self.assertTrue(self.eng.core.has_memory_provider)
+        self.assertTrue(self.eng.core.has_context_engine)
+
+    def test_the_provider_alone_still_rescues(self):
+        """Provider without the engine (the host's built-in compressor): its
+        pre-compress rescue is the handoff summary that compressor uses."""
+        self.eng.core.has_context_engine = False
+        self.prov.on_pre_compress(TestNothingCompressWritesWaitsOnTheEmbedder._important(10))
+        self.assertGreater(self._rescued(), 0)
+
+
+class TestOldToolOutputIsTrimmedWithoutAModel(unittest.TestCase):
+    """prune_tool_results_only: the host's cheap, earlier trim. Its built-in
+    compressor has it; a plugin engine inherits a no-op, so switching the
+    context engine to Chronicle quietly stopped trimming old tool output."""
+
+    BIG = "HEAD-STATUS ok\n" + ("x" * 6000) + "\nTAIL-RESULT 42"
+
+    def setUp(self):
+        self.eng = ChronicleContextEngine()          # no core needed: pure transform
+        self.eng.update_model("test-model", context_length=10000)
+
+    def _conv(self, tool_bodies):
+        msgs = [{"role": "system", "content": "You are helping Pat Testley."},
+                {"role": "user", "content": "Start."}, {"role": "assistant", "content": "ok"}]
+        for i, body in enumerate(tool_bodies):
+            msgs += [{"role": "assistant", "content": "", "tool_calls": [{"id": "c%d" % i}]},
+                     {"role": "tool", "tool_call_id": "c%d" % i, "content": body}]
+        msgs += [{"role": "user", "content": "And now?"}, {"role": "assistant", "content": "Next."}] * 3
+        return msgs
+
+    def test_below_the_trigger_nothing_happens(self):
+        msgs = self._conv([self.BIG] * 4)
+        out, n = self.eng.prune_tool_results_only(msgs, current_tokens=100)
+        self.assertIs(out, msgs)
+        self.assertEqual(n, 0)
+
+    def test_a_large_old_result_keeps_its_ends_and_says_what_went(self):
+        msgs = self._conv([self.BIG, "small", "small", self.BIG + " v2"])
+        out, n = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertIsNot(out, msgs, "a committed trim must be a new list (host contract)")
+        trimmed = [m["content"] for m in out if m.get("role") == "tool" and "trimmed" in m["content"]]
+        self.assertTrue(trimmed)
+        self.assertIn("HEAD-STATUS ok", trimmed[0])
+        self.assertIn("TAIL-RESULT 42", trimmed[0])
+        self.assertRegex(trimmed[0], r"\d+ characters of this old tool result trimmed")
+
+    def test_an_exact_duplicate_points_at_the_newest_copy(self):
+        """Pass 1 is lossless: every older copy becomes a pointer and the newest
+        is kept — then, like any large old result, trimmed to its ends by pass 2
+        (the host's built-in does the same). Nothing it pointed at is gone."""
+        msgs = self._conv([self.BIG, self.BIG, self.BIG])
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        tools = [m["content"] for m in out if m.get("role") == "tool"]
+        self.assertEqual(tools.count(ChronicleContextEngine._IDENTICAL), 2)
+        self.assertEqual(tools[:2], [ChronicleContextEngine._IDENTICAL] * 2, "older copies point on")
+        self.assertIn("HEAD-STATUS ok", tools[2])
+        self.assertIn("TAIL-RESULT 42", tools[2])
+
+    def test_only_tool_rows_are_touched_and_the_input_is_not_mutated(self):
+        msgs = self._conv([self.BIG] * 3)
+        snapshot = [dict(m) for m in msgs]
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertEqual(msgs, snapshot, "the host's list must not be edited in place")
+        for a, b in zip(msgs, out):
+            if a.get("role") != "tool":
+                self.assertEqual(a, b)
+            else:
+                self.assertEqual(a.get("tool_call_id"), b.get("tool_call_id"))
+
+    def test_the_protected_tail_is_never_trimmed(self):
+        msgs = self._conv([])
+        msgs += [{"role": "assistant", "content": "", "tool_calls": [{"id": "last"}]},
+                 {"role": "tool", "tool_call_id": "last", "content": self.BIG}]
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertEqual(out[-1]["content"], self.BIG)
+
+    def test_a_directive_in_tool_output_is_protected(self):
+        pinned = "You must always use metric units. " + ("y" * 6000)
+        msgs = self._conv([pinned, self.BIG, self.BIG + "b", self.BIG + "c"])
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertIn(pinned, [m["content"] for m in out])
+
+    def test_a_trim_too_small_to_pay_for_the_cache_break_is_not_made(self):
+        msgs = self._conv(["z" * 2100])
+        out, n = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertIs(out, msgs)
+        self.assertEqual(n, 0)
+
+    def test_after_a_trim_it_waits_for_the_context_to_regrow(self):
+        msgs = self._conv([self.BIG, self.BIG + "2", self.BIG + "3", self.BIG + "4"])
+        out, n = self.eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertGreater(n, 0)
+        grown = out + [{"role": "user", "content": "more"}]
+        again, n2 = self.eng.prune_tool_results_only(grown, current_tokens=9000)
+        self.assertIs(again, grown, "a second cache break right after the first")
+        self.assertEqual(n2, 0)
+
+    def test_a_compaction_or_a_reset_starts_the_cycle_again(self):
+        self.eng._prune_rearm_tokens = 10**9
+        self.eng.on_session_reset()
+        self.assertEqual(self.eng._prune_rearm_tokens, 0)
+
+    def test_it_can_be_switched_off(self):
+        home = temp_home(prefix="ce_prune_off_")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        eng = ChronicleContextEngine()
+        eng.on_session_start("p", hermes_home=home, principal_id="pat",
+                             config={"embeddings": {"model": "hashing"},
+                                     "context_engine": {"prune_tool_results": {"enabled": False}}})
+        self.addCleanup(ChronicleCore._instances.pop, home, None)
+        eng.update_model("test-model", context_length=10000)
+        msgs = self._conv([self.BIG] * 4)
+        out, n = eng.prune_tool_results_only(msgs, current_tokens=9000)
+        self.assertIs(out, msgs)
+
+
+class TestAPhotoInTheConversation(unittest.TestCase):
+    """A vision-capable host sends a photo as a LIST of parts. Read as a string
+    it crashed compress() (`'list' object has no attribute 'strip'`), and the
+    capture path stored the list's Python repr — the full base64 of the photo."""
+
+    B64 = "iVBORw0KGgo" + "A" * 20000
+    PHOTO = {"role": "user", "content": [
+        {"type": "text", "text": "What is in this picture?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "iVBORw0KGgo" + "A" * 20000}}]}
+
+    def setUp(self):
+        self.home = temp_home(prefix="ce_photo_")
+        self.eng = ChronicleContextEngine()
+        self.eng.on_session_start("photo-s1", hermes_home=self.home, principal_id="pat",
+                                  config=CFG)
+        self.eng.update_model("test-model", context_length=1500)
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _with_photo(self, standalone=True):
+        self.eng.core.has_memory_provider = not standalone
+        msgs = _conversation(80)
+        msgs.insert(5, dict(self.PHOTO))
+        return msgs
+
+    def test_compaction_survives_it_standalone(self):
+        out = self.eng.compress(self._with_photo(standalone=True))
+        self.assertIsInstance(out, list)
+
+    def test_compaction_survives_it_beside_the_provider(self):
+        out = self.eng.compress(self._with_photo(standalone=False))
+        self.assertIsInstance(out, list)
+
+    def test_an_evicted_photo_is_stored_as_text_not_as_its_bytes(self):
+        self.eng.compress(self._with_photo())
+        c = self.eng.core.store._conn()
+        payloads = [r[0] for r in c.execute("SELECT payload FROM events WHERE type='observed'")]
+        self.assertFalse(any(self.B64[:40] in x for x in payloads), "base64 reached the event log")
+
+    def test_capture_writes_the_caption_and_a_marker(self):
+        import json as _json
+        eid = self.eng.core.capture.observe("", "Nice.", session_id="photo-s1",
+                                            messages=[self.PHOTO, {"role": "assistant", "content": "Nice."}])
+        ex = _json.loads(self.eng.core.store.get_event(eid)["payload"])["excerpt"]
+        self.assertIn("What is in this picture?", ex)
+        self.assertIn("[image]", ex)
+        self.assertNotIn(self.B64[:40], ex)
+
+    def test_the_trim_leaves_it_alone(self):
+        msgs = self._with_photo()
+        out, _ = self.eng.prune_tool_results_only(msgs, current_tokens=10**6)
+        self.assertIn(self.PHOTO, out)
+
+
+class TestTheHostsMessagesAreNotEdited(unittest.TestCase):
+    """The pin check cached its hash AS A KEY ON THE HOST'S MESSAGE —
+    `m["_content_hash"]` — a private field riding along in whatever the host
+    sends the model, and stale as soon as the host rewrote that message's
+    content (its own pruning does)."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="ce_nomut_")
+        self.eng = ChronicleContextEngine()
+        self.eng.on_session_start("nomut-s1", hermes_home=self.home, principal_id="pat",
+                                  config=CFG)
+        self.eng.update_model("test-model", context_length=1500)
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_compress_does_not_write_into_them(self):
+        import copy as _copy
+        msgs = _conversation(80)
+        before = _copy.deepcopy(msgs)
+        self.eng.compress(msgs)
+        self.assertEqual(msgs, before)
+
+    def test_a_pin_still_holds_after_the_host_rewrites_the_message(self):
+        msgs = _conversation(80)
+        target = msgs[10]
+        self.eng._pinned_content_hashes.add(self.eng._compute_content_hash(target))
+        self.assertTrue(self.eng._is_pinned(target))
+        target["content"] = "rewritten by the host"
+        self.assertFalse(self.eng._is_pinned(target), "a stale hash must not protect other text")
+
+
 if __name__ == "__main__":
     unittest.main()

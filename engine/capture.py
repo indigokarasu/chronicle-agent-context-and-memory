@@ -236,7 +236,7 @@ class CaptureEngine:
                              author=ctx.get("author") if isinstance(ctx.get("author"), dict) else None)
         belief_events, summaries = [], []
         for msg in messages:
-            content = (msg.get("content") or "").strip()
+            content = spk.message_text(msg.get("content")).strip()
             if len(content) < 20:
                 continue
             crit, _ = classify_criticality(content)
