@@ -3,6 +3,25 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.8
+
+**Without its store, a compaction still keeps tool calls whole and says what
+went.** The fallback used when the core cannot open kept `body[:3] +
+body[-6:]`: a cut that could start the tail on a tool result whose call was
+dropped, hoisted every system message to the top, and left no trace of what
+was dropped. It now cuts the protected head and tail on whole tool units,
+keeps leading system messages where they are, and leaves one handoff that
+says plainly the folded turns are gone (nothing could be archived, so it
+names no ids) and quotes the user's requests from them.
+
+**An archive copy stays out of the user's own index.** A copy of a turn the
+memory provider already captured was also indexed in `observed_user_fts`, so
+per-turn recall could show the same turn twice. It stays searchable and
+expandable through the main index.
+
+Also removed: the pressure-warning helpers no path called since the warning
+moved into the handoff.
+
 ## 5.8.7
 
 **The budget counts what is sent.** Hermes stamps each user turn's recall

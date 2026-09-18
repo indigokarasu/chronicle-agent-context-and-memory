@@ -92,6 +92,13 @@ class TestTheUsersOwnConversations(_Core):
         self.assertTrue(users)
         self.assertEqual(sessions, {CHAT})
 
+    def test_an_archive_copy_of_a_captured_turn_is_not_in_it(self):
+        eid = self.core.capture.append("observed", {
+            "source_type": "context_eviction", "excerpt": "Sam Vimes owns a SunFake 9000.",
+            "extract": False}, actor="user", session_id=CHAT)
+        self.assertIn(eid, self.fts_ids("observed_fts"), "still searchable, still expandable")
+        self.assertNotIn(eid, self.fts_ids("observed_user_fts"))
+
     def test_the_per_turn_search_reads_it_and_answers_the_same(self):
         self._observe(CHAT, "We booked the Izakaya Nonesuch for Friday.")
         for i in range(5):
