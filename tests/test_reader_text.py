@@ -81,9 +81,8 @@ class TestTheReadersCopy(unittest.TestCase):
                                       actor="system"), tool)
 
 
-TURN = ("User: %s\nAssistant: Understood.\nUser: Did the Zorblax filing go out before the "
-        "Friday deadline, and did Robin Placeholder sign it?\nAssistant: Yes, it went out on "
-        "Tuesday." % HANDOFF)
+TURN = ("User: %s\nAssistant: Understood.\nUser: The Zorblax filing went out before the "
+        "Friday deadline, and Robin Placeholder signed it on Tuesday.\nAssistant: Noted." % HANDOFF)
 
 
 class TestExtraction(unittest.TestCase):
@@ -94,19 +93,44 @@ class TestExtraction(unittest.TestCase):
 
     def test_an_episode_is_not_about_the_handoff(self):
         (ep,) = self.episodes(TURN)
-        self.assertIn("Did the Zorblax filing go out before", ep["body"])
+        self.assertIn("The Zorblax filing went out before", ep["body"])
         self.assertNotIn("CONTEXT COMPACTION", ep["body"] + ep["key"]["title"])
 
     def test_an_episode_is_what_the_user_said(self):
         """5.8.3: not the assistant's reply -- only the user's own words say
         anything about the user (the facts and notes already worked so)."""
-        ask = "Did the Zorblax filing go out before the Friday deadline, and who signed it?"
-        (ep,) = self.episodes("User: %s\nAssistant: Yes, on Tuesday; Robin signed it." % ask)
-        self.assertEqual(ep["body"], ask)
+        said = "The Zorblax filing went out before the Friday deadline and Robin signed it."
+        (ep,) = self.episodes("User: %s\nAssistant: Great, I will remember that." % said)
+        self.assertEqual(ep["body"], said)
 
     def test_a_short_ask_is_no_episode(self):
         self.assertEqual(self.episodes("User: Did it go out?\nAssistant: Yes, on Tuesday, "
                                        "signed by Robin Placeholder at Acme Fake Co."), [])
+
+    def test_a_request_or_a_question_is_no_episode(self):
+        """5.8.12: sampled on the user's real messages, every episode the old
+        rule made was a request to the agent or a question."""
+        for said in ("Just work through all of the Zorblax repos one by one and update the "
+                     "version numbers.",
+                     "Did you make sure every Zorblax repo has the correct style hero image?",
+                     "Come up with a way to ensure the Zorblax backups run at least every 12 hours.",
+                     "Please check whether the Acme Fake Co export finished and tell me the total.",
+                     # only a question: no "you", no command
+                     "Where is the Zorblax filing stored these days, and is it still on the Acme share?",
+                     # only addressed to the agent
+                     "I think your Zorblax summary from yesterday missed the Acme Fake Co totals entirely.",
+                     # a question without its question mark
+                     "Can the Zorblax scheduler be spread out so that it never uses thirty percent at once",
+                     # a command the first list missed
+                     "Kill the Zorblax and Acme Fake Co export processes for now until the CPU settles."):
+            with self.subTest(said=said):
+                self.assertEqual(self.episodes("User: %s\nAssistant: On it." % said), [])
+
+    def test_what_happened_is_kept_around_a_request(self):
+        (ep,) = self.episodes("User: My sister Robin Placeholder moved to Riverton last week and "
+                              "started at Acme Fake Co. Can you remind me to call her?\nAssistant: Sure.")
+        self.assertEqual(ep["body"], "My sister Robin Placeholder moved to Riverton last week and "
+                                     "started at Acme Fake Co.")
 
     def test_the_model_is_not_asked_to_summarise_the_handoff(self):
         from engine.extraction import LLMExtractor
@@ -114,7 +138,7 @@ class TestExtraction(unittest.TestCase):
         sent = []
         x._chat = lambda prompt: (sent.append(prompt), "{}")[1]
         x.extract(TURN, source_event="ev1")
-        self.assertIn("Did the Zorblax filing go out before", sent[0])
+        self.assertIn("The Zorblax filing went out before", sent[0])
         self.assertNotIn("CONTEXT COMPACTION", sent[0])
 
 
@@ -145,12 +169,13 @@ class TestToolOutputIsNotWhatWasSaid(unittest.TestCase):
 
     def test_an_episode_is_not_the_file_it_read(self):
         from engine.extraction import HeuristicExtractor
-        turn = TOOL_TURN.replace("moved?", "moved since Pat Testley last looked at it?")
+        turn = TOOL_TURN.replace("Can you check whether the Zorblax filing deadline moved?",
+                                 "The Zorblax filing deadline moved since Pat Testley last looked at it.")
         (ep,) = [i for i in HeuristicExtractor().extract(turn, source_event="ev1").items
                  if i["kind"] == "episode"]
         self.assertNotIn("calendar sync", ep["body"])
         self.assertNotIn("still Friday", ep["body"], "nor the assistant's reply")
-        self.assertIn("Zorblax filing deadline moved since", ep["body"])
+        self.assertIn("The Zorblax filing deadline moved since", ep["body"])
 
     def test_the_model_is_not_sent_the_file(self):
         from engine.extraction import LLMExtractor
