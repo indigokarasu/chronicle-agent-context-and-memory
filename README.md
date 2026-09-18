@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.19.
+Version: 5.8.20.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -159,11 +159,12 @@ inflected (book/booked, city/cities), not merely as a prefix — and a message
 with more than three content words needs two of them in an item. A shorter
 message's single shared word is often a coincidence ("system health check" and
 a prescription's `health_event`), so such a match must also be near the
-message in meaning: the item's stored vector against the message's, one quick
-request to the embedder (`retrieval.prefetch_min_similarity`; measured per
-model, 0.65 for nomic-embed-text). Only the user's own words in a past
-exchange are asked; URLs, short numbers, host framing, tool output and the
-agent's own memory writes never count. A scheduled job's turn gets none
+message in meaning: the item's stored vector against the message's (a short
+item with none is embedded on the spot, a few per turn), within a second and a
+half of quick requests to the embedder (`retrieval.prefetch_min_similarity`;
+measured per model, 0.65 for nomic-embed-text). Only the user's own words in a
+past exchange are asked; URLs, short numbers, host framing, tool output and
+the agent's own memory writes never count. A scheduled job's turn gets none
 (`retrieval.prefetch_automation`). Explicit search, `chronicle_answer` and the
 context engine's recall are not gated.
 
