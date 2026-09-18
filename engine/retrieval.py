@@ -431,6 +431,25 @@ def relevance_words(text: str) -> frozenset:
         if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER)
 
 
+def relevance_fts_match(text: str) -> str:
+    """The FTS5 expression for the injection gate: the message's content words
+    -- as written and as `_gate_stem` folds them -- each a PREFIX term, OR'd.
+
+    The ordinary query ORs every word of the message ("which", "did" and "I"
+    included), so on the production store it ranked most of the transcript
+    table on every turn (0.77 s a call); the gate then threw away everything
+    that shared no content word. Asking FTS for exactly what the gate keeps is
+    both faster and the same answer. Prefix terms stand in for the stemming
+    the index does not do: "restaurant"* finds "restaurants". "" when the text
+    has no content words (the gate then runs no retrieval at all)."""
+    terms: set = set()
+    for t in _gate_words(text):
+        if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER:
+            terms.add(t)
+            terms.add(_gate_stem(t))
+    return " OR ".join('"%s"*' % t for t in sorted(terms) if '"' not in t)
+
+
 # What the agent wrote into its OWN memory (Hermes's memory tool, mirrored by
 # provider.on_memory_write). Hermes's built-in memory already puts the current
 # version of that memory into every system prompt; Chronicle's copies are older
@@ -1128,15 +1147,17 @@ class RetrievalEngine:
             if ident is not None:
                 self._wrong_dim_seen[(channel, ident)] = len(rows[i]["embedding"]) // 4
 
-    def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None):
+    def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
+               fts_match=None):
         """Fused FTS + vector + graph + structured search (§18). Thin wrapper:
         the body is `_search_inner`; this opens the A0c wrong-dimension scope so
         one top-level query reports one number across every channel."""
         with self._query_diagnostics():
             return self._search_inner(query, limit=limit, domain=domain, purpose=purpose,
-                                      principal=principal, now=now)
+                                      principal=principal, now=now, fts_match=fts_match)
 
-    def _search_inner(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None):
+    def _search_inner(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
+                      fts_match=None):
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         ranked: dict[str, dict] = {}
@@ -1180,7 +1201,8 @@ class RetrievalEngine:
             entry["why"].add(channel)
 
         of = self.cfg_overfetch()
-        for i, r in enumerate(self.store.fts_search_beliefs(query, limit=limit * of)):
+        for i, r in enumerate(self.store.fts_search_beliefs(
+                query, limit=limit * of, **({"match": fts_match} if fts_match is not None else {}))):
             add(r["belief_id"], _table_of_kind(r["kind"]), i + 1, "fts")
         if q["embedding"] is not None:
             for i, (bid, kind, _s) in enumerate(self._vector_beliefs(q["embedding"], limit * of)):
@@ -1680,7 +1702,8 @@ class RetrievalEngine:
         except (TypeError, ValueError):
             return None
 
-    def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False):
+    def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False,
+                     fts_match=None):
         """Raw observed/session/projection tier. Wrapper for the A0c scope; the
         body is `_retrieve_raw_inner`.
 
@@ -1694,7 +1717,8 @@ class RetrievalEngine:
         about the user."""
         with self._query_diagnostics():
             return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now,
-                                            exclude_automation=exclude_automation)
+                                            exclude_automation=exclude_automation,
+                                            fts_match=fts_match)
 
     @staticmethod
     def _from_automation(ev: dict | None) -> bool:
@@ -1741,7 +1765,7 @@ class RetrievalEngine:
         return text if text.strip() else None
 
     def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
-                            exclude_automation=False):
+                            exclude_automation=False, fts_match=None):
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         scored: dict[str, dict] = {}
@@ -1751,7 +1775,14 @@ class RetrievalEngine:
         # left out it is one fetch and exactly the first `limit` rows, as before.
         fetch = 2 * limit
         while True:
-            fts_rows = self.store.fts_search_observed(query, limit=fetch)
+            # The two narrowing arguments only when they narrow: an explicit
+            # search calls the store exactly as it always has.
+            narrow = {}
+            if fts_match is not None:
+                narrow["match"] = fts_match
+            if exclude_automation:
+                narrow["exclude_session_prefixes"] = _spk.AUTOMATION_SESSION_PREFIXES
+            fts_rows = self.store.fts_search_observed(query, limit=fetch, **narrow)
             scored = {}
             admitted = 0
             for i, r in enumerate(fts_rows):
@@ -2913,9 +2944,13 @@ class RetrievalEngine:
                 return None
             return said
 
+        # The gate keeps only rows that share a content word, so FTS is asked
+        # for exactly those (relevance_fts_match); None = the ordinary query.
+        fts_match = relevance_fts_match(hint) if gate else None
+
         def _raw(limit):
             rows = self.retrieve_raw(hint, limit=limit, principal=principal, now=now,
-                                     exclude_automation=exclude_automation)
+                                     exclude_automation=exclude_automation, fts_match=fts_match)
             if gate is None:
                 return rows
             kept = []
@@ -3126,7 +3161,8 @@ class RetrievalEngine:
         # of a reader whose whole job is to notice what the user likes.
         tier1_chars = 0
         for b in ([] if precision or pref_pack else
-                  self.search(hint, limit=10, purpose=purpose, principal=principal, now=now)):
+                  self.search(hint, limit=10, purpose=purpose, principal=principal, now=now,
+                              fts_match=fts_match)):
             if gate is not None:
                 if b.get("source_type") in _AGENT_OWN_SOURCES:
                     gate_drop["beliefs"] += 1
