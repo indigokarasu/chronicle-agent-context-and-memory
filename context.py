@@ -537,8 +537,16 @@ class ChronicleContextEngine(ContextEngine):
         warn_pending = self.is_under_pressure() and not self._pressure_warning_injected
 
         # 1) rescue critical/high-salience spans → durable beliefs (I14) —
-        # once per message per conversation, not once per compaction pass.
-        fresh = [m for m in messages if self._rescue_key(m) not in self._rescued_hashes]
+        # once per message per conversation, not once per compaction pass —
+        # and only when nothing else has captured them. With the memory
+        # provider live on this same core, every turn was already captured by
+        # sync_turn when it ended and will be extracted from that capture;
+        # rescue made a second copy and a second extraction of it. Measured on
+        # the production store: rescue drafted 19,089 notes and not one of them
+        # survived the attribution cleanup. Standalone (no provider), rescue is
+        # the only thing that makes these spans durable, so it still runs.
+        fresh = [] if self._provider_captures() else [
+            m for m in messages if self._rescue_key(m) not in self._rescued_hashes]
         if fresh:
             self.core.capture.rescue(fresh, session_id=self._session_id,
                                      speaker_context=self._host_context)
@@ -755,6 +763,14 @@ class ChronicleContextEngine(ContextEngine):
         while k < n and messages[k] == locked[k]:
             k += 1
         return k
+
+    def _provider_captures(self) -> bool:
+        """Is the memory provider live on this same core? Then every turn is
+        captured by its sync_turn and extracted from that capture, and anything
+        this engine writes is a second copy. Read at call time: a process where
+        the provider has not started yet (a subagent, standalone use) keeps the
+        engine's own capture, which is the safe side to err on."""
+        return bool(self.core is not None and getattr(self.core, "has_memory_provider", False))
 
     @staticmethod
     def _rescue_key(m) -> str:
@@ -1158,7 +1174,7 @@ class ChronicleContextEngine(ContextEngine):
         # Store each chunk as a separate durable event, just like observe() does
         chunk_ids = []
         for i, chunk in enumerate(chunks):
-            eid = self.core.capture.append("observed", {
+            payload = {
                 "source_type": "context_eviction",
                 "excerpt": chunk,
                 "source_ref": self._session_id,
@@ -1167,9 +1183,16 @@ class ChronicleContextEngine(ContextEngine):
                 "chunk_count": len(chunks),
                 "speakers": per_chunk[i],
                 "attribution": {"user_side": side, "role": str(role)},
-            },
-            actor=actor,
-            session_id=self._session_id)
+            }
+            if self._provider_captures():
+                # Durable (recall, chronicle_expand) but NOT extracted again: the
+                # provider captured this turn when it ended and extraction runs
+                # from that capture. Re-extracting evictions produced 4,955 notes
+                # on the production store, every one retracted. Carried in the
+                # event, so a rebuild makes the same decision (I3).
+                payload["extract"] = False
+            eid = self.core.capture.append("observed", payload,
+                                           actor=actor, session_id=self._session_id)
             chunk_ids.append(eid)
         return chunk_ids
 
