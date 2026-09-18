@@ -122,9 +122,18 @@ class TestExtraction(unittest.TestCase):
                      # a question without its question mark
                      "Can the Zorblax scheduler be spread out so that it never uses thirty percent at once",
                      # a command the first list missed
-                     "Kill the Zorblax and Acme Fake Co export processes for now until the CPU settles."):
+                     "Kill the Zorblax and Acme Fake Co export processes for now until the CPU settles.",
+                     "Then proceed with the Zorblax server option to connect the Acme Fake Co speakers.",
+                     "Yes, and once everything is backed up, trigger the Zorblax export again tonight."):
             with self.subTest(said=said):
                 self.assertEqual(self.episodes("User: %s\nAssistant: On it." % said), [])
+
+    def test_a_story_that_opens_like_a_question_is_kept(self):
+        for said in ("When we got to Riverton, the Izakaya Nonesuch was already closed for the night.",
+                     "What I did at Acme Fake Co last spring was rebuild the Zorblax billing system."):
+            with self.subTest(said=said):
+                (ep,) = self.episodes("User: %s\nAssistant: Noted." % said)
+                self.assertEqual(ep["body"], said)
 
     def test_what_happened_is_kept_around_a_request(self):
         (ep,) = self.episodes("User: My sister Robin Placeholder moved to Riverton last week and "

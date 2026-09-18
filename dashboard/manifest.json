@@ -3,7 +3,7 @@
   "label": "Chronicle",
   "description": "Monitor and control Chronicle memory — view store stats, embedding config, recent events, and facts.",
   "icon": "Clock",
-  "version": "5.8.12",
+  "version": "5.8.13",
   "tab": { "path": "/chronicle", "position": "after:skills" },
   "entry": "dist/index.js",
   "api": "plugin_api.py"
