@@ -3,6 +3,37 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.6
+
+**Recall serves what was said, not the host's framing around it.** Capture
+stores an excerpt byte-for-byte (its event id is a hash of it) and marks the
+host framing inside it with speaker spans, which is what has kept compaction
+handoffs, system notes and Chronicle's own `<memory-context>` injections out of
+extraction. Everything that handed text to a reader, though, used the stored
+bytes:
+
+* **Raw recall** (FTS, event vectors, the span channel, the session window)
+  served an earlier compaction's summary or a system note back as conversation.
+  It now serves `speaker.reader_text` — framing removed, every role label that
+  still has words under it kept, and the stored text itself, unchanged, when
+  there is nothing to remove. An event that was nothing but framing (the
+  compressor's copy of an evicted handoff) is not recalled at all.
+* **Session summaries** were built from every observed event in the session,
+  the compressor's eviction copies included, and 24 of the 107 interactive
+  session summaries on the production store carried a
+  `[CONTEXT COMPACTION — REFERENCE ONLY]` handoff into the session vector. They
+  are now built from the reader's copy, and from the session's transcript
+  captures alone when it has any: eviction and rescue copies repeat messages
+  the transcript already holds, and stand in only for a session without one.
+* **Episodes** were the one extraction output built from the raw text, so a
+  turn that opened with a handoff became an episode about the handoff, and the
+  model-based extractor was sent the handoff to summarise. Both now work from
+  the framing-free copy; a turn without framing produces exactly the episode
+  it did before.
+
+Existing session-index rows are a projection of the event log: re-running the
+summarizer over a session rebuilds its row from the events with these rules.
+
 ## 5.7.5
 
 **The memory put into a turn is about that turn.** The provider's `prefetch`
