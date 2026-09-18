@@ -3,6 +3,20 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.18
+
+**The user's newest request survives a tight budget wherever it sits.** A
+seeded fuzz of `compress()` (multimodal content, None content, tool calls
+that are not dicts, results with no id, system notes mid-list, host
+persistence markers) found one way to lose the request: on a small context
+window, the protected tail's newer tool results and the leading system
+messages claimed the budget before the request was reached, and it was
+dropped. The request is now fitted second — right after the newest unit —
+whether it is in the tail or further back. The fuzz runs 60 seeds, two
+passes each, and checks: nothing raises, no call/result pair is split, at
+most one handoff and never in the system role, no persistence marker, the
+newest request kept (whole, or shortened with the id that restores it).
+
 ## 5.8.17
 
 **The handoff alternates the way Hermes counts turns.** The handoff's role was
