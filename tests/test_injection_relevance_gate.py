@@ -88,6 +88,10 @@ class _Case(unittest.TestCase):
             {"role": "assistant", "content": "Reading the dates."},
             {"role": "tool", "content": '{"rows": "Quibbleton due-date export"}'},
             {"role": "assistant", "content": "Added them."}])
+        # The agent's own memory tool, mirrored by on_memory_write.
+        core.capture.agent_explicit(
+            "add", "memory", "Izakaya Nonesuch dispatch loop: re-assert the verifier, "
+            "action none, advance the gate on the Izakaya Nonesuch thread.")
         for sid in (CHAT, CHAT2, CHAT3):
             core.capture.finalize_session(sid, "clean_exit")
         core.process_pending()
@@ -221,6 +225,15 @@ class TestTheInjection(_Case):
         self.assertIn("blue folder", ctx)
         self.assertEqual(ctx.count("[DIRECTIVE] Always file"), 0 if "[NOTE] Always file" in ctx
                          else 1)   # once on the page, not once per tier
+
+    def test_the_agents_own_memory_is_not_memory_about_the_user(self):
+        """Hermes puts the agent's current memory into every system prompt
+        itself; Chronicle's older copy of it stays out of the user's turn."""
+        q = "Is the Izakaya Nonesuch booking still on?"
+        self.assertIn("dispatch loop", self.ctx(q, gate=False))
+        ctx = self.prov.prefetch(q)
+        self.assertIn("Izakaya Nonesuch", ctx)
+        self.assertNotIn("dispatch loop", ctx)
 
     def test_the_debug_field_says_what_was_left_out(self):
         self.prov.prefetch("Is the Izakaya Nonesuch booking still on?")

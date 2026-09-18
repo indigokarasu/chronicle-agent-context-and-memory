@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.8
+
+**The agent's memory stays the agent's.** 22 of the 72 active episodes on the
+production store were the agent's own memory-tool writes ("dispatcher cron
+runs across 53 repos", "GitHub API from this VPS is intermittently
+unreachable"), and the per-turn injection served them as memory about the
+user. Hermes's built-in memory already puts the agent's CURRENT memory into
+every system prompt; Chronicle's copies are older and include notes the agent
+has since removed from it (the log holds `remove` and `replace` actions whose
+earlier `add` still had an episode). The gated per-turn injection now leaves
+out beliefs and raw rows whose source is `agent_memory_write`. Explicit search
+still finds them.
+
 ## 5.7.7
 
 **A tool's output is not memory about the user.** Probed on the production
