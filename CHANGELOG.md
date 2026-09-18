@@ -3,6 +3,24 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.9
+
+**Older rescue copies lose their host frames too.** A dry run of the
+session-index rebuild on the production store left 69 of the 107 interactive
+session summaries still carrying framing. It sat in rescue copies written
+before speaker spans existed — single messages with no role label — and they
+were cron prompts ("[IMPORTANT: You are running as a scheduled cron job …")
+and skill-invocation frames, in sessions whose ids carry no `cron_` prefix.
+`speaker.reader_text` read such a copy only for an eviction by the user; it
+now reads any older eviction or rescue copy as the user side unless the agent
+wrote it, which removes only recognised host frames.
+
+**A session with nothing but framing has an empty index row.** Rebuilt, such a
+session has no conversation left, and the summarizer returned without writing,
+so the old row built from the frames stayed. It is now replaced by an empty
+one: nothing to find it by, and still a row, so the backfill sweep does not
+re-queue it (the stale-vector heal already skips empty summaries).
+
 ## 5.7.8
 
 **The agent's memory stays the agent's.** 22 of the 72 active episodes on the
