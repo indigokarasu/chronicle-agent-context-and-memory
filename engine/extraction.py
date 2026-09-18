@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 
+from . import speaker as spk
 from .embeddings import RemoteEndpointRefused, check_endpoint
 from .serialize import qualifiers_hash
 
@@ -187,7 +188,11 @@ class Extractor:
     version = "extractor-v1"
 
     def extract(self, excerpt: str, *, source_event: str, owner: str = "default",
-                domain: str = "user", session_id: str = "") -> ExtractionResult:
+                domain: str = "user", session_id: str = "", lines=None) -> ExtractionResult:
+        """`lines` is `[(text, speaker)]` from engine/speaker.attribute_lines: who
+        said each line. The curation worker always passes it. Without it the
+        excerpt's own `role:` labels are read and unlabelled text is the user's,
+        which is only right for a caller handing over the user's own words."""
         raise NotImplementedError
 
 
@@ -277,11 +282,13 @@ class HeuristicExtractor(Extractor):
 
     version = "extractor-v1"
 
-    def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id=""):
+    def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id="",
+                lines=None):
         items: list[dict] = []
         ambiguous = False
         text = _strip_roles(excerpt)
         seen: set = set()
+        lines = _role_lines(excerpt) if lines is None else lines
 
         def add(item):
             key = item.get("key") or {}
@@ -295,38 +302,42 @@ class HeuristicExtractor(Extractor):
 
         # Emails and URLs are matched on the UNSPLIT text (A6): they contain the
         # very characters a sentence splitter cuts on.
-        for line, is_assistant in _role_lines(excerpt):
-            if is_assistant:
+        for line, who in lines:
+            if who != spk.HUMAN:
                 continue
             em = _EMAIL.search(line)
             if em and _FIRST_PERSON.search(line):
                 add(_fact_item("user", "email", em.group(0), owner, domain, source_event,
                                "user_direct"))
 
-        for raw_line, is_assistant in _role_lines(excerpt):
+        for raw_line, who in lines:
+            # Only the user's own words say anything about the user. The
+            # assistant's "I ...", its suggestions and its advice ("Remember to
+            # taste as you go"), tool output, a scheduled job's prompt and the
+            # host's control frames are none of them facts, preferences or
+            # standing instructions the user gave. The same goes for "X is a Y":
+            # typed from assistant prose and tool output it produced entities such
+            # as "known cosmetic bug" and "valid result".
+            if who != spk.HUMAN:
+                continue
             for line in split_sentences(raw_line):
                 if not line:
                     continue
                 low = line.lower()
 
-                # The assistant's own "I ..." is not a fact about the user, its
-                # suggestions are not the user's preferences, and its advice
-                # ("Remember to taste as you go") is not a standing instruction
-                # the user gave. Third-person typing below still applies to it.
-                if not is_assistant:
-                    # Directives / norms → always-inject note (§16.2). Imperative
-                    # shape only; a first-person preference is a FACT, not a norm.
-                    if len(line) > 8 and is_standing_instruction(line):
-                        add(_note_item(line, "norm", owner, domain, source_event, risk="low"))
-                        continue
+                # Directives / norms → always-inject note (§16.2). Imperative
+                # shape only; a first-person preference is a FACT, not a norm.
+                if len(line) > 8 and is_standing_instruction(line):
+                    add(_note_item(line, "norm", owner, domain, source_event, risk="low"))
+                    continue
 
-                    before = len(items)
-                    for it in self._sentence_facts(line, low, owner, domain, source_event):
-                        if len(items) - before >= _MAX_FACTS_PER_SENTENCE:
-                            break
-                        add(it)
-                    if len(items) > before:
-                        continue
+                before = len(items)
+                for it in self._sentence_facts(line, low, owner, domain, source_event):
+                    if len(items) - before >= _MAX_FACTS_PER_SENTENCE:
+                        break
+                    add(it)
+                if len(items) > before:
+                    continue
 
                 # "X is a/an Y" entity typing — a real proper-noun subject only
                 # ("My wife Robin ..." is handled by the relation patterns).
@@ -593,31 +604,17 @@ def _strip_roles(excerpt: str) -> str:
     return re.sub(r"^(User|Assistant|system|user|assistant):\s*", "", excerpt or "", flags=re.MULTILINE)
 
 
-_ROLE_PREFIX = re.compile(r"^(User|Assistant|system|user|assistant):\s*")
-
-
 def _role_lines(excerpt: str) -> list:
-    """[(text, is_assistant)] per line (A6).
+    """[(text, speaker)] per line, for a caller that passed no attribution.
 
-    capture.observe() writes excerpts as "User: ...\nAssistant: ...", so the
-    speaker is recoverable. This is what stops the assistant's own "I'd suggest
-    ...", "I am an assistant" and "Remember to consult your doctor" from
-    becoming facts and standing directives attributed to the user.
-
-    Attribution is STICKY: a multi-line assistant answer carries its prefix on
-    the first line only, so an unprefixed line inherits the last speaker seen.
-    Before the first prefix — an unprefixed excerpt, a continuation chunk from
-    capture's `_split_excerpt`, or plain span text handed to compress() — the
-    speaker is the user, which is the pre-A6 behaviour for those paths.
+    Reads the excerpt's own `role:` labels (user, assistant, tool, system, ...);
+    an unlabelled line belongs to the message above it, and text before any
+    label is the user's. Host control frames inside a user message are split
+    out as system text. The curation worker never relies on this: it passes
+    the attribution recorded at capture (engine/speaker.attribute_lines), which
+    never assumes the user.
     """
-    out = []
-    is_assistant = False
-    for line in (excerpt or "").split("\n"):
-        m = _ROLE_PREFIX.match(line)
-        if m:
-            is_assistant = m.group(1).lower() == "assistant"
-        out.append((line[m.end():] if m else line, is_assistant))
-    return out
+    return spk.parse_labeled(excerpt, spk.HUMAN, spk.HUMAN)
 
 
 _CLAUSE_TAIL = re.compile(
@@ -699,10 +696,16 @@ class LLMExtractor(Extractor):
             data = _json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
 
-    def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id=""):
+    def extract(self, excerpt, *, source_event, owner="default", domain="user", session_id="",
+                lines=None):
         if not (self.base_url and self.model):
             return self.fallback.extract(excerpt, source_event=source_event, owner=owner,
-                                         domain=domain, session_id=session_id)
+                                         domain=domain, session_id=session_id, lines=lines)
+        lines = _role_lines(excerpt) if lines is None else lines
+        # A model cannot be trusted to tell who said what, so anything it says
+        # about the user, and any instruction it reports, must be found in the
+        # user's own words (engine/speaker.py).
+        said = _grounding_text(spk.human_text(lines))
         try:
             import json as _json
             reply = self._chat(_LLM_PROMPT + (excerpt or "")[:4000])
@@ -717,6 +720,8 @@ class LLMExtractor(Extractor):
                     continue
                 canon, _card = canonical_predicate(attr.replace("_", " "))
                 if subj.lower() in ("user", "the user", "i", "me"):
+                    if _grounding_text(val) not in said:
+                        continue
                     items.append(_fact_item("user", canon, val, owner, domain, source_event, "user_direct"))
                 else:
                     items.append(_fact_item(entity_token(subj), canon, val, owner, domain,
@@ -726,7 +731,7 @@ class LLMExtractor(Extractor):
                 if name:
                     items.append(_entity_item(name, etype, owner, domain, source_event))
             for d in (parsed.get("directives") or [])[:5]:
-                if str(d).strip():
+                if str(d).strip() and _grounding_text(d) in said:
                     items.append(_note_item(str(d).strip()[:400], "norm", owner, domain, source_event))
             ep = parsed.get("episode")
             if ep and str(ep).strip():
@@ -737,7 +742,13 @@ class LLMExtractor(Extractor):
             return ExtractionResult(items, False, "promote" if items else "skip")
         except Exception:
             return self.fallback.extract(excerpt, source_event=source_event, owner=owner,
-                                         domain=domain, session_id=session_id)
+                                         domain=domain, session_id=session_id, lines=lines)
+
+
+def _grounding_text(s) -> str:
+    """Lower-cased, whitespace-collapsed, for a substring test that ignores
+    line wrapping and case but nothing else."""
+    return " ".join(str(s or "").lower().split())
 
 
 def make_extractor(cfg):
