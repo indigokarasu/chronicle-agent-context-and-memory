@@ -10,9 +10,12 @@ Over 195 real messages 5.8.12 still made episodes of "Then proceed with the
 plex option…" and "Yes, and once everything is backed up, run genie again"
 (a command after "yes" or a leading clause), and would have dropped a story
 that opens like a question ("When we got to Riverton, …"). A command is now
-found after an affirmation or a leading "once/when/if …," clause; a question
-without its "?" is recognised only by an auxiliary opening ("can the…", "is
-there…", "did the…"), not by "when" or "what", which open narrative too.
+found after an affirmation or a leading "once/when/if …," clause — one that
+ends in a comma: the real "Yes, and once everything is correctly backed up
+and will back up run genie again" still slips; a question without its "?"
+is recognised only by an auxiliary opening ("can the…", "is there…", "did
+the…"), not by "when" or "what", which open narrative too. Over the 195
+messages: 9 episodes remain, mostly statements about the user's own systems.
 
 ## 5.8.12
 
