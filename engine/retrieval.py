@@ -431,6 +431,15 @@ def relevance_words(text: str) -> frozenset:
         if len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER)
 
 
+# What the agent wrote into its OWN memory (Hermes's memory tool, mirrored by
+# provider.on_memory_write). Hermes's built-in memory already puts the current
+# version of that memory into every system prompt; Chronicle's copies are older
+# and include notes the agent has since removed. So the injection into a user's
+# turn -- memory about the USER -- leaves them out: the agent's memory and the
+# user's are kept distinct. Explicit search still finds them.
+_AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
+
+
 def shares_content_word(words, text: str) -> bool:
     """Does `text` contain one of `words`? Equal stems match; so does an
     inflection that extends one by at most three letters ("book" / "booked",
@@ -2862,6 +2871,9 @@ class RetrievalEngine:
                 return rows
             kept = []
             for r in rows:
+                if self._event_source(r.get("event_id")) in _AGENT_OWN_SOURCES:
+                    gate_drop["excerpts"] += 1
+                    continue
                 said = _said(r.get("excerpt"))
                 if said is None:
                     continue
@@ -3069,8 +3081,12 @@ class RetrievalEngine:
         tier1_chars = 0
         for b in ([] if precision or pref_pack else
                   self.search(hint, limit=10, purpose=purpose, principal=principal, now=now)):
-            if gate is not None and not _relevant(self._gate_text(b), "beliefs"):
-                continue
+            if gate is not None:
+                if b.get("source_type") in _AGENT_OWN_SOURCES:
+                    gate_drop["beliefs"] += 1
+                    continue
+                if not _relevant(self._gate_text(b), "beliefs"):
+                    continue
             ann = epistemic.annotate(b, principal) if epistemic else ""
             line = self._render(b) + (f"  ({ann})" if ann else "")
             # Ladder 9 E4 (§issue-8): a matched fact with recorded supersede
@@ -4261,6 +4277,19 @@ class RetrievalEngine:
         if ev:
             return access.can_read(None, ev.get("owner"), principal)
         return True
+
+    def _event_source(self, event_id) -> str:
+        """The source_type of an observed event ("" for a session or projection
+        row, or an event that is not there)."""
+        if not event_id or event_id.startswith(("session:", "proj:")):
+            return ""
+        ev = self.store.get_event(event_id) or {}
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            return ""
+        return p.get("source_type") or ""
 
     def _gate_text(self, b) -> str:
         """What the injection relevance gate reads for a ranked belief: its
