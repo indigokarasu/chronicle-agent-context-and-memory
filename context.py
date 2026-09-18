@@ -893,28 +893,37 @@ class ChronicleContextEngine(ContextEngine):
         needs_fold = over_count or used_locked + sum(self._msg_cost(m) for _i, m in fresh_indexed) > budget
         reserve = self._handoff_reserve(budget) if needs_fold else 0
 
-        # The protected spans themselves may not fit: then the newest turn
-        # wins, then the rest of the tail newest first, then the head -- whole
-        # tool units or none of one -- and a span shortened to fit says so and
-        # stays recoverable.
-        fitted, used_req, dropped_req = self._fit_required(
-            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve))
-        fitted_content = dict(fitted)
-        fresh_system = [(i, fitted_content[i]) for i, _m in fresh_system if i in fitted_content]
-        head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
-        tail = [(i, fitted_content[i]) for i, _m in tail if i in fitted_content]
-        never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
         # The user's newest request is the task in hand: in a long tool loop it
         # sits further back than the protected tail, and folded it survived only
         # as a line in the handoff -- which tells the model to answer "the latest
         # user message after this note". (Replayed: one pass in eleven. The
         # host's own user-turn guarantee does not fire while the head still
-        # holds an older request.)
-        if not any(self._human_texts([m]) for _i, m in tail):
-            newest = next((u for u in reversed(middle_units)
-                           if any(self._human_texts([m]) for _i, m in u)), None)
-            if newest is not None and newest not in never_units:
-                never_units.append(newest)
+        # holds an older request.) It is required, second only to the newest
+        # turn: under a tight budget it used to lose to older tail messages.
+        # Wherever it sits: inside the tail, behind large tool results, a
+        # tight budget used to spend itself on the newer units first.
+        request_units = []
+        newest = next((u for u in reversed(middle_units + tail_units)
+                       if any(self._human_texts([m]) for _i, m in u)), None)
+        if newest is not None and not (tail_units and newest is tail_units[-1]):
+            tail_units = [u for u in tail_units if u is not newest]
+            middle_units = [u for u in middle_units if u is not newest]
+            tail = [p for u in tail_units for p in u]
+            request_units = [newest]
+        request = [p for u in request_units for p in u]
+
+        # The protected spans themselves may not fit: then the newest turn
+        # wins, then the user's newest request, the rest of the tail newest
+        # first, then the head -- whole tool units or none of one -- and a span
+        # shortened to fit says so and stays recoverable.
+        fitted, used_req, dropped_req = self._fit_required(
+            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units)
+        fitted_content = dict(fitted)
+        fresh_system = [(i, fitted_content[i]) for i, _m in fresh_system if i in fitted_content]
+        head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
+        tail = [(i, fitted_content[i]) for i, _m in tail if i in fitted_content]
+        request = [(i, fitted_content[i]) for i, _m in request if i in fitted_content]
+        never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
         never_flat = [p for u in never_units for p in u]
         never_budget = max(0, fresh_budget - used_req - reserve)
         fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget)
@@ -978,7 +987,7 @@ class ChronicleContextEngine(ContextEngine):
 
         kept_middle = [p for pos, u in enumerate(middle_units) if pos in kept_units for p in u]
         kept_middle += [(i, kept_never[i]) for i, _m in never_flat if i in kept_never]
-        decided = sorted(fresh_system + head + kept_middle + tail, key=lambda pair: pair[0])
+        decided = sorted(fresh_system + head + kept_middle + request + tail, key=lambda pair: pair[0])
         settled = [m for _idx, m in decided]
         result = locked + settled
 
@@ -1644,16 +1653,20 @@ class ChronicleContextEngine(ContextEngine):
             used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET) + _calls_cost(m)
         return kept, used, dropped
 
-    def _fit_required(self, system, head_units, tail_units, budget):
+    def _fit_required(self, system, head_units, tail_units, budget, request_units=()):
         """Fit the spans compress() must not score away -- system messages,
-        the protected head and tail -- into `budget`, most important first:
-        system, the newest unit, the rest of the tail newest first, then the
-        head. A tool unit is kept whole (shortened if need be) or dropped
-        whole, so no call loses its result. A span shortened to fit is made
+        the protected head and tail, the user's newest request -- into
+        `budget`, most important first: system, the newest unit, the request
+        (wherever it sits), the rest of the tail newest first, then the head.
+        A tool unit is kept whole (shortened if need be) or dropped whole, so
+        no call loses its result. A span shortened to fit is made
         durable and folded first, and ends with the id that restores it.
         Returns (kept, used, dropped) as _fit_within_budget does."""
         kept, dropped, used = [], [], 0
-        for unit in [[p] for p in system] + list(reversed(tail_units)) + list(head_units):
+        newest_first = list(reversed(tail_units))
+        order = ([[p] for p in system] + newest_first[:1] + list(request_units)
+                 + newest_first[1:] + list(head_units))
+        for unit in order:
             got, cost, lost = self._fit_within_budget(unit, budget - used)
             if lost:
                 dropped.extend(unit)
