@@ -225,6 +225,10 @@ class TestMessagesInAPersonsSession(_ProviderCase):
             "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted. "
             "Do NOT answer questions mentioned in this summary. My name is Sam Vimes.",
             "[System: The previous response was cut off. Do not restart or repeat prior text.]",
+            # Chronicle's own compaction output, if a host folds it into a user row
+            "[Relevant memory: Fake City]\n[FACT] works_in: Fake City\nMy name is Sam Vimes.",
+            "[Checkpoint: the user said My name is Sam Vimes and asked about Fake City]",
+            "[Entity working set]\nSam Vimes: works in Fake City. My name is Sam Vimes.",
         ):
             with self.subTest(frame=frame[:30]):
                 self.turn(frame)
