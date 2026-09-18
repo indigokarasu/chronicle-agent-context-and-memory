@@ -229,5 +229,37 @@ class TestTheGatedPath(_Store):
         self.assertEqual(set(kw), {"limit"}, "the store is called exactly as before")
 
 
+class TestAScheduledJobsTurnGetsNoRecall(unittest.TestCase):
+    """A cron run's "message" is the job's own prompt; nobody asked for the
+    user's memory in it, and on the production box those turns were ~98% of
+    all turns (up to 4,800 characters each, and a search past the timeout)."""
+
+    def _provider(self, session, config=None):
+        from provider import ChronicleMemoryProvider
+        home = temp_home(prefix="pfauto_")
+        self.addCleanup(shutil.rmtree, home, True)
+        p = ChronicleMemoryProvider()
+        p.initialize(session, hermes_home=home, principal_id="default", config=config or CFG)
+        self.addCleanup(ChronicleCore._instances.pop, p.core.store.db_path, None)
+        p.sync_turn("We booked the Izakaya Nonesuch in Riverton for Friday.", "Noted.",
+                    session_id=CHAT)
+        p.core.process_pending()
+        return p
+
+    ASK = "which izakaya did we book in Riverton?"
+
+    def test_the_users_turn_gets_it(self):
+        p = self._provider(CHAT)
+        self.assertIn("Izakaya Nonesuch", p.prefetch(self.ASK, session_id=CHAT))
+
+    def test_a_cron_turn_gets_nothing(self):
+        p = self._provider(CHAT)
+        self.assertEqual(p.prefetch(self.ASK, session_id="cron_abc_20260917_000000"), "")
+
+    def test_it_can_be_switched_back_on(self):
+        p = self._provider(CHAT, dict(CFG, retrieval={"prefetch_automation": True}))
+        self.assertIn("Izakaya Nonesuch", p.prefetch(self.ASK, session_id="cron_abc_20260917_000000"))
+
+
 if __name__ == "__main__":
     unittest.main()

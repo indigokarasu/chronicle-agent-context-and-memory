@@ -82,7 +82,8 @@ class TestTheReadersCopy(unittest.TestCase):
 
 
 TURN = ("User: %s\nAssistant: Understood.\nUser: Did the Zorblax filing go out before the "
-        "Friday deadline?\nAssistant: Yes, it went out on Tuesday." % HANDOFF)
+        "Friday deadline, and did Robin Placeholder sign it?\nAssistant: Yes, it went out on "
+        "Tuesday." % HANDOFF)
 
 
 class TestExtraction(unittest.TestCase):
@@ -96,12 +97,16 @@ class TestExtraction(unittest.TestCase):
         self.assertIn("Did the Zorblax filing go out before", ep["body"])
         self.assertNotIn("CONTEXT COMPACTION", ep["body"] + ep["key"]["title"])
 
-    def test_a_turn_without_framing_keeps_its_episode(self):
-        from engine.extraction import _strip_roles
-        plain = ("User: Did the Zorblax filing go out before the Friday deadline?\n"
-                 "Assistant: Yes, on Tuesday.")
-        (ep,) = self.episodes(plain)
-        self.assertEqual(ep["body"], _strip_roles(plain)[:400])
+    def test_an_episode_is_what_the_user_said(self):
+        """5.8.3: not the assistant's reply -- only the user's own words say
+        anything about the user (the facts and notes already worked so)."""
+        ask = "Did the Zorblax filing go out before the Friday deadline, and who signed it?"
+        (ep,) = self.episodes("User: %s\nAssistant: Yes, on Tuesday; Robin signed it." % ask)
+        self.assertEqual(ep["body"], ask)
+
+    def test_a_short_ask_is_no_episode(self):
+        self.assertEqual(self.episodes("User: Did it go out?\nAssistant: Yes, on Tuesday, "
+                                       "signed by Robin Placeholder at Acme Fake Co."), [])
 
     def test_the_model_is_not_asked_to_summarise_the_handoff(self):
         from engine.extraction import LLMExtractor
@@ -140,10 +145,12 @@ class TestToolOutputIsNotWhatWasSaid(unittest.TestCase):
 
     def test_an_episode_is_not_the_file_it_read(self):
         from engine.extraction import HeuristicExtractor
-        (ep,) = [i for i in HeuristicExtractor().extract(TOOL_TURN, source_event="ev1").items
+        turn = TOOL_TURN.replace("moved?", "moved since Pat Testley last looked at it?")
+        (ep,) = [i for i in HeuristicExtractor().extract(turn, source_event="ev1").items
                  if i["kind"] == "episode"]
         self.assertNotIn("calendar sync", ep["body"])
-        self.assertIn("deadline is still Friday", ep["body"])
+        self.assertNotIn("still Friday", ep["body"], "nor the assistant's reply")
+        self.assertIn("Zorblax filing deadline moved since", ep["body"])
 
     def test_the_model_is_not_sent_the_file(self):
         from engine.extraction import LLMExtractor

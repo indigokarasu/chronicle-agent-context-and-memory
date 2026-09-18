@@ -3,6 +3,23 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.3
+
+**An episode about the user is what the user said.** A transcript episode was
+the whole turn, so the assistant's reply ("Great, I will remember that ...",
+its code, its plan) became part of an episode about the user — the one output
+still built that way after the facts and notes moved to the user's own lines.
+On the production store 24 of the 32 active transcript episodes carried it,
+and once the belief index stopped burying them (5.8.2) they reached the
+user's turns. The episode is now the user's words in the turn (none when
+those are too short); `deploy570/rederive_transcript_episodes.py` re-derived
+the live ones through the capture path.
+
+**A scheduled job's turn gets no per-turn recall.** Nobody asked, the
+"message" is the job's own prompt, and on the production box those were ~98%
+of all turns — up to 4,800 characters of the user's memory each.
+`retrieval.prefetch_automation: true` restores it.
+
 ## 5.8.2
 
 **The per-turn search reads what it can return.** Profiled on the production
