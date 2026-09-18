@@ -524,7 +524,22 @@ class ChronicleMemoryProvider(MemoryProvider):
             relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)))
 
     def system_prompt_block(self) -> str:
-        return self.core.retrieval.static_block(self._principal_id) if self.core else ""
+        if not self.core:
+            return ""
+        return self.core.retrieval.static_block(
+            self._principal_id, include_agent_own=not self._host_injects_agent_memory())
+
+    @staticmethod
+    def _host_injects_agent_memory() -> bool:
+        """Does the host put the agent's own memory file into the system prompt
+        itself (Hermes' built-in memory, `memory.memory_enabled`)? Then
+        Chronicle's copies of the agent's memory writes are older duplicates."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False                  # outside Hermes: Chronicle is the only copy
+        return bool(mem.get("memory_enabled", True))
 
     def list_identity_candidates(self, status="pending", kind="", limit=50) -> list[dict[str, Any]]:
         """Identity split/merge candidates awaiting adjudication (§E7, issue #8).
