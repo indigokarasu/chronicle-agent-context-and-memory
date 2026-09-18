@@ -49,12 +49,23 @@ class _Timeouts:
         raise socket.timeout("timed out")
 
 
-def _embedder(cooldown=30.0):
+class _Resets(_Timeouts):
+    """A RETRYABLE failure -- the connection reset mid-request. The retry
+    budget and the breaker below are about these; a timeout is not retried at
+    all (TestATimeoutIsNotRetried), because on an on-host server it means
+    "busy", and a retry only queues another copy behind the running one."""
+
+    def __call__(self, *a, **k):
+        self.calls += 1
+        raise ConnectionResetError("connection reset by peer")
+
+
+def _embedder(cooldown=30.0, failure=_Resets):
     emb = E.OpenAICompatEmbedder("http://127.0.0.1:8080/v1", "nomic-embed-text", 768,
                                  timeout=0.2, max_attempts=3, backoff_base=0.0,
                                  backoff_cap=0.0, circuit_cooldown=cooldown)
-    emb._embed_raw = _Timeouts()
-    emb._embed_raw_batch = _Timeouts()
+    emb._embed_raw = failure()
+    emb._embed_raw_batch = failure()
     return emb
 
 
@@ -164,7 +175,7 @@ class TestTheCircuit(unittest.TestCase):
         emb._embed_raw = lambda text, timeout: [0.1] * 768
         emb.embed_document("back")
         self.assertEqual((emb._trips, emb._open_until), (0, 0.0))
-        failing = _Timeouts()
+        failing = _Resets()
         emb._embed_raw = failing
         with self.assertRaises(E.EmbeddingsUnavailable):
             emb.embed_document("down again")
@@ -256,6 +267,86 @@ class TestATurnDoesNotWaitOnADownServer(unittest.TestCase):
         failed = c.execute("SELECT COUNT(*) FROM curation_jobs WHERE task='embed' "
                            "AND status='failed'").fetchone()[0]
         self.assertEqual(failed, 0, "an outage defers vectors, it does not give up on them")
+
+
+class TestATimeoutIsNotRetried(unittest.TestCase):
+    """Measured on the production VPS: one failing embed spent ~60 s -- five
+    attempts at a 10 s timeout plus backoff -- and every attempt queued another
+    request behind the one the server was still working on."""
+
+    def test_one_timeout_is_one_request(self):
+        emb = _embedder(failure=_Timeouts)
+        with self.assertRaises(E.EmbeddingsUnavailable) as cm:
+            emb.embed_document("x")
+        self.assertEqual(emb._embed_raw.calls, 1)
+        self.assertIsInstance(cm.exception.__cause__, socket.timeout)
+        with self.assertRaises(E.EmbeddingsUnavailable):
+            emb.embed_document("y")                # breaker open: no request at all
+        self.assertEqual(emb._embed_raw.calls, 1)
+
+    def test_a_batch_timeout_is_one_request(self):
+        emb = _embedder(failure=_Timeouts)
+        with self.assertRaises(E.EmbeddingsUnavailable):
+            emb.embed_batch(["a", "b"])
+        self.assertEqual(emb._embed_raw_batch.calls, 1)
+
+
+class TestTheBackgroundTimeout(unittest.TestCase):
+    """Off the critical path a request may take as long as the loaded server
+    needs: a long excerpt timed out on every attempt at the live timeout, and
+    its job never succeeded (676 failed that way in six days)."""
+
+    def _recording(self):
+        emb = E.OpenAICompatEmbedder("http://127.0.0.1:8080/v1", "nomic-embed-text", 768,
+                                     timeout=10.0, max_attempts=1, backoff_base=0.0,
+                                     backoff_cap=0.0)
+        seen = []
+        emb._embed_raw = lambda text, timeout: (seen.append(timeout), [0.1] * 768)[1]
+        return emb, seen
+
+    def test_the_call_carries_its_own_timeout(self):
+        emb, seen = self._recording()
+        emb.embed_document("x", timeout=120.0)
+        emb.embed_document("y")
+        self.assertEqual(seen, [120.0, 10.0])
+
+    def test_the_patient_helper_passes_it_where_it_is_taken(self):
+        emb, seen = self._recording()
+        E.embed_document_patiently(emb, "x", 90.0)
+        self.assertEqual(seen, [90.0])
+        hashing = E.HashingEmbedder(dimensions=64)
+        self.assertEqual(len(E.embed_document_patiently(hashing, "x", 90.0)), 64)
+
+    def test_the_embed_job_uses_it(self):
+        import shutil
+        from _tmp_support import temp_home
+        from engine.core import ChronicleCore
+        home = temp_home(prefix="bgtimeout_")
+        try:
+            core = ChronicleCore.get(home, {"embeddings": {"model": "hashing",
+                                                           "background_timeout": 75}})
+            seen = []
+            real = core.embedder.embed_document
+
+            def recording(document, timeout=None):
+                seen.append(timeout)
+                return real(document)
+            core.embedder.embed_document = recording
+            core.initialize("s1", principal_id="default")
+            eid = core.capture.observe("I booked Izakaya Nonesuch for Friday.", "Noted.",
+                                       session_id="s1")
+            with core.store.transaction() as c:      # as if the inline embed had failed
+                c.execute("DELETE FROM observed_vectors WHERE event_id=?", (eid,))
+            seen.clear()
+            core.curation._task_embed({"target_id": eid, "kind": "observed",
+                                       "text": "I booked Izakaya Nonesuch"})
+            self.assertEqual(seen, [75.0])
+            seen.clear()
+            core.curation._task_session_summarize({"session_id": "s1"})
+            self.assertEqual(seen, [75.0])                  # the session summary too
+        finally:
+            ChronicleCore._instances.pop(home, None)
+            shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -303,6 +303,8 @@ class ChronicleContextEngine(ContextEngine):
                 from engine.core import ChronicleCore
             core = ChronicleCore.get(args["hermes_home"], args["config"])
             core.has_context_engine = True
+            if core.cfg.get("curation.drain.background", True):
+                core.drain_in_background()     # see provider.initialize
             with self._init_lock_budget(core):
                 core.initialize(self._session_id, hermes_home=args["hermes_home"],
                                 principal_id=self._principal_id)
