@@ -1025,12 +1025,17 @@ class OpenAICompatEmbedder:
     the next operation, so a transient outage never pins the whole session to a
     degraded embedder. Auth failures (401/403) are terminal and raised immediately
     (waiting will not fix a bad key).
+
+    An exhausted budget raises EmbeddingsUnavailable and opens a circuit for
+    `circuit_cooldown` seconds, during which calls fail at once rather than each
+    re-spending the whole budget (see _circuit_trip).
     """
 
     def __init__(self, base_url: str, model: str, dimensions: int, api_key: str = "", timeout: float = 10.0,
                  max_attempts: int = 5, backoff_base: float = 1.0, backoff_cap: float = 8.0,
                  max_input_tokens: int = _DEFAULT_MAX_INPUT_TOKENS, overflow: str = "truncate",
-                 task_prefixes: str | bool | None = None, allow_remote: bool = False):
+                 task_prefixes: str | bool | None = None, allow_remote: bool = False,
+                 circuit_cooldown: float = 30.0):
         self.base_url = base_url.rstrip("/")
         # A2: the on-host check happens HERE, once, before an object that can
         # POST an excerpt exists -- and it is the only place DNS is consulted,
@@ -1050,6 +1055,45 @@ class OpenAICompatEmbedder:
         self.overflow = normalize_overflow(overflow)
         # Determine if task prefixes should be used (only for real embedders)
         self.use_task_prefixes = should_use_task_prefixes(model, task_prefixes)
+        # Circuit breaker: see _circuit_trip.
+        self.circuit_cooldown = max(0.0, float(circuit_cooldown))
+        self._open_until = 0.0
+
+    # -- circuit breaker ------------------------------------------------------
+    # Every call used to start from a fresh retry budget with no memory that the
+    # endpoint had just failed. On a CPU-throttled host whose local embedding
+    # server answered `/v1/models` in 0.1 s and then timed out on real work, one
+    # context compaction that evicted twenty spans paid twenty full retry cycles
+    # — measured at over six minutes, with 26 timeouts, before it had finished its
+    # FIRST pass. Once a call exhausts its budget the endpoint is presumed down
+    # for `circuit_cooldown` seconds: calls in that window fail at once, the
+    # first call after it probes again, and a success closes the circuit.
+    #
+    # Exhaustion now raises EmbeddingsUnavailable, not the raw socket error.
+    # That is the exception every caller treats as "the backend is down, try
+    # later": _safe_vec queues a deferred embed job, the curation worker defers
+    # the job without spending its failure cap. A raw `socket.timeout` reached
+    # the generic handler instead, which logged at DEBUG and dropped the vector
+    # for good — while the warning line above it promised "embed retried on the
+    # next operation". Auth failures (401/403) are unchanged: waiting does not
+    # fix a bad key.
+    def _circuit_check(self):
+        left = self._open_until - time.monotonic()
+        if left > 0:
+            raise EmbeddingsUnavailable(
+                "%s is presumed down after repeated failures; next attempt in %.0fs"
+                % (_redact(self.base_url), left))
+
+    def _circuit_trip(self, attempts: int, exc: Exception) -> "EmbeddingsUnavailable":
+        self._open_until = time.monotonic() + self.circuit_cooldown
+        logger.error("Chronicle embeddings: %s failed after %d attempts (%s); vector deferred to "
+                     "the curation queue, FTS retrieval continues; calls fail fast for %.0fs",
+                     _redact(self.base_url), attempts, exc, self.circuit_cooldown)
+        return EmbeddingsUnavailable("%s unavailable after %d attempts: %s"
+                                     % (_redact(self.base_url), attempts, exc))
+
+    def _circuit_reset(self):
+        self._open_until = 0.0
 
     def _embed_raw(self, text: str, timeout: float) -> list[float]:
         import json as _json
@@ -1103,10 +1147,13 @@ class OpenAICompatEmbedder:
         """The original single-call retry loop, now reusable per-chunk so
         chunk_mean can retry each chunk independently without duplicating the
         backoff/terminal-error contract."""
+        self._circuit_check()
         attempt = 0
         while True:
             try:
-                return self._embed_raw(text, timeout=self.timeout)
+                vec = self._embed_raw(text, timeout=self.timeout)
+                self._circuit_reset()
+                return vec
             except Exception as e:
                 attempt += 1
                 if self._is_terminal(e):
@@ -1114,10 +1161,7 @@ class OpenAICompatEmbedder:
                                  self.base_url, e)
                     raise
                 if attempt >= self.max_attempts:
-                    logger.error("Chronicle embeddings: %s failed after %d attempts (%s); raising -- "
-                                 "no hash fallback; vector skipped this round, FTS retrieval continues, "
-                                 "embed retried on the next operation", self.base_url, attempt, e)
-                    raise
+                    raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 wait = wait * (0.5 + random.random() * 0.5)  # 50-100% jitter
                 logger.warning("Chronicle embeddings: %s embed failed (attempt %d/%d: %s); "
@@ -1171,14 +1215,19 @@ class OpenAICompatEmbedder:
         return out
 
     def _embed_raw_batch_retrying(self, part: list[str]) -> list[list[float]]:
+        self._circuit_check()
         attempt = 0
         while True:
             try:
-                return self._embed_raw_batch(part, timeout=max(self.timeout, 2.0 + 0.25 * len(part)))
+                out = self._embed_raw_batch(part, timeout=max(self.timeout, 2.0 + 0.25 * len(part)))
+                self._circuit_reset()
+                return out
             except Exception as e:
                 attempt += 1
-                if self._is_terminal(e) or attempt >= self.max_attempts:
+                if self._is_terminal(e):
                     raise
+                if attempt >= self.max_attempts:
+                    raise self._circuit_trip(attempt, e) from e
                 wait = min(self.backoff_cap, self.backoff_base * (2 ** (attempt - 1)))
                 time.sleep(wait * (0.5 + random.random() * 0.5))
 
