@@ -61,5 +61,53 @@ class TestExcludedSessionsAreNotEmbedded(unittest.TestCase):
         self.assertTrue(self.core.store.has_observed_vector(chat))
 
 
+class TestArchiveCopiesOfCapturedTurns(unittest.TestCase):
+    """The context engine archives every message it folds. When the memory
+    provider already captured the turn (it marks the copy `extract: False`),
+    the copy is durable and searchable but NOT embedded: the provider's capture
+    carries the vector, and each compaction queued one embed job per archived
+    message."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="embdup_")
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _evict(self, text, extract=None):
+        payload = {"source_type": "context_eviction", "excerpt": text, "source_ref": CHAT}
+        if extract is not None:
+            payload["extract"] = extract
+        return self.core.capture.append("observed", payload, actor="user", session_id=CHAT)
+
+    def _jobs(self, eid):
+        return self.core.store._conn().execute(
+            "SELECT COUNT(*) FROM curation_jobs WHERE task='embed' AND instr(payload, ?)>0",
+            (eid,)).fetchone()[0]
+
+    def test_a_copy_of_a_captured_turn_is_searchable_not_embedded(self):
+        eid = self._evict("Sam Vimes booked the Izakaya Nonesuch.", extract=False)
+        self.assertFalse(self.core.store.has_observed_vector(eid))
+        self.assertEqual(self._jobs(eid), 0, "no deferred embed job either")
+        hits = self.core.store.fts_search_observed("Nonesuch", limit=5)
+        self.assertIn(eid, [h["event_id"] for h in hits])
+
+    def test_a_queued_job_for_such_a_copy_does_nothing(self):
+        eid = self._evict("Sam Vimes booked the Izakaya Nonesuch again.", extract=False)
+        self.core.curation._task_embed({"target_id": eid, "kind": "observed", "text": "x"})
+        self.assertFalse(self.core.store.has_observed_vector(eid))
+
+    def test_standalone_the_copy_is_the_only_one_and_is_embedded(self):
+        """Its vector is deferred to the queue (it is written from inside a
+        compaction), and the queued job embeds it."""
+        eid = self._evict("Robin Placeholder prefers the window seat.")
+        self.assertEqual(self._jobs(eid), 1)
+        self.core.curation._task_embed({"target_id": eid, "kind": "observed",
+                                        "text": "Robin Placeholder prefers the window seat."})
+        self.assertTrue(self.core.store.has_observed_vector(eid))
+
+
 if __name__ == "__main__":
     unittest.main()
