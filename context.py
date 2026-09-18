@@ -170,6 +170,13 @@ class ChronicleContextEngine(ContextEngine):
         self.compression_count = 0
         # -- pinned message tracking (R3: span-level protection by ID) ------
         self._pinned_content_hashes = set()  # sha256 hashes of pinned message content
+        # Messages already handed to capture.rescue() this conversation (I14),
+        # by hash. rescue() gives each rescued span a fresh document_id and the
+        # event id includes the call's time, so nothing downstream dedupes a
+        # repeat: every compaction pass re-captured every important message in
+        # the window as a brand-new event. Measured: 60 rescued observations
+        # and 30 rescued notes PER PASS on a sixty-message conversation.
+        self._rescued_hashes = set()
         # Rolling checkpoint digest (§R7): deterministic, no-model lines built
         # from extraction artifacts over every span compress() has folded out
         # of the window this session. Oldest-first so the cap can trim the
@@ -181,6 +188,12 @@ class ChronicleContextEngine(ContextEngine):
         # warning is actually delivered inside a compress() return value (see
         # _emit_pressure_warning) -- never on intent alone.
         self._pressure_warning_injected = False  # latched only on actual delivery
+        # -- preflight deferral (host contract) ----------------------------
+        # Right after a compaction the host's ROUGH whole-context estimate is
+        # stale, and acting on it compacts a request that already fits. Set by
+        # every compaction, cleared by the next real usage figure.
+        self._awaiting_real_usage = False
+        self._provider_reports_usage = False
         # -- init resilience state (see _RETRY_* above) ---------------------
         # INVARIANT: `self.core is None` <=> the heuristic fallback is active.
         # Nothing may attach a core it did not finish initializing.
@@ -193,6 +206,45 @@ class ChronicleContextEngine(ContextEngine):
         self._recovered_after = 0        # failures the last recovery came back from
         self._last_error = ""            # last init error, kept after recovery
         self._retry_lock = threading.Lock()
+
+    # -- one copy per agent ---------------------------------------------------
+    # The host gives every agent its OWN copy of the registered engine
+    # (hermes-agent agent_init._select_context_engine: `copy.deepcopy(candidate)`)
+    # so a child's update_model() cannot move the parent's budget. A plain
+    # deepcopy of this object fails on `_retry_lock` — "cannot pickle
+    # '_thread.lock' object" — and the host then falls back to its BUILT-IN
+    # compressor for that agent, with a warning nobody reads. On the production
+    # gateway that happened 38 times in one day: Chronicle was configured as the
+    # context engine and never once compressed a conversation, while the built-in
+    # compressor it fell back to was pointed at a provider with no API key, so
+    # the user saw "Shortening the conversation history failed".
+    #
+    # What a copy must SHARE and what it must OWN:
+    #   core         SHARED. It is the process-wide ChronicleCore singleton
+    #                (ChronicleCore.get), holding the store, its connections and
+    #                the vector index. Copying it would duplicate all of that per
+    #                agent — the shape of the June leak that grew the gateway by
+    #                ~850 MB/min when this engine was last active.
+    #   _retry_lock  FRESH. A lock belongs to one object; a copy gets its own.
+    #   the rest     COPIED. Session id, budget counters, the locked prefix,
+    #                pinned hashes, the rolling digest: per-agent state, which is
+    #                exactly what the host is copying to keep separate.
+    _SHARED_ON_COPY = ("core",)
+    _FRESH_ON_COPY = {"_retry_lock": threading.Lock}
+
+    def __deepcopy__(self, memo):
+        import copy as _copy
+        cls = type(self)
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        for key, value in self.__dict__.items():
+            if key in self._SHARED_ON_COPY:
+                setattr(new, key, value)
+            elif key in self._FRESH_ON_COPY:
+                setattr(new, key, self._FRESH_ON_COPY[key]())
+            else:
+                setattr(new, key, _copy.deepcopy(value, memo))
+        return new
 
     # lifecycle
     def on_session_start(self, session_id, *, hermes_home=None, principal_id="default", config=None, **kw):
@@ -207,6 +259,7 @@ class ChronicleContextEngine(ContextEngine):
         self._locked_prefix = []  # §R5: a new session starts with nothing settled
         self._checkpoint_lines = []  # §R7: the rolling digest is scoped to THIS session
         self._pressure_warning_injected = False  # §R9: re-arm for the new session
+        self._rescued_hashes = set()  # I14: rescue once per message per conversation
         self._try_init()
         # One greppable line per session start. Which half of the plugin is live
         # is exactly what went unnoticed for a whole process life on 2026-08-02,
@@ -338,6 +391,39 @@ class ChronicleContextEngine(ContextEngine):
         if self.core:
             self.core.capture.finalize_session(session_id, "clean_exit")
 
+    def on_session_reset(self):
+        """`/new` or `/reset`: forget everything that belonged to the old conversation.
+
+        The host's default only zeroes the token counters. This engine also
+        keeps per-conversation state, and every piece of it describes messages
+        that no longer exist after a reset:
+
+          _locked_prefix   the cut-point geometry compress() committed to (§R5).
+                           Left in place, the NEW conversation's messages are
+                           compared against the OLD one's prefix;
+          _checkpoint_lines the rolling digest of what was folded out (§R7) —
+                           a summary of a conversation the user just discarded;
+          _pinned_content_hashes  spans the user pinned in that conversation;
+          _rescued_hashes  what compress() already rescued (I14) — a new
+                           conversation that repeats a message must rescue it;
+          focus            what that conversation was about (chronicle_focus);
+          _pressure_warning_injected  latched for a crossing that is over.
+
+        The same things on_session_start clears, for the same reason. The
+        core is NOT touched — it is the process-wide store, not conversation
+        state — and nothing is written: the host calls on_session_end for the
+        boundary, and that is where the old session is finalized."""
+        super().on_session_reset()
+        self._locked_prefix = []
+        self._checkpoint_lines = []
+        self._pinned_content_hashes = set()
+        self._rescued_hashes = set()
+        self._pressure_warning_injected = False
+        self.focus = None
+        self.focus_topic = None
+        self._awaiting_real_usage = False
+        self._provider_reports_usage = False
+
     def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode=""):
         self.context_length = context_length
         # HIGH watermark (§R2): the fraction of the window that decides a
@@ -348,6 +434,11 @@ class ChronicleContextEngine(ContextEngine):
         self.threshold_tokens = int(context_length * self.threshold_percent)
 
     def update_from_response(self, usage):
+        if (usage or {}).get("prompt_tokens"):
+            # The provider has now measured the request we sent after the
+            # compaction: the estimate no longer has to be second-guessed.
+            self._awaiting_real_usage = False
+            self._provider_reports_usage = True
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", 0)
@@ -445,9 +536,13 @@ class ChronicleContextEngine(ContextEngine):
         # the small-body early return below so that path is covered too.
         warn_pending = self.is_under_pressure() and not self._pressure_warning_injected
 
-        # 1) rescue critical/high-salience spans → durable beliefs (I14)
-        self.core.capture.rescue(messages, session_id=self._session_id,
-                                speaker_context=self._host_context)
+        # 1) rescue critical/high-salience spans → durable beliefs (I14) —
+        # once per message per conversation, not once per compaction pass.
+        fresh = [m for m in messages if self._rescue_key(m) not in self._rescued_hashes]
+        if fresh:
+            self.core.capture.rescue(fresh, session_id=self._session_id,
+                                     speaker_context=self._host_context)
+            self._rescued_hashes.update(self._rescue_key(m) for m in fresh)
 
         # 1.5) stable cut-point geometry (§R5): reuse whatever leading run of
         # `messages` is byte-identical, in order, to what compress() already
@@ -633,6 +728,7 @@ class ChronicleContextEngine(ContextEngine):
             actor="system", session_id=self._session_id)
 
         self.compression_count += 1
+        self._awaiting_real_usage = True
         # §R5: lock in everything just decided -- never rescored/reordered again
         # -- EXCEPT the memory injection, which is regenerated fresh every pass
         # and so stays ordinary evictable content on the NEXT call.
@@ -659,6 +755,16 @@ class ChronicleContextEngine(ContextEngine):
         while k < n and messages[k] == locked[k]:
             k += 1
         return k
+
+    @staticmethod
+    def _rescue_key(m) -> str:
+        """Identity of a message for rescue: who said it and what they said.
+        A hash, so a long conversation costs 64 bytes a message, not its text."""
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, sort_keys=True, default=str)
+        return hashlib.sha256(("%s\x00%s" % (role, content)).encode("utf-8")).hexdigest()
 
     def _keep_score(self, m, focus, recency_position=1.0):
         """Unified scorer (R3 + R8): the one place a keep/evict score is computed,
@@ -1226,6 +1332,7 @@ class ChronicleContextEngine(ContextEngine):
         system = [m for m in messages if m.get("role") == "system"]
         body = [m for m in messages if m.get("role") != "system"]
         self.compression_count += 1
+        self._awaiting_real_usage = True
         return system + body[:3] + body[-6:]
 
     # tools
@@ -1336,6 +1443,28 @@ class ChronicleContextEngine(ContextEngine):
         return st
 
     # status
+    def should_defer_preflight_to_real_usage(self, rough_tokens) -> bool:
+        """Whether a ROUGH over-threshold estimate should wait one request for
+        the provider's real count. The host's own semantics, point for point
+        (agent/context_compressor.py), because the host calls this only for
+        whole-context rough estimates and its anti-thrash reasoning assumes
+        them. Chronicle used to inherit the default `False`, so right after a
+        compaction a stale estimate could compact a request that already fit.
+
+          under the threshold        -> no reason to defer
+          a compaction just ran      -> defer: the last real reading predates it
+          the provider proved it     -> do not defer: real usage says it is over
+          provider omits usage       -> do not defer, or compression could never
+                                        fire on the estimate, its only signal
+        """
+        if not self.threshold_tokens or rough_tokens < self.threshold_tokens:
+            return False
+        if self._awaiting_real_usage:
+            return True
+        if self.last_prompt_tokens >= self.threshold_tokens:
+            return False
+        return self._provider_reports_usage
+
     def should_compress_preflight(self, messages) -> bool:
         """Preflight (§R10): use idle time BEFORE the HIGH watermark forces a
         reactive compress() to do that pass's expensive, I/O-bound prep early --

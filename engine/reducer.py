@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import re
+import threading
 
 from . import access
 from . import entities as ents
@@ -354,6 +355,36 @@ def _vector_text_from_source_event(conn, spec, kind, belief_id, projected) -> tu
     return text, bool(text)
 
 
+# Writes the context engine makes from INSIDE compress(): the spans it evicts and
+# the ones it rescues first (I14). compress() runs on the critical path of the
+# user's turn, and on a CPU-throttled host one compaction made 150 inline embed
+# calls — 60 rescued observations, 30 rescued notes at three embeds each (novelty,
+# vector, doc2query proxy) — every one a timeout. For these events the reducer
+# takes exactly the path a DEGRADED embedder already takes: the vector (and any
+# proxy) is queued as a deferred embed job, novelty is left unset. Their TEXT is
+# durable and FTS-indexed as before, so recall finds them the same turn.
+#
+# Keyed on the event's own source_type, not on who is calling, so a rebuild makes
+# the identical decision and the projection it produces is the one live wrote (I3).
+_DEFERRED_VECTOR_SOURCES = ("context_eviction", "rescue_extraction")
+_TLS = threading.local()
+
+
+def _defers_vectors(event) -> bool:
+    """Cheap: a substring test on the raw payload, before any json parse — this
+    runs for every event of a 400k-event rebuild. A false positive only defers
+    one vector."""
+    raw = event.get("payload")
+    if isinstance(raw, dict):
+        return raw.get("source_type") in _DEFERRED_VECTOR_SOURCES
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    return isinstance(raw, str) and any('"%s"' % s in raw for s in _DEFERRED_VECTOR_SOURCES)
+
+
+def _vectors_deferred() -> bool:
+    return getattr(_TLS, "defer_vectors", False)
+
 def _embed_document(embedder, text):
     """embedder.embed_document(text), falling back to embed() when the object
     predates E1's document/query split.
@@ -500,7 +531,13 @@ class Reducer:
         if handler is None:
             logger.warning("Unknown event type: %s", event.get("type"))
             return
-        handler(self, event)
+        outer = _vectors_deferred()
+        _TLS.defer_vectors = outer or (event.get("type") in ("observed", "asserted")
+                                       and _defers_vectors(event))
+        try:
+            handler(self, event)
+        finally:
+            _TLS.defer_vectors = outer
 
     def reduce_many(self, events):
         for e in events:
@@ -1063,6 +1100,8 @@ class Reducer:
         cached = self._vec_cache.get(text)
         if cached is not None:
             return cached
+        if _vectors_deferred():
+            return None
         try:
             return _embed_document(self.embedder, text)
         except EmbeddingsUnavailable:
@@ -1642,6 +1681,8 @@ class Reducer:
         try:
             if vec is not None:
                 return pack(vec)
+            if _vectors_deferred():
+                raise EmbeddingsUnavailable("deferred: written from inside compress()")
             cached = self._vec_cache.get(text)
             return pack(cached if cached is not None else _embed_document(self.embedder, text))
         except EmbeddingsUnavailable:
