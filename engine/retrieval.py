@@ -2211,10 +2211,10 @@ class RetrievalEngine:
                 expanded = self._expand_session_window(
                     g["sid"], principal, seen_excerpts, limit=max_events)
                 if keep is not None:
-                    # the injection relevance gate (get_context passes it): the
-                    # text to carry, or None to leave the turn out
+                    # the injection relevance gate (get_context passes it): given
+                    # the row, the text to carry, or None to leave the turn out
                     expanded = [dict(x, excerpt=said) for x in expanded
-                                for said in (keep(x.get("excerpt")),) if said is not None]
+                                for said in (keep(x),) if said is not None]
                 if not expanded:
                     continue
                 sessions_expanded += 1
@@ -2854,12 +2854,28 @@ class RetrievalEngine:
             gate_drop[kind] += 1
             return False
 
-        def _said(text):
-            """A raw excerpt as the gated injection carries it: what was said
-            -- not a tool's output, which is not memory about the user (a file
-            read that mentions "calendar" is not about the user's calendar) --
-            or None when nothing relevant is left."""
-            said = _spk.strip_framing(text or "", drop_tools=True)
+        metas: dict = {}
+
+        def _said(row):
+            """A raw row's text as the gated injection carries it, or None to
+            leave it out. What was SAID: not a tool's output (a file read that
+            mentions "calendar" is not about the user's calendar), not the
+            agent's own memory (see _AGENT_OWN_SOURCES), and not the unlabelled
+            opening of a later chunk of a long turn -- it starts mid-message,
+            and on the production store 473 of the 651 interactive transcript
+            events were such chunks, stored without spans that could say whose
+            words they are."""
+            eid = row.get("event_id")
+            if eid not in metas:
+                metas[eid] = self._event_meta(eid)
+            meta = metas[eid]
+            if meta.get("source_type") in _AGENT_OWN_SOURCES:
+                gate_drop["excerpts"] += 1
+                return None
+            later_chunk = (meta.get("source_type") == "session_transcript"
+                           and (meta.get("chunk_index") or 0) > 0)
+            said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
+                                      drop_unlabeled=later_chunk)
             if not said.strip() or not _relevant(said, "excerpts"):
                 return None
             return said
@@ -2871,10 +2887,7 @@ class RetrievalEngine:
                 return rows
             kept = []
             for r in rows:
-                if self._event_source(r.get("event_id")) in _AGENT_OWN_SOURCES:
-                    gate_drop["excerpts"] += 1
-                    continue
-                said = _said(r.get("excerpt"))
+                said = _said(r)
                 if said is None:
                     continue
                 if said is not r.get("excerpt"):
@@ -3427,7 +3440,7 @@ class RetrievalEngine:
                         existing_event_ids=seen_event_ids if precision else None)
                     if gate is not None:
                         expanded = [dict(x, excerpt=said) for x in expanded
-                                    for said in (_said(x.get("excerpt")),) if said is not None]
+                                    for said in (_said(x),) if said is not None]
                     if not expanded:
                         continue
                     sessions_expanded += 1
@@ -4278,18 +4291,18 @@ class RetrievalEngine:
             return access.can_read(None, ev.get("owner"), principal)
         return True
 
-    def _event_source(self, event_id) -> str:
-        """The source_type of an observed event ("" for a session or projection
-        row, or an event that is not there)."""
+    def _event_meta(self, event_id) -> dict:
+        """An observed event's source_type and chunk_index ({} for a session or
+        projection row, or an event that is not there)."""
         if not event_id or event_id.startswith(("session:", "proj:")):
-            return ""
+            return {}
         ev = self.store.get_event(event_id) or {}
         raw = ev.get("payload")
         try:
             p = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except ValueError:
-            return ""
-        return p.get("source_type") or ""
+            return {}
+        return {"source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
 
     def _gate_text(self, b) -> str:
         """What the injection relevance gate reads for a ranked belief: its
