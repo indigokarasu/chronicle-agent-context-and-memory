@@ -579,6 +579,24 @@ def contradictions(db_path: str, limit: int = 100, offset: int = 0, status: str 
         conn.close()
 
 
+def _in_supersession_order(versions: list) -> list:
+    """Versions by `created_at`, and a version before the one that replaced it
+    when both carry the same timestamp. Writes land in the same millisecond
+    routinely (a correction right after the fact it corrects), and the old
+    tie-break was the belief id -- a hash -- so a history could read backwards.
+    Rows are (belief_id, value, status, created_at, ..., superseded_by)."""
+    succ = {v[0]: v[6] for v in versions}
+
+    def after(bid):                     # how many versions replaced this one
+        n, seen = 0, {bid}
+        while succ.get(bid) and succ[bid] not in seen and n < len(succ):
+            bid = succ[bid]
+            seen.add(bid)
+            n += 1
+        return n
+    return sorted(versions, key=lambda v: (v[3] or "", -after(v[0]), v[0]))
+
+
 def fact_histories(db_path: str, limit: int = 100) -> dict:
     """Facts that were replaced, grouped into their value histories: every
     version of an (entity, predicate) in order, with when each held."""
@@ -605,10 +623,10 @@ def fact_histories(db_path: str, limit: int = 100) -> dict:
                 names[r[0]] = r[1]
         items = []
         for entity_id, predicate, n, _last in keys:
-            versions = conn.execute(
+            versions = _in_supersession_order(conn.execute(
                 "SELECT belief_id, value, status, created_at, valid_from, valid_until, superseded_by "
                 "FROM facts WHERE entity_id=? AND predicate_canonical=? ORDER BY created_at, belief_id",
-                (entity_id, predicate)).fetchall()
+                (entity_id, predicate)).fetchall())
             items.append({
                 "entity_id": entity_id, "entity": names.get(entity_id) or entity_id,
                 "predicate": predicate, "versions": [{
