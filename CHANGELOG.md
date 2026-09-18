@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.14
+
+**An instruction about the task in hand is not a standing one.** A standing
+instruction becomes a directive injected into every later turn. The
+classifier took any "don't …", "never …" or "I want you to …" — so, from the
+user's real messages, "Don't try to come up with a fix yet, just understand
+the issue", "don't stop until you have any stuck or broken processes fixed"
+and "I want you to review the search code here <url>" would each have told
+the agent, forever, not to fix things or to keep going. An instruction scoped
+to now ("yet", "for now", "until", "this", "here", a link) is not standing
+unless it says so ("always", "never", "from now on", "ever"). The five live
+directives are the agent's own memory writes and are untouched.
+
 ## 5.8.13
 
 **The episode rule, tightened where it leaked and loosened where it lost.**

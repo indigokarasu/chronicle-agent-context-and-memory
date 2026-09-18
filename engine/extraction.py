@@ -163,6 +163,14 @@ def _narrative(texts) -> str:
     return " ".join(keep).strip()
 
 
+_TASK_SCOPE = re.compile(
+    r"\b(?:yet|for now|right now|now|until|till|today|tonight|this|these|here|first|for the moment|this time)\b"
+    r"|https?://", re.IGNORECASE)
+_STANDING = re.compile(
+    r"\b(?:always|never|ever|from now on|going forward|in (?:the )?future|every time|each time|whenever"
+    r"|any time|anytime|at all times)\b", re.IGNORECASE)
+
+
 def is_standing_instruction(text: str) -> bool:
     """True only for imperative / standing-instruction shape (§16.2).
 
@@ -175,8 +183,15 @@ def is_standing_instruction(text: str) -> bool:
     low = _POLITE_PREFIX.sub("", line.lower()).strip()
     if not low or _NORM_REFUSE.search(low):
         return False
-    return bool(_NORM_LEAD.match(low) or _NORM_SECOND_PERSON.match(low)
-                or _NORM_REQUEST.search(low))
+    if not (_NORM_LEAD.match(low) or _NORM_SECOND_PERSON.match(low) or _NORM_REQUEST.search(low)):
+        return False
+    # An instruction about the task in hand is not a standing one: "Don't try
+    # to come up with a fix yet", "don't stop until the stuck processes are
+    # fixed", "I want you to review the search code here <url>" -- sampled from
+    # the user's real messages, each would have been injected into every
+    # later turn. Scoped ("yet", "for now", "until", "this", "here", a link)
+    # and not made standing ("always", "never", "from now on"), it is not one.
+    return not (_TASK_SCOPE.search(low) and not _STANDING.search(low))
 
 
 # -- first-person preference (A6) -----------------------------------------

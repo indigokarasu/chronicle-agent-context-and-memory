@@ -413,6 +413,21 @@ class TestDirectiveVsPreference(unittest.TestCase):
         self.assertFalse(is_standing_instruction("Should I always use metric?"))
         self.assertTrue(is_standing_instruction("Always use metric."))
 
+    def test_an_instruction_about_the_task_in_hand_is_not_standing(self):
+        """5.8.14: sampled from the user's real messages, each of these would
+        have been injected into every later turn as a standing directive."""
+        for line in ("Don't try to come up with a Zorblax fix yet, just understand the issue.",
+                     "Don't stop until the stuck Acme Fake Co processes are fixed.",
+                     "I want you to review the Zorblax search code here https://example.invalid/x",
+                     "Never mind the export for now."):
+            self.assertFalse(is_standing_instruction(line), line)
+            self.assertEqual(self.notes(line), [], "%r became a directive" % line)
+        for line in ("Never send email on my behalf without asking.",
+                     "From now on, never book the Izakaya Nonesuch without asking me.",
+                     "Don't use this Zorblax tool ever again.",
+                     "Always use metric units."):
+            self.assertTrue(is_standing_instruction(line), line)
+
     def test_preference_facts_are_retrievable_by_the_preference_query(self):
         """F3 §4b measured `pref_beliefs_n` = 0 rows in 7 of 8 haystacks, because
         no regex ever produced a `likes`/`prefers` surface. The addendum's query
