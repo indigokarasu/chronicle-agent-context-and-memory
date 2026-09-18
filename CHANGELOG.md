@@ -3,6 +3,26 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.7.14
+
+**The per-turn prefetch asks the store only for what it can use.** Profiled on
+the production store (one gated prefetch, 4.3 s):
+
+* The raw FTS channel was 2.3 s in three calls. It ORed every word of the
+  message ("which", "did" and "I" included) over a transcript table that is
+  ~98% cron runs, filtered the cron rows afterwards, and had to widen and
+  re-run the ranked match to find enough rows left. The gated path now asks
+  FTS for the message's content words as prefix terms
+  (`retrieval.relevance_fts_match` — what the gate keeps anyway; "restaurant"*
+  finds "restaurants", which the unstemmed index would not), for both the raw
+  and the belief channel, and `fts_search_observed` drops automation sessions
+  inside the query, before the LIMIT. Explicit retrieval asks exactly the
+  query it always did.
+* The standing-directive lookup was 0.8 s in two calls: its index covers
+  `always_inject` alone, and the attribution cleanup left 40,444 retracted
+  always-inject notes behind it for five active ones. A composite index on
+  `(always_inject, status)` now serves it.
+
 ## 5.7.13
 
 **A turn does not wait for the embedding server.** Measured on the production
