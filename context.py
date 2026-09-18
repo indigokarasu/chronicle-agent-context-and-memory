@@ -940,6 +940,10 @@ class ChronicleContextEngine(ContextEngine):
         else:
             asks, steps = self._handoff_asks[n_asks:], self._handoff_steps[n_steps:]
             known = [line for line in self._checkpoint_lines if line not in known_before]
+        # An "[episode]" digest line is a user request restated -- the handoff
+        # already quotes every folded request -- so only facts, entities and
+        # directives go under "Stated".
+        known = [line for line in known if not line.startswith("[episode] ")]
         handoff = None
         if asks or steps or known or extra:
             warn = None
@@ -1780,8 +1784,8 @@ class ChronicleContextEngine(ContextEngine):
         """Deterministic digest lines for one span's content -- no model call.
 
         Runs the same regex-only HeuristicExtractor durable capture uses (§16)
-        and turns whatever it finds (facts, entities, directives, episodes)
-        into short lines. Extraction is pure-function over `content`, so the
+        and turns the facts, entities and directives it finds into short
+        lines. Extraction is pure-function over `content`, so the
         same content always yields the same lines (replay determinism).
         """
         if _DIGEST_EXTRACTOR is None or not content or len(content) < 8:
@@ -1809,9 +1813,10 @@ class ChronicleContextEngine(ContextEngine):
                 line = f"entity: {body} ({etype})" if etype else f"entity: {body}"
             elif kind == "note":
                 line = f"[directive] {body}"
-            elif kind == "episode":
-                line = f"[episode] {body}"
             else:
+                # An episode is the user's message restated, and the handoff
+                # quotes folded requests verbatim; in the capped digest they
+                # pushed the facts out, oldest first.
                 continue
             lines.append(line[:200])
         return lines

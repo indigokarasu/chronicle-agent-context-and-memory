@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.1
+
+**A host notice is not the user.** Hermes' turn-liveness watchdog writes its
+abort — "Turn made no progress for 613s; aborting to release the session." —
+into the transcript as a plain user row. Replayed compactions quoted it back
+as something the user said; it is host framing now, wherever it appears in a
+message, and the user's own words next to it stay theirs.
+
+**The digest keeps facts, not restated requests.** The checkpoint digest turned
+every long user message into an `[episode]` line; the handoff already quotes
+folded requests verbatim, and in the 300-token rolling digest those lines
+pushed the actual facts out, oldest first. Episodes stay out of it.
+
 ## 5.8.0
 
 **Compaction leaves one handoff, keeps tool calls whole, and follows the
