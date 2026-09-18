@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+# The dashboard plugin UI is loaded straight from dashboard/dist by the Hermes
+# dashboard, with no build step on the host, so the built bundles ship in the repo.
+!dashboard/dist/
 build/
 .venv/
 venv/
@@ -37,3 +40,4 @@ s_ctx100.json
 # scripts/bench_a5_vectors.py's default store, now that its default is inside
 # the repo rather than an absolute path in one developer's home directory.
 .a5bench/
+dashboard/web/node_modules/

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chronicle Dashboard Harness</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; background: #0a0a14; color: #e7e5f1; font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .sdk-card { border: 1px solid rgba(150,130,230,.18); border-radius: .6rem; background: #0e0e1a; }
+  .sdk-card-h { padding: .7rem .9rem .2rem; }
+  .sdk-card-t { font-size: .85rem; font-weight: 500; }
+  .sdk-card-c { padding: .4rem .9rem .8rem; }
+  .sdk-badge { display: inline-block; font-size: .66rem; padding: .05rem .4rem; border-radius: 9999px; border: 1px solid rgba(150,130,230,.3); color: #cdc6f5; white-space: nowrap; }
+  .sdk-badge[data-tone=success] { border-color: #4fd6a6; color: #4fd6a6; }
+  .sdk-badge[data-tone=warning] { border-color: #f0b54e; color: #f0b54e; }
+  .sdk-badge[data-tone=destructive] { border-color: #f0706e; color: #f0706e; }
+  .sdk-btn { background: #17151f; color: #e7e5f1; border: 1px solid rgba(150,130,230,.3); border-radius: .4rem; padding: .3rem .6rem; font-size: .8rem; cursor: pointer; }
+  .text-sm { font-size: .85rem; } .text-xs { font-size: .72rem; } .text-xl { font-size: 1.25rem; }
+  .font-light { font-weight: 300; } .text-muted-foreground { color: #9b97b8; }
+</style>
+<!-- Stand-in for the dashboard's own React. Production gets React from the Hermes SDK. -->
+<script src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // Minimal Hermes plugin SDK: only what the Chronicle bundles use.
+  (function () {
+    var h = React.createElement;
+    function cls(base, extra) { return base + (extra ? " " + extra : ""); }
+    window.__HERMES_PLUGIN_SDK__ = {
+      React: React,
+      hooks: { useState: React.useState, useEffect: React.useEffect, useCallback: React.useCallback,
+               useMemo: React.useMemo, useRef: React.useRef, useContext: React.useContext, createContext: React.createContext },
+      fetchJSON: function (url, init) {
+        return fetch(url, init).then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status + " for " + url);
+          return r.json();
+        });
+      },
+      components: {
+        Card: function (p) { return h("div", { className: cls("sdk-card", p.className) }, p.children); },
+        CardHeader: function (p) { return h("div", { className: cls("sdk-card-h", p.className) }, p.children); },
+        CardTitle: function (p) { return h("div", { className: cls("sdk-card-t", p.className) }, p.children); },
+        CardContent: function (p) { return h("div", { className: cls("sdk-card-c", p.className) }, p.children); },
+        Badge: function (p) { return h("span", { className: "sdk-badge", "data-tone": p.tone || "outline" }, p.children); },
+        Button: function (p) { return h("button", { className: "sdk-btn", disabled: p.disabled, onClick: p.onClick }, p.children); },
+      },
+      utils: {},
+    };
+    window.__HERMES_PLUGINS__ = {
+      register: function (name, Component) {
+        ReactDOM.createRoot(document.getElementById("root")).render(h(Component));
+      },
+      registerSlot: function () {},
+    };
+    var s = document.createElement("script");
+    s.setAttribute("data-hermes-plugin", "chronicle");
+    s.src = "/dashboard-plugins/chronicle/dist/index.js";
+    document.body.appendChild(s);
+  })();
+</script>
+</body>
+</html>

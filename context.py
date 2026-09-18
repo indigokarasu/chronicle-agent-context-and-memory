@@ -137,6 +137,7 @@ class ChronicleContextEngine(ContextEngine):
         self.core = None
         self._session_id = ""
         self._principal_id = "default"
+        self._host_context = {}      # platform, for who is on the user side (engine/speaker.py)
         self.threshold_percent = 0.75
         self.protect_first_n = 3
         self.protect_last_n = 6
@@ -200,6 +201,7 @@ class ChronicleContextEngine(ContextEngine):
         hermes_home = hermes_home or _default_hermes_home()
         self._session_id = session_id
         self._principal_id = principal_id
+        self._host_context = {k: str(kw[k]) for k in ("agent_context", "platform") if kw.get(k)}
         self._init_args = {"hermes_home": hermes_home, "config": config}
         self._init_started = True
         self._locked_prefix = []  # §R5: a new session starts with nothing settled
@@ -444,7 +446,8 @@ class ChronicleContextEngine(ContextEngine):
         warn_pending = self.is_under_pressure() and not self._pressure_warning_injected
 
         # 1) rescue critical/high-salience spans → durable beliefs (I14)
-        self.core.capture.rescue(messages, session_id=self._session_id)
+        self.core.capture.rescue(messages, session_id=self._session_id,
+                                speaker_context=self._host_context)
 
         # 1.5) stable cut-point geometry (§R5): reuse whatever leading run of
         # `messages` is byte-identical, in order, to what compress() already
@@ -1014,20 +1017,37 @@ class ChronicleContextEngine(ContextEngine):
         content = m.get("content") or ""
         if len(content) < 1:
             return []
-        # Normalize chat-role to a valid Chronicle actor (CHECK constraint allows
-        # only 'user','agent','curator','system'). "assistant" is not a valid actor.
-        role = m.get("role", "system")
-        actor = role if role in ("user", "agent", "curator", "system") else "agent"
-
         # Import the chunker from capture (same as observe() uses)
         try:
+            from .engine import speaker as spk
             from .engine.capture import _split_excerpt
         except ImportError:
+            from engine import speaker as spk
             from engine.capture import _split_excerpt
+
+        # Who wrote this message (engine/speaker.py). The actor is `user` only for
+        # a person's own words; a cron prompt or a host control frame in a `user`
+        # row is `system`. (CHECK constraint: 'user','agent','curator','system'.)
+        role = m.get("role", "system")
+        side = spk.user_side(agent_context=self._host_context.get("agent_context", ""),
+                             platform=self._host_context.get("platform", ""),
+                             session_id=self._session_id)
+        who = spk.role_speaker(role, side)
+        if who in (spk.HUMAN, spk.AUTOMATION):
+            spans = spk.split_user_content(content, who)
+        else:
+            spans = [(0, len(content), who)]
+        if who == spk.HUMAN:
+            actor = "user" if spk.has_human([(content[a:b], w) for a, b, w in spans]) else "system"
+        elif who in (spk.AUTOMATION, spk.SYSTEM, spk.UNKNOWN):
+            actor = "system"
+        else:
+            actor = "agent"
 
         # Chunk the content to store it durably without loss
         cap = self.core.capture._excerpt_cap()
         chunks = _split_excerpt(content, cap)
+        per_chunk = spk.chunk_spans(spans, chunks)
 
         # Store each chunk as a separate durable event, just like observe() does
         chunk_ids = []
@@ -1038,7 +1058,9 @@ class ChronicleContextEngine(ContextEngine):
                 "source_ref": self._session_id,
                 "span_id": span_id,
                 "chunk_index": i,
-                "chunk_count": len(chunks)
+                "chunk_count": len(chunks),
+                "speakers": per_chunk[i],
+                "attribution": {"user_side": side, "role": str(role)},
             },
             actor=actor,
             session_id=self._session_id)
@@ -1359,7 +1381,8 @@ class ChronicleContextEngine(ContextEngine):
         I/O, never correctness. Stops the moment `deadline` (a time.monotonic()
         cutoff from capture.precompress.budget_ms) passes.
         """
-        self.core.capture.rescue(messages, session_id=self._session_id)
+        self.core.capture.rescue(messages, session_id=self._session_id,
+                                speaker_context=self._host_context)
         if time.monotonic() >= deadline:
             return
 

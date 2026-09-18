@@ -30,7 +30,7 @@ from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
                          estimate_tokens, pack, unpack, wrong_dim_indices)
 from .federated import FederatedChannel
 from .serialize import belief_id as compute_belief_id
-from .store import KIND_TABLE, now_iso
+from .store import KIND_TABLE, now_iso, word_tokens
 from .trust import Calibrator, confidence_summary
 from .vector_index import MAX_K as KNN_MAX_K
 from .vector_index import VectorIndex
@@ -552,7 +552,7 @@ def _route_tokens(text: str) -> str:
     on both sides is what lets "when did I go kayaking in Sacramento" match a
     bank of "when did this happen" -- shared noise words never get in the way
     of the one or two content words that actually mark the question kind."""
-    return " ".join(t for t in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+    return " ".join(t for t in word_tokens((text or "").lower())
                     if t not in _ROUTE_STOP)
 
 
@@ -4099,7 +4099,7 @@ def _clamp(v, lo=0.0, hi=1.0):
 
 
 def _content_tokens(text):
-    return {w for w in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+    return {w for w in word_tokens((text or "").lower())
                if len(w) > 3 and w not in _STOP}
 
 
@@ -4142,7 +4142,7 @@ def query_tokens(query: str) -> list:
     delegates here, and engine.hostmodel's rerank drain calls it directly, so
     the key a hint is FILED under and the key it is LOOKED UP by cannot drift
     apart across two modules."""
-    return [t for t in re.findall(r"[A-Za-z0-9']+", (query or "").lower())
+    return [t for t in word_tokens((query or "").lower())
             if t not in _STOP and len(t) > 1]
 
 

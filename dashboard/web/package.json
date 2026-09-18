@@ -1,0 +1,16 @@
+{
+  "name": "chronicle-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Source for dashboard/dist: the Chronicle Hermes dashboard plugin UI. React comes from the Hermes plugin SDK at runtime and is never bundled.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@deck.gl/core": "9.4.0",
+    "@deck.gl/layers": "9.4.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

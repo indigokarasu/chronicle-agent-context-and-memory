@@ -1039,6 +1039,7 @@ class TestDigest(unittest.TestCase):
         import importlib.util
         import types as _types
         self._seed()
+        installed_stub = False
         if "fastapi" not in sys.modules:
             stub = _types.ModuleType("fastapi")
             class _APIRouter:
@@ -1047,10 +1048,18 @@ class TestDigest(unittest.TestCase):
             stub.APIRouter = _APIRouter
             stub.Query = lambda default=None, **k: default
             sys.modules["fastapi"] = stub
+            installed_stub = True
         plugin_api_path = Path(__file__).parent.parent / "dashboard" / "plugin_api.py"
         spec = importlib.util.spec_from_file_location("chronicle_plugin_api_r12_unit", str(plugin_api_path))
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        try:
+            spec.loader.exec_module(mod)
+        finally:
+            # Left installed, the stub outlived this test: every later check of
+            # "is fastapi importable?" saw a two-method fake, so tests that must
+            # record routes through their own stub skipped in collection order.
+            if installed_stub:
+                sys.modules.pop("fastapi", None)
 
         stats = mod._get_embedding_stats(Path(self.core.store.db_path))
         self.assertIn("digest", stats)
