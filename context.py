@@ -1581,6 +1581,18 @@ class ChronicleContextEngine(ContextEngine):
         self._prune_rearm_tokens = after + max(reclaimed, trigger, min_reclaim)
         return out, changed
 
+    def has_content_to_compress(self, messages) -> bool:
+        """`/compress` preflight: is there anything compress() may evict?
+
+        The host asks before a manual compaction so it can answer "nothing to
+        compress yet" instead of running a pass that changes nothing. The
+        default says yes to everything. The same partition compress() uses:
+        system rows, the head, the tail, and directive or pinned spans are
+        protected; anything else in the middle is fair game."""
+        body = [m for m in messages if m.get("role") != "system"]
+        middle = body[self.protect_first_n: max(self.protect_first_n, len(body) - self.protect_last_n)]
+        return any(not self._never_evict(m) for m in middle)
+
     def should_defer_preflight_to_real_usage(self, rough_tokens) -> bool:
         """Whether a ROUGH over-threshold estimate should wait one request for
         the provider's real count. The host's own semantics, point for point
