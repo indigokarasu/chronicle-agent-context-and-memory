@@ -290,7 +290,6 @@ class HeuristicExtractor(Extractor):
         ambiguous = False
         seen: set = set()
         lines = _role_lines(excerpt) if lines is None else lines
-        text = _strip_roles(_reader_excerpt(excerpt, lines))
 
         def add(item):
             key = item.get("key") or {}
@@ -354,15 +353,20 @@ class HeuristicExtractor(Extractor):
                         add(_fact_item(tok, "is_a", etype, owner, domain, source_event,
                                        "session_transcript", entity_name=subject))
 
-        # An episodic summary of the turn with tiered abstraction levels
-        if len(text) > 60:
-            abstract_level = text[:60] + "..." if len(text) > 60 else text
-            gist_level = text[:200] + "..." if len(text) > 200 else text
+        # An episodic summary of the turn with tiered abstraction levels -- of
+        # what the USER said in it. It was built from the whole turn, so the
+        # assistant's reply ("Great, I will remember that ...", its code, its
+        # plan) became part of an episode about the user; on the production
+        # store 24 of the 32 active transcript episodes carried it.
+        said = "\n".join(t for t, who in lines if who == spk.HUMAN).strip()
+        if len(said) > 60:
+            abstract_level = said[:60] + "..."
+            gist_level = said[:200] + "..." if len(said) > 200 else said
             items.append({"type": "asserted", "kind": "episode",
-                          "key": {"title": text[:48], "session_ref": session_id},
-                          "body": text[:400], "confidence": 0.6, "source_event": source_event,
+                          "key": {"title": said[:48], "session_ref": session_id},
+                          "body": said[:400], "confidence": 0.6, "source_event": source_event,
                           "source_type": "session_transcript", "route": "promote",
-                          "abstract": abstract_level, "gist": gist_level, "verbatim": text})
+                          "abstract": abstract_level, "gist": gist_level, "verbatim": said})
         route = "promote" if items else "skip"
         return ExtractionResult(items, ambiguous, route)
 

@@ -205,6 +205,13 @@ class ChronicleMemoryProvider(MemoryProvider):
 
     # -- capture -----------------------------------------------------------
 
+    def _automation_turn(self, session_id="") -> bool:
+        """Is this turn a scheduled job's (a cron_ session, or an automation
+        platform)? A delegated subagent is not: it works on the user's ask."""
+        sid = session_id or self._session_id
+        platform = str(self._host_context.get("platform") or "").strip().lower()
+        return _speaker().is_automation_session(sid) or platform in ("cron", "batch", "curator", "flush")
+
     def _speaker_context(self, turn_author=None) -> dict:
         ctx = dict(self._host_context)
         author = turn_author if isinstance(turn_author, dict) else self._turn_author
@@ -502,6 +509,9 @@ class ChronicleMemoryProvider(MemoryProvider):
 
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
+            return ""
+        if self._automation_turn(session_id) and \
+                not self.core.cfg.get("retrieval.prefetch_automation", False):
             return ""
         # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
         # nothing from a scheduled job's own runs (engine/speaker) -- and only
