@@ -1854,12 +1854,14 @@ class ChronicleContextEngine(ContextEngine):
 
     def chronicle_expand(self, span_id):
         """Rehydrate a FOLDED (evicted) span back to its original content (R4),
-        by span_id from a `[FOLD span_id digest]` tombstone stub.
+        by the `fold_…` id the compaction handoff lists (brackets allowed).
 
         Reassembles the durable chunk events in order (R11) and checks the
         result against the stored digest, so a caller can tell a genuine
         rehydration from a store that's missing a chunk.
         """
+        # As the handoff shows it -- "[fold_ab12cd34ef56]" -- or bare.
+        span_id = str(span_id or "").strip().strip("[]()`'\" ").strip()
         if not span_id:
             return {"error": "span_id is required"}
         fold = self._find_fold_record(span_id)
@@ -2036,9 +2038,9 @@ class ChronicleContextEngine(ContextEngine):
                             "(memory-aware or heuristic fallback) and why.",
              "parameters": {"type": "object", "properties": {}, "required": []}},
             {"name": "chronicle_expand",
-             "description": "Rehydrate a span evicted from context back to its original "
-                            "content, given the span_id (the first token after '[FOLD') "
-                            "from a tombstone stub left in the window (R4 FOLD tier).",
+             "description": "Restore a turn a compaction folded out of the conversation, "
+                            "by the [fold_…] id the compaction note lists next to it "
+                            "(e.g. fold_ab12cd34ef56). Returns its original content.",
              "parameters": {"type": "object",
                             "properties": {"span_id": {"type": "string"}},
                             "required": ["span_id"]}},
