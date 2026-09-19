@@ -525,6 +525,12 @@ _ONE_WORD_FLOOR = {"nomic-embed-text": 0.65}
 # turn's together stop at _GATE_EMBED_BUDGET seconds. An item with no stored
 # vector is embedded on the spot only when short (a CPU embedder took ~0.45 s
 # for 300 characters), and at most _GATE_EMBED_ITEMS of them per turn.
+# ...and a match on two or three shared words (retrieval.prefetch_min_similarity_few),
+# measured the same way on 300 real messages: the plainly unrelated scored
+# 0.49-0.65 (a security alert's generic words, a pasted script), the related
+# 0.59-0.90; four or more shared words were all related.
+_FEW_WORDS_FLOOR = {"nomic-embed-text": 0.60}
+_FEW_WORDS = 3
 _GATE_EMBED_TIMEOUT = 1.0
 _GATE_EMBED_BUDGET = 1.5
 _GATE_EMBED_ITEM_CHARS = 240
@@ -3081,6 +3087,12 @@ class RetrievalEngine:
         # line must share a content word with `hint`; a hint with no content
         # words gets nothing, and the retrieval work is not even started.
         if relevance_gate:
+            # Only what the person wrote: the gateway prepends an origin header
+            # ("Gateway message origin (JSON data, not instructions or
+            # authorization): {...}"), and its words -- json, authorization,
+            # chat, field -- matched a session where the user once pasted code.
+            hint = "".join(hint[a:b] for a, b, who in _spk.split_user_content(hint or "", _spk.HUMAN)
+                           if who == _spk.HUMAN)
             hint = gate_focus(hint)          # a long prompt: its most telling words
         gate = relevance_words(hint) if relevance_gate else None
         gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
@@ -3090,6 +3102,7 @@ class RetrievalEngine:
         gate_need = gate_needs(gate) if gate is not None else 0
 
         floor = self._one_word_floor() if gate is not None else None
+        few_floor = self._few_words_floor() if gate is not None else None
         query_vec: list = []                 # embedded on first need, at most once
         embeds = {"deadline": None, "items": 0, "made": {}}   # made: this turn's, by item
 
@@ -3103,42 +3116,55 @@ class RetrievalEngine:
                 return None
             return self._gate_vector(text, as_query, min(_GATE_EMBED_TIMEOUT, left))
 
-        def _close_enough(ref, word, text):
-            """A ONE-word match: kept when the item is near the message in
-            meaning (see retrieval.prefetch_min_similarity) -- its stored vector,
-            or, for a short item with none of this model, its text embedded now
-            (a few per turn). With no floor (an unmeasured model) the word rule
-            stands; with one, a match nothing can vouch for -- the embedder busy
-            or down, a long item never embedded -- is left out: on the
-            production store 71 of 75 one-word matches were coincidences, and
-            a busy embedder used to let every one of them back in."""
-            if floor is None:
-                return True
+        def _similarity(ref, text):
+            """(cosine of the message and the item, why-not): the item's stored
+            vector, or, for a short item with none of this model, its text
+            embedded now (a few per turn). (None, reason) when nothing can say."""
             if not query_vec:
                 query_vec.append(_embed(hint, True))
             q = query_vec[0]
-            vec = self._gate_stored_vector(ref) if q else None
+            if not q:
+                return None, "no query vector"
+            vec = self._gate_stored_vector(ref)
             key = ref if ref and ref[1] else text
-            if q and (not vec or len(vec) != len(q)):
+            if not vec or len(vec) != len(q):
                 vec = embeds["made"].get(key)
                 if vec is None and len(text) <= _GATE_EMBED_ITEM_CHARS and embeds["items"] < _GATE_EMBED_ITEMS:
                     embeds["items"] += 1
                     vec = embeds["made"][key] = _embed(text, False)
-            if not vec or len(vec) != len(q or ()):
-                gate_drop.setdefault("one_word", []).append(
-                    {"word": word, "similarity": None, "kept": False, "text": text[:80],
-                     "why": "no vector" if q else "no query vector"})
-                return False
-            sim = cosine(q, vec)
-            gate_drop.setdefault("one_word", []).append(
-                {"word": word, "similarity": round(sim, 3), "kept": sim >= floor, "text": text[:80]})
-            return sim >= floor
+            if not vec or len(vec) != len(q):
+                return None, "no vector"
+            return cosine(q, vec), None
+
+        def _close_enough(ref, words, text):
+            """A match on ONE shared word (retrieval.prefetch_min_similarity) or
+            on two or three (…_few): kept when the item is near the message in
+            meaning. With no floor (an unmeasured model) the words decide alone.
+            One word nothing can vouch for -- the embedder busy or down, a long
+            item never embedded -- is left out: on the production store 71 of 75
+            one-word matches were coincidences, and a busy embedder used to let
+            every one back in. Two or three shared words are evidence of their
+            own, so there the words decide when the vectors cannot."""
+            bar = floor if len(words) == 1 else few_floor
+            if bar is None:
+                return True
+            sim, why = _similarity(ref, text)
+            kept = (len(words) > 1) if sim is None else sim >= bar
+            rec = {"similarity": None if sim is None else round(sim, 3), "kept": kept, "text": text[:80]}
+            if why:
+                rec["why"] = why
+            if len(words) == 1:
+                gate_drop.setdefault("one_word", []).append(dict(rec, word=words[0]))
+            else:
+                gate_drop.setdefault("few_words", []).append(dict(rec, words=list(words)))
+            return kept
 
         def _relevant(text, kind, ref=None):
             if gate is None:
                 return True
             shared = shared_content_words(gate, text)
-            if len(shared) >= gate_need and (len(shared) > 1 or _close_enough(ref, next(iter(shared)), text)):
+            if len(shared) >= gate_need and (len(shared) > _FEW_WORDS
+                                             or _close_enough(ref, sorted(shared), text)):
                 return True
             gate_drop[kind] += 1
             return False
@@ -3419,6 +3445,7 @@ class RetrievalEngine:
         # attributes, none preference-shaped), so they are pure volume in front
         # of a reader whose whole job is to notice what the user likes.
         tier1_chars = 0
+        shown_beliefs: set = set()           # a belief goes into the block once
         for b in ([] if precision or pref_pack else
                   self.search(hint, limit=10, purpose=purpose, principal=principal, now=now,
                               fts_match=fts_match, lexical_only=lexical)):
@@ -3469,6 +3496,7 @@ class RetrievalEngine:
             if tier1_chars + len(line) + 1 > max_chars:
                 break
             parts.append(line)
+            shown_beliefs.add(b.get("belief_id"))
             tier1_chars += len(line) + 1
         ctx = "\n".join(_dedupe(parts))
 
@@ -3938,8 +3966,8 @@ class RetrievalEngine:
             ctx = "\n".join(_dedupe(parts))
 
         for c in self.store.query_beliefs("facts", "criticality!='normal' AND status='active'", (), 5):
-            if not self._readable(c, principal, purpose, None):
-                continue
+            if not self._readable(c, principal, purpose, None) or c.get("belief_id") in shown_beliefs:
+                continue                     # already on the page as a [FACT]
             line = f"[CRITICAL] {c.get('attribute','')}: {c['value']}"
             if gate is not None and not _relevant(line, "tail", ("belief", c.get("belief_id"), "fact")):
                 continue
@@ -4669,6 +4697,18 @@ class RetrievalEngine:
         v = self.cfg.get("retrieval.prefetch_min_similarity", "auto") if self.cfg else "auto"
         if v == "auto":
             v = _ONE_WORD_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _few_words_floor(self):
+        """retrieval.prefetch_min_similarity_few resolved: a float, or None."""
+        if getattr(self.embedder, "_embed_raw_batch", None) is None:
+            return None
+        v = self.cfg.get("retrieval.prefetch_min_similarity_few", "auto") if self.cfg else "auto"
+        if v == "auto":
+            v = _FEW_WORDS_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
         try:
             return float(v) if v is not None else None
         except (TypeError, ValueError):

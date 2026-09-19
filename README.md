@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.29.
+Version: 5.8.30.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -163,9 +163,12 @@ message in meaning: the item's stored vector against the message's (a short
 item with none is embedded on the spot, a few per turn), within a second and a
 half of quick requests to the embedder (`retrieval.prefetch_min_similarity`;
 measured per model, 0.65 for nomic-embed-text); a match nothing can vouch for,
-with the embedder busy or down, is left out. Only the user's own words in a
-past exchange are asked; URLs, short numbers, host framing, tool output and
-the agent's own memory writes never count. A scheduled job's turn gets none
+with the embedder busy or down, is left out. Two or three shared words get the
+same check at their own floor (0.60), and there the words decide when there is
+no vector to compare. The gate reads only the person's words, not the host's
+framing around them. Only the user's own words in a past exchange are asked;
+URLs, short numbers, host framing, tool output and the agent's own memory
+writes never count. A scheduled job's turn gets none
 (`retrieval.prefetch_automation`). Nor does it repeat the conversation in
 progress: the live session's turns are already in the model's window, so only
 what a compaction folded out of it can come back. A credential's value (a
