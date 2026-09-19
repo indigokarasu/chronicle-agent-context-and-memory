@@ -521,7 +521,9 @@ class ChronicleMemoryProvider(MemoryProvider):
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
             principal=self._principal_id, epistemic=self.core.epistemic,
             exclude_automation=True,
-            relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)))
+            relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)),
+            # The conversation in progress is already in the model's window.
+            live_session=session_id or self._session_id or None)
 
     def system_prompt_block(self) -> str:
         if not self.core:

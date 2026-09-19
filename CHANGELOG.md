@@ -3,6 +3,28 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.21
+
+**Per-turn recall no longer repeats the conversation in progress.** The
+provider captures every turn as it happens, so a follow-up found the user's
+own message from minutes earlier and injected it again, though it was still
+in the model's window. On the production store, 10 of 101 real messages got
+an excerpt of their own conversation from before them: 23,000 characters,
+about 40% of everything recalled. Prefetch now passes the live session, and
+retrieval leaves its turns out, the session window included. The exception is
+the copies the context engine wrote when a compaction folded messages out of
+the window, which are exactly what the window no longer has. Explicit search
+is not narrowed. With the rule on, the same messages got 0 such excerpts;
+recall from other conversations was unchanged (21 items).
+
+**A one-word match nothing can vouch for is left out.** In 5.8.19/5.8.20 a
+one-word match fell back to the word rule when the embedder could not answer
+in time. Under load that let every coincidence back in: one probe run over the
+same messages carried 30 belief lines instead of 6. With a floor in force, an
+unvouched one-word match is now dropped (71 of 75 were coincidences). An
+embedder the gate cannot ask, such as hashing, has no floor and keeps the
+word rule.
+
 ## 5.8.20
 
 **An item with no vector to compare is embedded on the spot, if short.**

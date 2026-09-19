@@ -36,6 +36,7 @@ CHAT = "20260917_010203_ab12cd"
 CHAT2 = "20260916_090000_ef34ab"
 CHAT3 = "20260915_070000_9f8e7d"
 CHAT4 = "20260914_060000_1a2b3c"
+LIVE = "20260918_080000_5d6e7f"
 # A tool result longer than one stored chunk: its tail -- with a word nothing
 # else says -- opens a later chunk, with no label to say whose text it is.
 LONG_TOOL = " ".join("Row %d of the export is unremarkable." % i for i in range(160)) + \
@@ -125,7 +126,8 @@ class _Case(unittest.TestCase):
             core.capture.finalize_session(sid, "clean_exit")
         core.process_pending()
         cls.prov = ChronicleMemoryProvider()
-        cls.prov.initialize(CHAT, hermes_home=cls.home, principal_id="default", config=CFG)
+        # A later conversation: the fixture's memories are not the one in progress.
+        cls.prov.initialize(LIVE, hermes_home=cls.home, principal_id="default", config=CFG)
 
     @classmethod
     def tearDownClass(cls):
