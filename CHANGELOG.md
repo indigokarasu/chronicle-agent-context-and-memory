@@ -3,6 +3,27 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — Phase A: one importance model
+
+**Recall and compaction score importance with one model.** The per-turn recall
+gate (a message's content words, how many an item must share, when an
+inflection counts) and the context engine's keep/evict score (recency, focus
+match, salience and criticality keywords) were separate implementations of the
+same question, with nothing to make them agree: a rule fixed on one side — a
+URL's pieces are not content words, a short number is not either — had to be
+remembered on the other. Both now call `engine/salience.py`, which also offers
+the score over any unit (`Unit`, `rank`) so a turn, an episode and a memory can
+be ordered the same way.
+
+A pure extraction, moved verbatim. Accepted by replaying 34 real messages out
+of a copy of the production store through both checkouts: recall blocks
+byte-identical (93,149 characters), all 204 keep scores identical, full gate
+green in four modes. `tests/test_salience_parity.py` pins the values and the
+wiring (the names retrieval exports must BE salience's, and the engine must
+call `keep_score` rather than re-implement it).
+
+Not deployed: this track is local-only by the build spec.
+
 ## 5.8.35
 
 **The Hermes plugin security scan passes, on Chronicle's own files.** The

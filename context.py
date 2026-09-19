@@ -55,6 +55,11 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
 
         estimate_tokens = budget_chars = _no_estimator
 
+try:  # the one importance model recall and compaction share (Phase A) …
+    from .engine import salience as _salience  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import salience as _salience
+
 try:  # one rule for the TEXT of a message, shared with capture …
     from .engine.speaker import message_text  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -299,8 +304,10 @@ _DIGEST_EXTRACTOR = HeuristicExtractor() if HeuristicExtractor is not None else 
 
 _NEVER_EVICT_KW = ["always", "never", "must not", "do not", "don't", "[directive]"]
 
-_SALIENCE_RX = re.compile(r"\b(important|remember|critical|must)\b", re.IGNORECASE)
-_CRITICALITY_RX = re.compile(r"\b(critical|must|urgent|important)\b", re.IGNORECASE)
+# The keep/evict score and its keyword sets live in engine/salience.py, the one
+# importance model recall and compaction share (Phase A).
+_SALIENCE_RX = _salience._SALIENCE_RX
+_CRITICALITY_RX = _salience._CRITICALITY_RX
 
 # Structured focus (§R8). An entity NAME in focus.entities resolves to at most
 # this many candidate entity belief_ids (same substring-on-normalized_name rule
@@ -1357,29 +1364,8 @@ class ChronicleContextEngine(ContextEngine):
         Returns score in [0.0, 1.0].
         """
         w = self.core.cfg.get("context_engine.keep_weights", {}) if self.core else {}
-        content = _text(m).lower()
-
-        # Base score from recency (newer messages score higher)
-        score = recency_position * w.get("recency", 0.20)
-
-        # Relevance: any focus facet (topic, task, or entity name) matches
         focus = focus if isinstance(focus, dict) else self._normalize_focus(focus)
-        facets = list(focus.get("topics") or [])
-        if focus.get("task"):
-            facets.append(focus["task"])
-        facets += list(focus.get("entities") or [])
-        if any(f and f.lower() in content for f in facets):
-            score += w.get("relevance", 0.35)
-
-        # Salience: pre-compiled keyword match
-        if _SALIENCE_RX.search(content):
-            score += w.get("salience", 0.20)
-
-        # Criticality: pre-compiled keyword match
-        if _CRITICALITY_RX.search(content):
-            score += w.get("criticality", 0.20)
-
-        return min(1.0, score)  # Clamp to [0.0, 1.0]
+        return _salience.keep_score(_text(m), focus, recency_position, w)
 
     @staticmethod
     def _normalize_focus(focus) -> dict:
