@@ -137,11 +137,28 @@ class TestRetractMisattributed(unittest.TestCase):
         self.assertEqual(names, self.RETRACTED)
         self.assertEqual(self._status(), before)
 
+    def test_a_cron_session_is_answered_without_reading_its_payload(self):
+        """The fast path the live store needs: a scheduled job's session has no
+        person in it by construction, whatever its payload says."""
+        from scripts.retract_misattributed import human_events
+        c = sqlite3.connect(self.db)
+        try:
+            human = human_events(c)
+        finally:
+            c.close()
+        by_session = {}
+        for eid, sid in sqlite3.connect(self.db).execute(
+                "SELECT event_id, session_id FROM events WHERE type='observed'"):
+            by_session.setdefault(sid or "", []).append(eid)
+        self.assertTrue(by_session[CRON_SESSION])
+        self.assertTrue(all(human[e] is False for e in by_session[CRON_SESSION]))
+        self.assertTrue(any(human[e] for e in by_session[HUMAN_SESSION]))
+
     def test_the_report_says_why(self):
         report = Path(self.home) / "report.jsonl"
         self._run("--report", str(report))
         why = {r["belief_id"]: r["why"] for r in map(json.loads, report.read_text().splitlines())}
-        self.assertEqual(why[self.b["cron_email"]], ["no words by the user (assistant/automation, cron session)"])
+        self.assertEqual(why[self.b["cron_email"]], ["no words by the user"])
         self.assertEqual(why[self.b["assistant_norm"]], ["not in the user's words"])
         self.assertEqual(why[self.b["purged"]], ["event no longer in the log"])
 
@@ -180,6 +197,40 @@ class TestRetractMisattributed(unittest.TestCase):
         before = self._status()
         self.p.core.reducer.rebuild()
         self.assertEqual(self._status(), before)
+
+    def test_a_held_write_lock_is_waited_out_not_fatal(self):
+        """The store has one writer and an agent is using it: the apply waits
+        rather than dying 17 batches in, as it did on the production box."""
+        import scripts.retract_misattributed as mod
+        calls = {"n": 0}
+        real_sleep = mod.time.sleep
+
+        class _LockedOnce:
+            def __init__(self, capture):
+                self.capture = capture
+
+            def append(self, *a, **kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return self.capture.append(*a, **kw)
+
+        mod.time.sleep = lambda _s: None
+        try:
+            waits = mod._append_with_retry(_LockedOnce(self.cap), ["b_x"], "default")
+        finally:
+            mod.time.sleep = real_sleep
+        self.assertEqual((waits, calls["n"]), (1, 2))
+
+    def test_an_error_that_is_not_a_lock_is_raised(self):
+        import scripts.retract_misattributed as mod
+
+        class _Broken:
+            def append(self, *a, **kw):
+                raise sqlite3.OperationalError("no such table: events")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            mod._append_with_retry(_Broken(), ["b_x"], "default")
 
     def test_a_missing_database_is_an_error(self):
         with contextlib.redirect_stderr(io.StringIO()):
