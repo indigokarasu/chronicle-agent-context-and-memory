@@ -14,14 +14,22 @@ score's distribution over a fixed sample. Pass a previous record and it prints
 the deltas, so a change has to say what it did to the numbers before it earns
 a default.
 
-The first record is kept at `deploy570/bench_baseline.json`: 34 real messages
--> 246 items / 93,149 characters in 8.5 s; one real session 93,473 -> 29,595
-tokens with 278 of 1,497 literals still on the page; mean keep score 0.1422.
+Two baselines are kept. Offline, against the August store copy
+(`deploy570/bench_baseline.json`): 34 messages -> 246 items / 93,149
+characters; 93,473 -> 29,595 tokens with 278 of 1,497 literals. Against the
+live store, read-only, with the profile's own embedder and each message's own
+session excluded as a real turn would
+(`deploy570/bench_live_baseline.json`): 34 messages -> 27 items / 28,064
+characters in 6.6 s, with the similarity floors doing their work (28 one-word
+and 52 few-word checks, 984 gate drops); two real sessions 137,764 -> 56,839
+tokens, keeping 701 of 2,006 exact literals (34.9%) in 0.54 s.
 
-What the record is not: it is not production. The store copy predates the live
-retractions and repairs, and recall is asked with no live session to exclude,
-so it returns more than a real turn does. The similarity floors are inert
-under the offline hashing embedder and report zero checks by design.
+The two differ by four times on recall because the copy is a pre-cleanup
+snapshot: it still holds 67,685 active episodes and 30,018 notes that
+production has since retracted, most of them the phantom directives the
+speaker-attribution fix removed. Offline runs are for comparing a change
+against the previous offline run; the live figures are the ones that describe
+production, and `CHRONICLE_BENCH_PROFILE` is what turns the real embedder on.
 
 ## Unreleased — Phase B: what may be summarised, and what only pointed at
 
