@@ -75,14 +75,15 @@ def _connect(db_path) -> sqlite3.Connection:
     `mode=ro` is enforced by SQLite, so nothing here can write the live store.
     It cannot open a WAL database whose -shm does not exist; the live store
     always has one while Hermes runs, and a store nothing has open is read with
-    `immutable=1`, which is exact when no -wal holds frames."""
+    `immutable=1`, which is exact when no -wal holds frames and no rollback
+    journal is hot (either would hold changes the main file does not)."""
     # quoted: a "?" or "#" in the path would otherwise end the file name
     uri = "file:%s?mode=ro" % quote(Path(db_path).as_posix())
     last = None
     for suffix in ("", "&immutable=1"):
         if suffix:
-            wal = Path(str(db_path) + "-wal")
-            if wal.exists() and wal.stat().st_size > 0:
+            sidecars = (Path(str(db_path) + "-wal"), Path(str(db_path) + "-journal"))
+            if any(p.exists() and p.stat().st_size > 0 for p in sidecars):
                 break
         try:
             conn = sqlite3.connect(uri + suffix, uri=True, timeout=_BUSY_MS / 1000.0)
@@ -580,21 +581,34 @@ def contradictions(db_path: str, limit: int = 100, offset: int = 0, status: str 
 
 
 def _in_supersession_order(versions: list) -> list:
-    """Versions by `created_at`, and a version before the one that replaced it
-    when both carry the same timestamp. Writes land in the same millisecond
-    routinely (a correction right after the fact it corrects), and the old
-    tie-break was the belief id -- a hash -- so a history could read backwards.
-    Rows are (belief_id, value, status, created_at, ..., superseded_by)."""
-    succ = {v[0]: v[6] for v in versions}
-
-    def after(bid):                     # how many versions replaced this one
-        n, seen = 0, {bid}
-        while succ.get(bid) and succ[bid] not in seen and n < len(succ):
-            bid = succ[bid]
-            seen.add(bid)
-            n += 1
-        return n
-    return sorted(versions, key=lambda v: (v[3] or "", -after(v[0]), v[0]))
+    """A version always before the one that replaced it; `created_at` orders
+    versions the supersession chain does not relate. Writes land in the same
+    millisecond routinely (a correction right after the fact it corrects), and
+    an out-of-order event or a clock step can give a replacement an EARLIER
+    timestamp than its predecessor -- sorting by time first read that history
+    backwards. Rows are (belief_id, value, status, created_at, ..., superseded_by)."""
+    import heapq
+    by_id = {v[0]: v for v in versions}
+    preds = {bid: 0 for bid in by_id}
+    for v in versions:                  # v was replaced by v[6]: v comes first
+        if v[6] in by_id and v[6] != v[0]:
+            preds[v[6]] += 1
+    key = lambda bid: (by_id[bid][3] or "", bid)   # noqa: E731
+    ready = [key(b) for b, n in preds.items() if n == 0]
+    heapq.heapify(ready)
+    out = []
+    while ready:
+        _t, bid = heapq.heappop(ready)
+        out.append(by_id[bid])
+        nxt = by_id[bid][6]
+        if nxt in preds and nxt != bid:
+            preds[nxt] -= 1
+            if preds[nxt] == 0:
+                heapq.heappush(ready, key(nxt))
+    if len(out) < len(versions):        # a supersession cycle: the rest by time
+        done = {v[0] for v in out}
+        out += sorted((v for v in versions if v[0] not in done), key=lambda v: key(v[0]))
+    return out
 
 
 def fact_histories(db_path: str, limit: int = 100) -> dict:
@@ -798,7 +812,22 @@ def _people_kind(record) -> tuple:
         return ents.THING, "organization"
     if flag in (0, "0", False):
         return ents.PERSON, "contact"
-    return ents.PERSON, "contact (unreviewed)"
+    # Nobody has said whether this record is a person or an organization, and
+    # the read model does not guess: it is counted as unclassified.
+    return None, "contact (unreviewed)"
+
+
+def _count_derived(derived: dict, prefix: str, kind: str, subtype: str, f, eid) -> None:
+    """One more fact behind a place or concept derived from fact values: the
+    item is keyed by its lower-cased name, so every fact naming it lands on it."""
+    name = _title(f["value"])
+    key = prefix + ":" + name.lower()
+    item = derived.setdefault(key, {"id": key, "kind": kind, "subtype": subtype,
+                                    "name": _clip(name, 120), "origin": "fact",
+                                    "of": eid, "facts": 0, "sources": []})
+    item["facts"] += 1
+    if (f["src"] or "") not in item["sources"]:
+        item["sources"].append(f["src"] or "")
 
 
 def _merge_map(conn) -> Dict[str, str]:
@@ -808,19 +837,25 @@ def _merge_map(conn) -> Dict[str, str]:
     adjudicated, never inferred). Nothing in this read model used to look at it,
     so a store where one person had been merged still listed them twice — a
     production store held its principal as both `user` and the people store's
-    uuid for them, 366 facts on one and 273 on the other. A cycle cannot loop
-    here: the
-    walk stops at an id it has already seen."""
+    uuid for them, 366 facts on one and 273 on the other.
+
+    A merge CYCLE (A -> B -> A: two merges adjudicated in opposite directions)
+    has no end to follow. Every id in it maps to one representative, the
+    smallest id in the cycle, and the representative itself is not a key, so
+    the cycle is listed once instead of vanishing entirely."""
     raw = {r["belief_id"]: r["merged_into"] for r in conn.execute(
         "SELECT belief_id, merged_into FROM entities "
         "WHERE merged_into IS NOT NULL AND merged_into <> ''")}
     out: Dict[str, str] = {}
     for src in raw:
-        seen, cur = {src}, raw[src]
-        while cur in raw and cur not in seen:
-            seen.add(cur)
+        path, cur = [src], raw[src]
+        while cur in raw and cur not in path:
+            path.append(cur)
             cur = raw[cur]
-        out[src] = cur
+        if cur in path:                       # a cycle: path[path.index(cur):]
+            cur = min(path[path.index(cur):])
+        if cur != src:
+            out[src] = cur
     return out
 
 
@@ -868,24 +903,9 @@ def entity_index(db_path: str, limit: int = _ENTITY_INDEX_MAX,
                     "of": eid, "when": _event_when(f["value"], f["valid_from"], f["created_at"]),
                     "facts": 1, "sources": [f["src"] or ""]})
             elif (f["predicate_canonical"] or "") in _PLACE_PREDICATES:
-                name = _title(f["value"])
-                key = "place:" + name.lower()
-                item = derived.setdefault(key, {"id": key, "kind": ents.PLACE, "subtype": "",
-                                                "name": _clip(name, 120), "origin": "fact",
-                                                "of": eid, "facts": 0, "sources": []})
-                item["facts"] += 1
-                if (f["src"] or "") not in item["sources"]:
-                    item["sources"].append(f["src"] or "")
+                _count_derived(derived, "place", ents.PLACE, "", f, eid)
             elif (f["predicate_canonical"] or "") in _CONCEPT_PREDICATES:
-                name = _title(f["value"])
-                key = "concept:" + name.lower()
-                item = derived.setdefault(key, {"id": key, "kind": ents.CONCEPT,
-                                                "subtype": f["predicate_canonical"],
-                                                "name": _clip(name, 120), "origin": "fact",
-                                                "of": eid, "facts": 0, "sources": []})
-                item["facts"] += 1
-                if (f["src"] or "") not in item["sources"]:
-                    item["sources"].append(f["src"] or "")
+                _count_derived(derived, "concept", ents.CONCEPT, f["predicate_canonical"], f, eid)
 
         items: List[dict] = []
         name_of: Dict[str, str] = {}
@@ -964,7 +984,10 @@ def entity_detail(db_path: str, entity_id: str, people: Optional[Dict[str, dict]
             "SELECT belief_id, predicate_canonical, value, status, valid_from, valid_until, "
             "       confidence, criticality, occurrence_count, created_at, "
             "       json_extract(provenance, '$.source_type') AS src, "
-            "       json_extract(provenance, '$.source_event') AS src_event "
+            "       json_extract(provenance, '$.source_event') AS src_event, "
+            # the log selects events by seq, not id: carry it for "in the log"
+            "       (SELECT seq FROM events WHERE event_id = "
+            "            json_extract(facts.provenance, '$.source_event')) AS src_seq "
             "FROM facts WHERE entity_id IN (%s) "
             "ORDER BY status!='active', predicate_canonical, created_at"
             % ",".join("?" * len(ids)), ids)]

@@ -803,14 +803,10 @@ class ChronicleContextEngine(ContextEngine):
         # and pre-5.8 artifact comes out, everything after the protected head is
         # fresh again, and ONE consolidated handoff replaces them -- one cache
         # break, which is what Hermes' own compressor pays on every compaction.
-        locked_len = self._match_locked_prefix(messages)
-        used_locked = sum(self._msg_cost(m) for m in messages[:locked_len])
-        # Over the host's message limit, the pass also folds down to half of it.
-        over_count = bool(self.max_messages) and len(messages) >= self.max_messages
-        count_cap = (max(self.protect_first_n + self.protect_last_n + 2, self.max_messages // 2)
-                     if over_count else None)
-        rebase = (locked_len == 0 or used_locked > self._REBASE_AT * budget
-                  or (count_cap is not None and locked_len > self._REBASE_AT * count_cap))
+        # Over the host's message limit, the pass also folds down to half of it
+        # (count_cap); see _settled_prefix, shared with the /compress preflight.
+        locked_len, used_locked, count_cap, rebase = self._settled_prefix(messages, budget)
+        over_count = count_cap is not None
         if rebase:
             prior = [m for m in messages if _is_handoff(m)]
             if prior and not (self._handoff_asks or self._handoff_steps or self._checkpoint_lines):
@@ -1827,7 +1823,14 @@ class ChronicleContextEngine(ContextEngine):
         """
         content = _text(m)
         role = m.get("role", "system")
-        digest = hash_str(content)
+        # The id hashes what the message IS. For a plain string that is its
+        # text (unchanged, so existing ids and replays stay stable); for a list
+        # of parts -- a photo, a file, a caption -- _text() flattens every
+        # attachment to the same marker, so two different photos with one
+        # caption would share an id and expand to each other's record.
+        raw = m.get("content") if isinstance(m, dict) else None
+        digest = hash_str(content if isinstance(raw, str) or raw is None
+                          else json.dumps(raw, sort_keys=True, default=str, ensure_ascii=False))
         span_id = "fold_" + digest[:12]
         if self.core:
             self.core.capture.append("folded", {
@@ -2230,9 +2233,37 @@ class ChronicleContextEngine(ContextEngine):
         default says yes to everything. The same partition compress() uses:
         system rows, the head, the tail, and directive or pinned spans are
         protected; anything else in the middle is fair game."""
+        # No settled prefix (a first pass, or no core yet) is always a rebase,
+        # and needs no budget to say so.
+        rebase = True
+        if self._match_locked_prefix(messages):
+            locked_len, _used, _cap, rebase = self._settled_prefix(messages, self._target_budget())
+        if not rebase:
+            # An extending pass leaves the settled prefix alone and only looks at
+            # what came after it; asking about the whole list would answer from
+            # messages the pass will not touch.
+            fresh = [m for m in messages[locked_len:] if m.get("role") != "system"]
+            middle = fresh[:max(0, len(fresh) - self.protect_last_n)]
+            return any(not self._never_evict(m) and not _is_handoff(m) for m in middle)
         body = [m for m in messages if m.get("role") != "system"]
         middle = body[self.protect_first_n: max(self.protect_first_n, len(body) - self.protect_last_n)]
         return any(not self._never_evict(m) for m in middle)
+
+    def _settled_prefix(self, messages, budget) -> tuple:
+        """(locked_len, used_locked, count_cap, rebase): how much of `messages`
+        a previous pass settled and what it costs, the message cap when the host's
+        message limit is exceeded (else None), and whether the next pass will
+        REBASE (start over from the protected head) rather than extend after
+        it. One decision, shared by compress() and the /compress preflight, so
+        the two cannot disagree."""
+        locked_len = self._match_locked_prefix(messages)
+        used_locked = sum(self._msg_cost(m) for m in messages[:locked_len])
+        over_count = bool(self.max_messages) and len(messages) >= self.max_messages
+        count_cap = (max(self.protect_first_n + self.protect_last_n + 2, self.max_messages // 2)
+                     if over_count else None)
+        rebase = (locked_len == 0 or used_locked > self._REBASE_AT * budget
+                  or (count_cap is not None and locked_len > self._REBASE_AT * count_cap))
+        return locked_len, used_locked, count_cap, rebase
 
     def should_defer_preflight_to_real_usage(self, rough_tokens) -> bool:
         """Whether a ROUGH over-threshold estimate should wait one request for

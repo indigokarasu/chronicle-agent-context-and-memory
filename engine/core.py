@@ -68,6 +68,7 @@ class ChronicleCore:
         self.has_memory_provider = False
         self.has_context_engine = False
         self._startup_recovered = False   # on_startup_recovery: once per process
+        self._startup_recovering = False
         # The background drain (drain_in_background): off until a host asks.
         self._drain_in_background = False
         self._drain_kick = threading.Event()
@@ -262,13 +263,21 @@ class ChronicleCore:
         core. The drain that follows is one ordinary turn's slice
         (curation.drain.per_turn); every later turn drains another, which is the
         path the rest of the queue already takes."""
-        if self._startup_recovered:
+        if self._startup_recovered or self._startup_recovering:
             return
-        self._startup_recovered = True
-        # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
-        if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
-            self.reaper.startup_recovery()
-        self._drain_slice()            # one turn's slice of crash-recovered extraction (I13)
+        # Latched only once it has SUCCEEDED: a recovery that raises is retried
+        # at the next session start instead of being skipped for the rest of
+        # the process. The in-progress flag stops a re-entrant call (a hook the
+        # drain triggers) from starting a second recovery inside the first.
+        self._startup_recovering = True
+        try:
+            # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
+            if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
+                self.reaper.startup_recovery()
+            self._drain_slice()        # one turn's slice of crash-recovered extraction (I13)
+            self._startup_recovered = True
+        finally:
+            self._startup_recovering = False
 
     def start_sources(self):
         if self.cfg.get("sources.ocas_journals.enabled") in (True, "auto"):

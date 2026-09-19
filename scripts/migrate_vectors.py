@@ -680,7 +680,7 @@ class Migrator:
             items = [(r[1],) + session_vector_text(conn, r[1]) for r in rows]
             live = [(sid, text) for sid, text, ok in items if ok and text]
             for sid, _text, ok in items:
-                if not ok:
+                if not ok and not self._empty_session_row(conn, sid):
                     self._count_unrecoverable("session:" + str(sid))
             if not live:
                 continue
@@ -694,6 +694,17 @@ class Migrator:
                     self.store.update_session_vector(sid, pack(vec), self.active_tag)
                     batch.append(1)
             self._progress("session_index")
+
+    @staticmethod
+    def _empty_session_row(conn, sid) -> bool:
+        """A session of nothing but host framing: no summary AND no vector.
+        There is nothing to re-embed and no bytes a query could match, so it is
+        not a vector in the wrong geometry -- the health census leaves it out
+        for the same reason (HealthEngine._CENSUS_FILTER), and counting it here
+        made every migration of such a store end "unsuccessful" forever."""
+        row = conn.execute("SELECT COALESCE(summary, ''), COALESCE(length(embedding), 0) "
+                           "FROM session_index WHERE session_id=?", (sid,)).fetchone()
+        return bool(row) and not row[0] and not row[1]
 
     def reembed_projections(self):
         """Projections re-embed from the text their EMBED JOB recorded (A0e).

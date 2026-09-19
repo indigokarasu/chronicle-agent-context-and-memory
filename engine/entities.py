@@ -76,7 +76,7 @@ _fill(CONCEPT, """concept idea topic subject theme field discipline skill langua
 # else ("pediatrician", "radiologist", "psychiatrist", "photographer"), where a
 # bare "-ist" or "-er" would swallow "checklist" and "computer".
 _PERSON_SUFFIXES = ("ician", "ologist", "iatrist", "ographer", "ometrist", "opath",
-                    "therapist", "ographer")
+                    "therapist")
 
 # Predicates that say what their SUBJECT is, when the type does not.
 _KIND_OF_PREDICATE = {
@@ -176,7 +176,7 @@ def plausible_name(name) -> bool:
     if not significant:
         return False
     for w in significant:
-        core = w.strip("\"'()[[]-–—.,")
+        core = w.strip("\"'()[]-–—.,")
         if not core:
             continue
         if not any(ch.isupper() for ch in core) and not core.isdigit():
