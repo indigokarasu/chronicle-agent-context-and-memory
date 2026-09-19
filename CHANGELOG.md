@@ -3,6 +3,31 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.22
+
+**An importer's sender and sent-date no longer vouch for a subject line.** The
+rule that a fact must say what happened (5.7.3) keeps a value with a quoted
+title or an explicit date. The email importer appends `| from "<sender>" |
+<sent-time>` to every value, so the quoted sender and the sent-time passed
+both tests, and every subject line it wrote was kept. The production store
+held "Delivered 1 item: Skin Care", "Your Subscription Renewal" and "Your return
+drop off confirmation" as things the user had bought. The rule now judges the
+value without those provenance segments. An event date in its own segment
+("Dinner at Fake Izakaya | 2026-09-12") is content and stays.
+
+**A count of items names nothing.** "Delivered 1 item: Clothing" is the owner's
+own example of noise, and the rule still kept it because the capitalised store
+category after the count read as a name. A value whose object is a count of
+items ("Ordered 3 items: Appliances, Health Care, and more", "Shipped: 3 Pet
+items") now says something happened without saying what. A thing named first
+and counted after ("Refund issued for Acme Fake Switch… and 3 other items") is
+kept.
+
+Replayed over all 1,488 active facts on the production store: 45 refused, each
+read and each noise (37 item counts, 8 subject lines). The first version of the
+count rule also refused the switch refund, and was narrowed to a count as the
+object before release.
+
 ## 5.8.21
 
 **Per-turn recall no longer repeats the conversation in progress.** The
