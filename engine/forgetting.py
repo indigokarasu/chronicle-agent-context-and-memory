@@ -14,6 +14,8 @@ from __future__ import annotations
 import datetime
 import logging
 
+from . import sweeps
+
 logger = logging.getLogger("chronicle.forgetting")
 
 _LADDER = {"verbatim": "gist", "gist": "parametric_only", "parametric_only": "tombstone"}
@@ -25,20 +27,49 @@ class ForgettingEngine:
         self.cfg = cfg
         self.append = append_fn
 
-    def decay_sweep(self, *, now: datetime.datetime | None = None):
+    def decay_sweep(self, *, now: datetime.datetime | None = None) -> dict:
+        """One bounded, resumable pass over the active belief tables (§A9).
+
+        Was `query_beliefs(table, "status='active'", limit=5000)`: no ORDER BY,
+        no cursor, so on a store with more than 5000 active facts this read the
+        same prefix on every run and beliefs past it never aged at all — while
+        the sweep returned normally and health recorded success. Now each table
+        carries its own rowid cursor, so consecutive runs walk the whole table
+        and the lap restarts when it ends.
+
+        Decay is ROW-shaped — each belief's ladder step depends only on that
+        row — so rowid paging is exactly right here; nothing is grouped, and a
+        page boundary cannot split a decision.
+
+        The budget is per TABLE, not per run: one run touches at most 3 × the
+        decay budget (`sweeps.budgets.decay` if set, else the shared
+        `sweeps.row_budget`). Returned rather than discarded so the
+        `decay` curation job and `health.run()` can state how far behind the
+        sweep is instead of implying it finished."""
         now = now or datetime.datetime.now(datetime.timezone.utc)
         mults = self.cfg.get("salience.decay_multipliers",
                              {"pinned": 0, "high": 0.25, "normal": 1.0, "incidental": 4.0})
+        tables, decayed = {}, 0
         for table in ("facts", "episodes", "notes"):
-            for row in self.store.query_beliefs(table, "status='active'", (), limit=5000):
+            page = sweeps.next_row_page(self.store, self.cfg, "decay:" + table,
+                                        table, "status='active'", (),
+                                        budget=sweeps.sweep_budget(self.cfg, "decay"))
+            for row in page.rows:
                 if not self._eligible(row, now, mults):
                     continue
                 nxt = _LADDER.get(row.get("fidelity") or "verbatim")
                 if not nxt:
                     continue
+                decayed += 1
                 self.append("decayed", {"belief_id": row["belief_id"],
                                         "from_fidelity": row.get("fidelity") or "verbatim",
                                         "to_fidelity": nxt}, actor="curator", owner=row.get("owner", "default"))
+            tables[table] = sweeps.commit(self.store, page)
+        return {"decayed": decayed,
+                "scanned": sum(t["processed"] for t in tables.values()),
+                "remaining": sum(t["remaining"] for t in tables.values()),
+                "bounded": any(t["bounded"] for t in tables.values()),
+                "tables": tables}
 
     def _eligible(self, row, now, mults) -> bool:
         # I10: critical/high never decays; pinned never decays.

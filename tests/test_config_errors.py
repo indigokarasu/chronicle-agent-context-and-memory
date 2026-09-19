@@ -2,9 +2,11 @@
 Chronicle — tests for config.py and errors.py (§27, §32).
 """
 
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -12,6 +14,7 @@ from engine.config import (
     ABSTAIN_GATES,
     CONFIDENCE_BASE,
     DEFAULTS,
+    EMBED_MODEL_ENV,
     TRUST_CEILING,
     Config,
     _deep_merge,
@@ -36,14 +39,41 @@ from engine.errors import (
 
 
 class TestConfig(unittest.TestCase):
+    """Config's own defaults, asserted against a known-empty environment.
+
+    `Config.__init__` lets $CHRONICLE_EMBED_MODEL override `embeddings.model`,
+    so with the documented CI setting exported these tests were asserting the
+    shell's value, not the default: `test_config_get_nested_path` failed with
+    'hashing' != 'auto' (A11). Every test here now states the environment it
+    means instead of inheriting one.
+    """
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(EMBED_MODEL_ENV, None)
+
+    def test_embed_model_env_overrides_the_default(self):
+        """The override the other tests in this class switch off, asserted
+        head-on so clearing it above cannot quietly stop testing anything."""
+        os.environ[EMBED_MODEL_ENV] = "hashing"
+        self.assertEqual(Config().get("embeddings.model"), "hashing")
+        os.environ[EMBED_MODEL_ENV] = "   "          # blank is not an override
+        self.assertEqual(Config().get("embeddings.model"), "auto")
+
     def test_defaults_populated(self):
+        # §A12 removed `provider`, `store` (self-describing labels the engine
+        # never consulted), `security` (encrypt_at_rest promised encryption that
+        # does not happen) and `tier_triggers` from this list. A key is here
+        # because code reads it, not because it reads well.
         required_keys = [
-            "provider", "store", "db_path", "git_repo",
+            "db_path", "git_repo",
             "embeddings", "principals", "sources", "federation",
             "extraction", "derivation", "retrieval", "context",
             "capture", "reaper", "confidence", "forgetting",
             "salience", "domains", "curation", "health",
-            "learning", "consent", "security", "git",
+            "learning", "consent", "git",
             "context_engine",
         ]
         for k in required_keys:
@@ -51,8 +81,8 @@ class TestConfig(unittest.TestCase):
 
     def test_config_get_simple_path(self):
         cfg = Config()
-        self.assertEqual(cfg.get("provider"), "chronicle")
-        self.assertEqual(cfg.get("store"), "sqlite")
+        self.assertEqual(cfg.get("db_path"), "~/.hermes/commons/db/chronicle/chronicle.db")
+        self.assertIsNone(cfg.get("git_remote"))
 
     def test_config_get_nested_path(self):
         cfg = Config()
@@ -66,9 +96,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.get("nonexistent.key", "fallback"), "fallback")
 
     def test_config_override_flat(self):
-        cfg = Config({"provider": "custom"})
-        self.assertEqual(cfg.get("provider"), "custom")
-        self.assertEqual(cfg.get("store"), "sqlite")
+        cfg = Config({"db_path": "/tmp/custom.db"})
+        self.assertEqual(cfg.get("db_path"), "/tmp/custom.db")
+        self.assertEqual(cfg.get("git_repo"), "~/.hermes/commons/db/chronicle/git")
 
     def test_config_override_nested(self):
         cfg = Config({"embeddings": {"model": "hashing", "dimensions": 512}})
@@ -83,14 +113,14 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(cfg.get("domains.general.auto_decay"))
 
     def test_config_raw_returns_full_dict(self):
-        cfg = Config({"provider": "x"})
+        cfg = Config({"db_path": "/tmp/x.db"})
         raw = cfg.raw
-        self.assertEqual(raw["provider"], "x")
-        self.assertIn("store", raw)
+        self.assertEqual(raw["db_path"], "/tmp/x.db")
+        self.assertIn("git_repo", raw)
 
     def test_config_indexable(self):
         cfg = Config()
-        self.assertEqual(cfg["store"], "sqlite")
+        self.assertEqual(cfg["db_path"], "~/.hermes/commons/db/chronicle/chronicle.db")
 
     def test_deep_merge_overrides_leaf(self):
         base = {"a": {"b": 1, "c": 2}}

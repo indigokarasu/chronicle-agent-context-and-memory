@@ -14,13 +14,15 @@ Fixtures use obviously-fake values (Pat Testley, Acme Fake Co, Sam Vimes),
 per the shared Ladder 9 test-fixture convention.
 """
 
+import json
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.reducer import Reducer
@@ -28,7 +30,7 @@ from engine.store import MemoryStore
 
 
 def make_core(cfg_overrides=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if cfg_overrides:
         cfg.update(cfg_overrides)
@@ -47,7 +49,7 @@ class TestSupersedeCandidateStore(unittest.TestCase):
     """Store-layer contract in isolation, no embedder involved."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = temp_home()
         self.store = MemoryStore(str(Path(self.tmp) / "chronicle.db"))
 
     def tearDown(self):
@@ -161,26 +163,25 @@ class TestSupersedeCandidateWrite(unittest.TestCase):
         """E4's claim: re-stating the SAME value is not an update, so it must
         never produce a supersede chain.
 
-        Integration note (E4 x E5): this originally also asserted that the two
-        assertions stored as two separate facts. Once E5's near-duplicate merge
-        is in the tree that is no longer the expected shape -- E5's acceptance
-        bar is verbatim "identical re-assertion merges (1 item, 2 provenance
-        entries)", and this fixture is exactly an identical re-assertion. The
-        two specs agree on the thing E4 is actually testing (no chain); only
-        the storage shape underneath it changed, so the count assertion follows
-        E5 and the chain assertion -- E4's real subject -- is unchanged.
+        The re-assertion uses the SAME key. It used to differ in qualifiers_hash
+        ("" vs "v2") only to route around the fact-conflict path into E5's
+        cosine merge; qualifiers are part of a fact's natural key, so that
+        fixture described two different facts, which the exact merge keeps
+        apart. A same-key restatement is folded into the existing fact by the
+        re-assertion path, and E4's claim -- no chain -- is unchanged.
         """
         _assert_fact(self.core, self._pat_key(""), "Pat Testley works at Acme Fake Co",
                     source_event="e1")
-        _assert_fact(self.core, self._pat_key("v2"), "Pat Testley works at Acme Fake Co",
+        _assert_fact(self.core, self._pat_key(""), "Pat Testley works at Acme Fake Co",
                     source_event="e2")
         facts = self.core.store.query_beliefs("facts", "entity_id=?", ("pat_testley",), limit=10)
-        self.assertEqual(len(facts), 1, "E5 merges an identical re-assertion into one item")
+        self.assertEqual(len(facts), 1, "an identical re-assertion is one fact")
         # THE E4 ASSERTION, unchanged: no supersession was inferred.
         for f in facts:
             self.assertEqual(self.core.store.get_supersede_chain(f["belief_id"]), [])
-        # And the merge really was a merge, not a dropped write (E5 provenance).
-        self.assertGreaterEqual(facts[0].get("occurrence_count") or 1, 2)
+        # And the second sighting was recorded, not dropped.
+        prov = json.loads(facts[0]["provenance"])
+        self.assertEqual(len(prov.get("provenances", [])), 2)
 
     def test_dissimilar_same_subject_facts_stay_unchained(self):
         _assert_fact(self.core, self._pat_key(""), "Pat Testley works at Acme Fake Co",
@@ -248,7 +249,7 @@ class TestSupersedeCandidateNoEmbedder(unittest.TestCase):
     """§issue-8 shared constraint: the embedder may be absent -- no-op, no error."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = temp_home()
         self.store = MemoryStore(str(Path(self.tmp) / "chronicle.db"))
         self.reducer = Reducer(self.store, embedder=None, cfg=None)
 

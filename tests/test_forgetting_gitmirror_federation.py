@@ -3,13 +3,14 @@ Chronicle — tests for forgetting.py, gitmirror.py, and federation.py (§14, §
 """
 
 import datetime
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db
 
 from engine.federation import (
     E_AUTHORITY_UNAVAILABLE,
@@ -70,7 +71,7 @@ class TestForgettingEngine(unittest.TestCase):
         self.engine = ForgettingEngine(self.store, self.cfg, self._append)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def _append(self, type_, payload, **kw):
         self.events.append({"type": type_, "payload": payload, **kw})
@@ -185,7 +186,7 @@ class TestCapabilityRegistry(unittest.TestCase):
         self.registry = CapabilityRegistry(self.store, self.cfg)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_register_provider(self):
         class FakeProvider(CapabilityProvider):

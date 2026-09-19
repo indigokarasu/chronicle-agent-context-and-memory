@@ -23,11 +23,12 @@ the same mode the recall/ctx_eval gate harnesses use — over fake fixtures.
 """
 import re
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from unittest import mock
 
@@ -35,6 +36,7 @@ from engine import capture as capture_mod
 from engine import embeddings as embeddings_mod
 from engine.config import DEFAULTS
 from engine.core import ChronicleCore
+from engine.embeddings import budget_chars, estimate_tokens
 from engine.retrieval import _MSG_START, _split_lead_message
 
 
@@ -42,7 +44,7 @@ def make_core(cfg_overrides=None):
     cfg = {"embeddings": {"model": "hashing"}}
     if cfg_overrides:
         cfg.update(cfg_overrides)
-    return ChronicleCore(tempfile.mkdtemp(), cfg)
+    return ChronicleCore(temp_home(), cfg)
 
 
 # -- fixture: the F3 report's `1d4e3b97` shape, in fake data ------------------
@@ -322,7 +324,12 @@ class TestPreferencePacking(unittest.TestCase):
         debug = core.retrieval.last_context_debug
         self.assertEqual(debug["route"], "preference")
         self.assertTrue(debug["pref_pack"])
+        # The DEFAULT restated again, and again only because the estimator's
+        # unit moved -- not because the feature was retuned. The assertion that
+        # matters is the CHAR size the F3 measurement set, which never changed:
+        #   A10 4000 tok x 3 = 12000 chars | A10b 3000 tok x 4 = 12000 chars
         self.assertEqual(debug["token_budget"], 3000)
+        self.assertEqual(budget_chars(debug["token_budget"]), 12000)
 
     def test_budget_is_cut_to_the_preference_budget(self):
         core = self.build()
@@ -364,9 +371,21 @@ class TestPreferencePacking(unittest.TestCase):
         cannot hold both, EVERY user turn still arrives and no assistant half
         does — a single streaming pass would instead spend session 0's whole
         share on its own assistant replies and never reach session 3."""
-        core = self.build({"context": {"preference_budget": 800}})
+        # This fixture was measured at a ~3 200-CHAR budget, written as `800`
+        # back when get_context converted tokens to chars at 4 and every other
+        # consumer counted 3. It is stated through the shared estimator rather
+        # than as a literal, so it RESTATES ITSELF: A10 read 3 150 chars as
+        # 1 050 tokens, A10b reads them as 788, and both are the same 3 150
+        # chars -- which is the only quantity this test was ever about.
+        # 3 150 rather than the old literal's 3 200: measured on this fixture,
+        # "every user turn fits and no assistant half does" holds over
+        # 3 074-3 200 chars, and 3 200 sat exactly on the upper edge. Sitting a
+        # knife-edge apart from the outcome is how the old literal turned a
+        # unit change into a mystery failure; 3 150 is the middle of the band.
+        pref_tokens = estimate_tokens("x" * 3150)
+        core = self.build({"context": {"preference_budget": pref_tokens}})
         ctx = core.retrieval.get_context(self.PREF_Q, token_budget=12000)
-        self.assertLessEqual(len(ctx), 800 * 4)
+        self.assertLessEqual(len(ctx), budget_chars(pref_tokens))
         self.assertNotIn("reservation advice", ctx)
         missing = [t for t in self.all_user_turns() if t not in ctx]
         self.assertEqual(missing, [], "user turns dropped: %d" % len(missing))
@@ -434,7 +453,7 @@ class TestPreferencePackingDegradesSafely(unittest.TestCase):
         """No vector channel means no route classification at all, so nothing
         below the routing call can change (I18)."""
         def build(cfg):
-            core = ChronicleCore(tempfile.mkdtemp(), cfg)
+            core = ChronicleCore(temp_home(), cfg)
             core.capture.observe("I love spicy Thai food", "A long reply. " * 40,
                                  session_id="s1")
             core.capture.observe("I prefer window seats", "Another long reply. " * 40,

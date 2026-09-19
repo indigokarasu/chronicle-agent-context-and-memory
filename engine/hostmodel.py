@@ -645,7 +645,7 @@ def _apply_rerank(core, request, result, owner: str = "default") -> int:
         return 0
     core.store.add_rerank_hints(key, query_text[:200], tokens, hints,
                                 _iso_in(ttl_days * 86400.0), max_entries=max_entries,
-                                owner=access.user_of(owner))
+                                owner=access.user_of(owner), principal=owner)
     return len(hints)
 
 

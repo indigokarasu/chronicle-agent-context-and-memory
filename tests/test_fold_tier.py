@@ -1,31 +1,35 @@
 """
 Chronicle — tests for context.py's FOLD tier: reversible eviction via
-tombstone stubs + chronicle_expand (Ladder 7, R4).
+the compaction handoff + chronicle_expand (Ladder 7, R4; 5.8).
 
 Scope, tight to what R4 itself changes on top of R2's watermark eviction and
 R11's chunked durability:
 
-  1. A span compress() evicts leaves a one-line tombstone stub AT ITS OLD
-     POSITION in the window (id + digest), instead of vanishing outright.
+  1. A span compress() folds is NAMED in the one handoff message that stands
+     where the folded turns were -- `[fold_…]` id plus what it said -- in a
+     conversation role, never `system`. (Until 5.8 each folded span left a
+     `[FOLD fold_x 1a2b3c4d]` stub: an id with no content, which also dropped
+     tool_calls/tool_call_id and so orphaned the paired tool results.)
   2. chronicle_expand(span_id) rehydrates that span back to its original
      content byte-for-byte, whether it fit in a single durable event or had
      to be chunked (R11) across several.
-  3. The stub -- and therefore compress()'s whole output -- stays fully
-     deterministic across repeated calls on identical input (span_id/digest
-     are a content hash, not derived from any event id or timestamp).
-  4. Tombstones are themselves budget-accounted: compress() never exceeds
-     its token budget just because it started adding stubs back in.
+  3. compress()'s whole output stays fully deterministic across repeated
+     calls on identical input (span_id/digest are a content hash, not derived
+     from any event id or timestamp).
+  4. The handoff is itself budget-accounted: compress() never exceeds its
+     token budget because of it.
   5. An unknown span_id fails closed, not with a stack trace.
 """
 
 import json
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from engine.embeddings import estimate_tokens
@@ -63,7 +67,7 @@ def _lorem(n_chars):
 
 class FoldTierTests(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r4_")
+        self.home = temp_home(prefix="r4_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r4-s1", hermes_home=self.home, principal_id="pat", config=CFG)
@@ -78,18 +82,19 @@ class FoldTierTests(unittest.TestCase):
         return sum(estimate_tokens(m.get("content")) for m in out)
 
     @staticmethod
-    def _fold_stub(out):
-        """The (at most one, in this fixture) tombstone stub in `out`, or None."""
-        stubs = [m for m in out if (m.get("content") or "").startswith("[FOLD ")]
-        return stubs[0] if stubs else None
+    def _handoff(out):
+        """The compaction handoff in `out`, or None."""
+        hs = [m for m in out if (m.get("content") or "").startswith(
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle folded")]
+        return hs[-1] if hs else None
 
     @staticmethod
-    def _span_id_from_stub(stub):
-        # "[FOLD fold_xxxxxxxxxxxx yyyyyyyy]" -> "fold_xxxxxxxxxxxx"
-        return stub["content"].split(" ")[1]
+    def _span_ids(handoff):
+        import re
+        return re.findall(r"\[(fold_[0-9a-f]{12})\]", handoff["content"])
 
     # -- 1. eviction leaves an in-window tombstone, not a silent drop -----
-    def test_evicted_span_leaves_a_tombstone_stub_in_window(self):
+    def test_folded_spans_are_named_in_the_handoff(self):
         # A few large middle spans against a budget that keeps most of them
         # but not all: recency-weighted scoring (§R3) keeps the newest, the
         # oldest lose the budget race, and the room left over is comfortably
@@ -98,7 +103,10 @@ class FoldTierTests(unittest.TestCase):
         # fixture depended on exact budget-boundary arithmetic that R3's
         # recency reorder perturbs; large distinct spans make the assertion
         # structural rather than luck-of-the-packing.)
-        self.eng.update_model("test-model", context_length=1000)  # budget = 550
+        self.eng.update_model("test-model", context_length=750)   # budget = 412
+        # A10b units restatement: 1000 tok x 3 = 3000 = 750 tok x 4; the LOW-watermark budget is
+        # the same window in chars: 550 x 3 = 1650, 412 x 4 = 1648 (the 2-char gap is
+        # the pre-existing int() truncation in _target_budget, not the restatement).
         # 20 uniform ~50-token middle spans: recency-weighted scoring keeps the
         # ~10 newest that fit, evicting ~10. The leftover budget fits a couple
         # of one-line tombstones but not all ten, so the output both SHRINKS
@@ -117,16 +125,21 @@ class FoldTierTests(unittest.TestCase):
         )
         out = self.eng.compress(list(messages), focus_topic=None)
         self.assertLess(len(out), len(messages), "fixture should force real eviction")
-        stub = self._fold_stub(out)
-        self.assertIsNotNone(stub, "an evicted span should leave a [FOLD ...] tombstone in-window")
-        # "[FOLD <span_id> <digest-prefix>]" -- both an id and a digest, one line.
-        parts = stub["content"].strip("[]").split(" ")
-        self.assertEqual(len(parts), 3)
-        self.assertTrue(parts[1].startswith("fold_"))
+        handoff = self._handoff(out)
+        self.assertIsNotNone(handoff, "folded spans should be named in a handoff in-window")
+        self.assertIn(handoff["role"], ("user", "assistant"), "never a system message")
+        self.assertTrue(self._span_ids(handoff), "the handoff names the folded spans by id")
+        self.assertFalse([m for m in out if (m.get("content") or "").startswith("[FOLD ")],
+                         "no content-free stubs any more")
 
     # -- 2. chronicle_expand rehydrates byte-exact -------------------------
     def test_chronicle_expand_rehydrates_small_span_byte_exact(self):
-        self.eng.update_model("test-model", context_length=1000)  # budget = 550
+        # budget = 495: the fillers and a handoff naming what was folded fit;
+        # the ~240-token target does not.
+        self.eng.update_model("test-model", context_length=900)
+        # A10b units restatement: 1000 tok x 3 = 3000 = 750 tok x 4; the LOW-watermark budget is
+        # the same window in chars: 550 x 3 = 1650, 412 x 4 = 1648 (the 2-char gap is
+        # the pre-existing int() truncation in _target_budget, not the restatement).
         # 10 small same-score fillers comfortably fit budget with room left
         # over (~80 tokens); target (~240 tokens) is the one thing too big to
         # also fit, so it -- and only it -- is evicted, and the room left
@@ -147,10 +160,12 @@ class FoldTierTests(unittest.TestCase):
         out = self.eng.compress(list(messages), focus_topic=None)
         self.assertNotIn(target, [m.get("content") for m in out], "target should be evicted")
         expected_span_id = "fold_" + hash_str(target)[:12]
-        stubs = [m for m in out if (m.get("content") or "").startswith("[FOLD %s " % expected_span_id)]
-        self.assertEqual(len(stubs), 1, "expected exactly one tombstone for the target span")
-        span_id = self._span_id_from_stub(stubs[0])
-        self.assertEqual(span_id, expected_span_id)
+        handoff = self._handoff(out)
+        self.assertIsNotNone(handoff)
+        self.assertIn(expected_span_id, self._span_ids(handoff),
+                      "the target span is named in the handoff by its id")
+        self.assertIn("UNIQUE-FOLD-TARGET", handoff["content"], "…with what it said")
+        span_id = expected_span_id
         result = json.loads(self.eng.handle_tool_call("chronicle_expand", {"span_id": span_id}))
         self.assertEqual(result.get("content"), target)
         self.assertTrue(result.get("verified"), "rehydrated content should verify against its digest")
@@ -159,7 +174,8 @@ class FoldTierTests(unittest.TestCase):
     def test_chronicle_expand_rehydrates_chunked_span_byte_exact(self):
         """A span past the excerpt cap is chunked (R11) across multiple durable
         events; chronicle_expand must still reassemble it byte-for-byte."""
-        self.eng.update_model("test-model", context_length=100000)  # plenty of budget headroom
+        self.eng.update_model("test-model", context_length=75000)  # plenty of budget headroom
+        # A10b units restatement: 100000 x 3 = 300000 = 75000 x 4.
         target = "UNIQUE-LARGE-" + _lorem(9000)
         self.assertGreater(len(target), 4000)
         messages = (
@@ -170,21 +186,20 @@ class FoldTierTests(unittest.TestCase):
                for i in range(2)]  # "always" -> never_evict, keeps middle non-trivial
             + [_msg("assistant", "tail %d" % i) for i in range(6)]
         )
-        # Force eviction of the (otherwise low-score) large span directly, the
-        # same way compress() would once its score loses the budget race --
-        # exercised end-to-end via a tight budget instead:
-        self.eng.update_model("test-model", context_length=200)  # budget = 110: too tight to keep it
+        # Force eviction of the (otherwise low-score) large span with a budget
+        # that cannot hold it but does hold the handoff naming it.
+        self.eng.update_model("test-model", context_length=1500)  # budget = 825
         out = self.eng.compress(list(messages), focus_topic=None)
-        stub = self._fold_stub(out)
-        self.assertIsNotNone(stub, "the oversized span should be evicted and folded under a tight budget")
-        span_id = self._span_id_from_stub(stub)
+        span_id = "fold_" + hash_str(target)[:12]
+        self.assertNotIn(target, [m.get("content") for m in out], "the oversized span is folded")
+        self.assertIn(span_id, self._span_ids(self._handoff(out)))
         result = json.loads(self.eng.handle_tool_call("chronicle_expand", {"span_id": span_id}))
         self.assertEqual(result.get("content"), target)
         self.assertTrue(result.get("verified"))
 
     # -- 3. determinism: identical input -> identical stub -----------------
     def test_fold_stub_is_deterministic_across_repeated_compress_calls(self):
-        self.eng.update_model("test-model", context_length=2000)
+        self.eng.update_model("test-model", context_length=1500)
         messages = _messages(40)
         out1 = self.eng.compress([dict(m) for m in messages], focus_topic=None)
         out2 = self.eng.compress([dict(m) for m in messages], focus_topic=None)
@@ -193,7 +208,7 @@ class FoldTierTests(unittest.TestCase):
 
     # -- 4. tombstones are budget-accounted, not free ----------------------
     def test_output_with_tombstones_still_fits_budget(self):
-        self.eng.update_model("test-model", context_length=2000)
+        self.eng.update_model("test-model", context_length=1500)
         messages = _messages(40)
         out = self.eng.compress(list(messages), focus_topic=None)
         budget = self.eng._target_budget()
@@ -205,7 +220,10 @@ class FoldTierTests(unittest.TestCase):
         """When the protected set alone exhausts the budget, a stub may not fit
         -- the span must still be durably recoverable (I17) even without an
         in-window tombstone."""
-        self.eng.update_model("test-model", context_length=1000)  # budget = 550
+        self.eng.update_model("test-model", context_length=750)   # budget = 412
+        # A10b units restatement: 1000 tok x 3 = 3000 = 750 tok x 4; the LOW-watermark budget is
+        # the same window in chars: 550 x 3 = 1650, 412 x 4 = 1648 (the 2-char gap is
+        # the pre-existing int() truncation in _target_budget, not the restatement).
         huge = "Acme Fake Co tool output: " + ("x" * 6000)
         messages = (
             [_msg("system", "sys")]
@@ -232,7 +250,7 @@ class FoldTierTests(unittest.TestCase):
 
     # -- 6. the compressed audit event carries real span ids (R6-adjacent) -
     def test_compressed_audit_event_carries_evicted_span_ids(self):
-        self.eng.update_model("test-model", context_length=2000)
+        self.eng.update_model("test-model", context_length=1500)
         messages = _messages(40)
         self.eng.compress(list(messages), focus_topic=None)
         events = self.core.store.get_events_by_type("compressed")

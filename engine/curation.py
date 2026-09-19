@@ -2,9 +2,31 @@
 Chronicle — Curation pipeline (§17).
 
 A worker claims the lowest-id ready job and writes every result via
-`append_event` (no special path). DAG: extract → route → criticality →
-canonicalize → consolidate → contradiction → identity → derive → consistency.
-Heuristics are a pre-filter + sanity bound, never a silent writer.
+`append_event` (no special path). Heuristics are a pre-filter + sanity bound,
+never a silent writer.
+
+Where the jobs come from, since a list of handlers reads like a pipeline that
+runs itself and this one does not:
+  * `extract` (and the `canonicalize`/`digest` it enqueues per subject),
+    `session_summarize`, `journal_ingest`, `embed`, `verify` and
+    `federate_sweep` are EVENT-DRIVEN — a capture, a session ending, a
+    high-criticality fact, a deferred vector, a health run.
+  * `decay`, `consistency`, `health`, `backfill_sweep` and `identity` are
+    SCHEDULED, by engine/scheduler.py, on the hook cadence (§17.4). Before
+    ladder-10 A3 nothing enqueued them at all; `identity` stayed unscheduled
+    one rung longer because its handler auto-merged entities on an exact name
+    match, and it joined the cadence in A8 once that became a candidate.
+  * `derive`, `consolidate` and `reextract` have handlers and NO producer, on
+    purpose; `scheduler.UNSCHEDULED` records the reason for each.
+
+Every task name the curation_jobs CHECK admits has a handler here, and every
+handler's name is admitted by the CHECK — asserted by
+tests/test_task_check_handler_consistency.py, because for three values that was
+not true. `route` and `criticality` were CHECK-listed with no handler in any
+build (an enqueue completed as 'no_handler' and looked like maintenance);
+`contradiction` was a second name for `consistency`. All three were retired from
+the schema in ladder-10 A13 (store.RETIRED_CURATION_TASKS), which is why they
+are no longer listed as merely-unscheduled above either.
 """
 
 from __future__ import annotations
@@ -14,10 +36,34 @@ import logging
 import os
 import urllib.parse
 
-from . import access
-from .embeddings import EmbeddingsUnavailable, cosine, pack, unpack
+from . import access, sweeps
+from . import entities as ents
+from . import speaker as spk
+from .embeddings import (
+    EmbeddingsUnavailable,
+    cosine,
+    embed_document_patiently,
+    embedder_model_tag,
+    expected_blob_len,
+    is_usable_model_tag,
+    pack,
+    unpack,
+)
+from .reducer import (
+    belief_vector_text,
+    is_duplicate_copy,
+    observed_vector_text,
+    projection_vector_text,
+    session_vector_text,
+)
 from .serialize import belief_id as compute_belief_id
-from .store import KIND_TABLE, now_iso
+from .store import (
+    KIND_TABLE,
+    TASK_CLASSES,
+    drain_quotas,
+    now_iso,
+    tasks_in_class,
+)
 
 logger = logging.getLogger("chronicle.curation")
 
@@ -38,6 +84,11 @@ _FEDERATE_ROW_BUDGET = 200
 # Entities one name collision may propose for review. A name matching hundreds of
 # entities is not evidence of anything; it is noise, and it is capped like noise.
 _FEDERATE_MAX_CANDIDATES = 10
+# Merge candidates ONE exact-name collision may propose for review (ladder-10 A8),
+# for the same reason and with the same number as the federation cap above: a name
+# shared by hundreds of entities is noise, and 200 pending questions nobody can
+# answer is a queue nobody reads.
+_IDENTITY_MAX_CANDIDATES_PER_NAME = 10
 # Session-summary caps (§E6): per-episode line stays at the pre-E6 single-blob
 # cap so a homogeneous (one-episode) session renders byte-identical to today.
 # The whole-summary cap is raised past that so a genuinely multi-episode
@@ -79,6 +130,19 @@ _DOMAIN = {"user_direct": "user", "session_transcript": "user", "rescue_extracti
 
 def domain_for(source_type: str) -> str:
     return _DOMAIN.get(source_type, "general")
+
+
+def _accepts_lines(extractor) -> bool:
+    """Whether a (possibly third-party) extractor takes the `lines` attribution.
+    One written to the older interface still runs; the no-human gate in
+    _task_extract has already kept automation-only events away from it."""
+    import inspect
+    try:
+        params = inspect.signature(extractor.extract).parameters
+    except (TypeError, ValueError):
+        return False
+    return "lines" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                    for p in params.values())
 
 
 # -- topic-shift episode boundaries (§E6, curation.topic_shift_threshold) --
@@ -136,8 +200,11 @@ class CurationWorker:
 
     # -- loop --------------------------------------------------------------
 
-    def run_once(self) -> bool:
-        job = self.store.claim_curation_job()
+    def run_once(self, tasks=None) -> bool:
+        """Claim and run one job. `tasks` restricts the claim to one fairness
+        class's task values (§A7); None means any task, the pre-A7 behavior
+        every direct caller still gets."""
+        job = self.store.claim_curation_job(tasks=tasks)
         if job is None:
             return False
         try:
@@ -165,11 +232,100 @@ class CurationWorker:
             self.store.complete_curation_job(job["id"], error=str(e)[:300])
         return True
 
-    def drain(self, max_jobs: int = 1000) -> int:
-        n = 0
-        while n < max_jobs and self.run_once():
-            n += 1
-        return n
+    # -- fair drain (§A7) --------------------------------------------------
+
+    def _drain_budget(self, max_jobs) -> int:
+        """The per-turn job budget. `max_jobs=None` reads
+        `curation.drain.per_turn` (default 16), which is what core.tick() now
+        passes; an explicit number (process_pending's 1000, a test's 5) wins."""
+        if max_jobs is not None:
+            return max(0, int(max_jobs))
+        try:
+            return max(0, int(self.cfg.get("curation.drain.per_turn", 16)))
+        except (TypeError, ValueError):
+            return 16
+
+    @staticmethod
+    def _share(raw, default: float) -> float:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _drain_shares(self) -> dict:
+        """Declared per-class weights, read as three scalar config keys so each
+        one is individually greppable and individually auditable (a nested dict
+        read as one blob reports as unwired, and A12 audits config honesty).
+
+        The `self.cfg.get("<key>", ...)` calls are written out literally rather
+        than looped over a list of paths: scripts/audit_config.py finds a key by
+        matching that exact form, so a loop — or a local helper taking the path
+        — makes a wired key report as dormant. The audit is only worth having if
+        the code stays in the shape it can see."""
+        return {
+            "write_path": self._share(
+                self.cfg.get("curation.drain.share_write_path", 0.5), 0.5),
+            "embed": self._share(
+                self.cfg.get("curation.drain.share_embed", 0.3), 0.3),
+            "maintenance": self._share(
+                self.cfg.get("curation.drain.share_maintenance", 0.2), 0.2),
+        }
+
+    def drain(self, max_jobs=None) -> int:
+        """Run up to `max_jobs` jobs, apportioned across task classes so no one
+        class's backlog can starve another (§A7).
+
+        THE FAILURE THIS REPLACES: `claim_curation_job` is strict FIFO by id and
+        `drain` used to take whatever it handed back. One heal run enqueues an
+        embed job per stale vector — 105k of them on the live store — and every
+        `extract` enqueued afterwards sits behind all of them. At 16 jobs a turn
+        that is ~6,500 turns before the next new turn is read at all. Extraction
+        is the premise's write path; it stopping is not a slowdown, it is the
+        system not working.
+
+        THE SHAPE: weighted round-robin over classes, FIFO within a class.
+        `drain_quotas` splits the budget by the configured shares with a
+        one-job floor, then this loop serves the classes in rounds, taking at
+        most one job per class per round. A class that runs dry hands its unused
+        quota back: the second phase spends whatever is left on whoever still
+        has work, in class order, so fairness never costs throughput on an
+        uncontended queue — the common case, where this is exactly the old
+        behavior.
+
+        Round-robin rather than "drain class A's quota, then B's" because the
+        two differ when a handler ENQUEUES: an extract that queues a digest
+        should not have that digest wait behind the whole embed quota."""
+        budget = self._drain_budget(max_jobs)
+        if budget <= 0:
+            return 0
+        quotas = drain_quotas(budget, self._drain_shares())
+        classes = [c for c in TASK_CLASSES if quotas.get(c, 0) > 0]
+        tasks = {c: tasks_in_class(c) for c in TASK_CLASSES}
+        left = dict(quotas)
+        done = 0
+        # Phase 1: rounds of at most one job per class, up to each class's quota.
+        while done < budget:
+            progressed = False
+            for c in classes:
+                if left[c] <= 0 or done >= budget:
+                    continue
+                if self.run_once(tasks=tasks[c]):
+                    left[c] -= 1
+                    done += 1
+                    progressed = True
+                else:
+                    left[c] = 0          # class is empty for this drain
+            if not progressed:
+                break
+        # Phase 2: work conservation. Unused quota is not thrown away — it goes
+        # to whatever still has pending work, in class order. A class whose
+        # share is 0 is DEPRIORITISED, not disabled: it drains here, after every
+        # class with a positive share has had its own quota.
+        if done < budget:
+            for c in list(TASK_CLASSES):
+                while done < budget and self.run_once(tasks=tasks[c]):
+                    done += 1
+        return done
 
     # -- tasks -------------------------------------------------------------
 
@@ -190,10 +346,28 @@ class CurationWorker:
         p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
         excerpt = p.get("excerpt", "")
         source_type = p.get("source_type", "session_transcript")
+        # Who said each line (engine/speaker.py): the spans recorded at capture,
+        # or the legacy reading, which never assumes the user. Memory about the
+        # user comes only from the user's own words, so an event with none of
+        # them is left raw-indexed for recall and extracts nothing.
+        lines = spk.attribute_lines(p, session_id=ev.get("session_id") or "",
+                                    actor=ev.get("actor") or "")
+        if source_type != "agent_memory_write" and not spk.has_human(lines):
+            self.store.record_extraction(eid, version, {"skipped": "no_human_speaker"}, 0, "skip")
+            self._advance_watermark(ev)
+            return
+        if source_type == "agent_memory_write":
+            # An explicit save by the agent (on_memory_write) is the agent's own
+            # deliberate record, kept under the agent domain; its text is read as
+            # written.
+            lines = [(ln, spk.HUMAN) for ln in excerpt.split("\n") if ln.strip()]
         domain = domain_for(source_type)
         owner = ev["owner"]
-        result = self.core.extractor.extract(excerpt, source_event=eid, owner=owner,
-                                             domain=domain, session_id=ev.get("session_id") or "")
+        kwargs = {"source_event": eid, "owner": owner, "domain": domain,
+                  "session_id": ev.get("session_id") or ""}
+        if _accepts_lines(self.core.extractor):
+            kwargs["lines"] = lines
+        result = self.core.extractor.extract(excerpt, **kwargs)
         # Every item that survives routing becomes an `asserted` event whose reduce
         # embeds its body — one blocking round trip each against a networked
         # backend, which is where this job spends nearly all of its wall clock. The
@@ -202,6 +376,8 @@ class CurationWorker:
         self.core.reducer.prefetch_vectors(
             [{"type": "asserted", "payload": it} for it in result.items
              if it.get("route") != "skip"])
+        # A15: a SET for dedupe, but never iterated as one -- see
+        # `ordered_subjects` below. Membership is order-free; iteration is not.
         subjects = set()
         for item in result.items:
             if item.get("route") == "skip":
@@ -214,15 +390,40 @@ class CurationWorker:
         self.store.record_extraction(eid, version,
                                      {"n": len(result.items)}, 1 if result.ambiguous else 0, result.route)
         self._advance_watermark(ev)
+        # A15 (determinism sibling of the F1 query-text bug): `subjects` is a
+        # set, and CPython randomises string hashing per process, so ITERATING
+        # it -- which both consumers below do -- ordered this function's writes
+        # differently in every process:
+        #
+        #   * `derive_for_subject` appends `derived` events, so the seq and
+        #     prev_head of everything downstream of them moved with the shuffle;
+        #   * `enqueue_curation("digest", ...)` fixes the job ids that decide
+        #     which entity is digested first;
+        #   * `list(subjects)` is STORED, as the canonicalize job's payload, and
+        #     `enqueue_curation` dedupes on `json.dumps(payload, sort_keys=True)`
+        #     -- sort_keys orders the KEYS, not a list VALUE -- so the same
+        #     extraction produced a different dedupe key in every process and the
+        #     collapse that key exists for silently stopped collapsing.
+        #
+        # Measured on this tree before the fix: five PYTHONHASHSEED values over
+        # one six-subject transcript gave five different digest orders and five
+        # different canonicalize payloads.
+        #
+        # Sorted once, at the boundary, and both consumers read the SAME list --
+        # two sorts could drift. The key tolerates a None entity_id (an item
+        # whose subject grounding `_emit_item` rejected still lands here) rather
+        # than filtering it, so the payload keeps exactly the members it always
+        # had; only their order is now fixed.
+        ordered_subjects = sorted(subjects, key=lambda s: (s is None, s or ""))
         # Inline derive for touched subjects (guarded; §9.4).
-        for subj in subjects:
+        for subj in ordered_subjects:
             if subj:
                 self.core.derivation.derive_for_subject(subj, self.core.active_principal)
                 # Consolidation digest (§u2), enqueued unconditionally: the handler
                 # owns the >=3-fact threshold, so extraction never counts facts.
                 self.store.enqueue_curation("digest", {"entity_id": subj})
         # Canonicalize newly seen predicates.
-        self.store.enqueue_curation("canonicalize", {"subjects": list(subjects)})
+        self.store.enqueue_curation("canonicalize", {"subjects": ordered_subjects})
 
     def _emit_item(self, item, ev, owner, domain, source_type, version):
         kind = item.get("kind", "fact")
@@ -239,15 +440,19 @@ class CurationWorker:
             except ValueError as e:
                 logger.warning("chronicle: dropped fact with bad subject grounding: %s", e)
                 return
+        if kind == "entity":
+            # The same bar the extractor applies, at the boundary that writes the
+            # log: a pronoun or half a sentence is not an entity (engine/entities.py).
+            name = key.get("name") or item.get("body") or ""
+            if not ents.plausible_name(name):
+                logger.warning("chronicle: dropped entity with an implausible name: %r", name[:80])
+                return
         risk = item.get("key", {}).get("risk_tier", "low")
         # Risk-tiered application (§16.4): behavior-changing high-risk → draft + review.
         status = item.get("status", "active")
         if kind == "note" and item.get("key", {}).get("note_type") in ("norm", "procedure"):
             if risk == "high":
                 status = "draft"
-        ext = {"extractor_version": version, "valid_from": ev.get("occurred_at")}
-        if "_entity_id" in item:
-            ext["entity_token"] = item["_entity_id"]
         self.core.capture.append("asserted", {
             "kind": kind, "key": item["key"], "body": item["body"], "domain": domain,
             "confidence": item.get("confidence", 0.8), "source_event": item["source_event"],
@@ -292,42 +497,128 @@ class CurationWorker:
             self.core.derivation.materialize_all(self.core.active_principal)
 
     def _task_canonicalize(self, payload):
-        """Predicate schema induction (§17): ensure predicates table + infer cardinality."""
-        rows = self.store.query_beliefs("facts", "status='active'", (), limit=5000)
-        by_pred = {}
-        for r in rows:
-            by_pred.setdefault(r["predicate_canonical"], {}).setdefault(r["entity_id"], set()).add(r["value"])
-        for pred, ents in by_pred.items():
-            if not pred:
+        """Predicate schema induction (§17): ensure predicates table + infer cardinality.
+
+        Two §A9 changes, and the second is the one that matters:
+
+        1. Resumable. Was a 5000-row unordered prefix of `facts`, so on a large
+           store predicates whose facts sat past the prefix were never given a
+           row in `predicates` — and the sweep reported success. It now pages
+           over DISTINCT `predicate_canonical` with a persisted cursor, so a lap
+           reaches every predicate in the store.
+
+        2. Cardinality is asked of the DATABASE, not of the page. The old code
+           inferred `multi` by grouping only the rows it had read; with any kind
+           of paging that becomes actively wrong (a predicate's two values for
+           one entity can land in different pages, and the sweep would write
+           `single` — permanently, since the upsert is guarded on the predicate
+           being absent). `predicate_has_multi_value` answers over all active
+           facts and stops at the first witness."""
+        from .extraction import canonical_predicate
+        page = sweeps.next_distinct_page(self.store, self.cfg, "canonicalize", "facts",
+                                         "predicate_canonical", "status='active'", ())
+        for pred in page.rows:
+            if not pred or self.store.get_predicate(pred) is not None:
                 continue
-            multi = any(len(vals) > 1 for vals in ents.values())
-            from .extraction import canonical_predicate
             _, seed_card = canonical_predicate(pred)
+            multi = self.store.predicate_has_multi_value(pred)
             cardinality = "multi" if (multi and seed_card != "single") else seed_card
-            if self.store.get_predicate(pred) is None:
-                self.store.upsert_predicate(pred, pred, cardinality)
+            self.store.upsert_predicate(pred, pred, cardinality)
+        return sweeps.commit(self.store, page)
 
     def _task_consolidate(self, payload):
         self._task_canonicalize(payload)
         self.core.derivation.materialize_all(self.core.active_principal)
 
-    def _task_contradiction(self, payload):
-        self.core.health.consistency_sweep()
-
     def _task_identity(self, payload):
-        """Exact name/alias dedup → merge (§17). Fuzzy is proposed, never auto."""
-        ents = self.store.query_beliefs("entities", "merged_into IS NULL", (), limit=5000)
+        """Exact name collisions -> merge CANDIDATES, on a resumable page
+        (§17, §E7, ladder-10 A8 x A9).
+
+        A8 -- WHAT IT DOES. This handler used to MERGE. Every entity sharing
+        (normalized_name, owner, domain) with another was folded into whichever
+        one the scan happened to see first, by appending a `merged` event
+        carrying `evidence: exact_name_match`. That is an identity decision
+        INFERRED from a similarity, and the premise of this codebase is that
+        identity is adjudicated, never inferred.
+
+        The project's own worked example is the entire argument.
+        "Robin Placeholder" is ONE person recorded twice — a split risk, if you
+        assume difference.
+        Two DIFFERENT people are both named "Pat Testley" — a merge risk, if
+        you assume sameness. An exact name match is exactly the second case, and
+        this sweep answered it in the wrong direction on a timer. Worse, the
+        answer does not come back: supersession can reverse a belief because the
+        old row survives with `status` flipped, but `merged_into` collapses two
+        provenance chains into one, so the fact that the store ever held two
+        distinct people is gone from the projection.
+
+        A name is EVIDENCE, not identity. So the collision is routed into E7's
+        existing adjudication queue (`identity_candidates`, kind='merge') and
+        nothing is applied: no `merged` event, no `merged_into` write, no entity
+        row touched. The queue row is a QUESTION.
+
+        What stays: an explicit `merged` event still merges (reducer._on_merged),
+        because that event records an adjudication a principal made. Only the
+        INFERRED path is gone.
+
+        This reuses E7's machinery whole rather than building a parallel queue —
+        including its dedupe key (kind, entity_id, other_id, mention_ref). The
+        pair goes in sorted order with an empty mention_ref, the same key
+        identity.observe_mention's centroid-driven proposal uses, so ONE entity
+        pair is ONE pending question however it was raised; and because
+        enqueue_identity_candidate is INSERT OR IGNORE, re-running this sweep
+        keeps the original row — decision included — instead of duplicating the
+        question or resurrecting an answered one.
+
+        A9 -- HOW MUCH IT LOOKS AT, and the two are orthogonal: A9 changed the
+        SELECTION, A8 changed the VERDICT. It was
+        `query_beliefs("entities", "merged_into IS NULL", limit=5000)` — an
+        unordered 5000-row prefix, so on a store with more entities than that
+        the same head was re-examined every run and duplicates further in were
+        never even looked at, while the job completed successfully.
+
+        Identity is GROUP-shaped: the unit of work is every entity sharing a
+        normalized name, and a rowid page that split such a group would hide the
+        very collision this sweep exists to notice — a bounded sweep returning a
+        WRONG answer, which is worse than the silent truncation. So the cursor
+        runs over DISTINCT `normalized_name` and each page's names are then
+        loaded whole. Pace: `sweeps.budgets.identity` if set, else the shared
+        `sweeps.row_budget`. The page's processed/remaining/bounded report is
+        RETURNED, which is what tells a caller the sweep is still behind.
+
+        Composing them matters more now than before A8: a bounded sweep that
+        MERGED left a wrong, irreversible write behind on the rows it did reach.
+        A bounded sweep that QUEUES leaves a question behind, and the cursor
+        means the ones it has not reached yet are still coming.
+        """
+        page = sweeps.next_distinct_page(self.store, self.cfg, "identity", "entities",
+                                         "normalized_name", "merged_into IS NULL", ())
+        ents = self.store.beliefs_for_values("entities", "normalized_name", page.rows,
+                                             "merged_into IS NULL", ())
         by_name = {}
         for e in ents:
             by_name.setdefault((e["normalized_name"], e["owner"], e["domain"]), []).append(e)
+        queued = 0
         for group in by_name.values():
-            if len(group) > 1:
-                keep = group[0]
-                for dup in group[1:]:
-                    self.core.capture.append("merged", {"from_entity": dup["belief_id"],
-                                                        "into_entity": keep["belief_id"],
-                                                        "evidence": "exact_name_match"},
-                                             actor="curator", owner=keep["owner"])
+            if len(group) < 2:
+                continue
+            # Neither beliefs_for_values nor the old query_beliefs has an
+            # ORDER BY, so which entity anchors the group must not be decided by
+            # scan order: sort, then propose (anchor, other) pairs. Star, not
+            # all-pairs — k-1 questions express "these k records may be one
+            # subject" without an O(k^2) queue.
+            ids = sorted(e["belief_id"] for e in group)
+            anchor = ids[0]
+            for other in ids[1:1 + _IDENTITY_MAX_CANDIDATES_PER_NAME]:
+                a, b = sorted([anchor, other])
+                # similarity=1.0: the NAMES are identical. It is a score on the
+                # evidence, never a verdict on the entities.
+                if self.store.enqueue_identity_candidate("merge", a, b, "", 1.0):
+                    queued += 1
+        if queued:
+            logger.info("identity: queued %d exact-name merge candidate(s) for "
+                        "adjudication (nothing merged)", queued)
+        return sweeps.commit(self.store, page)
 
     def _task_verify(self, payload):
         """Verify a high-criticality fact against its source span (§16.6)."""
@@ -347,23 +638,88 @@ class CurationWorker:
                                     _bucket(f.get("confidence", 0.5)), ok)
 
     def _task_decay(self, payload):
-        self.core.forgetting.decay_sweep()
+        """The two time-based sweeps: session reaping (§12.4) and belief decay (§20).
+
+        `Reaper.run()` had no caller anywhere in the tree — only
+        `startup_recovery()` was ever invoked — so a session that went quiet
+        without a clean exit stayed 'active' forever and its observed events
+        were never finalized. It runs here, as a curation job, on the same
+        queue as every other piece of maintenance, rather than from a thread.
+
+        `sweep` selects one half, because the two want very different cadences:
+        a session is stale after ~45 minutes, while fidelity decay is supposed
+        to take months and takes one rung off the ladder per sweep. An absent
+        `sweep` runs both — that is what a hand-enqueued `decay` job (a
+        dashboard button, a test) has always meant, and it stays true.
+
+        The decay half's report is RETURNED, not swallowed: decay_sweep()'s
+        processed/remaining/bounded is what tells a caller the ladder is still
+        behind (§A9), and the persisted copy reaches health.run() via
+        store.list_sweep_states(). A reaper-only run has no such report and
+        returns None, which is the honest answer — the reaper is not a paced
+        sweep and has no cursor to be behind on."""
+        sweep = payload.get("sweep") or "all"
+        if sweep in ("all", "reaper"):
+            self.core.reaper.run()
+        if sweep in ("all", "beliefs"):
+            return self.core.forgetting.decay_sweep()
+        return None
 
     def _task_consistency(self, payload):
+        """The CSP sweep (§21). Also the only name for it: `contradiction` was a
+        second task value whose handler made this identical call, so an operator
+        could queue the same sweep under two names and a scheduler could run it
+        twice for one answer. Retired in A13; existing `contradiction` rows are
+        re-tasked to this one by the schema_version-13 migration."""
         self.core.health.consistency_sweep()
 
     def _task_health(self, payload):
         self.core.health.run()
 
     def _task_reextract(self, payload):
-        """Replay extraction at the current version, criticality-prioritized (§16.5)."""
-        events = self.store.get_events_by_type("observed")
+        """Replay extraction at the current version (§16.5), resumably (§A9).
+
+        The old shape was the worst instance of this defect in the engine. It
+        loaded EVERY observed event (89,562 of them on the live store), sorted
+        the whole list in Python, sliced the first 200 — and those 200 are the
+        oldest events, which have had an extraction at every version for years.
+        So each run materialised ~90k rows, enqueued nothing, and completed
+        successfully; every event that actually needed re-extraction sat past
+        the slice and was unreachable. Exactly the A7 heal failure: re-select
+        the same prefix, find it already done, achieve nothing, forever.
+        Measured on a store shaped like the live one (89,562 observed events,
+        67,000 of them already extracted at the current version): the old shape
+        took 221 ms to select 0 events that needed work, out of 22,562 that did.
+
+        Both halves are fixed. Eligibility ("no extraction at THIS version") is
+        now a SQL predicate rather than a post-filter, so the page is 200 events
+        that need work instead of 200 that don't; and the rowid cursor means run
+        N+1 starts past run N. `remaining` is then the true size of the backlog
+        — the number nobody could see before.
+
+        `payload["limit"]` still wins when given (a caller asking for a specific
+        batch), otherwise the pace is `sweeps.budgets.reextract`."""
         version = self.core.extractor.version
-        prioritized = sorted(events, key=lambda e: e["seq"])
-        for ev in prioritized[: payload.get("limit", 200)]:
-            if not self.store.has_extraction(ev["event_id"], version):
-                self.store.enqueue_curation("extract", {"event_id": ev["event_id"],
-                                                        "session_id": ev.get("session_id")})
+        page = sweeps.next_row_page(
+            self.store, self.cfg, "reextract", "events",
+            "type='observed' AND event_id NOT IN "
+            "(SELECT observed_event FROM extractions WHERE extractor_version=?)",
+            (version,), budget=payload.get("limit"))
+        for ev in page.rows:
+            self.store.enqueue_curation("extract", {"event_id": ev["event_id"],
+                                                    "session_id": ev.get("session_id")})
+        report = sweeps.commit(self.store, page)
+        logger.info("reextract: enqueued %d event(s) at version %s, %d still awaiting",
+                    report["processed"], version, report["remaining"])
+        return report
+
+    def _background_timeout(self) -> float:
+        """`embeddings.background_timeout`, clamped to [10, 600] seconds."""
+        try:
+            t = float(self.cfg.get("embeddings.background_timeout", 120) if self.cfg else 120)
+        except (TypeError, ValueError):
+            t = 120.0
+        return max(10.0, min(600.0, t))
 
     def _task_embed(self, payload):
         """Deferred vector write (§24.4): the backend was unreachable when this
@@ -374,18 +730,76 @@ class CurationWorker:
         is deferred again, UNBOUNDED: an outage is recoverable and visible in the
         job queue, and dropping the vector would leave a permanent hole no later
         pass looks for. Errors from a reachable model are bounded instead — they
-        may never clear, and a poison payload must not churn forever."""
+        may never clear, and a poison payload must not churn forever.
+
+        THE TEXT IS RE-RESOLVED HERE, FOR EVERY KIND (A0g N1), through the
+        reducer's four `*_vector_text` accessors -- the same function objects the
+        heal and scripts/migrate_vectors.py use -- and NEVER embedded from the job
+        payload. The payload is a snapshot taken at enqueue time; the row is the
+        thing the vector has to mean. Before this, only kind='session' re-resolved,
+        while `observed` and the belief kinds embedded `payload["text"]`, which
+        store.enqueue_embed_job had clamped to 8000 characters. The repair path
+        therefore embedded a DIFFERENT string from the write path for any item over
+        that length -- measured on the production shape (max_input_tokens 650,
+        overflow chunk_mean, so every chunk of the input reaches the model): a
+        9,736-character note re-embedded from 8,017 wire characters and a
+        10,731-character excerpt from the same 8,017, each written back under the
+        canonical model tag that declares the vector correct. Re-resolving also
+        means a body edited between enqueue and drain is embedded as it now reads
+        rather than as it read when the job was queued.
+
+        `recoverable` False is the A0fix refusal contract: the store cannot say
+        what this row's text is, so NOTHING is written and the row is left exactly
+        as it is for the heal to count -- never re-embedded from a near-miss."""
         target, kind = payload.get("target_id"), payload.get("kind")
         text = payload.get("text") or ""
         emb = self.core.embedder
         if not target or not kind or not text or emb is None:
             return
         provider = external_id = None
-        model_name = emb.model_with_prefix_marker()
+        # The tag AS OF NOW, used only to answer "is this row already done".
+        # It is deliberately NOT the tag that gets stamped: `recheck()` below may
+        # adopt a live backend inside this very job, and this value would then be
+        # the stale 'degraded' placeholder (D2). The stamped tag is re-resolved
+        # after the embed succeeds.
+        known_tag = embedder_model_tag(emb)
+        # A0b: "already done" is TAG AND WIDTH, never the tag alone. A
+        # wrong-dimension blob can carry a perfectly current tag -- that is
+        # exactly what the live nemotron rows did -- and a tag-only check made
+        # this handler a no-op on precisely the rows the heal requeued it for,
+        # so the heal re-queued them again next run, forever. `want_len` is 0
+        # when the embedder does not report a dimensionality, which means
+        # "cannot check", not "everything is wrong": the tag-only behavior.
+        want_len = expected_blob_len(emb)
+
+        def _already_current(existing_model, existing_len):
+            if existing_model is None or existing_model != known_tag:
+                return False
+            return not (want_len and existing_len and existing_len != want_len)
+
         if kind == "observed":
-            existing_model = self.store.get_observed_vector_model(target)
-            if existing_model is not None and existing_model == model_name:
-                return  # Vector exists and model matches, no-op
+            # The same exclusion the write path applies (§27
+            # embeddings.exclude_session_prefixes): a job queued before the
+            # prefix was excluded, or by an older build, must not embed it now.
+            # Nor an archive copy of a turn the provider already embedded.
+            excluded = tuple(self.cfg.get("embeddings.exclude_session_prefixes", []) or ())
+            row = self.store._conn().execute(
+                "SELECT session_id, payload FROM events WHERE event_id=?", (target,)).fetchone()
+            if row is not None:
+                if excluded and (row[0] or "").startswith(excluded):
+                    return
+                try:
+                    ev_payload = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                except ValueError:
+                    ev_payload = None
+                if is_duplicate_copy(ev_payload):
+                    return
+            if _already_current(self.store.get_observed_vector_model(target),
+                                self.store.get_observed_vector_len(target)):
+                return  # Vector exists, model matches AND width is right: no-op
+            text, recoverable = observed_vector_text(self.store._conn(), target)
+            if not recoverable:
+                return
         elif kind == "projection":
             # External-DB projection (§g5a): no belief table backs this — identity
             # is the (provider, external_id) pair carried alongside target_id,
@@ -393,16 +807,44 @@ class CurationWorker:
             provider, external_id = payload.get("provider"), payload.get("external_id")
             if not provider or not external_id:
                 return
-            existing_model = self.store.get_projection_vector_model(provider, external_id)
-            if existing_model is not None and existing_model == model_name:
-                return  # Vector exists and model matches, no-op
+            if _already_current(self.store.get_projection_vector_model(provider, external_id),
+                                self.store.get_projection_vector_len(provider, external_id)):
+                return  # Vector exists, model matches AND width is right: no-op
+            # The one channel whose text lives nowhere but the embed job itself
+            # (§g5a): the authority reads it back out of the NEWEST job for this
+            # target, so a re-rendered projection is embedded as it now reads and
+            # this handler still never invents a text of its own.
+            text, recoverable = projection_vector_text(self.store._conn(), provider, external_id)
+            if not recoverable:
+                return
+        elif kind == "session":
+            # Session summary vector (A0e). `target` is the session_id, and the
+            # row already exists — the summarizer wrote it — so only its
+            # embedding + tag are repaired here.
+            if _already_current(self.store.get_session_vector_model(target),
+                                self.store.get_session_vector_len(target)):
+                return  # Vector exists, model matches AND width is right: no-op
+            # Re-embed the SUMMARY THE ROW HOLDS, resolved through the reducer's
+            # authority — never the job payload's copy of it. The payload is a
+            # snapshot clamped at enqueue time; the row is the thing the vector
+            # has to mean. `recoverable` False (no such session, or an empty
+            # summary) is the A0fix refusal contract: leave the row exactly as
+            # it is rather than embed something else.
+            text, recoverable = session_vector_text(self.store._conn(), target)
+            if not recoverable:
+                return
         else:
-            existing_model = self.store.get_memory_vector_model(target, kind)
-            if existing_model is not None and existing_model == model_name:
-                return  # Vector exists and model matches, no-op
+            if _already_current(self.store.get_memory_vector_model(target, kind),
+                                self.store.get_memory_vector_len(target, kind)):
+                return  # Vector exists, model matches AND width is right: no-op
             table = KIND_TABLE.get(kind)
             # Retracted/forgotten between capture and retry: no vector to write back.
             if not table or self.store.get_belief(table, target) is None:
+                return
+            # THE belief-text authority, exactly as the heal and migrate_vectors
+            # resolve it -- not this job's clamped copy of the body.
+            text, recoverable = belief_vector_text(self.store._conn(), kind, target)
+            if not recoverable:
                 return
         # A degraded embedder re-probes ONLY here: this is the backoff path, so a
         # dead endpoint costs a connection refusal per job, never a user query.
@@ -410,17 +852,41 @@ class CurationWorker:
         if recheck is not None:
             recheck()
         try:
-            blob = pack(emb.embed_document(text))
+            blob = pack(embed_document_patiently(emb, text, self._background_timeout()))
         except EmbeddingsUnavailable as e:
             raise JobDeferred(str(e))
         except Exception as e:
             raise JobDeferred(f"embed failed: {e}", max_attempts=_EMBED_MAX_ATTEMPTS)
+        # D2: resolve the tag AFTER recheck() and AFTER the embed succeeded. The
+        # old code resolved it at the top of the handler, so the FIRST job drained
+        # after a backend recovery stamped the pre-recheck 'degraded' placeholder
+        # onto a perfectly good vector -- a row claiming a geometry that does not
+        # exist, which the next heal then spends a re-embed undoing. Resolving it
+        # here means the tag always names the embedder that actually produced
+        # `blob`.
+        model_name = embedder_model_tag(emb)
+        if not is_usable_model_tag(model_name):
+            # Belt and braces: an embed succeeded but the embedder still will not
+            # name a geometry (a duck-typed embedder reporting 'auto', say).
+            # Writing the vector under 'degraded'/'auto' would label it with a
+            # non-geometry -- exactly what DegradedEmbedder.model_tag promises
+            # never happens. The job stays queued instead, bounded, so the vector
+            # is written as soon as the embedder can say what it is.
+            raise JobDeferred(f"embedder reports no usable geometry ({model_name!r}); "
+                              f"refusing to stamp it on a vector",
+                              max_attempts=_EMBED_MAX_ATTEMPTS)
         if kind == "observed":
             ev = self.store.get_event(target)
             self.store.add_observed_vector(target, blob, model_name, (ev or {}).get("owner", "default"))
         elif kind == "projection":
             owner = payload.get("owner") or "default"
             self.store.add_projection_vector(provider, external_id, blob, model_name, owner)
+        elif kind == "session":
+            # UPDATE, never INSERT OR REPLACE: a re-embed has no authority over
+            # the summary text, the owner or occurred_at, and re-deriving those
+            # from an embed job's payload would let a vector repair rewrite
+            # content.
+            self.store.update_session_vector(target, blob, model_name)
         else:
             self.store.add_memory_vector(target, kind, blob, model_name)
 
@@ -535,14 +1001,40 @@ class CurationWorker:
         if any(sid.startswith(prefix) for prefix in excluded):
             return
         events = self.store.get_events_by_session(sid)
-        obs = []  # (event_id, excerpt) for every observed event, in session order
+        obs = []         # (event_id, text) for every observed event, in session order
+        transcript = []  # the same, for the session's transcript captures only
         for ev in events:
             if ev["type"] == "observed":
                 p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
-                obs.append((ev["event_id"], p.get("excerpt", "")))
-        if not obs:
-            return
+                # The reader's copy, not the stored bytes (speaker.reader_text),
+                # and without tool output: a session is summarised by what was
+                # said in it. Built from the stored text, 24 of the 107
+                # interactive session summaries on the production store carried
+                # a "[CONTEXT COMPACTION — REFERENCE ONLY]" handoff into the
+                # session vector, and many more a tool's raw JSON.
+                text = spk.reader_text(p, actor=ev.get("actor") or "", drop_tools=True)
+                if not text.strip():
+                    continue
+                obs.append((ev["event_id"], text))
+                if p.get("source_type") == "session_transcript":
+                    transcript.append((ev["event_id"], text))
+        # A session the provider captured is its transcript. The compressor's
+        # eviction copies and the rescue copies repeat messages the transcript
+        # already holds, and were what carried the handoffs in; they stand in
+        # only for a session with no transcript at all.
+        if transcript:
+            obs = transcript
         owner = events[0]["owner"] if events else "default"
+        if not obs:
+            # Nothing in the session is conversation (every event was host
+            # framing: a cron prompt, a skill-invocation frame). Its row, if an
+            # earlier summarizer wrote one from those frames, is replaced by an
+            # empty one: nothing to find it by, and a row, so the backfill sweep
+            # does not re-queue it. The stale-vector heal skips empty summaries.
+            if events and self.store.get_session_vector(sid):
+                self.store.add_session_vector(sid, "", b"", owner,
+                                              events[0].get("occurred_at", now_iso()), model=None)
+            return
 
         # §E6: open a new episode wherever consecutive event embeddings show a
         # topic shift, then emit one summary line per episode instead of one
@@ -567,12 +1059,22 @@ class CurationWorker:
                 lines.append(line)
         summary = "\n".join(lines)[:_SESSION_SUMMARY_MAX_CHARS]
         vec = b""
+        model_name = None
         if self.core.embedder is not None:
             try:
-                vec = pack(self.core.embedder.embed_document(summary))
+                vec = pack(embed_document_patiently(self.core.embedder, summary,
+                                                    self._background_timeout()))
+                # A0e: stamped ONLY on the success path, and only through the
+                # single choke point every other vector table goes through. A tag
+                # written next to a failed embed would claim a geometry for bytes
+                # that do not exist; NULL there says "no usable vector, unknown
+                # model", which is the truth and is what the heal reads as stale.
+                model_name = embedder_model_tag(self.core.embedder)
             except Exception:
                 vec = b""  # incl. degraded: the summary row still indexes, unvectored
-        self.store.add_session_vector(sid, summary, vec, owner, events[0].get("occurred_at", now_iso()))
+                model_name = None
+        self.store.add_session_vector(sid, summary, vec, owner,
+                                      events[0].get("occurred_at", now_iso()), model=model_name)
 
     def _task_journal_ingest(self, payload):
         """OCAS journals → observed events, deduped by content addressing (§14.1)."""
@@ -590,9 +1092,15 @@ class CurationWorker:
                         text = fh.read()
                 except OSError:
                     continue
+                # Skill journals are written by the agent's own runs, not by the
+                # user: kept for recall, never read as the user's words.
+                excerpt = text[:4000]
                 self.core.capture.append("observed",
-                                         {"source_type": "ocas_journal", "excerpt": text[:4000],
-                                          "source_ref": fp}, actor="user", trust_level=2)
+                                         {"source_type": "ocas_journal", "excerpt": excerpt,
+                                          "source_ref": fp,
+                                          "speakers": [[0, len(excerpt), spk.AUTOMATION]]
+                                          if excerpt else []},
+                                         actor="system", trust_level=2)
 
     # -- federation sweep (§14, g4) ----------------------------------------
 
@@ -864,15 +1372,26 @@ class CurationWorker:
         """Backfill session_index for ended/reaped sessions lacking an index row
         (issue #6).
 
-        Deterministic batch job: finds <=200 ended sessions without an index
-        entry, enqueues session_summarize for each, and advances the watermark
-        for idempotent pagination. Stateless: calling again after completion
-        yields 0.
+        Deterministic batch job: takes one `sweeps.budgets.backfill` page of
+        ended sessions without an index entry, enqueues session_summarize for
+        each, and persists the cursor so the NEXT run starts past this one.
+
+        §A9: the batch size was the literal 200 and the watermark never wrapped,
+        so once the cursor reached the highest session id this job returned an
+        empty list forever — including for sessions whose index row disappeared
+        behind the cursor afterwards. It also reported nothing but a count, so a
+        store 40k sessions behind and a store fully caught up logged the same
+        line. The wrap and the processed/remaining/bounded report both live in
+        `get_sessions_needing_index_backfill` now; this returns the report.
         """
-        sids = self.store.get_sessions_needing_index_backfill(limit=200)
+        budget = sweeps.sweep_budget(self.cfg, "backfill", default=200)
+        sids = self.store.get_sessions_needing_index_backfill(limit=budget)
         for sid in sids:
             self.store.enqueue_curation("session_summarize", {"session_id": sid})
-        logger.info("backfill_sweep: enqueued %d sessions for summarization", len(sids))
+        report = self.store.get_sweep_state("backfill")
+        logger.info("backfill_sweep: enqueued %d sessions for summarization, %d remaining",
+                    len(sids), report.get("remaining", 0))
+        return report
 
 
 def _quote_ident(name: str) -> str:

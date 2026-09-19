@@ -15,6 +15,7 @@ import logging
 import re
 import uuid
 
+from . import speaker as spk
 from .criticality import classify as classify_criticality
 from .serialize import event_id, hash_str
 from .store import now_iso
@@ -136,7 +137,7 @@ class CaptureEngine:
 
     def observe(self, user_content: str, assistant_content: str, *, session_id: str = "",
                 messages: list[dict] | None = None, trust_level: int = 2,
-                occurred_at: str | None = None) -> str:
+                occurred_at: str | None = None, speaker_context: dict | None = None) -> str:
         """sync_turn: durable observed event(s) (§12.1, I12).
 
         A long turn is chunked, never truncated: one `observed` event per chunk,
@@ -145,13 +146,43 @@ class CaptureEngine:
         the payload (§5.3) and append_event dedups on it (I2), so byte-identical
         chunks would otherwise collapse into one event, i.e. silent data loss.
         Returns the first chunk's eid; signature unchanged.
+
+        Who said what is decided here (engine/speaker.py) and recorded on the
+        chunk as `speakers` spans over its excerpt plus `attribution`, the host
+        context it was decided from. `speaker_context` is what the host told the
+        provider (agent_context, platform, the turn author); a host that says
+        nothing is a person typing, unless the session is a scheduled job's. The
+        actor is `user` only when the user side of the turn is a person.
+
+        The record is omitted only when it adds nothing: no host context, a
+        person on the user side, and labels that the legacy reading attributes
+        exactly as the spans do. Such a chunk's payload, and so its event id, is
+        the same as before attribution existed.
         """
+        ctx = speaker_context or {}
+        author = ctx.get("author") if isinstance(ctx.get("author"), dict) else None
+        side = spk.user_side(agent_context=ctx.get("agent_context", ""),
+                             platform=ctx.get("platform", ""),
+                             session_id=session_id, author=author)
         if messages:
-            excerpt = "\n".join(f"{m.get('role','?')}: {m.get('content','')}" for m in messages[-12:])
+            excerpt, spans = spk.render_messages(messages[-12:], side)
         else:
-            excerpt = f"User: {user_content}\nAssistant: {assistant_content}"
+            excerpt, spans = spk.render_messages(
+                [{"role": "User", "content": user_content},
+                 {"role": "Assistant", "content": assistant_content}], side)
         chunks = _split_excerpt(excerpt, self._excerpt_cap())
-        actor = "user" if user_content else "agent"
+        per_chunk = spk.chunk_spans(spans, chunks)
+        attribution = {"user_side": side}
+        for k in ("agent_context", "platform"):
+            if ctx.get(k):
+                attribution[k] = str(ctx[k])
+        if author:
+            attribution["author"] = {k: author[k] for k in ("id", "name", "is_bot")
+                                     if author.get(k) not in (None, "")}
+        if not user_content:
+            actor = "agent"
+        else:
+            actor = "user" if side == spk.HUMAN else "system"
         # One occurred_at across the whole turn so siblings stay one group.
         stamp = occurred_at or self._now()
         first = ""
@@ -160,10 +191,15 @@ class CaptureEngine:
             # now, and one forbidden span must not suppress the rest of the turn.
             if self.store.is_forbidden(hash_str(chunk)):
                 continue  # forbidden content is never re-captured
-            eid = self.append("observed",
-                              {"source_type": "session_transcript", "excerpt": chunk,
-                               "source_ref": session_id,
-                               "chunk_index": i, "chunk_count": len(chunks)},
+            payload = {"source_type": "session_transcript", "excerpt": chunk,
+                       "source_ref": session_id,
+                       "chunk_index": i, "chunk_count": len(chunks)}
+            if len(attribution) > 1 or side != spk.HUMAN or \
+                    spk.legacy_lines(chunk, source_type="session_transcript", session_id=session_id,
+                                     chunk_index=i) != spk.lines_from_spans(chunk, per_chunk[i]):
+                payload["speakers"] = per_chunk[i]
+                payload["attribution"] = attribution
+            eid = self.append("observed", payload,
                               actor=actor, occurred_at=stamp,
                               session_id=session_id or None, trust_level=trust_level)
             first = first or eid
@@ -187,32 +223,59 @@ class CaptureEngine:
                             "task": task, "result": result, "child_session_id": child_session_id},
                            actor="agent", occurred_at=occurred_at)
 
-    def rescue(self, messages: list[dict], *, session_id: str = "") -> tuple[list[str], str]:
+    def rescue(self, messages: list[dict], *, session_id: str = "",
+               speaker_context: dict | None = None) -> tuple[list[str], str]:
         """Two-speed rescue (§12.6, I14): durably persist + fast-extract high-salience spans
-        to `asserted(draft, salience=high)` so nothing critical is lost on eviction."""
+        to `asserted(draft, salience=high)` so nothing critical is lost on eviction.
+
+        Every important message is persisted, with its speaker, for recall. Only
+        the user's own words become a rescued note: an assistant's "never do X",
+        a tool's error text or a compaction handoff is not something the user
+        said, and a note is always injected."""
+        ctx = speaker_context or {}
+        side = spk.user_side(agent_context=ctx.get("agent_context", ""),
+                             platform=ctx.get("platform", ""), session_id=session_id,
+                             author=ctx.get("author") if isinstance(ctx.get("author"), dict) else None)
         belief_events, summaries = [], []
         for msg in messages:
-            content = (msg.get("content") or "").strip()
+            content = spk.message_text(msg.get("content")).strip()
             if len(content) < 20:
                 continue
             crit, _ = classify_criticality(content)
             important = crit != "normal" or any(kw in content.lower() for kw in _RESCUE_KW)
             if not important:
                 continue
-            # 1) raw durability (recall floor) + 2) draft belief (I14)
+            excerpt = content[:2000]
+            who = spk.role_speaker(msg.get("role"), side)
+            if who in (spk.HUMAN, spk.AUTOMATION):
+                spans = spk.split_user_content(excerpt, who)
+            else:
+                spans = [(0, len(excerpt), who)]
+            # 1) raw durability (recall floor)
             obs = self.append("observed",
-                             {"source_type": "rescue_extraction", "excerpt": content[:2000],
-                              "source_ref": session_id, "document_id": str(uuid.uuid4())},
-                             actor="system", session_id=session_id or None)
-            note_type = "norm" if any(k in content.lower() for k in ["always", "never", "must", "don't", "do not"]) else "belief"
+                             {"source_type": "rescue_extraction", "excerpt": excerpt,
+                              "source_ref": session_id, "document_id": str(uuid.uuid4()),
+                              "speakers": [list(x) for x in spans],
+                              "attribution": {"user_side": side, "role": str(msg.get("role") or "")}},
+                             actor="user" if who == spk.HUMAN else "system",
+                             session_id=session_id or None)
+            belief_events.append(obs)
+            summaries.append(content[:200])
+            # 2) draft belief (I14), from the user's own words only
+            said = "\n".join(excerpt[a:b] for a, b, w in spans if w == spk.HUMAN).strip()
+            if len(said) < 20:
+                continue
+            low = said.lower()
+            crit, _ = classify_criticality(said)
+            if crit == "normal" and not any(kw in low for kw in _RESCUE_KW):
+                continue
+            note_type = "norm" if any(k in low for k in ["always", "never", "must", "don't", "do not"]) else "belief"
             self.append("asserted",
                        {"kind": "note", "key": {"note_type": note_type, "subject": "rescued", "salience": "high"},
-                        "body": content[:500], "confidence": 0.7, "source_event": obs,
+                        "body": said[:500], "confidence": 0.7, "source_event": obs,
                         "source_type": "rescue_extraction", "status": "draft"},
                        parents=[obs],
                        actor="system", session_id=session_id or None)
-            belief_events.append(obs)
-            summaries.append(content[:200])
         return belief_events, ("\n".join(summaries) if summaries else "")
 
     # -- sessions & reaper -------------------------------------------------
@@ -244,9 +307,6 @@ class CaptureEngine:
         else:
             self.store.upsert_session({"session_id": session_id, "status": "active", "started_at": now,
                                        "last_activity_at": now, "last_extracted_seq": 0})
-
-    def flush_best_effort(self):
-        pass  # not relied upon (§12.3 shutdown)
 
 
 class Reaper:

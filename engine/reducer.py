@@ -14,13 +14,19 @@ import datetime
 import json
 import logging
 import re
+import threading
 
 from . import access
+from . import entities as ents
 from . import doc2query
 from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
+from . import sweeps
+from . import speaker as spk
+from . import credentials as _cred
+from . import substance as sub
 from .criticality import classify as classify_criticality
-from .embeddings import EmbeddingsUnavailable, cosine, pack, unpack
+from .embeddings import EmbeddingsUnavailable, cosine, embedder_model_tag, pack, unpack
 from .serialize import belief_id as compute_belief_id
 from .serialize import hash_str
 from .store import BELIEF_TABLES, KIND_TABLE, now_iso
@@ -28,11 +34,44 @@ from .trust import base_confidence, clamp_to_ceiling, raw_confidence
 
 logger = logging.getLogger("chronicle.reducer")
 
+# Fallback contradiction policy per domain. §A12: this used to be the ONLY
+# source -- `domains.<d>.contradiction_policy` was declared in DEFAULTS and read
+# by nothing, so an operator who set `domains: user: contradiction_policy:
+# newer_wins` still got flag_for_review. `_contradiction_policy` below reads the
+# config first and falls back here, which is what keeps the several
+# `Reducer(store)`-with-cfg=None construction paths working unchanged.
 DOMAIN_POLICY = {
     "user": {"contradiction": "flag_for_review"},
     "agent": {"contradiction": "newer_wins"},
     "general": {"contradiction": "refetch"},
 }
+
+# The policies the fact-conflict handler actually branches on. A config value
+# outside this set would silently fall through to the `refetch` tail, i.e. an
+# operator's typo would change behaviour without saying so; instead the
+# fallback wins and the typo is logged once.
+_CONTRADICTION_POLICIES = ("flag_for_review", "newer_wins", "refetch")
+_POLICY_WARNED: set = set()
+
+
+def contradiction_policy(cfg, domain: str) -> str:
+    """`domains.<domain>.contradiction_policy`, or the DOMAIN_POLICY default."""
+    fallback = DOMAIN_POLICY.get(domain, DOMAIN_POLICY["general"])["contradiction"]
+    if cfg is None:
+        return fallback
+    try:
+        val = cfg.get("domains.{}.contradiction_policy".format(domain), None)
+    except Exception:
+        return fallback
+    if val is None:
+        return fallback
+    if val not in _CONTRADICTION_POLICIES:
+        if domain not in _POLICY_WARNED:
+            _POLICY_WARNED.add(domain)
+            logger.warning("chronicle: domains.%s.contradiction_policy=%r is not one of %s; "
+                           "using %r", domain, val, _CONTRADICTION_POLICIES, fallback)
+        return fallback
+    return val
 
 # Core identity predicates about the user — always-known, elevated so they enter the
 # injected/static block regardless of their value text (a phone number or city name
@@ -55,6 +94,308 @@ _VECTORED_KINDS = ("fact", "episode", "note", "reference", "procedure")
 # shortlist without a second pass, at a cost of 25 (float, id) pairs.
 NOVELTY_TOP_K = 25
 
+
+# -- THE belief-text authority (A0fix D3) ------------------------------------
+#
+# WHAT WENT WRONG. `vector_text` below is what the reducer embeds. Everything
+# that later has to RE-embed a stored row — the health heal,
+# scripts/migrate_vectors.py, scripts/requeue_hash_vectors.py — has to answer the
+# same question from the other end: given a row in memory_vectors, what text was
+# it made of? That answer used to live in a second, hand-maintained table
+# (`HealthEngine.BELIEF_TEXT`) that mapped each kind to one column, and for
+# `procedure` it named `procedures.name`. But `vector_text` embeds
+# `body or key.name or key.topic`, and `tools._t_remember(kind="procedure")` sets
+# `key.name = content[:40]` with `body = content`. So every tool-written
+# procedure longer than 40 characters was vectorised from the full body and
+# re-vectorised from a 40-character truncation — silently, with no error and no
+# count, and then stamped with the canonical model tag that declares the vector
+# correct.
+#
+# THE RULE THIS ENFORCES. There is ONE function that says what text a belief's
+# vector is made of, and it is derived from `vector_text` itself, not maintained
+# alongside it. `belief_vector_text` rebuilds the payload fields `vector_text`
+# reads out of the projection and then calls `vector_text`, so the write side and
+# every read side execute the SAME expression. A new kind, or a changed
+# fallback order, cannot make them disagree; it can only make
+# BELIEF_VECTOR_SOURCE incomplete, which
+# tests/test_belief_text_authority.py fails on for every kind in
+# _VECTORED_KINDS.
+#
+# WHAT IT REFUSES. When the projection does not RECORD a field vector_text
+# reads, the text is not recoverable and this function says so instead of
+# substituting the nearest string to hand. Callers must then leave the row
+# exactly as it is and report it. A wrong-geometry vector you can find again is
+# strictly better than a right-geometry vector of the wrong text, because only
+# the first one is detectable.
+#
+# THE FULL SET (A0e). One `(text, recoverable)` accessor per vector-bearing
+# table, all in THIS module, so no consumer ever reaches into a column itself:
+#   observed_vectors    -> observed_vector_text(conn, event_id)
+#   memory_vectors      -> belief_vector_text(conn, kind, belief_id)
+#   session_index       -> session_vector_text(conn, session_id)
+#   projection_vectors  -> projection_vector_text(conn, provider, external_id)
+#   query_proxy_vectors -> the row's own `question` column, which the tool reads
+#     in the same SELECT that finds the row (there is nothing to reconstruct: a
+#     proxy IS its question). The heal does not re-embed proxies at all — it
+#     drops them, because the embed-job queue is keyed (target, kind) and cannot
+#     express a variable-length proxy set.
+# tests/test_a0e_session_projection_vectors.py asserts every consumer binds the
+# same function OBJECTS, so a second definition cannot appear beside these.
+#
+# kind -> (table, body_col, name_col, topic_col), in vector_text's own fallback
+# order. `None` means the projection does not store that payload field for this
+# kind. `procedures.body` is schema_version 12; rows written before it are NULL
+# and are refused (or recovered from the source event), never guessed at.
+BELIEF_VECTOR_SOURCE = {
+    "fact":      ("facts",      "value",          None,   None),
+    "episode":   ("episodes",   "summary",        None,   None),
+    "note":      ("notes",      "body",           None,   None),
+    "reference": ("refs",       "cached_summary", None,   "topic"),
+    "procedure": ("procedures", "body",           "name", None),
+}
+
+
+def vector_text(event_type, payload) -> str:
+    """THE exact text Chronicle embeds for an event, or '' if none.
+
+    One definition, so a prefetch can never embed something subtly different
+    from what the handler then looks up (a cache keyed on text is only useful if
+    both sides derive the key the same way), and so no re-embedding tool can
+    recover a DIFFERENT string than the one that was stored."""
+    if event_type == "observed":
+        return payload.get("excerpt", "") or ""
+    if event_type == "asserted" and payload.get("kind", "fact") in _VECTORED_KINDS:
+        key = payload.get("key") or {}
+        return payload.get("body", "") or key.get("name", "") or key.get("topic", "") or ""
+    return ""
+
+
+def observed_vector_text(conn, event_id) -> tuple:
+    """`(text, recoverable)` for an observed event's vector, from the event log.
+
+    Same contract as `belief_vector_text`: `recoverable` False means the caller
+    must refuse the row rather than embed something else."""
+    try:
+        row = conn.execute("SELECT payload FROM events WHERE event_id=?", (event_id,)).fetchone()
+    except Exception:
+        return "", False
+    payload = _event_payload(row)
+    if payload is None:
+        return "", False
+    text = vector_text("observed", payload)
+    return text, bool(text)
+
+
+def session_vector_text(conn, session_id) -> tuple:
+    """`(text, recoverable)` for a session-summary vector, from `session_index`.
+
+    THE authority for that channel, in the same module and with the same
+    contract as `belief_vector_text` / `observed_vector_text`, so the heal and
+    scripts/migrate_vectors.py resolve it through one function object rather
+    than each reaching into the column themselves. (A parallel `kind -> column`
+    map is exactly what A0fix D3 removed; adding a second one here for
+    sessions would have re-created the defect in a new table.)
+
+    Unlike a belief there is no expression to rebuild: the summarizer embeds
+    `summary` VERBATIM (curation._task_session_summarize), so the recovered
+    text is that column read back. `recoverable` is False when the row is gone
+    or its summary is empty — there is then nothing honest to re-embed FROM,
+    and the caller must leave the vector exactly as it is and count it."""
+    try:
+        row = conn.execute("SELECT summary FROM session_index WHERE session_id=?",
+                           (session_id,)).fetchone()
+    except Exception:
+        return "", False           # table absent on an un-migrated store
+    if row is None:
+        return "", False           # a re-embed never INVENTS a session
+    text = row[0] or ""
+    return text, bool(text)
+
+
+def projection_vector_text(conn, provider, external_id) -> tuple:
+    """`(text, recoverable)` for an external-projection vector (§g5a).
+
+    The ONE channel whose source text the store does not otherwise hold: a
+    projection's text is rendered by the CALLER of
+    `store.enqueue_projection_embed` out of an external database and is
+    persisted nowhere else in Chronicle. The embed job's own payload is
+    therefore the only honest record of what those bytes mean, and it is what
+    this recovers — the identical string that was sent, not a fresh guess at
+    how the row should read.
+
+    When no job survives, `recoverable` is False and the caller must leave the
+    row untouched: a wrong-geometry vector that can still be found beats one
+    silently re-embedded from a text nobody wrote.
+
+    Newest job wins (ids are monotonic) and status is not filtered: a `done`
+    job is the normal case, and a `failed` one still records the text that was
+    sent."""
+    if not provider or not external_id:
+        return "", False
+    target_id = "proj:%s:%s" % (provider, external_id)
+    # `instr`, not LIKE: a provider or external id may legitimately contain `%`
+    # or `_`, which LIKE would read as wildcards. The needle is the canonical
+    # json rendering of the one key, so it cannot match a different job that
+    # merely mentions the id somewhere inside its text.
+    needle = json.dumps({"target_id": target_id}, sort_keys=True)[1:-1]
+    try:
+        rows = conn.execute(
+            "SELECT payload FROM curation_jobs WHERE task='embed' AND instr(payload, ?)>0 "
+            "ORDER BY id DESC LIMIT 50", (needle,)).fetchall()
+    except Exception:
+        return "", False
+    for row in rows:
+        raw = row[0]
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            payload = json.loads(raw or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("target_id") == target_id and payload.get("kind") == "projection":
+            text = payload.get("text") or ""
+            return text, bool(text)
+    return "", False
+
+
+def belief_vector_text(conn, kind, belief_id) -> tuple:
+    """`(text, recoverable)` — the EXACT text the reducer vectorised for a belief.
+
+    `recoverable` is False when the store does not hold enough to reconstruct
+    that text: an unknown/unvectored kind, a belief that no longer exists, a
+    projection that never recorded the field vector_text read, or a row that
+    predates the column that records it. The caller MUST then leave the row
+    untouched and count it as unrepairable — never re-embed a near-miss.
+
+    `text` is '' with `recoverable` False in every refusal, so a caller that only
+    checks the text still fails safe."""
+    spec = BELIEF_VECTOR_SOURCE.get(kind)
+    if spec is None:
+        return "", False
+    table, body_col, name_col, topic_col = spec
+    cols = [c for c in (body_col, name_col, topic_col) if c]
+    try:
+        row = conn.execute("SELECT %s FROM %s WHERE belief_id=?" % (", ".join(cols), table),
+                           (belief_id,)).fetchone()
+    except Exception:
+        return "", False           # table/column absent on an un-migrated store
+    if row is None:
+        return "", False           # retracted/forgotten between write and re-embed
+    got = dict(zip(cols, tuple(row)))
+    body = got.get(body_col) if body_col else None
+    if body is None:
+        # The store has NO RECORD of what `body` was here — the projection never
+        # had the column, or this row predates it. `body or name or topic` would
+        # then quietly substitute a different string (for a procedure: a 40-char
+        # truncation). Try the event this belief was reduced from; refuse if that
+        # cannot be corroborated.
+        return _vector_text_from_source_event(conn, spec, kind, belief_id, got)
+    payload = {"kind": kind, "body": body,
+               "key": {"name": (got.get(name_col) or "") if name_col else "",
+                       "topic": (got.get(topic_col) or "") if topic_col else ""}}
+    text = vector_text("asserted", payload)
+    return text, bool(text)
+
+
+def _event_payload(row):
+    """An events.payload cell as a dict, or None if it is not one."""
+    if not row:
+        return None
+    raw = row[0]
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _vector_text_from_source_event(conn, spec, kind, belief_id, projected) -> tuple:
+    """Recover a belief's vectorised text from the event it was reduced from.
+
+    Used ONLY when the projection cannot answer (today: a `procedure` row
+    written before schema_version 12 added `procedures.body`). This is what makes
+    an existing store repairable at all rather than permanently stuck with
+    wrong-geometry procedure vectors — but it is corroborated, never trusted:
+    the event must still exist, be an `asserted` event of the SAME kind, and
+    agree with every key field the projection DOES record. Any mismatch, any
+    missing piece, and this refuses. `vector_text` is then applied to the event's
+    own payload, so the text returned is the identical expression the reducer
+    evaluated when it wrote the vector."""
+    table, _body_col, name_col, topic_col = spec
+    try:
+        prov = conn.execute("SELECT provenance FROM %s WHERE belief_id=?" % table,
+                            (belief_id,)).fetchone()
+    except Exception:
+        return "", False
+    if not prov or not prov[0]:
+        return "", False
+    try:
+        source_event = (json.loads(prov[0]) or {}).get("source_event")
+    except (ValueError, TypeError):
+        return "", False
+    if not source_event:
+        return "", False
+    try:
+        row = conn.execute("SELECT payload FROM events WHERE event_id=? AND type='asserted'",
+                           (source_event,)).fetchone()
+    except Exception:
+        return "", False
+    payload = _event_payload(row)
+    if payload is None or payload.get("kind", "fact") != kind:
+        return "", False
+    key = payload.get("key") or {}
+    for col, field in ((name_col, "name"), (topic_col, "topic")):
+        if col and (projected.get(col) or "") != (key.get(field) or ""):
+            return "", False       # the event does not describe THIS row any more
+    text = vector_text("asserted", payload)
+    return text, bool(text)
+
+
+# Writes the context engine makes from INSIDE compress(): the spans it evicts and
+# the ones it rescues first (I14). compress() runs on the critical path of the
+# user's turn, and on a CPU-throttled host one compaction made 150 inline embed
+# calls — 60 rescued observations, 30 rescued notes at three embeds each (novelty,
+# vector, doc2query proxy) — every one a timeout. For these events the reducer
+# takes exactly the path a DEGRADED embedder already takes: the vector (and any
+# proxy) is queued as a deferred embed job, novelty is left unset. Their TEXT is
+# durable and FTS-indexed as before, so recall finds them the same turn.
+#
+# Keyed on the event's own source_type, not on who is calling, so a rebuild makes
+# the identical decision and the projection it produces is the one live wrote (I3).
+_DEFERRED_VECTOR_SOURCES = ("context_eviction", "rescue_extraction")
+_TLS = threading.local()
+
+
+def _defers_vectors(event) -> bool:
+    """Cheap: a substring test on the raw payload, before any json parse — this
+    runs for every event of a 400k-event rebuild. A false positive only defers
+    one vector."""
+    raw = event.get("payload")
+    if isinstance(raw, dict):
+        return raw.get("source_type") in _DEFERRED_VECTOR_SOURCES
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    return isinstance(raw, str) and any('"%s"' % s in raw for s in _DEFERRED_VECTOR_SOURCES)
+
+
+def is_duplicate_copy(payload) -> bool:
+    """An archive copy of a message the memory provider already captured (the
+    context engine marks those `extract: False`): kept durable and FTS-indexed
+    for chronicle_expand and search, but not embedded -- the provider's capture
+    of the same turn carries the vector, and each compaction queued one embed
+    job per archived message on a host whose embedding server is its
+    bottleneck. Carried in the event, so a rebuild decides the same (I3)."""
+    return (isinstance(payload, dict) and payload.get("extract") is False
+            and payload.get("source_type") == "context_eviction")
+
+
+def _vectors_deferred() -> bool:
+    return getattr(_TLS, "defer_vectors", False)
 
 def _embed_document(embedder, text):
     """embedder.embed_document(text), falling back to embed() when the object
@@ -102,15 +443,9 @@ class Reducer:
     def vector_text(self, event_type, payload) -> str:
         """The exact text this reducer embeds for an event, or '' if none.
 
-        One definition, so a prefetch can never embed something subtly different
-        from what the handler then looks up (a cache keyed on text is only useful
-        if both sides derive the key the same way)."""
-        if event_type == "observed":
-            return payload.get("excerpt", "") or ""
-        if event_type == "asserted" and payload.get("kind", "fact") in _VECTORED_KINDS:
-            key = payload.get("key") or {}
-            return payload.get("body", "") or key.get("name", "") or key.get("topic", "") or ""
-        return ""
+        Delegates to the module-level `vector_text` so there is literally ONE
+        definition (see its docstring)."""
+        return vector_text(event_type, payload)
 
     def doc2query_text(self, event_type, payload) -> list:
         """E2: the exact question strings this event's write will try to embed
@@ -208,7 +543,13 @@ class Reducer:
         if handler is None:
             logger.warning("Unknown event type: %s", event.get("type"))
             return
-        handler(self, event)
+        outer = _vectors_deferred()
+        _TLS.defer_vectors = outer or (event.get("type") in ("observed", "asserted")
+                                       and _defers_vectors(event))
+        try:
+            handler(self, event)
+        finally:
+            _TLS.defer_vectors = outer
 
     def reduce_many(self, events):
         for e in events:
@@ -244,15 +585,20 @@ class Reducer:
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = (self.cfg.get("embeddings.exclude_session_prefixes", []) if self.cfg else [])
         sid = event.get("session_id") or ""  # observed events may carry no session_id at all
-        skip_vec = any(sid.startswith(prefix) for prefix in excluded)
+        skip_vec = any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
         if excerpt:
-            self.store.fts_index_observed(eid, excerpt)
+            # The user's own index leaves out an archive copy of a turn the
+            # provider already captured: recall would show that turn twice.
+            self.store.fts_index_observed(
+                eid, excerpt, user=not spk.is_automation_session(sid) and not is_duplicate_copy(p))
             if self.embedder is not None and not skip_vec:
                 blob = self._safe_vec(excerpt, target_id=eid, kind="observed")
                 if blob is not None:
-                    self.store.add_observed_vector(eid, blob, self.embedder.model_with_prefix_marker(),
-                                                   event.get("owner", "default"))
-                self._write_doc2query_excerpt_proxies(eid, excerpt)
+                    self.store.add_observed_vector(eid, blob, embedder_model_tag(self.embedder),
+                                                   event.get("owner", "default"),
+                                                   created_at=event.get("recorded_at") or "")
+                self._write_doc2query_excerpt_proxies(eid, excerpt,
+                                                      created_at=event.get("recorded_at") or "")
         # Skip extraction for branch-abandoned spans (I16).
         if event.get("branch_id") == "__abandoned__":
             return
@@ -261,6 +607,11 @@ class Reducer:
         # raw-indexed above for recall, but must not become facts/notes/episodes:
         # memory is about the user and their world, not the assistant running itself.
         if _is_operational(event, p, excerpt):
+            return
+        # A capture that says it is a copy of something already extracted — an
+        # eviction made while the memory provider captured the same turn — is
+        # kept for recall and not extracted a second time.
+        if p.get("extract") is False:
             return
         self.store.enqueue_curation("extract", {"event_id": eid, "session_id": event.get("session_id")})
 
@@ -276,10 +627,37 @@ class Reducer:
         trust = event.get("trust_level", 2)
         source_type = p.get("source_type") or _provenance_source(event)
 
-        raw = p.get("confidence", base_confidence(source_type))
-        confidence = clamp_to_ceiling(raw, trust)
+        raw = p.get("confidence", base_confidence(source_type, self.cfg))
+        confidence = clamp_to_ceiling(raw, trust, cfg=self.cfg)
 
+        key, body = _without_credentials(key, body)
         b_id = compute_belief_id(kind, key, [source_event])
+        if kind == "entity":
+            # An entity IS its token: the id facts reference (`entity_id`) and the
+            # id of the row describing it must be the same, or every entity exists
+            # twice — once with its type and once with the facts hanging off it.
+            # Derived from the name, here in the fold, so nothing about the EVENT
+            # changes: the same log replays to the repaired projection.
+            b_id = ents.entity_token(key.get("name") or body) or b_id
+            # A pronoun or half a sentence is not an entity (engine/entities.py).
+            # The rule lives HERE as well as at the write boundary because the
+            # fold must reproduce the projection from the log alone (I3): the log
+            # already holds years of `asserted` entity events from before the
+            # rule, and a rebuild must not resurrect what they named.
+            if not ents.plausible_name(key.get("name") or body):
+                return
+        if kind == "fact":
+            # A fact that asserts an EVENT has to say what happened, not that
+            # something did (engine/substance.py). Here as well as at the write
+            # boundary, and for the same reason as the entity rule above: an
+            # importer wrote 159 email subject lines into a production store as
+            # things the user had done, and a rebuild must not bring them back.
+            _pred = key.get("predicate_canonical") or key.get("attribute") or ""
+            if not sub.states_what_happened(body, _pred):
+                logger.info("chronicle: not a memory (%s) — %s",
+                            _pred or "fact", sub.refusal(body, _pred))
+                return
+            self._name_entity_from_fact(key, body)
         existing = self._find_existing(kind, key, owner, domain)
 
         if kind == "fact" and existing:
@@ -325,14 +703,16 @@ class Reducer:
             self.store.update_belief(table, b_id,
                                      contradiction_count=(row.get("contradiction_count") or 0) + 1)
         self._recompute_confidence(table, b_id)
-        self.store.open_contradiction(b_id, p.get("conflicting_event", ""), p.get("detail", ""))
+        self.store.open_contradiction(b_id, p.get("conflicting_event", ""), p.get("detail", ""),
+                                      source=event["event_id"],
+                                      created_at=event.get("recorded_at") or "")
 
     def _on_corrected(self, event):
         p = _payload(event)
         b_id = p.get("belief_id")
         if not b_id:
             return
-        new_body = p.get("new_body")
+        new_body = _cred.redact(p.get("new_body") or "")
         if new_body:
             found = self.store.find_belief(b_id)
             if found:
@@ -376,23 +756,47 @@ class Reducer:
                                                  "event", "correction")
         else:
             self._retract(b_id)
-        self._cascade(b_id)
-        self.store.record_correction(b_id, p.get("reason", "corrected"), p.get("source_ref", ""), [])
+        self._cascade(b_id, source=event["event_id"], now=event.get("recorded_at") or "")
+        self.store.record_correction(b_id, p.get("reason", "corrected"), p.get("source_ref", ""), [],
+                                     source=event["event_id"],
+                                     created_at=event.get("recorded_at") or "")
 
     def _on_retracted(self, event):
+        """One retraction, or one decision that retracts many (`belief_ids`).
+
+        A cleanup is a single decision about a whole class of beliefs, and
+        scripts/retract_misattributed.py found 112,652 of them in one production
+        store. Writing that as 112,652 events would put 112,652 transactions,
+        git-mirror rows and reduces through a live agent's write path on a
+        CPU-capped box; as a batch it is a few hundred. Each id is retracted and
+        cascaded exactly as a single-id event would be, so a replay of either
+        shape reaches the same projection (I3)."""
         p = _payload(event)
-        b_id = p.get("belief_id")
-        if b_id:
-            self._retract(b_id)
-            self._cascade(b_id)
+        ids = p.get("belief_ids")
+        if not isinstance(ids, list):
+            ids = [p.get("belief_id")]
+        for b_id in ids:
+            if b_id and isinstance(b_id, str):
+                self._retract(b_id)
+                self._cascade(b_id, source=event["event_id"], now=event.get("recorded_at") or "")
 
     def _on_forbidden(self, event):
+        """Erase every trace of forbidden content — the one fold §A9 does NOT
+        bound.
+
+        Everywhere else a per-run row budget is the right answer, because a
+        sweep that is behind is merely late. Here a partial pass leaves
+        forbidden content live and readable while the event log records that it
+        was forbidden, which is a worse defect than the one being fixed. So this
+        loops to exhaustion; `iter_all_rows` pages it for MEMORY only (it used
+        to materialise all 89,562 observed events at once) and never truncates.
+        """
         p = _payload(event)
         ch = p.get("content_hash", "")
         if not ch:
             return
         self.store.add_tombstone(ch, p.get("scope", "*"))
-        for ev in self.store.get_events_by_type("observed"):
+        for ev in sweeps.iter_all_rows(self.store, self.cfg, "events", "type=?", ("observed",)):
             if hash_str(_payload(ev).get("excerpt", "")) == ch:
                 self.store.fts_delete_observed(ev["event_id"])
                 self.store.delete_observed_vector(ev["event_id"])
@@ -402,11 +806,10 @@ class Reducer:
     def _on_derived(self, event):
         p = _payload(event)
         kind = p.get("kind", "fact")
-        key = p.get("key", {})
-        body = p.get("body", "")
+        key, body = _without_credentials(p.get("key", {}), p.get("body", ""))
         rule_id = p.get("rule_id", "")
         premises = p.get("premises", [])
-        confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2)  # C(inference)=0.75
+        confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2, cfg=self.cfg)  # C(inference)=0.75
         status = p.get("status", "draft")
         event["domain"] = p.get("domain", "general")
         b_id = compute_belief_id(kind, key, sorted(premises) + [rule_id])
@@ -522,9 +925,6 @@ class Reducer:
     def _on_signal(self, event):
         logger.debug("signal: %s", _payload(event).get("signal_type"))
 
-    def _on_distilled(self, event):
-        pass  # deferred (§20.4)
-
     def _on_federated(self, event):
         """Federation writes (§14, I20). Two kinds, only one of which projects.
 
@@ -563,7 +963,14 @@ class Reducer:
         "grant": _on_grant, "revoke": _on_revoke, "decayed": _on_decayed,
         "rehearsed": _on_rehearsed, "verified": _on_verified, "merged": _on_merged,
         "unmerged": _on_unmerged, "compressed": _on_compressed, "signal": _on_signal,
-        "distilled": _on_distilled, "federated": _on_federated, "folded": _on_folded,
+        # No "distilled" entry: no code path in this build appends a `distilled`
+        # event, and its handler was `pass`. A13 removed both — an entry whose
+        # body is a no-op silently swallows an event type instead of reporting
+        # it, so a log that DOES carry one (from a build that wrote them) now
+        # gets the honest "Unknown event type" warning from reduce() rather than
+        # being dropped without a word. Compare _on_folded/_on_signal, which are
+        # near-no-ops but have real producers (context.py) and say why.
+        "federated": _on_federated, "folded": _on_folded,
         "checkpoint_digest": _on_checkpoint_digest, "adjudicated": _on_adjudicated,
     }
 
@@ -587,7 +994,7 @@ class Reducer:
             self.store.add_justification(existing["belief_id"], source_event, "event", "extraction")
             self.store.update_belief("facts", existing["belief_id"], last_seen_at=now)
             return
-        policy = DOMAIN_POLICY.get(domain, DOMAIN_POLICY["general"])["contradiction"]
+        policy = contradiction_policy(self.cfg, domain)
         old_conf = existing.get("confidence", 0.8)
         if policy == "newer_wins":
             # Supersede FIRST: it takes the old row out of status='active', which
@@ -620,7 +1027,8 @@ class Reducer:
             if stored_id != existing["belief_id"]:
                 # Skipped only when the near-duplicate merge folded the new value
                 # INTO this very row — a belief cannot contradict itself.
-                self.store.open_contradiction(existing["belief_id"], stored_id, "value conflict")
+                self.store.open_contradiction(existing["belief_id"], stored_id, "value conflict",
+                                              source=source_event, created_at=now)
                 self.store.update_belief(
                     "facts", existing["belief_id"],
                     contradiction_count=(existing.get("contradiction_count") or 0) + 1)
@@ -657,6 +1065,27 @@ class Reducer:
             return rows[0] if rows else None
         return None
 
+    def _name_entity_from_fact(self, key, body):
+        """An entity row named by another store's id takes the name the log asserts.
+
+        Chronicle references, it does not own (I20): a fact whose subject is a
+        people-store uuid creates an entity row named by that uuid, and a
+        production store held 1,003 of them — unreadable in every listing even
+        though the `name` fact right beside them says "Pat Testley". This is not
+        an inference: it is the name the log already carries for that id, applied
+        to the row, so a rebuild produces it too."""
+        if (key.get("predicate_canonical") or key.get("attribute")) != "name":
+            return
+        entity_id = key.get("entity_id") or ""
+        row = self.store.get_belief("entities", entity_id) if entity_id else None
+        if not row:
+            return
+        current = row.get("name") or entity_id
+        resolved = ents.resolve_name(current, body)
+        if resolved and resolved != current:
+            self.store.update_belief("entities", entity_id, name=resolved,
+                                     normalized_name=resolved.lower())
+
     def _ensure_entity(self, entity_id, name, owner, domain, event):
         if not entity_id:
             return
@@ -682,7 +1111,7 @@ class Reducer:
         counts, so it is computed here once and passed to both.
 
         Document-side (E1): this vector is stored as the item's memory vector --
-        tagged model_with_prefix_marker() -- and is scanned against other stored
+        tagged embedder_model_tag() -- and is scanned against other stored
         document vectors. The prefetch cache is filled by embed_batch(), which
         already prefixes "search_document: ", so a bare embed() here would make
         the cache-hit and cache-miss paths disagree and would tag a bare vector
@@ -691,6 +1120,8 @@ class Reducer:
         cached = self._vec_cache.get(text)
         if cached is not None:
             return cached
+        if _vectors_deferred():
+            return None
         try:
             return _embed_document(self.embedder, text)
         except EmbeddingsUnavailable:
@@ -699,42 +1130,32 @@ class Reducer:
             logger.debug("embedding skipped (%s)", e)
             return None
 
-    def _calculate_novelty(self, query_embedding, kind, key, body, owner, domain):
-        """Score this write's novelty and find its ONE legal merge candidate.
+    def _calculate_novelty(self, query_embedding, kind, owner, domain):
+        """This write's novelty: 1 − max cosine against existing same-KIND vectors.
 
-        Takes the already-computed embedding (see _embed_once) and returns
-        `(novelty, dup_belief_id, dup_similarity)`; `(None, None, None)` when
-        the kind is not stored in a belief table (§E5: "no embedder → store as
-        today" is handled by the caller, which never gets a vector at all).
+        Takes the already-computed embedding (see _embed_once); None when there
+        is no embedding or the kind is not stored in a belief table (§E5: "no
+        embedder → store as today" is handled by the caller).
 
-        Two DIFFERENT questions, deliberately answered by two different scans:
+        The spec's definition verbatim, scoped to owner+domain, so an episode is
+        scored against every episode and a fact against every fact. Scoping it
+        to the same SUBJECT instead — what the first pass did — left it NULL on
+        nearly every write, because the overwhelmingly common case is the first
+        item of its subject. A first-ever item of its kind scores 1.0 (maximally
+        novel), never NULL: NULL means "not computed", and conflating the two
+        makes the column unreadable.
 
-        novelty  — the spec's definition verbatim: 1 − max cosine against
-            existing same-KIND vectors (owner+domain scoped), so an episode is
-            scored against every episode, a fact against every fact. Scoping it
-            to the same SUBJECT instead — what the first pass did — left it NULL
-            on nearly every write, because the overwhelmingly common case is the
-            first item of its subject. A first-ever item of its kind scores 1.0
-            (maximally novel), never NULL: NULL means "not computed", and
-            conflating the two makes the column unreadable.
+        Novelty is a SCORE and only a score. It used to also nominate the
+        near-duplicate merge candidate, which made belief content depend on the
+        embedder; that decision is now `_exact_duplicate`'s, and it never reads
+        a vector.
 
-        dup_belief_id — the nearest neighbour that ALSO matches this item's
-            subject / natural key EXACTLY, restricted in SQL (see _merge_scope).
-            Never a bare owner+domain neighbour: merging discards the incoming
-            body and keeps only its provenance, so a cross-subject merge is
-            silent data loss. Kinds with no natural key never merge at all.
-
-        `dup_similarity` is that candidate's OWN cosine — not `1 − novelty`,
-        which is the global maximum and may belong to a different subject
-        entirely; comparing the global max against the threshold would fire a
-        merge on the strength of an item the merge is not allowed to touch.
-
-        Candidate retrieval goes through store.nearest_memory_vectors (top-K by
-        cosine over every same-kind vector, paged), not a rowid-ordered
-        `LIMIT 100` scan, so behaviour does not silently degrade past 100 items.
+        Neighbours come from store.nearest_memory_vectors (top-K by cosine over
+        every same-kind vector, paged), not a rowid-ordered `LIMIT 100` scan, so
+        the score does not silently degrade past 100 items.
         """
         if not query_embedding or KIND_TABLE.get(kind) not in BELIEF_TABLES:
-            return None, None, None
+            return None
 
         k = NOVELTY_TOP_K
         if self.cfg:
@@ -747,23 +1168,41 @@ class Reducer:
             neighbours = self.store.nearest_memory_vectors(kind, query_embedding, owner, domain, k)
         except Exception as e:
             logger.debug("novelty scan skipped (%s)", e)
-            return None, None, None
+            return None
         # Clamp at 0: an anti-correlated neighbour is not "more than new".
         top = max(0.0, neighbours[0][1]) if neighbours else 0.0
-        novelty = 1.0 - top
+        return 1.0 - top
 
+    def _exact_duplicate(self, kind, key, body, owner, domain):
+        """The active row this write would duplicate EXACTLY, or None.
+
+        Legal merge target = same kind, owner and domain, the same subject /
+        natural key (_merge_scope, restricted in SQL so a cross-subject row
+        cannot even be returned), and a byte-identical body in the column the
+        belief-text authority names for the kind (BELIEF_VECTOR_SOURCE). Nothing
+        here reads a vector or a threshold, so the decision is the same with the
+        embedder healthy, timed out or absent, and the same on every replay.
+
+        Anything short of identical is kept as its own row. A paraphrase stored
+        twice costs a row; an update merged away costs the update. Kinds with no
+        natural key, and empty bodies, never merge. When legacy duplicates
+        already exist the OLDEST (created_at, then belief_id) is chosen, so the
+        survivor does not depend on rowid order.
+        """
+        spec = BELIEF_VECTOR_SOURCE.get(kind)
         scope = _merge_scope(kind, key, body)
-        if scope is None:
-            return novelty, None, None       # no natural key → never merges
+        if spec is None or scope is None or not body:
+            return None
+        table, body_col = spec[0], spec[1]
         try:
-            same = self.store.nearest_memory_vectors(kind, query_embedding, owner, domain, k,
-                                                     scope[0], scope[1])
+            rows = self.store.query_beliefs(
+                table,
+                "owner=? AND domain=? AND status='active' AND (%s) AND %s=?" % (scope[0], body_col),
+                (owner, domain, *scope[1], body), limit=1, order="created_at, belief_id")
         except Exception as e:
-            logger.debug("duplicate scan skipped (%s)", e)
-            return novelty, None, None
-        if not same:
-            return novelty, None, None
-        return novelty, same[0][0], same[0][1]
+            logger.debug("duplicate lookup skipped (%s)", e)
+            return None
+        return rows[0]["belief_id"] if rows else None
 
     def _append_provenance(self, existing, source_event, source_type, now=None):
         """Append a new provenance entry to an existing belief's provenance JSON.
@@ -845,29 +1284,48 @@ class Reducer:
         p = _payload(event)
         source_event = event.get("event_id", "")
 
-        # E5: Calculate novelty and check for near-duplicates (if embedder available)
-        text_to_embed = self.vector_text("asserted", p)
+        # THE TEXT THIS BELIEF'S VECTOR IS MADE OF (A0g N2). It is derived from the
+        # `kind`, `key` and `body` THIS CALL WRITES -- never from the triggering
+        # event's payload. The two agree for `asserted` and `derived`, whose handlers
+        # pass that payload's own fields straight through, but a `corrected` event
+        # carries `new_body` and no `body` at all, so `vector_text("asserted", p)`
+        # evaluated `payload.get("body", "") or key.name or key.topic` over a payload
+        # that has none of them and returned "". Every belief a user explicitly fixed
+        # through chronicle_correct was therefore written with the vector of the EMPTY
+        # STRING while the projection stored the corrected text (0.576 cosine against
+        # the real text, measured on live nomic) -- precisely the facts someone took
+        # deliberate action to correct, made invisible to vector retrieval.
+        # `body`/`key` are what the projection stores below and what
+        # reducer.belief_vector_text reads back, so deriving the text from them is
+        # what makes the write side and every repair side ONE expression. This is the
+        # same rule _write_doc2query_proxies already follows for proxy questions.
+        text_to_embed = self.vector_text("asserted", {"kind": kind, "key": key, "body": body})
         novelty = None
-        dup_similarity_threshold = (self.cfg.get("curation.dup_similarity", 0.95)
-                                     if self.cfg else 0.95)
-
         write_vec = None
+
+        # E5 duplicate merge: EXACT content, decided before anything is embedded.
+        # A merge keeps the existing row and discards this body, so it is only
+        # legal when this body carries nothing that row lacks. Cosine similarity
+        # cannot tell that: on the production nomic model "Standup is at 9am" ->
+        # "10am" scores 0.9945, "allergic to peanuts" -> "not allergic" 0.9795
+        # and "offsite in Denver" -> "Boston" 0.9547, while a pure paraphrase
+        # scores 0.9948, so the old 0.95 floor silently threw those updates away.
+        # It also made the projection a function of whichever embedder answered:
+        # a timed-out or absent embed skipped the check, so every repeat became a
+        # new active row (22,358 redundant copies of 2,696 directives in one
+        # production scope), and a rebuild under another model merged differently
+        # (I3). A byte-identical body in the same scope depends on the log alone.
+        if kind in _VECTORED_KINDS:
+            dup_id = self._exact_duplicate(kind, key, body, owner, domain)
+            if dup_id:
+                merged_into = self._merge_duplicate(dup_id, _table_for(kind), event,
+                                                    source_event, source_type)
+                if merged_into:
+                    return merged_into
 
         if self.embedder is not None and text_to_embed and kind in _VECTORED_KINDS:
             write_vec = self._embed_once(text_to_embed)
-            novelty, dup_candidate_id, dup_similarity = self._calculate_novelty(
-                write_vec, kind, key, body, owner, domain)
-            # Merge only on the candidate's OWN similarity: `1 - novelty` is the
-            # nearest neighbour of ANY subject, which is exactly the item the
-            # merge is forbidden to touch.
-            if dup_candidate_id and dup_similarity is not None \
-                    and dup_similarity >= dup_similarity_threshold:
-                table = _table_for(kind)
-                if table:
-                    merged_into = self._merge_duplicate(dup_candidate_id, table, event,
-                                                        source_event, source_type)
-                    if merged_into:
-                        return merged_into
+            novelty = self._calculate_novelty(write_vec, kind, owner, domain)
 
         prov = {"source_type": source_type, "source_event": source_event,
                 "extracted_by": "chronicle-v5", "extracted_at": now}
@@ -957,8 +1415,18 @@ class Reducer:
                 "last_seen_at": now, "purpose_scope": '["*"]', "provenance": provenance,
                 "novelty": novelty, "rule_id": extras.get("rule_id"), "premises": extras.get("premises")})
         elif kind == "procedure":
+            # `body` (schema_version 12) is the text vector_text() embeds for this
+            # kind, and until it existed a procedure's body was stored in NO
+            # column: the only text on the row was `name`, which
+            # tools._t_remember sets to content[:40]. Every re-embed therefore
+            # rebuilt the vector from a truncation. Written verbatim, '' included
+            # -- an empty string here means "the body really was empty, so
+            # key.name is what was embedded", which is a different statement from
+            # the NULL a pre-12 row carries.
             self.store.upsert_belief("procedures", {
-                "belief_id": b_id, "name": key.get("name", ""), "params": json.dumps(key.get("params", [])),
+                "belief_id": b_id, "name": key.get("name", ""),
+                "body": "" if body is None else str(body),
+                "params": json.dumps(key.get("params", [])),
                 "steps": json.dumps(key.get("steps", [])),
                 "success_criteria": json.dumps(key.get("success_criteria", [])), "domain": domain,
                 "owner": owner, "read_acl": access.DEFAULT_ACL, "status": status, "salience": salience,
@@ -975,10 +1443,18 @@ class Reducer:
                 "purpose_scope": '["*"]', "provenance": provenance, "novelty": novelty})
 
         if self.embedder is not None and kind in _VECTORED_KINDS:
-            text = self.vector_text("asserted", p)
-            blob = self._safe_vec(text, target_id=b_id, kind=kind, vec=write_vec)
+            # `text_to_embed`, evaluated ONCE above: the write vector and the E5
+            # candidate vector can never be of two different strings (A0g N2).
+            # An empty text writes NO vector rather than the vector of "": an
+            # embedding of the empty string is not a weak vector, it is a vector of
+            # nothing, and belief_vector_text reports "" as UNRECOVERABLE -- so such a
+            # row could never be repaired by the heal or migrate_vectors either, and
+            # would sit in every run's `failed` list forever.
+            blob = self._safe_vec(text_to_embed, target_id=b_id, kind=kind,
+                                  vec=write_vec) if text_to_embed else None
             if blob is not None:
-                self.store.add_memory_vector(b_id, kind, blob, self.embedder.model_with_prefix_marker())
+                self.store.add_memory_vector(b_id, kind, blob, embedder_model_tag(self.embedder),
+                                             created_at=now)
                 # §E7: this fact's own vector IS the mention context for the
                 # entity it is about — reused, never re-embedded. `blob is not
                 # None` is also the degradation gate: no embedder and a degraded
@@ -986,8 +1462,8 @@ class Reducer:
                 # feature stays entirely inert instead of guessing.
                 if kind == "fact":
                     self._identity_evidence(key.get("entity_id", ""), b_id, blob, now)
-                    self._detect_supersede_candidate(b_id, key, body, blob, owner, domain)
-            self._write_doc2query_proxies(b_id, kind, key, body)
+                    self._detect_supersede_candidate(b_id, key, body, blob, owner, domain, now)
+            self._write_doc2query_proxies(b_id, kind, key, body, created_at=now)
         return b_id
 
     def _identity_evidence(self, entity_id, mention_ref, blob, now):
@@ -999,22 +1475,25 @@ class Reducer:
         (§7.2, I3). Failures are swallowed inside identity.observe_mention for
         the same reason _safe_vec swallows its own (I12).
 
-        The model tag is model_with_prefix_marker(), not the bare model name
-        (E1). observe_mention keys the running centroid on it and RESETS the
-        accumulator when it changes, precisely because a sum of vectors from
-        one geometry cannot be compared against another. Flipping task
-        prefixes is exactly such a geometry change -- the vectors folded in
-        afterwards carry a "search_document: " prefix -- but it does NOT change
-        embedder.model, so tagging with the bare name would let the centroid
-        silently average across both geometries and never trip its own reset."""
+        The model tag is embedder_model_tag() -- canonical identity + the E1
+        prefix marker (A0) -- not the bare model name. observe_mention keys the
+        running centroid on it and RESETS the accumulator when it changes,
+        precisely because a sum of vectors from one geometry cannot be compared
+        against another. Flipping task prefixes is exactly such a geometry
+        change -- the vectors folded in afterwards carry a "search_document: "
+        prefix -- but it does NOT change embedder.model, so tagging with the
+        bare name would let the centroid silently average across both
+        geometries and never trip its own reset. Canonicalizing is the other
+        half: an ollama-named and a gguf-path-named session of the SAME model
+        must NOT reset the accumulator, which is exactly what raw-string
+        tagging used to do on every restart that resolved the name differently."""
         if not entity_id:
             return
-        marker_fn = getattr(self.embedder, "model_with_prefix_marker", None)
-        model = marker_fn() if callable(marker_fn) else getattr(self.embedder, "model", "")
+        model = embedder_model_tag(self.embedder)
         identity.observe_mention(self.store, self.cfg, model,
                                  entity_id, mention_ref, unpack(blob), now)
 
-    def _detect_supersede_candidate(self, b_id, key, body, new_blob, owner, domain):
+    def _detect_supersede_candidate(self, b_id, key, body, new_blob, owner, domain, now=""):
         """Ladder 9 E4 (§issue-8): nearest-neighbor update detection.
 
         Additive-only signal, never a side effect on the write it rides along
@@ -1078,11 +1557,12 @@ class Reducer:
             return  # same claim re-asserted, not an update -- nothing to chain
         try:
             self.store.add_supersede_candidate(b_id, best_id, best_sim, new_value=body,
-                                               old_value=best_row.get("value", ""))
+                                               old_value=best_row.get("value", ""),
+                                               created_at=now or None)
         except Exception as e:
             logger.debug("supersede candidate not recorded for %s (%s)", b_id, e)
 
-    def _write_doc2query_proxies(self, b_id, kind, key, body):
+    def _write_doc2query_proxies(self, b_id, kind, key, body, created_at=""):
         """E2 doc2query: embed up to doc2query.MAX_PROXIES question strings
         this belief can answer (doc2query_text — Tier 1 template, or the H1
         callback slot, see engine/doc2query.py) as `query_proxy_vectors` rows
@@ -1116,10 +1596,10 @@ class Reducer:
             return
         questions = self.doc2query_text("asserted", {"kind": kind, "key": key, "body": body})
         questions = doc2query.merge_questions(self.store.host_proxy_questions(b_id), questions)
-        self.store_proxies(b_id, kind, questions)
+        self.store_proxies(b_id, kind, questions, created_at=created_at)
         self._offer_doc2query(b_id, kind, body)
 
-    def store_proxies(self, b_id, kind, questions):
+    def store_proxies(self, b_id, kind, questions, created_at=""):
         """Delete-then-write ONE item's proxy set (§E2, integration fix D).
 
         The single write path for query_proxy_vectors, shared verbatim by the
@@ -1135,7 +1615,8 @@ class Reducer:
             blob = self._safe_vec(q)
             if blob is not None:
                 self.store.add_query_proxy_vector(b_id, idx, kind, q, blob,
-                                                  self.embedder.model_with_prefix_marker())
+                                                  embedder_model_tag(self.embedder),
+                                                  created_at=created_at)
                 written += 1
         return written
 
@@ -1161,7 +1642,7 @@ class Reducer:
         except Exception as e:
             logger.debug("doc2query host-model offer not enqueued for %s (%s)", b_id, e)
 
-    def _write_doc2query_excerpt_proxies(self, event_id, excerpt):
+    def _write_doc2query_excerpt_proxies(self, event_id, excerpt, created_at=""):
         """E2 doc2query, raw-excerpt path (§27 embeddings.doc2query.excerpts,
         default OFF — see engine/config.py for why). Same contract as
         _write_doc2query_proxies, just keyed by event_id/kind='observed'
@@ -1197,7 +1678,7 @@ class Reducer:
             self.doc2query_text("observed", {"excerpt": excerpt}))
         if not questions:
             return
-        self.store_proxies(event_id, "observed", questions)
+        self.store_proxies(event_id, "observed", questions, created_at=created_at)
 
     def _safe_vec(self, text, target_id=None, kind=None, vec=None):
         """Pack an embedding, or return None on ANY failure — so the embedding
@@ -1220,6 +1701,8 @@ class Reducer:
         try:
             if vec is not None:
                 return pack(vec)
+            if _vectors_deferred():
+                raise EmbeddingsUnavailable("deferred: written from inside compress()")
             cached = self._vec_cache.get(text)
             return pack(cached if cached is not None else _embed_document(self.embedder, text))
         except EmbeddingsUnavailable:
@@ -1279,8 +1762,9 @@ class Reducer:
             return
         st = json.loads(row.get("provenance") or "{}").get("source_type", "session_transcript")
         corroborated = (row.get("confirm_count") or 0) >= 1
-        raw = raw_confidence(st, row.get("confirm_count") or 0, row.get("contradiction_count") or 0)
-        conf = clamp_to_ceiling(raw, row.get("trust_level") or 2, corroborated)
+        raw = raw_confidence(st, row.get("confirm_count") or 0,
+                             row.get("contradiction_count") or 0, cfg=self.cfg)
+        conf = clamp_to_ceiling(raw, row.get("trust_level") or 2, corroborated, cfg=self.cfg)
         self.store.update_belief(table, b_id, confidence=conf)
 
     def _retract(self, b_id):
@@ -1290,13 +1774,25 @@ class Reducer:
         else:
             self.store.update_belief_all_tables(b_id, status="retracted")
         self.store.delete_justifications(b_id)
+        # A contradiction is a pair the store cannot both hold; once one side is
+        # retracted there is nothing left to reconcile, and an open row that
+        # names a retracted belief is a question nobody can answer. (A cleanup
+        # of 112,652 beliefs left 1,550 of them behind on a production store.)
+        self.store.resolve_contradictions_for(b_id)
 
-    def _cascade(self, b_id):
+    def _cascade(self, b_id, source="", now=""):
         """Revision cascade (§9.3, I5, I24d): retract dependents that lose support.
 
         A rule-derived belief is a conjunction of its premises, so losing ANY one
         premise retracts it. An ordinary belief with several independent supports
-        survives while ≥1 real support remains."""
+        survives while ≥1 real support remains.
+
+        `source`/`now` are the TRIGGERING EVENT's id and timestamp, carried down
+        the recursion so every `corrections` row this cascade writes is a
+        function of the log rather than of the wall clock and a uuid4 (Ladder
+        10 A4). They are threaded rather than re-read at each level precisely
+        because one event produces the whole cascade: a rebuild must reproduce
+        the same set of rows with the same ids and the same date."""
         for dep in self.store.get_dependents(b_id):
             dep_id = dep["belief_id"]
             if dep_id == b_id:
@@ -1305,15 +1801,17 @@ class Reducer:
             derived_dep = rule not in ("", "extraction", "confirmation")
             if derived_dep:
                 self._retract(dep_id)
-                self.store.record_correction(dep_id, "cascade_premise_retracted", b_id, [b_id])
-                self._cascade(dep_id)
+                self.store.record_correction(dep_id, "cascade_premise_retracted", b_id, [b_id],
+                                             source=source, created_at=now)
+                self._cascade(dep_id, source=source, now=now)
                 continue
             remaining = [j for j in self.store.get_justifications(dep_id) if j["support"] != b_id]
             real = [j for j in remaining if j["support_kind"] != "assumption"]
             if not real:
                 self._retract(dep_id)
-                self.store.record_correction(dep_id, "cascade_from_retraction", b_id, [b_id])
-                self._cascade(dep_id)
+                self.store.record_correction(dep_id, "cascade_from_retraction", b_id, [b_id],
+                                             source=source, created_at=now)
+                self._cascade(dep_id, source=source, now=now)
 
     def _update_materialized_profile(self, owner: str, predicate: str, value: str):
         """Update materialized active profile summary for an owner."""
@@ -1333,14 +1831,37 @@ class Reducer:
         self.store.set_meta(key, json.dumps(curr))
 
     def _beliefs_matching_hash(self, content_hash):
-        out = [r["belief_id"] for r in self.store.query_beliefs("notes", "body_hash=?", (content_hash,), limit=1000)]
-        for row in self.store.query_beliefs("facts", "1=1", (), limit=5000):
+        """EVERY belief whose content hashes to `content_hash` — complete by
+        construction (§A9).
+
+        The old pair of caps (notes limit=1000, facts limit=5000, neither
+        ordered) meant a `forbidden` event on a store past those sizes retracted
+        a prefix of the matching beliefs and left the rest active, reporting
+        success either way. A bound on a redaction is not a pace, it is a leak,
+        so both loops now run to exhaustion, paged for memory by
+        `sweeps.page_rows`. The facts scan stays a full scan because the hash is
+        of the value text and there is no index on it; the notes scan is a
+        `body_hash` lookup and is cheap."""
+        out = [r["belief_id"] for r in
+               sweeps.iter_all_rows(self.store, self.cfg, "notes", "body_hash=?", (content_hash,))]
+        for row in sweeps.iter_all_rows(self.store, self.cfg, "facts", "1=1", ()):
             if hash_str(row.get("value", "")) == content_hash:
                 out.append(row["belief_id"])
         return out
 
 
 # -- module helpers -------------------------------------------------------
+
+def _without_credentials(key, body):
+    """A belief's key and body with any credential value masked
+    (engine/credentials.py). A login the user handed the agent is not a memory
+    about them; a belief would carry it into later prompts unasked. The belief
+    itself stays -- an appointment whose meeting link carries `?pwd=` is still
+    an appointment -- and the transcript keeps the message. In the fold, so a
+    rebuild masks the ones already asserted too (I3)."""
+    key = {k: (_cred.redact(v) if isinstance(v, str) else v) for k, v in (key or {}).items()}
+    return key, _cred.redact(body) if isinstance(body, str) else body
+
 
 def _payload(event) -> dict:
     p = event.get("payload", "{}")
@@ -1377,6 +1898,13 @@ def _is_operational(event, p, excerpt) -> bool:
     # An autonomous agent turn: a session transcript with no user content
     # (capture.observe tags actor='agent' exactly when user_content is empty).
     if src == "session_transcript" and event.get("actor") == "agent":
+        return True
+    # Nobody but the user can be the source of memory about the user: a turn
+    # whose every line is a scheduled job, the assistant, a tool or the host
+    # (engine/speaker.py) is not promoted. The curation worker applies the same
+    # test to jobs already queued.
+    if not spk.has_human(spk.attribute_lines(p, session_id=event.get("session_id") or "",
+                                             actor=event.get("actor") or "")):
         return True
     head = (excerpt or "")[:400]
     low = head.lstrip().lower()
@@ -1421,7 +1949,7 @@ def _merge_scope(kind, key, body):
     the restriction is structural. A candidate from another subject cannot be
     returned and then rejected downstream; it cannot be returned at all.
 
-    Kinds that HAVE a subject (fact: entity+predicate; note: type+subject) use
+    Kinds that HAVE a subject (fact: entity+predicate+qualifiers; note: type+subject) use
     it. Kinds that don't use their natural key: an episode's title+session, a
     reference's topic+URL, a procedure's name, a relationship's triple. Anything
     else, or an empty natural key, returns None.
@@ -1434,8 +1962,11 @@ def _merge_scope(kind, key, body):
     path in the system was destroying unrelated content by default.
     """
     if kind == "fact":
-        return ("entity_id=? AND predicate_canonical=?",
-                (key.get("entity_id", "") or "", key.get("predicate_canonical", "") or ""))
+        # qualifiers_hash is part of a fact's natural key: "work phone is X" and
+        # "home phone is X" share entity, predicate and value, and are two facts.
+        return ("entity_id=? AND predicate_canonical=? AND COALESCE(qualifiers_hash,'')=?",
+                (key.get("entity_id", "") or "", key.get("predicate_canonical", "") or "",
+                 key.get("qualifiers_hash", "") or ""))
     if kind == "note":
         return ("note_type=? AND subject=?",
                 (key.get("note_type", "belief") or "belief", key.get("subject", "") or ""))
