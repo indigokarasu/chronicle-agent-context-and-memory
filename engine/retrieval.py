@@ -27,6 +27,7 @@ from itertools import zip_longest
 from time import monotonic as _time_monotonic
 
 from . import access
+from . import credentials as _cred
 from . import speaker as _spk
 from .config import DEFAULTS, check_abstain_gate
 from . import embeddings as _embeddings
@@ -2983,6 +2984,10 @@ class RetrievalEngine:
                                           principal=principal, epistemic=epistemic, now=now,
                                           exclude_automation=exclude_automation,
                                           relevance_gate=relevance_gate, live_session=live_session)
+            if relevance_gate:
+                # Put into a turn unasked: never a credential's value (the
+                # agent's own search still finds the message that held it).
+                out = _cred.redact(out)
             if isinstance(self.last_context_debug, dict):
                 # exact count, not the bounded identity sample -- see answer()
                 self.last_context_debug["vectors_skipped_wrong_dim"] = \
