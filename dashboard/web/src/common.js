@@ -1,4 +1,4 @@
-// Shared by dist/index.js and dist/atlas.js. Everything the plugin needs from the
+// Shared by dist/index.js and dist/tapestry.js. Everything the plugin needs from the
 // dashboard comes through the Hermes plugin SDK; nothing here imports React.
 
 export const SDK = window.__HERMES_PLUGIN_SDK__;

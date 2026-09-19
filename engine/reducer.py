@@ -14,13 +14,17 @@ import datetime
 import json
 import logging
 import re
+import threading
 
 from . import access
+from . import entities as ents
 from . import doc2query
 from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
 from . import sweeps
 from . import speaker as spk
+from . import credentials as _cred
+from . import substance as sub
 from .criticality import classify as classify_criticality
 from .embeddings import EmbeddingsUnavailable, cosine, embedder_model_tag, pack, unpack
 from .serialize import belief_id as compute_belief_id
@@ -352,6 +356,47 @@ def _vector_text_from_source_event(conn, spec, kind, belief_id, projected) -> tu
     return text, bool(text)
 
 
+# Writes the context engine makes from INSIDE compress(): the spans it evicts and
+# the ones it rescues first (I14). compress() runs on the critical path of the
+# user's turn, and on a CPU-throttled host one compaction made 150 inline embed
+# calls — 60 rescued observations, 30 rescued notes at three embeds each (novelty,
+# vector, doc2query proxy) — every one a timeout. For these events the reducer
+# takes exactly the path a DEGRADED embedder already takes: the vector (and any
+# proxy) is queued as a deferred embed job, novelty is left unset. Their TEXT is
+# durable and FTS-indexed as before, so recall finds them the same turn.
+#
+# Keyed on the event's own source_type, not on who is calling, so a rebuild makes
+# the identical decision and the projection it produces is the one live wrote (I3).
+_DEFERRED_VECTOR_SOURCES = ("context_eviction", "rescue_extraction")
+_TLS = threading.local()
+
+
+def _defers_vectors(event) -> bool:
+    """Cheap: a substring test on the raw payload, before any json parse — this
+    runs for every event of a 400k-event rebuild. A false positive only defers
+    one vector."""
+    raw = event.get("payload")
+    if isinstance(raw, dict):
+        return raw.get("source_type") in _DEFERRED_VECTOR_SOURCES
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    return isinstance(raw, str) and any('"%s"' % s in raw for s in _DEFERRED_VECTOR_SOURCES)
+
+
+def is_duplicate_copy(payload) -> bool:
+    """An archive copy of a message the memory provider already captured (the
+    context engine marks those `extract: False`): kept durable and FTS-indexed
+    for chronicle_expand and search, but not embedded -- the provider's capture
+    of the same turn carries the vector, and each compaction queued one embed
+    job per archived message on a host whose embedding server is its
+    bottleneck. Carried in the event, so a rebuild decides the same (I3)."""
+    return (isinstance(payload, dict) and payload.get("extract") is False
+            and payload.get("source_type") == "context_eviction")
+
+
+def _vectors_deferred() -> bool:
+    return getattr(_TLS, "defer_vectors", False)
+
 def _embed_document(embedder, text):
     """embedder.embed_document(text), falling back to embed() when the object
     predates E1's document/query split.
@@ -498,7 +543,13 @@ class Reducer:
         if handler is None:
             logger.warning("Unknown event type: %s", event.get("type"))
             return
-        handler(self, event)
+        outer = _vectors_deferred()
+        _TLS.defer_vectors = outer or (event.get("type") in ("observed", "asserted")
+                                       and _defers_vectors(event))
+        try:
+            handler(self, event)
+        finally:
+            _TLS.defer_vectors = outer
 
     def reduce_many(self, events):
         for e in events:
@@ -534,9 +585,12 @@ class Reducer:
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = (self.cfg.get("embeddings.exclude_session_prefixes", []) if self.cfg else [])
         sid = event.get("session_id") or ""  # observed events may carry no session_id at all
-        skip_vec = any(sid.startswith(prefix) for prefix in excluded)
+        skip_vec = any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
         if excerpt:
-            self.store.fts_index_observed(eid, excerpt)
+            # The user's own index leaves out an archive copy of a turn the
+            # provider already captured: recall would show that turn twice.
+            self.store.fts_index_observed(
+                eid, excerpt, user=not spk.is_automation_session(sid) and not is_duplicate_copy(p))
             if self.embedder is not None and not skip_vec:
                 blob = self._safe_vec(excerpt, target_id=eid, kind="observed")
                 if blob is not None:
@@ -553,6 +607,11 @@ class Reducer:
         # raw-indexed above for recall, but must not become facts/notes/episodes:
         # memory is about the user and their world, not the assistant running itself.
         if _is_operational(event, p, excerpt):
+            return
+        # A capture that says it is a copy of something already extracted — an
+        # eviction made while the memory provider captured the same turn — is
+        # kept for recall and not extracted a second time.
+        if p.get("extract") is False:
             return
         self.store.enqueue_curation("extract", {"event_id": eid, "session_id": event.get("session_id")})
 
@@ -571,7 +630,34 @@ class Reducer:
         raw = p.get("confidence", base_confidence(source_type, self.cfg))
         confidence = clamp_to_ceiling(raw, trust, cfg=self.cfg)
 
+        key, body = _without_credentials(key, body)
         b_id = compute_belief_id(kind, key, [source_event])
+        if kind == "entity":
+            # An entity IS its token: the id facts reference (`entity_id`) and the
+            # id of the row describing it must be the same, or every entity exists
+            # twice — once with its type and once with the facts hanging off it.
+            # Derived from the name, here in the fold, so nothing about the EVENT
+            # changes: the same log replays to the repaired projection.
+            b_id = ents.entity_token(key.get("name") or body) or b_id
+            # A pronoun or half a sentence is not an entity (engine/entities.py).
+            # The rule lives HERE as well as at the write boundary because the
+            # fold must reproduce the projection from the log alone (I3): the log
+            # already holds years of `asserted` entity events from before the
+            # rule, and a rebuild must not resurrect what they named.
+            if not ents.plausible_name(key.get("name") or body):
+                return
+        if kind == "fact":
+            # A fact that asserts an EVENT has to say what happened, not that
+            # something did (engine/substance.py). Here as well as at the write
+            # boundary, and for the same reason as the entity rule above: an
+            # importer wrote 159 email subject lines into a production store as
+            # things the user had done, and a rebuild must not bring them back.
+            _pred = key.get("predicate_canonical") or key.get("attribute") or ""
+            if not sub.states_what_happened(body, _pred):
+                logger.info("chronicle: not a memory (%s) — %s",
+                            _pred or "fact", sub.refusal(body, _pred))
+                return
+            self._name_entity_from_fact(key, body)
         existing = self._find_existing(kind, key, owner, domain)
 
         if kind == "fact" and existing:
@@ -626,7 +712,7 @@ class Reducer:
         b_id = p.get("belief_id")
         if not b_id:
             return
-        new_body = p.get("new_body")
+        new_body = _cred.redact(p.get("new_body") or "")
         if new_body:
             found = self.store.find_belief(b_id)
             if found:
@@ -720,8 +806,7 @@ class Reducer:
     def _on_derived(self, event):
         p = _payload(event)
         kind = p.get("kind", "fact")
-        key = p.get("key", {})
-        body = p.get("body", "")
+        key, body = _without_credentials(p.get("key", {}), p.get("body", ""))
         rule_id = p.get("rule_id", "")
         premises = p.get("premises", [])
         confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2, cfg=self.cfg)  # C(inference)=0.75
@@ -980,6 +1065,27 @@ class Reducer:
             return rows[0] if rows else None
         return None
 
+    def _name_entity_from_fact(self, key, body):
+        """An entity row named by another store's id takes the name the log asserts.
+
+        Chronicle references, it does not own (I20): a fact whose subject is a
+        people-store uuid creates an entity row named by that uuid, and a
+        production store held 1,003 of them — unreadable in every listing even
+        though the `name` fact right beside them says "Pat Testley". This is not
+        an inference: it is the name the log already carries for that id, applied
+        to the row, so a rebuild produces it too."""
+        if (key.get("predicate_canonical") or key.get("attribute")) != "name":
+            return
+        entity_id = key.get("entity_id") or ""
+        row = self.store.get_belief("entities", entity_id) if entity_id else None
+        if not row:
+            return
+        current = row.get("name") or entity_id
+        resolved = ents.resolve_name(current, body)
+        if resolved and resolved != current:
+            self.store.update_belief("entities", entity_id, name=resolved,
+                                     normalized_name=resolved.lower())
+
     def _ensure_entity(self, entity_id, name, owner, domain, event):
         if not entity_id:
             return
@@ -1014,6 +1120,8 @@ class Reducer:
         cached = self._vec_cache.get(text)
         if cached is not None:
             return cached
+        if _vectors_deferred():
+            return None
         try:
             return _embed_document(self.embedder, text)
         except EmbeddingsUnavailable:
@@ -1593,6 +1701,8 @@ class Reducer:
         try:
             if vec is not None:
                 return pack(vec)
+            if _vectors_deferred():
+                raise EmbeddingsUnavailable("deferred: written from inside compress()")
             cached = self._vec_cache.get(text)
             return pack(cached if cached is not None else _embed_document(self.embedder, text))
         except EmbeddingsUnavailable:
@@ -1664,6 +1774,11 @@ class Reducer:
         else:
             self.store.update_belief_all_tables(b_id, status="retracted")
         self.store.delete_justifications(b_id)
+        # A contradiction is a pair the store cannot both hold; once one side is
+        # retracted there is nothing left to reconcile, and an open row that
+        # names a retracted belief is a question nobody can answer. (A cleanup
+        # of 112,652 beliefs left 1,550 of them behind on a production store.)
+        self.store.resolve_contradictions_for(b_id)
 
     def _cascade(self, b_id, source="", now=""):
         """Revision cascade (§9.3, I5, I24d): retract dependents that lose support.
@@ -1736,6 +1851,17 @@ class Reducer:
 
 
 # -- module helpers -------------------------------------------------------
+
+def _without_credentials(key, body):
+    """A belief's key and body with any credential value masked
+    (engine/credentials.py). A login the user handed the agent is not a memory
+    about them; a belief would carry it into later prompts unasked. The belief
+    itself stays -- an appointment whose meeting link carries `?pwd=` is still
+    an appointment -- and the transcript keeps the message. In the fold, so a
+    rebuild masks the ones already asserted too (I3)."""
+    key = {k: (_cred.redact(v) if isinstance(v, str) else v) for k, v in (key or {}).items()}
+    return key, _cred.redact(body) if isinstance(body, str) else body
+
 
 def _payload(event) -> dict:
     p = event.get("payload", "{}")

@@ -37,10 +37,12 @@ import os
 import urllib.parse
 
 from . import access, sweeps
+from . import entities as ents
 from . import speaker as spk
 from .embeddings import (
     EmbeddingsUnavailable,
     cosine,
+    embed_document_patiently,
     embedder_model_tag,
     expected_blob_len,
     is_usable_model_tag,
@@ -49,6 +51,7 @@ from .embeddings import (
 )
 from .reducer import (
     belief_vector_text,
+    is_duplicate_copy,
     observed_vector_text,
     projection_vector_text,
     session_vector_text,
@@ -437,15 +440,19 @@ class CurationWorker:
             except ValueError as e:
                 logger.warning("chronicle: dropped fact with bad subject grounding: %s", e)
                 return
+        if kind == "entity":
+            # The same bar the extractor applies, at the boundary that writes the
+            # log: a pronoun or half a sentence is not an entity (engine/entities.py).
+            name = key.get("name") or item.get("body") or ""
+            if not ents.plausible_name(name):
+                logger.warning("chronicle: dropped entity with an implausible name: %r", name[:80])
+                return
         risk = item.get("key", {}).get("risk_tier", "low")
         # Risk-tiered application (§16.4): behavior-changing high-risk → draft + review.
         status = item.get("status", "active")
         if kind == "note" and item.get("key", {}).get("note_type") in ("norm", "procedure"):
             if risk == "high":
                 status = "draft"
-        ext = {"extractor_version": version, "valid_from": ev.get("occurred_at")}
-        if "_entity_id" in item:
-            ext["entity_token"] = item["_entity_id"]
         self.core.capture.append("asserted", {
             "kind": kind, "key": item["key"], "body": item["body"], "domain": domain,
             "confidence": item.get("confidence", 0.8), "source_event": item["source_event"],
@@ -706,6 +713,14 @@ class CurationWorker:
                     report["processed"], version, report["remaining"])
         return report
 
+    def _background_timeout(self) -> float:
+        """`embeddings.background_timeout`, clamped to [10, 600] seconds."""
+        try:
+            t = float(self.cfg.get("embeddings.background_timeout", 120) if self.cfg else 120)
+        except (TypeError, ValueError):
+            t = 120.0
+        return max(10.0, min(600.0, t))
+
     def _task_embed(self, payload):
         """Deferred vector write (§24.4): the backend was unreachable when this
         event/belief was reduced, so the work was queued instead of hashed.
@@ -763,6 +778,22 @@ class CurationWorker:
             return not (want_len and existing_len and existing_len != want_len)
 
         if kind == "observed":
+            # The same exclusion the write path applies (§27
+            # embeddings.exclude_session_prefixes): a job queued before the
+            # prefix was excluded, or by an older build, must not embed it now.
+            # Nor an archive copy of a turn the provider already embedded.
+            excluded = tuple(self.cfg.get("embeddings.exclude_session_prefixes", []) or ())
+            row = self.store._conn().execute(
+                "SELECT session_id, payload FROM events WHERE event_id=?", (target,)).fetchone()
+            if row is not None:
+                if excluded and (row[0] or "").startswith(excluded):
+                    return
+                try:
+                    ev_payload = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                except ValueError:
+                    ev_payload = None
+                if is_duplicate_copy(ev_payload):
+                    return
             if _already_current(self.store.get_observed_vector_model(target),
                                 self.store.get_observed_vector_len(target)):
                 return  # Vector exists, model matches AND width is right: no-op
@@ -821,7 +852,7 @@ class CurationWorker:
         if recheck is not None:
             recheck()
         try:
-            blob = pack(emb.embed_document(text))
+            blob = pack(embed_document_patiently(emb, text, self._background_timeout()))
         except EmbeddingsUnavailable as e:
             raise JobDeferred(str(e))
         except Exception as e:
@@ -970,14 +1001,40 @@ class CurationWorker:
         if any(sid.startswith(prefix) for prefix in excluded):
             return
         events = self.store.get_events_by_session(sid)
-        obs = []  # (event_id, excerpt) for every observed event, in session order
+        obs = []         # (event_id, text) for every observed event, in session order
+        transcript = []  # the same, for the session's transcript captures only
         for ev in events:
             if ev["type"] == "observed":
                 p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
-                obs.append((ev["event_id"], p.get("excerpt", "")))
-        if not obs:
-            return
+                # The reader's copy, not the stored bytes (speaker.reader_text),
+                # and without tool output: a session is summarised by what was
+                # said in it. Built from the stored text, 24 of the 107
+                # interactive session summaries on the production store carried
+                # a "[CONTEXT COMPACTION — REFERENCE ONLY]" handoff into the
+                # session vector, and many more a tool's raw JSON.
+                text = spk.reader_text(p, actor=ev.get("actor") or "", drop_tools=True)
+                if not text.strip():
+                    continue
+                obs.append((ev["event_id"], text))
+                if p.get("source_type") == "session_transcript":
+                    transcript.append((ev["event_id"], text))
+        # A session the provider captured is its transcript. The compressor's
+        # eviction copies and the rescue copies repeat messages the transcript
+        # already holds, and were what carried the handoffs in; they stand in
+        # only for a session with no transcript at all.
+        if transcript:
+            obs = transcript
         owner = events[0]["owner"] if events else "default"
+        if not obs:
+            # Nothing in the session is conversation (every event was host
+            # framing: a cron prompt, a skill-invocation frame). Its row, if an
+            # earlier summarizer wrote one from those frames, is replaced by an
+            # empty one: nothing to find it by, and a row, so the backfill sweep
+            # does not re-queue it. The stale-vector heal skips empty summaries.
+            if events and self.store.get_session_vector(sid):
+                self.store.add_session_vector(sid, "", b"", owner,
+                                              events[0].get("occurred_at", now_iso()), model=None)
+            return
 
         # §E6: open a new episode wherever consecutive event embeddings show a
         # topic shift, then emit one summary line per episode instead of one
@@ -1005,7 +1062,8 @@ class CurationWorker:
         model_name = None
         if self.core.embedder is not None:
             try:
-                vec = pack(self.core.embedder.embed_document(summary))
+                vec = pack(embed_document_patiently(self.core.embedder, summary,
+                                                    self._background_timeout()))
                 # A0e: stamped ONLY on the success path, and only through the
                 # single choke point every other vector table goes through. A tag
                 # written next to a failed embed would claim a geometry for bytes

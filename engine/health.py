@@ -250,7 +250,19 @@ class HealthEngine:
                 self.store.open_contradiction(a["belief_id"], b["belief_id"],
                                               f"{pred} single-cardinality has {len(distinct)} active values")
                 self._fingerprint("cardinality_violation", "tier2", "review", auto=0)
-        return sweeps.commit(self.store, page)
+        report = sweeps.commit(self.store, page)
+        report["contradictions_settled"] = self.settle_dead_contradictions()
+        return report
+
+    def settle_dead_contradictions(self) -> int:
+        """Close open contradictions whose beliefs are no longer both active.
+
+        A contradiction is a pair the store cannot both hold. The reducer closes
+        them as it retracts (reducer._retract), but a store repaired by an older
+        build keeps whatever it opened: one production cleanup left 1,550 open
+        rows naming beliefs that no longer exist, and "open contradictions" is
+        the first number the memory view shows. Resolved, never deleted."""
+        return self.store.resolve_contradictions_without_two_active()
 
     def _fingerprint(self, pattern, tier, action, auto):
         fp = f"{pattern}:{tier}"
@@ -360,6 +372,18 @@ class HealthEngine:
             params.extend([tag, blen])
         return (" OR ".join(clauses), params)
 
+    # A row with nothing in it is not a vector in the wrong geometry. A
+    # session-index row with no summary AND no vector (a session of nothing but
+    # host framing, 5.7.9) has no text a re-embed could use -- the heal skips it
+    # -- and no bytes a query could match. Counted, it was a permanent,
+    # unrepairable "mismatch" in every census. A row with no summary but a
+    # vector still stays counted: that vector is findable, in the wrong geometry.
+    _CENSUS_FILTER = {"session_index": "COALESCE(summary, '') <> '' OR COALESCE(length(embedding), 0) > 0"}
+
+    def _census_where(self, table, joiner="AND"):
+        f = self._CENSUS_FILTER.get(table)
+        return (" %s (%s)" % (joiner, f)) if f else ""
+
     def _tag_groups(self, table):
         """(tag, blob_len, count) for every distinct (model, length(embedding))
         pair in `table` — the WHOLE census, including the healthy majority.
@@ -370,8 +394,9 @@ class HealthEngine:
         heal's path."""
         try:
             return [(r[0], r[1], r[2]) for r in self.store._conn().execute(
-                "SELECT model, length(embedding), COUNT(*) FROM %s "
-                "GROUP BY model, length(embedding)" % table).fetchall()]
+                "SELECT model, length(embedding), COUNT(*) FROM %s%s "
+                "GROUP BY model, length(embedding)" % (table, self._census_where(table, "WHERE"))
+            ).fetchall()]
         except sqlite3.Error as e:                # table absent on an old store
             logger.debug("tag scan skipped for %s (%s)", table, e)
             return []
@@ -404,26 +429,27 @@ class HealthEngine:
         tag at the expected width. Index-seeked; empty on a healthy store."""
         conn = self.store._conn()
         out = []
+        also = self._census_where(table)
         try:
             for op in ("<", ">"):
                 out.extend((r[0], r[1], r[2]) for r in conn.execute(
-                    "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model %s ? "
-                    "GROUP BY model, length(embedding)" % (table, op), (active_tag,)).fetchall())
+                    "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model %s ?%s "
+                    "GROUP BY model, length(embedding)" % (table, op, also), (active_tag,)).fetchall())
             # A NULL tag is ordered outside both ranges above, so it needs its
             # own probe -- and it is precisely the "written by something that
             # had no embedder identity" row, which must never read as healthy.
             out.extend((r[0], r[1], r[2]) for r in conn.execute(
-                "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model IS NULL "
-                "GROUP BY length(embedding)" % table).fetchall())
+                "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model IS NULL%s "
+                "GROUP BY length(embedding)" % (table, also)).fetchall())
             if expect_len:
                 for op in ("<", ">"):
                     out.extend((r[0], r[1], r[2]) for r in conn.execute(
                         "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model IS ? AND "
-                        "length(embedding) %s ? GROUP BY model, length(embedding)" % (table, op),
-                        (active_tag, expect_len)).fetchall())
+                        "length(embedding) %s ?%s GROUP BY model, length(embedding)"
+                        % (table, op, also), (active_tag, expect_len)).fetchall())
                 out.extend((r[0], r[1], r[2]) for r in conn.execute(
                     "SELECT model, length(embedding), COUNT(*) FROM %s WHERE model IS ? AND "
-                    "length(embedding) IS NULL GROUP BY model, length(embedding)" % table,
+                    "length(embedding) IS NULL%s GROUP BY model, length(embedding)" % (table, also),
                     (active_tag,)).fetchall())
         except sqlite3.Error as e:                # table absent on an old store
             logger.debug("tag scan skipped for %s (%s)", table, e)
@@ -462,7 +488,8 @@ class HealthEngine:
 
     def _count_table(self, table) -> int:
         try:
-            return int(self.store._conn().execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0])
+            return int(self.store._conn().execute(
+                "SELECT COUNT(*) FROM %s%s" % (table, self._census_where(table, "WHERE"))).fetchone()[0])
         except sqlite3.Error:
             return 0
 

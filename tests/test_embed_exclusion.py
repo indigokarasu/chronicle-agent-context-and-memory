@@ -1,0 +1,113 @@
+"""
+Chronicle — `embeddings.exclude_session_prefixes` holds on every path.
+
+On the production box the embedding server is the bottleneck (~7 s per 200
+words while throttled) and ~98% of what it embedded was cron transcripts —
+text that, since 5.7.2, never becomes the user's memory and that the per-turn
+recall never reads. The write path already skipped excluded sessions; a job
+queued before the prefix was excluded (or by an older build) still embedded
+them from the curation queue.
+
+Fixtures use obviously fake values.
+"""
+
+import shutil
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
+
+from engine.core import ChronicleCore
+
+CRON = "cron_abc123_20260917_000000"
+CHAT = "20260917_161616_ff66aa"
+
+
+class TestExcludedSessionsAreNotEmbedded(unittest.TestCase):
+    def setUp(self):
+        self.home = temp_home(prefix="embex_")
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing",
+                                                             "exclude_session_prefixes": ["cron_"]}})
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _observe(self, sid, text):
+        return self.core.capture.append("observed", {"source_type": "session_transcript",
+                                                     "excerpt": text}, actor="user", session_id=sid)
+
+    def test_the_write_path_skips_them(self):
+        cron = self._observe(CRON, "Zorblax dispatch run 7: verifier re-asserted.")
+        chat = self._observe(CHAT, "We booked the Izakaya Nonesuch for Friday.")
+        self.assertFalse(self.core.store.has_observed_vector(cron))
+        self.assertTrue(self.core.store.has_observed_vector(chat))
+
+    def test_a_queued_job_does_not_embed_them_either(self):
+        cron = self._observe(CRON, "Zorblax dispatch run 8: verifier re-asserted.")
+        self.core.curation._task_embed({"target_id": cron, "kind": "observed",
+                                        "text": "Zorblax dispatch run 8: verifier re-asserted."})
+        self.assertFalse(self.core.store.has_observed_vector(cron))
+
+    def test_a_queued_job_for_the_user_still_embeds(self):
+        chat = self._observe(CHAT, "Robin Placeholder moved to Riverton.")
+        self.core.store.delete_observed_vector(chat)
+        self.assertFalse(self.core.store.has_observed_vector(chat))
+        self.core.curation._task_embed({"target_id": chat, "kind": "observed",
+                                        "text": "Robin Placeholder moved to Riverton."})
+        self.assertTrue(self.core.store.has_observed_vector(chat))
+
+
+class TestArchiveCopiesOfCapturedTurns(unittest.TestCase):
+    """The context engine archives every message it folds. When the memory
+    provider already captured the turn (it marks the copy `extract: False`),
+    the copy is durable and searchable but NOT embedded: the provider's capture
+    carries the vector, and each compaction queued one embed job per archived
+    message."""
+
+    def setUp(self):
+        self.home = temp_home(prefix="embdup_")
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+
+    def tearDown(self):
+        ChronicleCore._instances.pop(self.home, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _evict(self, text, extract=None):
+        payload = {"source_type": "context_eviction", "excerpt": text, "source_ref": CHAT}
+        if extract is not None:
+            payload["extract"] = extract
+        return self.core.capture.append("observed", payload, actor="user", session_id=CHAT)
+
+    def _jobs(self, eid):
+        return self.core.store._conn().execute(
+            "SELECT COUNT(*) FROM curation_jobs WHERE task='embed' AND instr(payload, ?)>0",
+            (eid,)).fetchone()[0]
+
+    def test_a_copy_of_a_captured_turn_is_searchable_not_embedded(self):
+        eid = self._evict("Sam Vimes booked the Izakaya Nonesuch.", extract=False)
+        self.assertFalse(self.core.store.has_observed_vector(eid))
+        self.assertEqual(self._jobs(eid), 0, "no deferred embed job either")
+        hits = self.core.store.fts_search_observed("Nonesuch", limit=5)
+        self.assertIn(eid, [h["event_id"] for h in hits])
+
+    def test_a_queued_job_for_such_a_copy_does_nothing(self):
+        eid = self._evict("Sam Vimes booked the Izakaya Nonesuch again.", extract=False)
+        self.core.curation._task_embed({"target_id": eid, "kind": "observed", "text": "x"})
+        self.assertFalse(self.core.store.has_observed_vector(eid))
+
+    def test_standalone_the_copy_is_the_only_one_and_is_embedded(self):
+        """Its vector is deferred to the queue (it is written from inside a
+        compaction), and the queued job embeds it."""
+        eid = self._evict("Robin Placeholder prefers the window seat.")
+        self.assertEqual(self._jobs(eid), 1)
+        self.core.curation._task_embed({"target_id": eid, "kind": "observed",
+                                        "text": "Robin Placeholder prefers the window seat."})
+        self.assertTrue(self.core.store.has_observed_vector(eid))
+
+
+if __name__ == "__main__":
+    unittest.main()

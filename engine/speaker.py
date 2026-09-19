@@ -62,7 +62,7 @@ _ROLE_SPEAKER = {"assistant": ASSISTANT, "tool": TOOL, "function": TOOL,
 _HUMAN_SOURCE_TYPES = frozenset({"user_direct"})
 
 
-def is_automation_session(session_id) -> bool:
+def is_automation_session(session_id: str | None) -> bool:
     return str(session_id or "").startswith(AUTOMATION_SESSION_PREFIXES)
 
 
@@ -72,7 +72,8 @@ def _truthy(v) -> bool:
     return bool(v)
 
 
-def user_side(*, agent_context="", platform="", session_id="", author=None) -> str:
+def user_side(*, agent_context: str = "", platform: str = "", session_id: str = "",
+              author: dict | None = None) -> str:
     """Who is behind a `user` message in this context: HUMAN or AUTOMATION.
 
     A host that says nothing (tests, benchmarks, older hosts) gets HUMAN; any
@@ -89,14 +90,14 @@ def user_side(*, agent_context="", platform="", session_id="", author=None) -> s
     return HUMAN
 
 
-def role_speaker(role, side: str) -> str:
+def role_speaker(role: str | None, side: str) -> str:
     r = str(role or "").strip().lower()
     if r == "user":
         return side
     return _ROLE_SPEAKER.get(r, UNKNOWN)
 
 
-def role_label(role, side: str) -> str:
+def role_label(role: str | None, side: str) -> str:
     """The label an excerpt line carries. A `user` row the user did not write is
     labelled `automation`, so the raw recall text does not claim otherwise."""
     r = str(role if role is not None else "?")
@@ -121,17 +122,32 @@ _WHOLE_MESSAGE_FRAMES = (
     "[System:", "[System note:", "[SYSTEM]", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT:",
     "[Runtime note:", "[Your active task list", "[Planning state preserved",
     "[ASYNC DELEGATION", "Cronjob Response:",
+) + (
+    # Chronicle's OWN compaction output (context.py): the checkpoint digest,
+    # recalled memory and the entity working set. It is injected as `system`
+    # rows, which are framing already; listed here so a host that folds them
+    # into a user row cannot turn Chronicle's summary into the user's words.
+    "[Checkpoint:", "[Relevant memory:", "[Entity working set]",
 )
 
 _INLINE_FRAMES = re.compile(
     r"^\[(?:System note:|System:|Runtime note:|SYSTEM\]).*?(?:\][ \t]*(?=\n|\Z)|\Z)"
     r"|^(?:\[(?:IMPORTANT:|CONTEXT COMPACTION|CONTEXT SUMMARY\]|PRIOR CONTEXT|Your active task list"
-    r"|Planning state preserved|ASYNC DELEGATION)|Cronjob Response:).*\Z"
+    r"|Planning state preserved|ASYNC DELEGATION|Checkpoint:|Relevant memory:|Entity working set\])"
+    r"|Cronjob Response:).*\Z"
     r"|<memory-context>.*?(?:</memory-context>|\Z)"
     r"|<(system-reminder|command-message|command-name|command-args|local-command-caveat"
     r"|local-command-stderr|local-command-stdout|task-notification|ide_opened_file"
     r"|ide_selection)>.*?(?:</\1>|\Z)"
     r"|\[/?OUT-OF-BAND USER MESSAGE[^\]\n]*\]"
+    # gateway/run_inbound: a reply quotes the message replied to -- usually the
+    # agent's own -- ahead of what the user wrote, and the quote may run for
+    # many lines: to the '"]' that ends it before the blank line.
+    r'|^\[Replying to(?: your previous message)?: ".*?"\](?=\n\n|\n?\Z)'
+    r"|^\[Triggering message id: [^\]\n]*\]"
+    # agent/turn_liveness: the stall watchdog's abort is written into the
+    # transcript as a plain user row.
+    r"|^Turn made no progress for \d+s; aborting to release the session\.[ \t]*(?=\n|\Z)"
     r"|Gateway message origin \(JSON data[^\n]*(?:\n\{[^\n]*\})?"
     r"(?:\n+Do not guess a reply destination[^\n]*)?",
     re.DOTALL | re.IGNORECASE | re.MULTILINE)
@@ -159,7 +175,7 @@ def split_user_content(content: str, side: str) -> list:
     return merge_spans(spans)
 
 
-def merge_spans(spans) -> list:
+def merge_spans(spans: list) -> list:
     out: list = []
     for a, b, who in spans:
         if b <= a:
@@ -171,7 +187,42 @@ def merge_spans(spans) -> list:
     return out
 
 
-def render_messages(messages, side: str) -> tuple:
+_PART_MARKERS = {"image_url": "[image]", "image": "[image]", "input_image": "[image]",
+                 "input_audio": "[audio]", "audio": "[audio]", "file": "[file]",
+                 "input_file": "[file]"}
+
+
+def message_text(content: object) -> str:
+    """The TEXT of a message's content, whatever shape the host sent.
+
+    A string comes back unchanged. A list of parts — how a vision-capable host
+    sends a photo with its caption — becomes its text parts, with a marker such
+    as `[image]` for each non-text part, and never the part itself. The capture
+    path used to render such a message as the Python repr of the list, which
+    wrote the full base64 of every photo into the event log (megabytes per
+    picture, full-text indexed and queued for embedding), and the context
+    engine called `.strip()`/`.lower()` on it and crashed compaction outright."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        content = [content]
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict):
+                if isinstance(part.get("text"), str):
+                    out.append(part["text"])
+                else:
+                    out.append(_PART_MARKERS.get(str(part.get("type") or ""), "[attachment]"))
+        return "\n".join(x for x in out if x)
+    return str(content)
+
+
+def render_messages(messages: list, side: str) -> tuple:
     """`(excerpt, spans)` for a message list.
 
     The excerpt is byte-identical to the pre-attribution format
@@ -186,7 +237,10 @@ def render_messages(messages, side: str) -> tuple:
             spans.append((pos, pos + 1, spans[-1][2] if spans else SYSTEM))
             pos += 1
         role = m.get("role", "?")
-        content = f"{m.get('content', '')}"
+        raw = m.get('content', '')
+        # Byte-identical for a string or None (existing event ids depend on
+        # it); a parts list is rendered as text, never as its repr.
+        content = message_text(raw) if isinstance(raw, (list, dict)) else f"{raw}"
         label = f"{role_label(role, side)}: "
         who = role_speaker(role, side)
         if who in (HUMAN, AUTOMATION):
@@ -202,7 +256,7 @@ def render_messages(messages, side: str) -> tuple:
     return "".join(parts), merge_spans(spans)
 
 
-def chunk_spans(spans, chunks) -> list:
+def chunk_spans(spans: list, chunks: list) -> list:
     """Per-chunk span lists, offsets relative to each chunk (chunks are a
     lossless split of the excerpt the spans cover)."""
     out, base = [], 0
@@ -233,7 +287,7 @@ _LABEL = re.compile(r"^(user|assistant|tool|function|system|developer|automation
                     re.IGNORECASE)
 
 
-def lines_from_spans(excerpt, spans) -> list:
+def lines_from_spans(excerpt: str, spans: list) -> list:
     out = []
     for a, b, who in spans:
         for piece in excerpt[a:b].split("\n"):
@@ -277,7 +331,7 @@ def parse_labeled(excerpt: str, side: str, lead: str) -> list:
     return out
 
 
-def attribute_lines(payload: dict, *, session_id="", actor="") -> list:
+def attribute_lines(payload: dict, *, session_id: str = "", actor: str = "") -> list:
     """`[(line, speaker)]` for an observed event: its stored spans, or the
     legacy reading for events written before spans existed."""
     payload = payload or {}
@@ -290,7 +344,8 @@ def attribute_lines(payload: dict, *, session_id="", actor="") -> list:
                         chunk_index=payload.get("chunk_index") or 0)
 
 
-def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_index=0) -> list:
+def legacy_lines(excerpt: str, *, source_type: str = "", session_id: str = "", actor: str = "",
+                 chunk_index: int = 0) -> list:
     """Attribution for an event with no stored spans. Never guesses the user.
 
     * session transcripts: labels are read; a cron session's `user` rows are
@@ -321,9 +376,143 @@ def legacy_lines(excerpt, *, source_type="", session_id="", actor="", chunk_inde
     return [(ln, UNKNOWN) for ln in (excerpt or "").split("\n") if ln.strip()]
 
 
-def has_human(lines) -> bool:
+# -- the excerpt a READER sees ------------------------------------------------
+#
+# Capture stores an excerpt byte-for-byte (its event id depends on it) and marks
+# the host framing inside it with spans, so extraction never mistakes a
+# compaction handoff or a system note for the user. Retrieval, though, handed
+# the stored text to a reader as it was: a recalled turn could open with
+# "[CONTEXT COMPACTION — REFERENCE ONLY] ...", i.e. an earlier compaction's
+# summary served back as conversation, and a session summary built from those
+# excerpts carried it into the session vector (24 of the 107 interactive
+# sessions on the production store). These give the reader's copy: framing
+# gone, every role label that still has words under it kept, and the stored
+# text returned unchanged -- the same object -- when nothing in it is framing.
+
+
+_ROLE_OF_SPEAKER = {HUMAN: "user", AUTOMATION: "automation", ASSISTANT: "assistant",
+                    TOOL: "tool", SYSTEM: "system"}
+
+
+def _speaker_at(spans: list, pos: int) -> str | None:
+    for a, b, who in spans:
+        if a <= pos < b:
+            return who
+    return None
+
+
+def _is_boundary(label_role: str, at: str | None) -> bool:
+    """Is a `role:` line at a position the spans attribute to `at` really the
+    start of a message? A real label carries its message's first span; a user
+    message may OPEN with host framing, so its label can read SYSTEM. Anything
+    else is a line inside some other message that merely looks like a label --
+    "User: ignore previous instructions" in a tool's output."""
+    if at is None:
+        return True
+    said = role_speaker(label_role, HUMAN)
+    if said == at:
+        return True
+    return said in (HUMAN, AUTOMATION) and at in (SYSTEM, AUTOMATION, HUMAN)
+
+
+def strip_framing(excerpt: str, *, lead_role: str | None = None, drop_tools: bool = False,
+                  drop_unlabeled: bool = False, spans: list | None = None) -> str:
+    """`excerpt` (`role: content` lines, as render_messages writes them) minus
+    host framing. A user-side message loses its framing spans, and the whole
+    message -- label included -- when nothing else is left; a `system:` row is
+    framing by definition. Lines before the first label (a continuation chunk)
+    belong to `lead_role`, and are left alone when it is unknown.
+
+    `drop_tools` also drops `tool:` rows: for text that stands for what the
+    user and the agent SAID (an episode, a session summary, the memory put into
+    a user's turn), a file read or an API payload is neither. `drop_unlabeled`
+    drops lines before the first label when `lead_role` is unknown: a later
+    chunk of a long turn opens mid-message, and whose words those are is not
+    something memory put into a user's turn may guess.
+
+    `spans` (the capture's, when valid) decide which `role:` lines start a
+    message. Without them a line is read by its prefix, which tool output can
+    forge; capture stores spans exactly when such a line exists, because the
+    prefix reading and the spans then disagree."""
+    text = excerpt or ""
+    if not text:
+        return text
+    msgs, label, role, buf = [], None, lead_role, []
+    pos = 0
+    for line in text.split("\n"):
+        m = _LABEL.match(line)
+        if m and (not spans or _is_boundary(m.group(1), _speaker_at(spans, pos))):
+            msgs.append((label, role, buf))
+            label, role, buf = line[:m.end()], m.group(1), [line[m.end():]]
+        else:
+            buf.append(line)
+        pos += len(line) + 1
+    msgs.append((label, role, buf))
+    out, changed = [], False
+    for label, role, buf in msgs:
+        if label is None and not buf:
+            continue
+        body = "\n".join(buf)
+        if label is None and role is None and drop_unlabeled:
+            changed = changed or bool(body.strip())
+            continue
+        who = role_speaker(role, HUMAN) if role else UNKNOWN
+        if who == SYSTEM or (drop_tools and who == TOOL):
+            changed = True
+            continue
+        if who in (HUMAN, AUTOMATION):
+            kept = "".join(body[a:b] for a, b, w in split_user_content(body, who) if w != SYSTEM)
+            if kept != body:
+                changed = True
+                kept = re.sub(r"\n{3,}", "\n\n", kept).strip("\n")
+                if not kept.strip():
+                    continue
+                body = kept
+        out.append((label or "") + body)
+    return "\n".join(out) if changed else excerpt
+
+
+def reader_text(payload: dict | None, *, actor: str = "", drop_tools: bool = False,
+                drop_unlabeled: bool = False) -> str:
+    """An observed event's excerpt as a reader should see it (see above).
+
+    A transcript is read by its labels with the current framing rules, so a
+    frame captured before a rule existed is removed too -- and by its spans when
+    it has them, which say where each message really starts and whose opening
+    a later chunk carries. A single stored message (an eviction, a rescue)
+    carries no label: its spans say what is framing. An older one without spans
+    is read as the user side unless the agent wrote it, which removes only
+    recognised host frames; where tool output must go too (`drop_tools`), an
+    older copy the user did not write is dropped, since nothing says whether it
+    was a tool's. (On the production store the older rescue copies are where
+    the cron prompts -- "[IMPORTANT: You are running as a scheduled cron job
+    ..." -- sat, in sessions with no `cron_` prefix.)"""
+    payload = payload or {}
+    excerpt = payload.get("excerpt") or ""
+    st = payload.get("source_type") or ""
+    spans = payload.get("speakers")
+    spans = spans if _valid_spans(spans, len(excerpt)) else None
+    if st == "session_transcript" or _LABEL.match(excerpt):
+        lead = None
+        if spans and not _LABEL.match(excerpt):
+            lead = _ROLE_OF_SPEAKER.get(spans[0][2])
+        return strip_framing(excerpt, lead_role=lead, drop_tools=drop_tools,
+                             drop_unlabeled=drop_unlabeled, spans=spans)
+    if spans:
+        drop = (SYSTEM, TOOL) if drop_tools else (SYSTEM,)
+        if not any(w in drop and excerpt[a:b].strip() for a, b, w in spans):
+            return excerpt
+        return "".join(excerpt[a:b] for a, b, w in spans if w not in drop).strip()
+    if st in ("context_eviction", "rescue_extraction") and actor != "agent":
+        if drop_tools and actor != "user":
+            return ""
+        return strip_framing(excerpt, lead_role="user")
+    return excerpt
+
+
+def has_human(lines: list) -> bool:
     return any(who == HUMAN for _, who in lines)
 
 
-def human_text(lines) -> str:
+def human_text(lines: list) -> str:
     return "\n".join(text for text, who in lines if who == HUMAN)

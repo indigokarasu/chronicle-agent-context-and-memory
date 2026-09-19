@@ -234,11 +234,11 @@
         ActivityCard(recent && recent.events)
       );
     }
-    let atlasPromise = null;
-    function loadAtlas() {
-      if (window.__CHRONICLE_ATLAS__) return Promise.resolve(window.__CHRONICLE_ATLAS__);
-      if (atlasPromise) return atlasPromise;
-      atlasPromise = new Promise((resolve, reject) => {
+    let tapestryPromise = null;
+    function loadTapestry() {
+      if (window.__CHRONICLE_TAPESTRY__) return Promise.resolve(window.__CHRONICLE_TAPESTRY__);
+      if (tapestryPromise) return tapestryPromise;
+      tapestryPromise = new Promise((resolve, reject) => {
         const self = document.querySelector('script[data-hermes-plugin="chronicle"]');
         const src = self && self.src ? self.src.split("?")[0] : "";
         const base = src ? src.slice(0, src.lastIndexOf("/") + 1) : "";
@@ -247,26 +247,26 @@
           return;
         }
         const s = document.createElement("script");
-        s.src = base + "atlas.js";
+        s.src = base + "tapestry.js";
         s.async = true;
-        s.onload = () => window.__CHRONICLE_ATLAS__ ? resolve(window.__CHRONICLE_ATLAS__) : reject(new Error("atlas.js loaded but registered nothing"));
+        s.onload = () => window.__CHRONICLE_TAPESTRY__ ? resolve(window.__CHRONICLE_TAPESTRY__) : reject(new Error("tapestry.js loaded but registered nothing"));
         s.onerror = () => {
-          atlasPromise = null;
+          tapestryPromise = null;
           reject(new Error("could not load " + s.src));
         };
         document.head.appendChild(s);
       });
-      return atlasPromise;
+      return tapestryPromise;
     }
-    function AtlasTab() {
-      const [mod, setMod] = useState(window.__CHRONICLE_ATLAS__ || null);
+    function TapestryTab() {
+      const [mod, setMod] = useState(window.__CHRONICLE_TAPESTRY__ || null);
       const [err, setErr] = useState(null);
       useEffect(() => {
-        if (!mod) loadAtlas().then(setMod).catch((e) => setErr(e.message));
+        if (!mod) loadTapestry().then(setMod).catch((e) => setErr(e.message));
       }, []);
       if (err) return h("div", { className: "chr-err" }, "Tapestry could not load: " + err);
       if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading Tapestry\u2026");
-      return h(mod.Atlas, null);
+      return h(mod.Tapestry, null);
     }
     function ChronicleDashboard() {
       const initial = (() => {
@@ -294,9 +294,9 @@
           "div",
           { className: "chr-tabs", role: "tablist" },
           h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "overview", onClick: () => choose("overview") }, "Overview"),
-          h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "atlas", onClick: () => choose("atlas") }, "Tapestry")
+          h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "tapestry", onClick: () => choose("tapestry") }, "Tapestry")
         ),
-        tab === "atlas" ? h(AtlasTab) : h(Overview)
+        tab === "tapestry" ? h(TapestryTab) : h(Overview)
       );
     }
     PLUGINS.register("chronicle", ChronicleDashboard);

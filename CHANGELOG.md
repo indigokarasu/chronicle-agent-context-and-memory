@@ -3,6 +3,1125 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.33
+
+**`chronicle_search`'s raw tier scores from memory.** The raw tier's vector pass
+read every observed vector from SQLite a page at a time on every query; on the
+production store that was ~3.0 of `chronicle_search`'s 3.4 s. Each process now
+keeps them as a float16 matrix (`engine/vector_cache.py`, ~100 MB for 66k
+768-wide rows) and scores a query against all of them at once. On a local
+synthetic store of that size: paged scan 0.19 s, warm cache 0.064 s, first
+build 0.39 s, identical top results. (Not measured on the production box: no
+VPS work while deploys are frozen.)
+
+* The result is the paged scan's: the same 0.1 floor, ACL check, automation
+  exclusion and framing check, the same top-k heap; FTS hits are credited
+  whatever their rank. Candidates are visited best-first, so the scan stops
+  once nothing left can enter the heap. Scores differ from float32 by ~1e-3.
+* Never stale: every use checks the table's row count and max rowid at the
+  query's width. New rows are appended; a delete or a re-embed rebuilds.
+* `retrieval.observed_vector_cache` (default on) and
+  `retrieval.observed_vector_cache_max_rows` (250,000; above it, the paged
+  scan). No numpy, or any error in the cache, also falls back to the scan.
+* Not sqlite-vec: its index is filled only by new writes and never backfilled,
+  so enabling it over a populated store hides every existing vector.
+
+## 5.8.32
+
+**The AI review threads on #20 and #23 that were real bugs, fixed.** Each has a
+test in `tests/test_review_fixes_5832.py`, mutation-checked.
+
+* **A hot rollback journal is never read `immutable`.** The write-back reader
+  and the Tapestry read model fell back to `immutable=1` when a read-only open
+  failed, checking only for WAL frames; a non-empty `-journal` needs a rollback
+  that an immutable open skips, so they could read a half-written file. Both
+  now refuse instead.
+* **Tapestry read model:** an unreviewed people-store contact is counted as
+  unclassified instead of being guessed to be a person; a merge cycle
+  (A -> B -> A) lists its entity once under the smallest id instead of hiding
+  every id in it; a fact history orders a version before the one that replaced
+  it even when the replacement carries an earlier timestamp (a topological
+  order, time breaking ties); the log opened from a fact or mention selects and
+  centres the event it cites (facts now carry `src_seq`); speaker labels are
+  looked up as own properties only; the place/concept counting is one helper.
+* **`scripts/clean_entities.py`:** a live relationship keeps both of its
+  endpoints (an entity only a relationship used could be dropped), and a merge
+  moves relationship endpoints and fact `entity_id`s to the survivor.
+* **An event fact written plainly is kept.** "bought dog food" and "went to the
+  gym" were refused because nothing in them is capitalised. A short lower-case
+  account with any word outside the notification vocabulary is kept; "Payment
+  received", "Delivery delayed" and "Your order has shipped!" still are not.
+* **Startup recovery is latched only when it succeeds.** A recovery that raised
+  was marked done, so the rest of the process skipped it.
+* **Folded attachments get distinct ids.** Two photos with the same caption
+  flattened to the same text and so the same fold id; a message with parts is
+  hashed as its full structure (a plain string keeps its old id).
+* **The `/compress` preflight asks about what the next pass would touch.** After
+  a compaction it looked at the settled prefix too, and could report content
+  to compress when an extending pass had none. It now shares compress()'s own
+  extend-or-rebase decision (`_settled_prefix`).
+* **`migrate_vectors` stops counting framing-only sessions as unrecoverable**
+  (no summary and no vector), agreeing with the health census, so such a store
+  no longer fails every migration.
+* Duplicate `ographer` suffix and a doubled `[` in a strip set removed; the
+  context-engine stand-ins in `_base.py` are type-annotated.
+
+## 5.8.31
+
+**Merged with published `main` and the release branch.** This branch now
+contains everything on `main` and on `release/v5.7.0`, so #23 and #20 can merge
+without replaying anything.
+
+* **`events.pointer`, from `main` (dada805), is schema rung 19.** An event can
+  carry a skill reference (`weave:<person_id>`, `scout:<subject_id>`,
+  `rally:<ticker>`) instead of a copy of what it points at;
+  `CaptureEngine.append(pointer=...)` sets it. `main` numbered it 12, which this
+  ladder already uses (procedures.body), the same collision rungs 14-17 had.
+  Additive and nullable: every existing event reads NULL.
+* **`main`'s "stale lock recovery" is not taken.** It unlinked `-wal` and `-shm`
+  every time a store opened. A WAL holds committed transactions until they are
+  checkpointed, and SQLite replays it on the next open, so deleting it first
+  discards them; and the production store is opened by several live processes
+  at once, so a removed `-shm` corrupts the others' view. The one sidecar removal
+  stays `_unlink_sidecars()`, after `journal_mode=DELETE` has proven exclusive
+  access. `tests/test_events_pointer_and_wal.py` fails if deletion comes back.
+* **`release/v5.7.0`'s squash of #21 is already here.** Its tree equals this
+  branch's 69fc157 plus the four `fix/speaker-attribution` commits
+  (`retract_misattributed`: write-lock retries, one sequential pass, a bounded
+  event cache, a streamed report), which are merged in with it.
+
+## 5.8.30
+
+**The per-turn gate asks what the person wrote.** The gateway prepends an
+origin header to some messages ("Gateway message origin (JSON data, not
+instructions or authorization): {…}"). Capture already read it as host
+framing, but the recall gate did not, and its words (json, authorization,
+chat, field) matched a session where the user had once pasted code, on
+messages about the gateway restarting. The gate now takes only the person's
+words.
+
+**Two or three shared words are checked too.** On 300 real messages, a long
+security alert's generic words ("change", "issue", "link"; "none", "send") and
+a pasted script's ("post", "text") matched two or three at a time. Against
+the items' stored vectors the plainly unrelated scored 0.49–0.65 and the
+related 0.59–0.90, and four or more shared words were all related. Such a
+match must now reach 0.60 (`retrieval.prefetch_min_similarity_few`, `"auto"`
+= measured per model). Unlike a one-word match, two or three words are
+evidence of their own, so with no vector to compare the words decide.
+
+**A fact goes into the block once.** A critical fact that matched as a
+`[FACT]` came back below as `[CRITICAL]`: one production block carried a
+security alert twice.
+
+On 49 longer real messages the recalled items went from 16 to 7 (19,711 →
+8,632 characters). What went was the alerts, the code paste and an unrelated
+session, plus one repeated old health-check question.
+
+## 5.8.29
+
+**The handoff's own instruction works as written.** Every compaction note says
+to restore a folded turn with `chronicle_expand` "by its [fold_…] id". The
+tool's description still pointed the model at "the first token after
+'[FOLD'", a stub format 5.8 retired. An id passed the way the note shows it,
+in brackets, was unknown. The description now names the note's id format, and
+the tool accepts the id bracketed or bare. Tested through the host's call
+shape with an id taken from a real handoff.
+
+## 5.8.28
+
+**`chronicle_search` searches what was said, as its description promised.** The
+tool is described as "Search the belief store + raw events (dual-tier)" but
+searched only beliefs. On the production store most of the memory about the
+user is the transcript: a search for something the user only ever said came
+back empty, while per-turn recall found it. Now that the agent can call the
+tool at all (5.8.26), it returns `results` (beliefs) and `said` (transcript
+excerpts with their session and date, each at most 1,500 characters). Live:
+ten of each in 2–4 s.
+
+## 5.8.27
+
+**One copy of the static block, under one rule.** The plugin also registers a
+system-prompt section, `chronicle.memory-guidelines`, which renders the static
+block. Hermes renders that section and also puts the memory provider's own
+`system_prompt_block()` into the prompt. With Chronicle as the memory provider
+the block went in twice, and the section's copy did not leave out the agent's
+own notes, which the host injects itself. 5.8.16 had removed them from the
+provider's copy only: every production system prompt still carried 612
+characters of stale copies, one cut off mid-sentence. The section now renders
+nothing when Chronicle is the host's memory provider. It serves a host running
+Chronicle as the context engine alone, and then follows the same
+agent's-own-notes rule.
+
+## 5.8.26
+
+**The agent can call Chronicle's memory tools.** Hermes routes a memory
+provider's tools by the list it takes at `add_provider()`, which runs before
+the provider's `initialize()`. The model's own tool list is asked for again
+later. Chronicle answered the first request with nothing, because its tools
+lived on a core that did not exist yet. So the production log read "Memory
+provider 'chronicle' registered (0 tools)" on every start, and the model,
+shown `chronicle_search`, `chronicle_remember` and the rest, got "Unknown tool"
+on all 77 calls it made from 2026-09-03 to 2026-09-17. The schemas do not
+depend on the store, and are now returned before `initialize()`. Checked with
+Hermes' own MemoryManager: 0 routable tools before, 35 after. The context
+engine's tools (`chronicle_expand`, `chronicle_pin_context` …) were registered
+by a different path and were not affected.
+
+## 5.8.25
+
+**A request is not something that happened, and a wanted state is not a fact.**
+Three shapes from the user's real messages were still stored as memories:
+
+- "…once everything is correctly backed up … run genie again" became an
+  episode. The command followed a leading clause with no comma, and only a
+  clause ending in a comma was recognised.
+- "Same rules apply, don't out yourself, use the vibes skill on any prose"
+  became an episode, because the commands came after commas. Command clauses
+  are now taken out and the account stays: "There isn't enough space on the
+  VPS …, so that isn't a viable path, figure out something …" keeps everything
+  but "figure out …".
+- "Fix is so that my library is a folder slskd can see" became a fact,
+  library = "folder slskd can see". The generic "my X is Y" rule now ignores
+  a state asked for (after "so that", "should", "want", "until" …), a
+  hypothetical, and a sentence that opens with a command.
+
+A listed verb after a subject, an auxiliary, a preposition or a determiner is
+not a command ("I would run every morning before work"). Over 195 real
+messages, exactly those three items went and nothing else changed.
+
+## 5.8.24
+
+**Masking is final.** 5.8.23 read its own `[redacted]` marker as a credential
+value: masking text that was already masked trimmed the marker's closing
+bracket and masked it again, so per-turn recall showed a belief the fold had
+masked as `pwd=[redacted]]`. The detector also reported the masked text as
+still holding a credential. A masked value is now never a credential, and
+masking twice changes nothing.
+
+## 5.8.23
+
+**A credential is not a memory.** Users hand the agent logins to use. On the
+production store the extractor turned two such messages, a site login and a
+file-sharing account ("Username: … Password: …"), into episodes. Those are
+beliefs, which per-turn recall puts into later prompts unasked and the
+dashboard shows. Now (`engine/credentials.py`):
+
+- The fold masks any credential value in a belief's key and body, on assert,
+  derive and correct. The belief stays, masked: an appointment whose meeting
+  link carries `?pwd=` is still an appointment. Being in the fold, a rebuild
+  masks the ones already stored.
+- Per-turn recall masks them in what it injects unasked.
+- The transcript keeps the message, and the agent's own explicit search still
+  finds it.
+
+Detection is by shape. A labelled value counts (password, passcode, PIN, API
+key, token, secret, private key, auth code, OTP, then `:`, `=` or "is", then
+something that looks like a secret), as does a key-shaped token (`sk-…`,
+`ghp_…`, `AKIA…` and similar). "The full password is not in the log" and
+"Your password has been updated" name no value and are left alone. On the
+production store one active belief held one: an appointment's meeting
+passcode.
+
+## 5.8.22
+
+**An importer's sender and sent-date no longer vouch for a subject line.** The
+rule that a fact must say what happened (5.7.3) keeps a value with a quoted
+title or an explicit date. The email importer appends `| from "<sender>" |
+<sent-time>` to every value, so the quoted sender and the sent-time passed
+both tests, and every subject line it wrote was kept. The production store
+held "Delivered 1 item: Skin Care", "Your Subscription Renewal" and "Your return
+drop off confirmation" as things the user had bought. The rule now judges the
+value without those provenance segments. An event date in its own segment
+("Dinner at Fake Izakaya | 2026-09-12") is content and stays.
+
+**A count of items names nothing.** "Delivered 1 item: Clothing" is the owner's
+own example of noise, and the rule still kept it because the capitalised store
+category after the count read as a name. A value whose object is a count of
+items ("Ordered 3 items: Appliances, Health Care, and more", "Shipped: 3 Pet
+items") now says something happened without saying what. A thing named first
+and counted after ("Refund issued for Acme Fake Switch… and 3 other items") is
+kept.
+
+Replayed over all 1,488 active facts on the production store: 45 refused, each
+read and each noise (37 item counts, 8 subject lines). The first version of the
+count rule also refused the switch refund, and was narrowed to a count as the
+object before release.
+
+## 5.8.21
+
+**Per-turn recall no longer repeats the conversation in progress.** The
+provider captures every turn as it happens, so a follow-up found the user's
+own message from minutes earlier and injected it again, though it was still
+in the model's window. On the production store, 10 of 101 real messages got
+an excerpt of their own conversation from before them: 23,000 characters,
+about 40% of everything recalled. Prefetch now passes the live session, and
+retrieval leaves its turns out, the session window included. The exception is
+the copies the context engine wrote when a compaction folded messages out of
+the window, which are exactly what the window no longer has. Explicit search
+is not narrowed. With the rule on, the same messages got 0 such excerpts;
+recall from other conversations was unchanged (21 items).
+
+**A one-word match nothing can vouch for is left out.** In 5.8.19/5.8.20 a
+one-word match fell back to the word rule when the embedder could not answer
+in time. Under load that let every coincidence back in: one probe run over the
+same messages carried 30 belief lines instead of 6. With a floor in force, an
+unvouched one-word match is now dropped (71 of 75 were coincidences). An
+embedder the gate cannot ask, such as hashing, has no floor and keeps the
+word rule.
+
+## 5.8.20
+
+**An item with no vector to compare is embedded on the spot, if short.**
+5.8.19's check needs the item's stored vector; entities have none, and a few
+facts and the newest turns are not embedded yet, so their one-word matches
+passed unchecked. Live that was "address and fix all the issues" bringing an
+entity named "Issue-closing" and "…would return nothing?" an Amazon return
+receipt. A short item (240 characters or less) with no vector of this model
+is now embedded on the spot. That's at most three per turn, all of a turn's
+gate requests within 1.5 s, and a long one keeps the word rule. The second
+directive path (topic notes) now carries the note's id, so a directive is
+checked on either path. Over 400 real messages: 59 one-word matches, 55
+dropped, 4 kept (0.66–0.75); a turn's recall took 0.08 s at the median and
+0.60 s at the slowest.
+
+## 5.8.19
+
+**A short message's one shared word must also be near it in meaning.** A
+message with three content words or fewer passes the per-turn gate on a single
+shared word, and on the production store that word was usually a coincidence.
+Over 250 real messages there were 64 such matches: "system health check"
+brought a prescription refill (its attribute is `health_event`), "address and
+fix all the issues" refunds that were "issued", "why is the gateway restarting
+every 10 mins?" two contacts named Min, "sure get it set up" a model-switching
+chat. The item's stored vector against the message's separates them. Read one
+by one, the plainly unrelated matches scored 0.32–0.64 (nomic-embed-text) and
+the plainly related ones 0.66–0.75. A few loosely related ones — an older
+question about the same tool — fell on both sides. A one-word match is now
+kept only at 0.65 or above (`retrieval.prefetch_min_similarity`, `"auto"` =
+the floor measured for the model, none for an unknown one). The message is
+embedded once, only when a one-word match needs it, in one request with a
+one-second limit that never trips the embedder's breaker. With no vector of
+the item's, or no answer in time, the word rule stands as before. Each
+decision is in `last_context_debug["relevance_gate"]["one_word"]`.
+
+**A long session's compactions no longer slow down pass after pass.** Naming
+the entries the handoff has no room to show compared each one against a list,
+and the lists grow all session. Over 150 compactions of a synthetic 3,000-turn
+session, a pass went from 0.15 s to 0.49 s; it now stays at 0.15–0.2 s, and
+the output is identical. A new test runs 25 compactions and checks that every
+pass lands at the target, the newest request survives, and the handoff does
+not grow.
+
+**A pass over the message count keeps the count.** 5.8.18 moved the user's
+newest request out of the tail into a list of its own, and the count of kept
+messages did not include that list: a pass folding down to half of
+`hygiene_hard_message_limit` kept one message more than half. (5.8.18 was
+released after a gate whose log was stale; the full suite, run properly,
+caught it. The gate now writes its own log.)
+
+## 5.8.18
+
+**The user's newest request survives a tight budget wherever it sits.** A
+seeded fuzz of `compress()` (multimodal content, None content, tool calls
+that are not dicts, results with no id, system notes mid-list, host
+persistence markers) found one way to lose the request: on a small context
+window, the protected tail's newer tool results and the leading system
+messages claimed the budget before the request was reached, and it was
+dropped. The request is now fitted second — right after the newest unit —
+whether it is in the tail or further back. The fuzz runs 60 seeds, two
+passes each, and checks: nothing raises, no call/result pair is split, at
+most one handoff and never in the system role, no persistence marker, the
+newest request kept (whole, or shortened with the id that restores it).
+
+## 5.8.17
+
+**The handoff alternates the way Hermes counts turns.** The handoff's role was
+the opposite of the last row before it, a tool row counting as the
+assistant's side, so after a tool loop — "…tool result, [handoff], the user's
+request" — it came out as a second user message in a row. Hermes places its
+own summary against the roles a strict chat template counts, where tool rows
+and an assistant's tool-call row are exempt; so does the handoff now (after a
+tool loop the last counted turn is the user's request, and the handoff is the
+assistant's).
+
+## 5.8.16
+
+**The agent's own notes come from the agent's own file.** Every directive in
+the production static block was a copy of something the agent wrote with its
+memory tool — and Hermes' built-in memory already puts the agent's CURRENT
+memory file into the same system prompt. Chronicle's copies were older: one
+read "never answer from a assumed location (e", cut off mid-sentence by an
+earlier extractor, while the agent's file had since rewritten it. When the
+host injects the agent's memory itself (`memory.memory_enabled`), the static
+block leaves those copies out; outside Hermes, or with built-in memory off,
+Chronicle's copy is the only one and stays. The user's own directives are
+always included.
+
+## 5.8.15
+
+**Every system prompt carries only what must always be there.** The memory
+provider's static block goes into every agent's system prompt — scheduled
+jobs included — whatever the turn is about. On the production store its
+"CRITICAL" section was the user's medical history (a prescription refill, a
+lab visit, a past procedure: medical facts are critical so they never decay,
+and "Quest Diagnostics" is medical by its name), and its "USER PROFILE" an
+attended birthday. The always-on section now holds safety facts only (an
+allergy, anaphylaxis, a DNR); medical facts still never decay and still
+surface when a message is about them. The profile leaves out events — what
+happened to the user, not who they are.
+
+## 5.8.14
+
+**An instruction about the task in hand is not a standing one.** A standing
+instruction becomes a directive injected into every later turn. The
+classifier took any "don't …", "never …" or "I want you to …" — so, from the
+user's real messages, "Don't try to come up with a fix yet, just understand
+the issue", "don't stop until you have any stuck or broken processes fixed"
+and "I want you to review the search code here <url>" would each have told
+the agent, forever, not to fix things or to keep going. An instruction scoped
+to now ("yet", "for now", "until", "this", "here", a link) is not standing
+unless it says so ("always", "never", "from now on", "ever"). The five live
+directives are the agent's own memory writes and are untouched.
+
+## 5.8.13
+
+**The episode rule, tightened where it leaked and loosened where it lost.**
+Over 195 real messages 5.8.12 still made episodes of "Then proceed with the
+plex option…" and "Yes, and once everything is backed up, run genie again"
+(a command after "yes" or a leading clause), and would have dropped a story
+that opens like a question ("When we got to Riverton, …"). A command is now
+found after an affirmation or a leading "once/when/if …," clause — one that
+ends in a comma: the real "Yes, and once everything is correctly backed up
+and will back up run genie again" still slips; a question without its "?"
+is recognised only by an auxiliary opening ("can the…", "is there…", "did
+the…"), not by "when" or "what", which open narrative too. Over the 195
+messages: 9 episodes remain, mostly statements about the user's own systems.
+
+## 5.8.12
+
+**An episode is something the user says happened.** The heuristic extractor
+made an episode of every user message over 60 characters. Run over the
+user's sixty most recent real messages, that rule made 17 episodes, and every
+one was a request to the agent or a question: "Just work through all of them
+one by one…", "Come up with a way to ensure backups…", "Would any of this
+help SIFT? <url>". A sentence now counts only when it does not ask (a "?", or
+an opening such as "can", "what" or "did"), does not speak to the agent
+("you", "please"), and does not open — after a filler word or two — with a
+command; the episode is those sentences. Same sixty messages: 17 → 0 such
+episodes, while "My sister moved to Riverton last week. Can you remind me to
+call her?" still keeps its first sentence.
+
+**A reply quote is the host's.** When the user replies to a message, the
+gateway quotes it — usually the agent's own — as `[Replying to: "…"]` ahead
+of what the user wrote, over as many lines as it has. That quote was read as
+the user's words. It is host framing now (no stored memory came from one).
+
+## 5.8.11
+
+**A folded tool step says what happened.** Each folded tool step is one line
+in the handoff, and on a real session most of that line was envelope:
+`terminal({"command": "journalctl -xn 50 …", "timeout": 10}) → {"output":
+"░░ \nThe job identifier…", "exit_code": 0, "error": null}`. The line now
+carries the call's telling argument (the command, path, query or URL) and the
+result's error if it has one, else its output, with a non-zero exit code:
+`called terminal(systemctl start nginx) → exit 1: Job for nginx.service
+failed…`.
+
+**The README says how compaction and per-turn recall behave** — the policy it
+follows, what it keeps, the handoff, restoring a folded turn, cache behaviour,
+what goes into a turn unasked — and lists the new keys.
+
+## 5.8.10
+
+**The user's newest request is always kept.** In a long tool loop the request
+the agent is working on sits further back than the protected tail (twenty
+messages of calls and results), and a compaction could fold it — leaving it
+only as a line in the handoff, which tells the model to answer "the latest
+user message after this note". Hermes' own user-turn guarantee does not fire
+while the protected head still holds an older request. Replayed over six real
+sessions it happened in one pass of eleven; driving a compaction through
+Hermes' own `_compress_context` showed the same. The newest real user message
+is now kept verbatim, after the handoff, whenever the tail does not already
+hold one.
+
+## 5.8.9
+
+**The gate matches words, not prefixes, and a long message needs two.**
+Sampled on fourteen real messages against the production store, most of the
+per-turn block was a coincidence of letters: any extension of up to three
+letters counted as the same word, so "repos" drew "earnings report", "rich"
+Richard, "access" accessories and "spec" a person named Specht; a pasted URL
+contributed "https", "com" and its year; and in a long message a single
+shared word — "fire every hour" and "SF Fire Credit Union", "suite" and every
+street address with a Suite B — was enough. Now:
+
+* two words are one only as an inflection: an ending (s, es, ed, d, ing, er,
+  ers), a doubled consonant (plan/planned), a dropped "e" (bake/baking) or
+  "y" as "i" (happy/happier);
+* URLs and numbers of four digits or fewer are not content words;
+* a message with more than three content words needs two of them in an
+  item.
+
+Same fourteen messages: 22,100 → 9,200 characters injected; seven of them
+now get nothing, where everything they got was such a match. (The threshold
+also had to get its own name: `need` is reused further down the function for
+character budgets, and the closure read the later value.)
+
+## 5.8.8
+
+**Without its store, a compaction still keeps tool calls whole and says what
+went.** The fallback used when the core cannot open kept `body[:3] +
+body[-6:]`: a cut that could start the tail on a tool result whose call was
+dropped, hoisted every system message to the top, and left no trace of what
+was dropped. It now cuts the protected head and tail on whole tool units,
+keeps leading system messages where they are, and leaves one handoff that
+says plainly the folded turns are gone (nothing could be archived, so it
+names no ids) and quotes the user's requests from them.
+
+**An archive copy stays out of the user's own index.** A copy of a turn the
+memory provider already captured was also indexed in `observed_user_fts`, so
+per-turn recall could show the same turn twice. It stays searchable and
+expandable through the main index.
+
+Also removed: the pressure-warning helpers no path called since the warning
+moved into the handoff.
+
+## 5.8.7
+
+**The budget counts what is sent.** Hermes stamps each user turn's recall
+block into an `api_content` sidecar and replays that sidecar, not `content`,
+on every later call; its own compressor charges the sidecar. Chronicle
+charged `content`, so every kept turn's recall block (up to 4,800 characters
+before 5.8.4) went uncounted. It is charged now; when the protected spans do
+not fit, a turn's stale recall block is the first thing to go, before any of
+the user's words; and a shortened message loses its sidecar too (replayed,
+the sidecar would have sent the whole original again).
+
+## 5.8.6
+
+**A compaction can be inspected.** `chronicle_context_status` reported only
+whether the engine was live; it now also carries the compaction policy in
+force (trigger and target tokens, protected head/tail, the host's message
+limit), how many passes ran, whether the last one extended or rebased, and
+what the handoff is carrying (folded requests and steps, stated facts, pins).
+Each pass also writes one INFO line (`chronicle compaction: session=… mode=…
+messages N->M folded=… used=…/… tokens handoff=… chars`), which the gateway's
+log keeps where the store's audit event is not easy to reach.
+
+## 5.8.5
+
+**The host's bookkeeping stays the host's.** A compaction returned the host's
+own message dicts for the turns it kept, `_db_persisted` marker and all.
+Hermes' invariant is that no assembled compaction output carries that marker
+(its own compressor sweeps it off; a leaked one makes a rotation flush skip
+the row) and it stamps committed rows itself; its current child-session
+insert writes every row, so this keeps the invariant rather than fixing an
+observed loss. Kept messages now come back as unmarked copies (the host's
+dicts are never edited). The settled prefix is also compared on what the
+model sees — role, content, tool calls — so a transcript reloaded from
+state.db, stamped or carrying a sidecar key, still extends instead of
+rebasing and breaking the prompt cache.
+
+## 5.8.4
+
+**The gate asks what the user said.** A past conversation excerpt went into
+the user's turn when ANY line of it shared a content word with the message —
+and the assistant's own briefings and status reports share a word with almost
+anything. Once 5.8.2 stopped retracted beliefs from crowding the ranking, such
+replies filled the block: on the production store "remind me where I work and
+what my role is" drew 2,952 characters of calendar briefing and MCP status.
+The gate now asks the USER's words in the excerpt; the excerpt is still shown
+whole, the reply being context for what the user said. Measured on the
+production store: 2,952 → 156, 4,784 → 1,599 (the same facts, without the
+reply-only excerpts), 1,187 → 277 characters. A chunk that is only the
+assistant's reply no longer reaches the turn; explicit search still finds it.
+
+## 5.8.3
+
+**An episode about the user is what the user said.** A transcript episode was
+the whole turn, so the assistant's reply ("Great, I will remember that ...",
+its code, its plan) became part of an episode about the user — the one output
+still built that way after the facts and notes moved to the user's own lines.
+On the production store 24 of the 32 active transcript episodes carried it,
+and once the belief index stopped burying them (5.8.2) they reached the
+user's turns. The episode is now the user's words in the turn (none when
+those are too short); `deploy570/rederive_transcript_episodes.py` re-derived
+the live ones through the capture path.
+
+**A scheduled job's turn gets no per-turn recall.** Nobody asked, the
+"message" is the job's own prompt, and on the production box those were ~98%
+of all turns — up to 4,800 characters of the user's memory each.
+`retrieval.prefetch_automation: true` restores it.
+
+## 5.8.2
+
+**The per-turn search reads what it can return.** Profiled on the production
+store, a scheduled job's prompt (4,400 characters, 210 content words) made the
+gated per-turn search take 42-84 s — far past Hermes' 8 s prefetch timeout,
+and while that call was stuck the host skipped Chronicle for every turn, the
+user's own included. Three causes, all fixed:
+
+* The gated search asked for every content word, as prefix terms (234 of
+  them). It now asks for the message's 24 most telling words — said most
+  often, capitalised, longest — when it has more; a short message is
+  unchanged.
+* `belief_fts` held 101,188 rows, 97,790 of them retracted beliefs ranked on
+  every search and then thrown away. A belief now leaves the index when it
+  stops being searchable, and returns if it is reactivated.
+* The observed index is ~98% cron transcripts, which the per-turn search
+  ranked and then filtered out. The user's own conversations now have their
+  own index (`observed_user_fts`), read once it is known complete: a new store
+  is born complete; an upgraded one waits for `deploy570/repair_fts_582.py`.
+
+Also: indexing an observed event no longer runs a DELETE on an unindexed
+column first — a scan of the whole index on every capture.
+
+## 5.8.1
+
+**A host notice is not the user.** Hermes' turn-liveness watchdog writes its
+abort — "Turn made no progress for 613s; aborting to release the session." —
+into the transcript as a plain user row. Replayed compactions quoted it back
+as something the user said; it is host framing now, wherever it appears in a
+message, and the user's own words next to it stay theirs.
+
+**The digest keeps facts, not restated requests.** The checkpoint digest turned
+every long user message into an `[episode]` line; the handoff already quotes
+folded requests verbatim, and in the 300-token rolling digest those lines
+pushed the actual facts out, oldest first. Episodes stay out of it.
+
+## 5.8.0
+
+**Compaction leaves one handoff, keeps tool calls whole, and follows the
+operator's settings.** Read against Hermes' own compaction path and replayed
+over real sessions, the context engine had six problems:
+
+* **It ignored the operator's policy.** The host never hands a plugin engine
+  its `compression:` settings, so Chronicle compacted at 75% of the window down
+  to 55% while the profile says `threshold: 0.5, target_ratio: 0.15,
+  protect_first_n: 3, protect_last_n: 20`; and because the host calls
+  `update_model()` before `on_session_start()`, even Chronicle's own
+  `context_engine.*` settings never applied. The engine now reads the host's
+  section (explicit Chronicle settings still win): HIGH is `threshold`, LOW is
+  twice `threshold × target_ratio`, and the protected head/tail come from the
+  host.
+* **It ignored the message limit.** The gateway also compacts at
+  `hygiene_hard_message_limit` messages whatever the tokens, and when that
+  compaction makes no progress it cuts the model's input to the newest `limit`
+  messages every turn — head and all, no handoff. Chronicle, under its token
+  budget, returned the transcript unchanged. A pass over the limit now folds
+  down to half of it.
+* **Injected blocks were `system` messages after the latest turn.** Hermes'
+  Anthropic converter makes the LAST system message the system parameter, so
+  `[Checkpoint:]`, `[Relevant memory:]`, `[Entity working set]` and the
+  pressure warning could replace the agent's own system prompt. All of it now
+  rides in ONE message, `[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle
+  folded …`, in a conversation role that alternates with the turn before it,
+  where the folded turns were: the user's folded requests verbatim (newest
+  first), one line per folded step (`called read_file(…) → …`), the facts
+  stated in them, memory recalled for the focus and the host's
+  `memory_context` (which was dropped), and the ids of whatever did not fit.
+  Each section gets a share of the room; identical turns are listed once.
+* **Fold stubs orphaned tool results.** Each folded message left `[FOLD id
+  digest]` in its role but without `tool_calls`/`tool_call_id`, so the host's
+  sanitizer deleted or faked the paired results, and the stub said nothing. An
+  assistant call and its results are now kept or folded together, and the
+  handoff names each step by its first result (every empty-content call used
+  to hash to the same id).
+* **When the protected spans alone were over budget, the newest turn was
+  dropped** — the fit ran head first. Now: system, the newest unit, the rest
+  of the tail newest first, then the head; a span shortened to fit is archived
+  first and ends with the `chronicle_expand` id that restores it.
+* **"never / always / must" pinned tool output.** The keywords counted in any
+  message; they now count in the user's own words only (pins are unchanged),
+  and the checkpoint digest is fed only the user's words.
+
+A pass normally EXTENDS the settled prefix byte for byte (earlier handoffs
+included) so the provider's prompt cache holds; once that prefix is most of
+the budget, or over the message limit, it REBASES: earlier handoffs and pre-5.8
+artifacts come out and one consolidated handoff replaces them. A restarted
+engine adopts what an earlier handoff said, ids included. Archive writes are
+batched (one transaction per ~64 messages): a 961-message pass went 1.4 s →
+0.7 s.
+
+**A compaction costs seconds, not tens of them.** Profiled on the production
+box, one real 258-message compaction took 17.3 s, 12 s of it in the canonical
+JSON encoder, which escaped strings one character at a time in Python — and
+every event id and span id hashes the full text. The standard library's C
+string encoder applies exactly the same rule (checked over every code point);
+the same compaction now takes 4.6 s, and every capture is cheaper. The
+protected head no longer keeps a large tool result whole (one 43 KB skill
+description cost a third of the budget on every call): it is shortened,
+archived, and says how to restore it. An archive copy of a turn the memory
+provider already captured is searchable but not embedded — each compaction
+queued one embed job per folded message, duplicating vectors the provider's
+capture already has.
+
+**Excluded sessions stay unembedded.** `embeddings.exclude_session_prefixes`
+stopped the inline embed of an excluded session's turn, but an embed job
+queued before the prefix was excluded (or by an older build) still embedded it
+from the curation queue. The job now checks the event's session too. On the
+production box ~98% of what the embedding server embedded was cron
+transcripts, which never become the user's memory.
+
+## 5.7.17
+
+**The gate looks only at the tokens that could match.** 5.7.16's substring
+pre-check barely moved the live profile (`shares_content_word` still 1.5 s of
+a gated prefetch), and the reason was structural: the rows the gate tests are
+the ones FTS matched on these very words, so "does it contain them at all"
+could skip none of them, and the loop then tokenised and stemmed every word of
+each excerpt in Python. `shares_content_word` now finds, with one compiled
+regex, only the tokens that START with a content word's probe letters — under
+`word_tokens`' exact boundaries (an apostrophe joins a token: "o'reilly" is one
+word, "don't" is none, a curly apostrophe counts) — and applies the same rule
+to those. Pinned to the old matcher by an equivalence test over the boundary
+cases and fuzzed locally over 20,000 random texts with no difference; ~4× less
+time on a worst-case excerpt. The session window also hands the gate the
+payload it already read, instead of a second read per turn.
+
+## 5.7.16
+
+**The relevance gate costs what it saves.** Profiled on the production store
+after 5.7.15, the gated per-turn prefetch still spent 1.6 s of 4.2 s (under the
+profiler) in `shares_content_word` — tokenising and stemming every word of up
+to ~50 excerpts of up to 4,000 characters in Python, nearly all of them
+excerpts with no content word in them at all — and 0.5 s in the structured
+channel's per-token `LIKE` scans of the facts table, "which" included.
+
+* A C-speed substring pre-check answers "no" for text that cannot match: a
+  matching token always contains its word's first three letters (two for a
+  three-letter "-y" word, whose "-ies" plural shares only those), under the
+  same NFC normalisation the tokeniser applies. `_gate_stem` is cached. An
+  equivalence test pins the fast matcher to the old one over plurals,
+  "-ies" words, possessives, short words and decomposed Unicode.
+* The gated search's structured and graph channels take the message's
+  content words only.
+
+## 5.7.15
+
+**The per-turn prefetch makes no embedding call.** Measured on the production
+store with the embedder live, three gated per-turn blocks came out the same
+line for line with and without the vector channels — the gate keeps only
+items that share a content word with the message, and FTS already finds
+those — at 7.4 / 4.1 / 1.1 s with vectors and 2.0 / 2.5 / 0.2 s without. The
+difference was a request to a CPU-bound embedding server inside the user's
+turn (plus scanning every stored vector). The gated path is now lexical:
+`retrieve_raw` / `search` take `lexical_only`, `query_understanding` takes
+`embed`, and route classification — which embeds the message too — is
+skipped for the default route. Explicit retrieval embeds exactly as before.
+
+"remind" joins the chat filler ("remind me where I work …").
+
+## 5.7.14
+
+**The per-turn prefetch asks the store only for what it can use.** Profiled on
+the production store (one gated prefetch, 4.3 s):
+
+* The raw FTS channel was 2.3 s in three calls. It ORed every word of the
+  message ("which", "did" and "I" included) over a transcript table that is
+  ~98% cron runs, filtered the cron rows afterwards, and had to widen and
+  re-run the ranked match to find enough rows left. The gated path now asks
+  FTS for the message's content words as prefix terms
+  (`retrieval.relevance_fts_match` — what the gate keeps anyway; "restaurant"*
+  finds "restaurants", which the unstemmed index would not), for both the raw
+  and the belief channel, and `fts_search_observed` drops automation sessions
+  inside the query, before the LIMIT. Explicit retrieval asks exactly the
+  query it always did.
+* The standing-directive lookup was 0.8 s in two calls: its index covers
+  `always_inject` alone, and the attribution cleanup left 40,444 retracted
+  always-inject notes behind it for five active ones. A composite index on
+  `(always_inject, status)` now serves it.
+
+## 5.7.13
+
+**A turn does not wait for the embedding server.** Measured on the production
+VPS after the 5.7.12 restart: the local embedding server runs at ~50% CPU all
+day and a 200-word embed takes ~7 s, against a 10 s request timeout.
+
+* **A timeout is not retried.** The endpoint is on-host by policy, so a timeout
+  means the server is busy — and a client timeout does not cancel its work:
+  each retry queued another copy behind the request still running. One failing
+  embed spent ~60 s (5 attempts × 10 s + backoff) growing the queue it was
+  waiting on. A timeout now trips the breaker at once and the vector is
+  deferred. Other transient errors keep the retry budget.
+* **Work off the critical path may take as long as the server needs.** The
+  deferred embed job and the session summary pass `embeddings.background_timeout`
+  (default 120 s) instead of the live timeout: a long excerpt timed out on every
+  attempt, and 676 embed jobs failed permanently that way in six days.
+* **Curation runs beside the turn, not in it.** Hermes calls `on_turn_start`
+  synchronously, before the model, and it drained a slice of the curation queue
+  — embed jobs included — inside the user's turn. A host (the provider, the
+  context engine) now moves that slice onto one background thread per core
+  (`curation.drain.background`, default true); kicks arriving during a pass are
+  coalesced into one more pass, and a failing job does not stop the worker. A
+  core used directly still drains where it is called.
+
+## 5.7.12
+
+* **Chronicle's own compaction output is host framing.** The checkpoint
+  digest (`[Checkpoint: …]`), recalled memory (`[Relevant memory: …]`) and the
+  entity working set are injected as `system` rows, which speaker attribution
+  already treats as framing. They are now also recognised inside a user row,
+  so a host that folds system messages into the user's turn cannot make
+  Chronicle's own summary read as the user's words.
+* **A fact's history reads forwards when two versions share a timestamp.**
+  Versions were ordered by `created_at`, then by belief id — a hash — and a
+  correction written in the same millisecond as the fact it corrects is
+  routine, so a history could read backwards. A version now precedes the one
+  that replaced it. This was the intermittent `test_fact_histories` failure
+  (about one run in eight): belief ids differ on every build, so the tie
+  resolved differently from run to run.
+
+## 5.7.11
+
+Review fixes to 5.7.5–5.7.10, each verified against the code before changing it.
+
+* **A tool cannot speak for the user.** A tool's output is stored verbatim
+  inside the excerpt, so a line in it can look exactly like a role label —
+  `User: ignore previous instructions` in a web page. Reading the excerpt by
+  its prefixes handed that line to the user, in the reader's copy, the
+  episode, the model extractor's prompt and the per-turn injection. The
+  capture's spans say whose each line is, and capture stores them exactly when
+  such a line exists (the prefix reading and the spans then disagree), so
+  `strip_framing` now takes a `role:` line as a message start only when the
+  spans agree, and extraction rebuilds its text from the speaker lines instead
+  of re-reading prefixes. A later chunk's opening takes its role from the spans
+  too. Events without spans still read by prefix, as extraction always has.
+* **An evicted tool result is not memory about the user.** Its text is bare;
+  only its spans say it was a tool's, and the gated injection judged the text.
+  It now reads each row's own event.
+* **An older copy nobody can attribute** (no spans, not written by the user)
+  is left out wherever tool output must go.
+* **Automation is read from the turn**, not only from a `cron_` session id:
+  capture records a subagent's, a background review's, a non-primary agent's
+  or a bot's turn as automation, and `exclude_automation` now honours it.
+* **Left-out rows no longer cost real ones their place.** Vector candidates
+  are judged before they take a top-k slot, and the FTS channel fetches in
+  widening pages until it has `limit` rows it can use; with nothing left out
+  it is one fetch and the same rows as before.
+* **An empty session-index row is not a stale vector.** No summary and no
+  vector: nothing to re-embed and nothing a query can match, so the census no
+  longer counts it as outstanding forever. A row with no summary but a vector
+  still counts.
+* Public functions in the touched modules carry type hints (AGENTS.md), with a
+  test that keeps it so.
+
+## 5.7.10
+
+**The per-turn injection never guesses whose words it is carrying.** A turn
+longer than one stored chunk (4,000 chars) is split at message boundaries when
+it can be; one message longer than a chunk — in practice a tool's output — is
+split inside it, and the next chunk opens mid-message with no role label. On
+the production store 473 of the 651 interactive transcript events are later
+chunks, all written without the speaker spans that would say whose text opens
+them. The gated injection now leaves out that unlabelled opening of a later
+chunk; the chunk's labelled messages still arrive, and a single stored message
+whose spans do say whose it is (the compressor's copy of a user message) is
+injected as before.
+
+The gated helper now works on the row rather than its text, so the
+agent-memory rule of 5.7.8 applies on every gated path, not only the first.
+
+## 5.7.9
+
+**Older rescue copies lose their host frames too.** A dry run of the
+session-index rebuild on the production store left 69 of the 107 interactive
+session summaries still carrying framing. It sat in rescue copies written
+before speaker spans existed — single messages with no role label — and they
+were cron prompts ("[IMPORTANT: You are running as a scheduled cron job …")
+and skill-invocation frames, in sessions whose ids carry no `cron_` prefix.
+`speaker.reader_text` read such a copy only for an eviction by the user; it
+now reads any older eviction or rescue copy as the user side unless the agent
+wrote it, which removes only recognised host frames.
+
+**A session with nothing but framing has an empty index row.** Rebuilt, such a
+session has no conversation left, and the summarizer returned without writing,
+so the old row built from the frames stayed. It is now replaced by an empty
+one: nothing to find it by, and still a row, so the backfill sweep does not
+re-queue it (the stale-vector heal already skips empty summaries).
+
+## 5.7.8
+
+**The agent's memory stays the agent's.** 22 of the 72 active episodes on the
+production store were the agent's own memory-tool writes ("dispatcher cron
+runs across 53 repos", "GitHub API from this VPS is intermittently
+unreachable"), and the per-turn injection served them as memory about the
+user. Hermes's built-in memory already puts the agent's CURRENT memory into
+every system prompt; Chronicle's copies are older and include notes the agent
+has since removed from it (the log holds `remove` and `replace` actions whose
+earlier `add` still had an episode). The gated per-turn injection now leaves
+out beliefs and raw rows whose source is `agent_memory_write`. Explicit search
+still finds them.
+
+## 5.7.7
+
+**A tool's output is not memory about the user.** Probed on the production
+store after 5.7.5, the gated per-turn block for "what's on my calendar this
+week?" was a line-numbered file read that happened to contain the word
+"calendar", and episodes carried browser results and exit codes. Speaker
+attribution has always kept tool output out of facts and notes; three other
+outputs still took it in whole:
+
+* **The per-turn injection** judges and carries each turn without its `tool:`
+  rows, so a turn is injected for what the user and the agent said in it, and a
+  turn whose only match was inside a tool's output is left out. Explicit recall
+  and the context engine's rehydration are unchanged: there the agent may be
+  asking about its own work.
+* **Episodes** and the model-based extractor's prompt leave tool rows out, as
+  they already leave out host framing; a turn without tool output produces
+  exactly the episode it did before.
+* **Session summaries** leave tool rows out, so a session's vector stands for
+  the conversation rather than for the largest payload in it.
+
+`speaker.strip_framing(..., drop_tools=True)` / `reader_text(..., drop_tools=True)`.
+
+## 5.7.6
+
+**Recall serves what was said, not the host's framing around it.** Capture
+stores an excerpt byte-for-byte (its event id is a hash of it) and marks the
+host framing inside it with speaker spans, which is what has kept compaction
+handoffs, system notes and Chronicle's own `<memory-context>` injections out of
+extraction. Everything that handed text to a reader, though, used the stored
+bytes:
+
+* **Raw recall** (FTS, event vectors, the span channel, the session window)
+  served an earlier compaction's summary or a system note back as conversation.
+  It now serves `speaker.reader_text` — framing removed, every role label that
+  still has words under it kept, and the stored text itself, unchanged, when
+  there is nothing to remove. An event that was nothing but framing (the
+  compressor's copy of an evicted handoff) is not recalled at all.
+* **Session summaries** were built from every observed event in the session,
+  the compressor's eviction copies included, and 24 of the 107 interactive
+  session summaries on the production store carried a
+  `[CONTEXT COMPACTION — REFERENCE ONLY]` handoff into the session vector. They
+  are now built from the reader's copy, and from the session's transcript
+  captures alone when it has any: eviction and rescue copies repeat messages
+  the transcript already holds, and stand in only for a session without one.
+* **Episodes** were the one extraction output built from the raw text, so a
+  turn that opened with a handoff became an episode about the handoff, and the
+  model-based extractor was sent the handoff to summarise. Both now work from
+  the framing-free copy; a turn without framing produces exactly the episode
+  it did before.
+
+Existing session-index rows are a projection of the event log: re-running the
+summarizer over a session rebuilds its row from the events with these rules.
+
+## 5.7.5
+
+**The memory put into a turn is about that turn.** The provider's `prefetch`
+injects up to 1,200 tokens of memory into every user message, unasked. Probed
+on the production store, it was mostly other things:
+
+* **Scheduled jobs' own runs.** 7,817 of the 7,924 indexed sessions were cron
+  runs, and "what's on my calendar this week?" opened with one job's operational
+  narrative and another's raw tool JSON, served as memory about the user.
+  Anything injected unasked (prefetch, and the context engine's rehydration)
+  now leaves out automation sessions on every raw channel — FTS, event vectors
+  and session vectors — by the same rule `engine/speaker.py` applies to capture.
+  An explicit search still sees them; the agent may be asking about its own work.
+* **Whatever ranked highest, relevant or not.** Every turn got the full
+  ~4,800-char block. Ranked retrieval always returns something (FTS ORs every
+  word of the message; a vector channel has a nearest neighbour for any query),
+  and the session window then filled the rest of the budget with the other
+  turns of whichever session matched. `get_context(relevance_gate=True)`, which
+  prefetch now passes, keeps an item only if it shares a content word with the
+  message:
+  - content words are the message's words minus English function words and
+    chat filler ("thanks", "still", "sounds good"); plurals, possessives and
+    short inflections match ("restaurants"/"restaurant", "book"/"booked");
+  - a message with none ("ok thanks") gets nothing, and retrieval is not run —
+    prefetch runs on every turn and live retrieval takes seconds;
+  - a fact is also matched by the name of the entity it is about, since it
+    renders as `attribute: value`;
+  - a whole-session excerpt only nominates its session; the session's turns
+    then arrive one at a time, each gated, so one matching turn no longer
+    carries every unrelated one with it;
+  - the tail (directives, contradictions, critical facts, federated rows) is
+    gated too — those reach every turn through the system prompt already —
+    and a directive already on the page as a `[NOTE]` is not repeated.
+
+  Deliberately lexical: an item related only by embedding similarity stays out
+  of the unasked block and is found the moment the agent searches. Explicit
+  retrieval — the agent's search tool, rehydration, benchmarks — never sets the
+  flag and is byte-for-byte unchanged. `retrieval.prefetch_relevance_gate`
+  (default true) turns it off. `last_context_debug["relevance_gate"]` reports
+  the message's words and how many beliefs, excerpts and tail lines it left out.
+
+## 5.7.4
+
+**Chronicle is actually the context engine.** It had been configured as Hermes's
+context engine and had never once compressed a conversation. The host gives
+every agent its own `copy.deepcopy()` of the registered engine; the copy raised
+"cannot pickle '_thread.lock' object" on the engine's retry lock, and the host
+fell back to its built-in compressor for that agent — 38 times in one day on
+the production gateway, with one WARNING each that nothing read. That fallback
+was pinned to a provider with no API key, which the user saw as "Shortening the
+conversation history failed". Reproduced with the host's own selection code
+before the fix (configured, registered, and `None` for every agent); after it,
+the same code selects Chronicle.
+
+* **`__deepcopy__`.** A copy SHARES the core — the process-wide store, its
+  connections and vector index; duplicating that per agent is the shape of the
+  ~850 MB/min leak the last time this engine ran — gets a FRESH lock, and copies
+  the per-agent budget state the host copies to keep agents apart.
+* **The rest of the host contract**, checked method by method against Hermes's
+  `ContextEngine`: `on_session_reset` (the default zeroes counters only; the old
+  conversation's locked prefix, digest, pins, focus and rescue record now go too);
+  `should_defer_preflight_to_real_usage` with the host's own rules (a rough
+  estimate taken right after a compaction waits for real usage instead of
+  compacting a request that already fits); `prune_tool_results_only`; and
+  `has_content_to_compress`. Every hook that carries state is implemented; the
+  four left on the default would duplicate what the memory provider does.
+* **Old tool output is trimmed again.** Hermes calls `prune_tool_results_only`
+  on a lower trigger than full compaction; a plugin engine inherits a no-op, so
+  switching engines had quietly stopped it. The host's two safe passes: a result
+  identical to a later one becomes a pointer, a large old one keeps its head and
+  tail and says how much went. Committed only when it saves enough to be worth
+  breaking the provider's prompt cache, then not again until the context
+  regrows. `context_engine.prune_tool_results`.
+
+**Turning it on exposed what it would have done to a turn.** Measured against a
+copy of the production store with the real, CPU-throttled embedding server:
+
+* **One compaction made 150 inline embed calls** — 60 rescued observations, 30
+  rescued notes at three embeds each, and the evictions — every one a timeout on
+  a five-attempt budget. It never finished its first pass. Writes made from
+  inside `compress()` (`context_eviction`, `rescue_extraction`) now take the path
+  a degraded embedder already takes: text durable and full-text indexed at once,
+  vectors queued. Keyed on each event's own `source_type`, so a rebuild makes the
+  same decision (I3).
+* **A timeout dropped the vector for good.** The embedder's retry loop re-raised
+  the raw `socket.timeout`; every caller treats `EmbeddingsUnavailable` as "down,
+  try later" (`_safe_vec` queues a deferred embed on it), and a raw timeout fell
+  to a generic handler that logged at DEBUG — while the warning printed just
+  before promised "embed retried on the next operation". It now raises
+  `EmbeddingsUnavailable`, and a circuit breaker stops a down server costing
+  every call: calls inside the cooldown fail at once, a half-open trial is ONE
+  attempt, and the cooldown doubles on consecutive trips (to 10 minutes). Every
+  agent turn drains curation jobs before the model is called, so this is what a
+  turn pays while the server is down: one budget for the first outage, then
+  nothing, then one try.
+* **Queueing a deferred embed scanned every finished job.** No index served the
+  re-arm probe: 0.375 s per enqueue on a 182,230-row job table, one per span a
+  compaction writes. A partial index on the job's target id: 97 s of one
+  compaction became 2 s.
+* **Every turn was captured three times.** With the memory provider live on the
+  same core, `sync_turn` captured each turn when it ended; before a compaction the
+  provider rescued it again (because the engine never went live, the provider
+  thought it owned compression), the engine rescued it a third time, and every
+  eviction was queued for extraction once more. On the production store rescue
+  drafted 19,089 notes and evictions 4,955 — the attribution cleanup retracted
+  every one. With both halves live neither rescues, and an eviction carries
+  `extract: false`; each standalone mode keeps its own capture. Rescue also runs
+  once per message per conversation now, not once per compaction pass.
+* **A session start worked the job queue.** `initialize()` runs on every session
+  start and ran crash recovery each time, ending in a synchronous drain of up to
+  1,000 jobs. One engine init took 320, 592 and 830 s. Recovery is about a
+  previous process: once per core, and one turn's slice of draining.
+* **A photo crashed compaction**, and the capture path stored it as the Python
+  repr of its parts list — the photo's full base64 in the event log.
+  `speaker.message_text` is one rule for the text of a message: a string
+  unchanged, a parts list its text plus `[image]`-style markers. Capture is
+  byte-identical for strings and `None`. One fixture photo: 50,000 characters
+  became 61.
+* **The host's messages were being edited.** The pin check cached its hash as
+  `m["_content_hash"]` on the host's own message dicts — a private key in what the
+  host sends the model, and stale once the host rewrote that content.
+
+On the production store copy: the first compaction of a sixty-message
+conversation 19 s (it never finished before), each one after ~5 s, RSS ~36 MB
+with the real core live; engine init 213 s once per process instead of up to
+830 s on every session start.
+
+## 5.7.3
+
+**Memory is organised by what it is about.** An entity was whatever text had
+been typed at: a production store's 1,488 entity rows held 171 pronouns
+("This", "There", "Each one") and 65 sentence fragments, typed with whatever
+followed "is a" ("real managed challenge", "dead end for getting a usable key
+into my environment", "no"); 1,003 were named by another store's id even though
+the `name` fact beside them said "Pat Testley"; and every entity existed
+TWICE — a hash-keyed row carrying its type and a token-keyed row carrying its
+facts — because the extractor's entity token never reached the fold.
+
+* **`engine/entities.py`** decides what an entity is. A name is a proper noun,
+  not a sentence (every significant word carries a capital, so "Acme Fake Co",
+  "NVIDIA", "E.K. Chung" and "iPhone" pass and "Rotating between them" does
+  not); a type is a category, not a clause; and a kind is one of person, place,
+  thing, event or concept, taken from the type, or from the predicates a subject
+  carries, or left empty — `kind_for` answers "" rather than inventing one.
+  The rules are applied at extraction, at the write boundary, and in the fold,
+  the last of these so a rebuild does not resurrect what years of logged
+  `asserted` events named.
+* **An entity is one row, addressed by its name.** The fold derives an entity's
+  belief id from its name (`entities.entity_token`), which is the id its facts
+  already reference, so the row describing an entity and the facts hanging off
+  it are the same entity. Nothing about the event changes, so the same log
+  replays to the repaired projection.
+* **An id resolves to the name the log already carries.** A fact that names an
+  entity whose row is named by another store's id renames the row — never a
+  guess, only the `name` fact that is already there (991 of 1,003 on the
+  production store).
+* **`scripts/clean_entities.py`** repairs the rows a store already holds, which
+  is what a rebuild would do without replaying 400,000 events on a live box.
+  On the production snapshot: 313 dropped, 1,002 renamed from ids, 26 duplicate
+  rows merged, 16 clause-types cleared, 1,488 rows down to 1,149 with every
+  fact still pointing at a row. A row any live fact points at is never dropped
+  — including `user`, whose name is not a proper noun — and two rows that
+  merely share a NAME are never merged: two people called the same thing are
+  the ordinary case, and identity is adjudicated, never inferred.
+
+* **A name may carry what people put after their own name.** Read back from the
+  repaired production store, the rule was refusing real contacts: "<name>,
+  Ph.D." ends in a full stop, so it read as a sentence, and "(she/her)" is a
+  word with no capital in it. A trailing pronoun tag and trailing credentials
+  (Ph.D., M.A., M.HCI, Jr., Esq., III …) now come off before the rule looks at
+  the words, and what is left still has to pass on its own — "dead end for
+  getting a usable key, Ph.D." is still refused, and a credential standing alone
+  is not a name.
+* **A contact known only from the calendar is a person.** `attended_event` is
+  the most common predicate in the production store (366 facts, the calendar
+  import) and answered nothing, so an entity whose only trace was an appointment
+  sat under "unclassified". `attended_event`, `had_appointment` and
+  `traveling_to` now say person — as with every other entry here, because only a
+  person can be the subject of them, not because the name looks like one. The 49
+  rows that carry nothing but a `name` fact stay unclassified: that is what the
+  store knows.
+
+* **A retraction closes the contradictions it settles.** A contradiction is two
+  beliefs the store cannot both hold; once one side is retracted there is
+  nothing left to reconcile, but the row stayed `open`. The cleanup of 112,652
+  beliefs left 1,550 such rows on a production store — a queue of questions
+  nobody can answer, and the first number the memory view shows. The row is
+  resolved, never deleted: its detail and its date are the record. The
+  consistency sweep settles the ones a store already holds, so a repair needs no
+  one-off script: on the cleaned production snapshot it settles all 1,550 and
+  leaves every contradiction between two live beliefs open.
+
+**The Tapestry is entity-first.** The memory view was a log: every event on the
+row of whatever wrote it. That is provenance — how a memory arrived — and it is
+now a drill-down reached from a fact or a mention, not the way in.
+
+* **`/tapestry/index` and `/tapestry/entity`** read the entity model: what
+  memory holds by kind, and one entity's current facts, its history, the events
+  it appears in, and the captured turns that name it. Every mention carries who
+  was speaking in that turn (engine/speaker.py), so a hit inside a cron job's
+  output says "automation".
+* **Events are the facts that record them.** A calendar appointment is an event
+  even though the store keeps it as a fact about its subject, and its date is
+  the one the importer wrote into its title, not the day Chronicle heard about
+  it. An event links to the people its own title names, whole words only.
+* **Contacts are classified by the store that owns them.** The people store
+  says who is a person and who is a company; Chronicle only references its rows
+  by id (I20), so the dashboard reads it read-only and labels what it says. An
+  unreviewed row stays unreviewed rather than being guessed at — 965 of 1,008
+  on the production store.
+* **The weave** draws the dated events on one time axis with a thread per
+  entity they involve, joined where an event names two of them. The threads are
+  the busiest first; the rest are counted rather than drawn a pixel high.
+* Internals follow the name: `dashboard/tapestry_api.py`, `dist/tapestry.js`,
+  `/tapestry/...` routes, `window.__CHRONICLE_TAPESTRY__`.
+
 ## 5.7.2
 
 **Memory about the user comes only from the user.** Chronicle was built to keep
