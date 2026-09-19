@@ -18,11 +18,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # actions/checkout can only write inside the workspace, and the plugin
+      # directory being validated IS the workspace: left there, the validator's
+      # own repository is scanned as part of this plugin (4,282 findings, all in
+      # Hermes's tests, docs and .mailmap). Move it out before validating.
+      - name: Move the validator out of the plugin tree
+        run: mv .hermes-validator "$RUNNER_TEMP/hermes-validator"
       - name: Install validator dependency
         run: python -m pip install pyyaml packaging
       - name: Validate against the Hermes plugin admission checks
         env:
-          HERMES_VALIDATOR: .hermes-validator
+          HERMES_VALIDATOR: ${{ runner.temp }}/hermes-validator
         run: |
           python - <<'PY'
           import json
