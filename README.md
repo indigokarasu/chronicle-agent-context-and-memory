@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.20.
+Version: 5.8.21.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -162,11 +162,14 @@ a prescription's `health_event`), so such a match must also be near the
 message in meaning: the item's stored vector against the message's (a short
 item with none is embedded on the spot, a few per turn), within a second and a
 half of quick requests to the embedder (`retrieval.prefetch_min_similarity`;
-measured per model, 0.65 for nomic-embed-text). Only the user's own words in a
+measured per model, 0.65 for nomic-embed-text); a match nothing can vouch for,
+with the embedder busy or down, is left out. Only the user's own words in a
 past exchange are asked; URLs, short numbers, host framing, tool output and
 the agent's own memory writes never count. A scheduled job's turn gets none
-(`retrieval.prefetch_automation`). Explicit search, `chronicle_answer` and the
-context engine's recall are not gated.
+(`retrieval.prefetch_automation`). Nor does it repeat the conversation in
+progress: the live session's turns are already in the model's window, so only
+what a compaction folded out of it can come back. Explicit search,
+`chronicle_answer` and the context engine's recall are not gated.
 
 **Maintenance runs on those hooks, not on cron.** There is no daemon, no timer
 and no background thread: on a hook call the `Scheduler` (`engine/scheduler.py`)

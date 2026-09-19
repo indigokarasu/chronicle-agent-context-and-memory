@@ -11,7 +11,9 @@ cannot: the plainly unrelated scored 0.32-0.64 against the message, the
 plainly related 0.66-0.75 (a few loosely related fell on both sides).
 So a one-word match is kept only when the item's vector is near the message's.
 A short item with no vector of this model is embedded on the spot (a few per
-turn); a long one, or an embedder that cannot answer in time, keeps the word
+turn). A match nothing can vouch for -- a long item never embedded, an
+embedder that cannot answer in time -- is left out: a busy embedder used to
+let every coincidence back in. A model with no measured floor keeps the word
 rule.
 
 Fixtures use obviously fake values; vectors are hand-placed.
@@ -166,21 +168,22 @@ class TestOneWordMatches(unittest.TestCase):
         docs = [t for texts, _ in server.calls for t in texts if t.startswith("search_document: ")]
         self.assertEqual(len(docs), 4, docs)
 
-    def test_a_long_item_with_no_vector_keeps_the_word_rule(self):
-        self.assertIn("Glimmerfen", self.ctx()[0])
+    def test_a_long_item_with_no_vector_is_left_out(self):
+        self.assertNotIn("Glimmerfen", self.ctx()[0])
 
-    def test_a_few_items_per_turn_are_embedded_the_rest_keep_the_word_rule(self):
+    def test_a_few_items_per_turn_are_embedded_the_rest_left_out(self):
         out, server = self.ctx()
         docs = [t for texts, _ in server.calls for t in texts if t.startswith("search_document: ")]
         self.assertEqual(len(docs), R._GATE_EMBED_ITEMS)
         kept = sum(w in out for w in ("Robin Placeholder", "SunFake 9000", "Izakaya Nonesuch", "pager rota"))
-        self.assertEqual(kept, 2)       # one unembedded by the cap, and the near one
+        self.assertEqual(kept, int(any("pager rota" in d for d in docs)))   # only the near one, if reached
 
     def test_the_turn_budget_bounds_every_request(self):
         with mock.patch.object(R, "_GATE_EMBED_BUDGET", 0.0):
             out, server = self.ctx()
         self.assertEqual(server.calls, [])
-        self.assertIn("Zorbaxol", out)
+        self.assertNotIn("Zorbaxol", out)
+        self.assertIn("Acme Fake Co", out)         # two shared words need no vector
 
     def test_the_query_is_embedded_once_raw_and_prefixed(self):
         _out, server = self.ctx()
@@ -193,10 +196,12 @@ class TestOneWordMatches(unittest.TestCase):
         _out, server = self.ctx("Is the Zorblax server health dashboard still at the Riverton office?")
         self.assertEqual(server.calls, [])
 
-    def test_an_embedder_that_fails_keeps_the_word_rule(self):
+    def test_an_embedder_that_fails_leaves_one_word_matches_out(self):
         out, server = self.ctx(server=FakeServer(fail=True))
         self.assertEqual(len(server.calls), 1)          # the query; nothing more is tried
-        self.assertIn("Zorbaxol", out)
+        self.assertNotIn("Zorbaxol", out)
+        self.assertNotIn("dashboard", out)              # unvouched, even the near one
+        self.assertIn("Acme Fake Co", out)
 
     def test_an_open_breaker_is_not_asked(self):
         import time
@@ -204,7 +209,7 @@ class TestOneWordMatches(unittest.TestCase):
         server._open_until = time.monotonic() + 60
         out, _ = self.ctx(server=server)
         self.assertEqual(server.calls, [])
-        self.assertIn("Zorbaxol", out)
+        self.assertNotIn("Zorbaxol", out)
 
     def test_auto_knows_no_floor_for_an_unknown_model(self):
         server = FakeServer()

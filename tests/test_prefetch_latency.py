@@ -29,6 +29,7 @@ from engine.retrieval import relevance_fts_match
 
 CFG = {"embeddings": {"model": "hashing"}}
 CHAT = "20260917_161616_ff66aa"
+LATER = "20260918_090000_aa11bb"      # a later conversation, recalling CHAT
 
 
 class TestTheMatchIsTheContentWords(unittest.TestCase):
@@ -311,7 +312,7 @@ class TestAScheduledJobsTurnGetsNoRecall(unittest.TestCase):
 
     def test_the_users_turn_gets_it(self):
         p = self._provider(CHAT)
-        self.assertIn("Izakaya Nonesuch", p.prefetch(self.ASK, session_id=CHAT))
+        self.assertIn("Izakaya Nonesuch", p.prefetch(self.ASK, session_id=LATER))
 
     def test_a_cron_turn_gets_nothing(self):
         p = self._provider(CHAT)
