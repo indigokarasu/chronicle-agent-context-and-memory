@@ -183,6 +183,12 @@ class TestTheInjection(_Case):
         self.assertNotIn("penicillin", ctx)      # critical, but not this subject
         self.assertNotIn("blue folder", ctx)     # a directive, but not this subject
 
+    def test_a_critical_fact_on_the_page_is_not_repeated_below(self):
+        """It matched as a [FACT]; the critical tail used to add it again as
+        [CRITICAL] -- a production recall block carried one security alert twice."""
+        ctx = self.prov.prefetch("Remind me about the penicillin allergy details")
+        self.assertEqual(sum("penicillin" in line for line in ctx.splitlines()), 1, ctx)
+
     def test_small_talk_gets_nothing(self):
         self.assertEqual(self.prov.prefetch("thanks!"), "")
         dbg = self.core.retrieval.last_context_debug

@@ -620,6 +620,11 @@ DEFAULTS: dict[str, Any] = {
         # number = that floor; null = off. No query vector, or an item with no
         # vector of this model, keeps the lexical rule alone.
         "prefetch_min_similarity": "auto",
+        # The same check for a match on two or three shared words ("send" and
+        # "none" in a security alert's text), measured separately: "auto" =
+        # 0.60 for nomic-embed-text. Unlike one word, two or three are evidence
+        # of their own, so with no vector to compare the words decide.
+        "prefetch_min_similarity_few": "auto",
         # A scheduled job's turn (a cron_ session, or an automation platform)
         # gets no per-turn recall: nobody asked, the "message" is the job's own
         # prompt, and on the production box those turns were ~98% of all turns
