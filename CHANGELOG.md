@@ -3,6 +3,39 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.35
+
+**The Hermes plugin security scan passes, on Chronicle's own files.** The
+validation workflow checked the validator (Hermes itself) out INSIDE the plugin
+directory it validates, so the scan's first real run reported 4,282 "dangerous"
+findings, every one in Hermes's own tests, docs and `.mailmap`. The validator
+now lives in `$RUNNER_TEMP`. On Chronicle alone the verdict is `caution`, with
+11 findings, each reviewed:
+
+* **Fixed:** literal bidi-control characters in `engine/substance.py` (the
+  table that strips Gmail's bidi isolates) and one test, invisible in review.
+  Written as `\u` escapes (same code points); `tests/test_no_invisible_unicode.py`
+  fails if a literal one enters any tracked text file again.
+* **Intended test data, left as is:** `sk-FAKEfake...` and "hunter2" in
+  `tests/test_credentials.py` (the credential masker's own fixtures, invented);
+  "ignore previous instructions" in `tests/test_reader_text.py` and one
+  CHANGELOG line (adversarial fixtures proving a forged `User:` line is never
+  read as the user); `0.0.0.0` in `tests/test_onhost_guard.py` (an endpoint the
+  on-host guard must classify, not a bind); `os.environ` in the workflow (the
+  validator path) and a README paragraph about the hermetic suite.
+
+A separate sweep of the tree and all history reachable from `main` found no API
+keys, private keys or real credentials.
+
+## 5.8.34
+
+**CI green again.** The 5.8.33 cache tests assumed numpy; the CI runner has
+none, so the cache (correctly) stepped aside and five tests failed. They now
+skip without numpy, and a new test checks that without it the paged scan gives
+the same answer. The Hermes plugin-validation workflow also installs
+`packaging`, which the upstream validator imports (that job was already failing
+on `main` before the merge).
+
 ## 5.8.33
 
 **`chronicle_search`'s raw tier scores from memory.** The raw tier's vector pass
