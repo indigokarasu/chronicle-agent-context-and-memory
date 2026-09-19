@@ -552,6 +552,17 @@ class ChronicleMemoryProvider(MemoryProvider):
             return False                  # outside Hermes: Chronicle is the only copy
         return bool(mem.get("memory_enabled", True))
 
+    @staticmethod
+    def _host_serves_this_provider() -> bool:
+        """Is Chronicle the host's memory provider (`memory.provider`)? Then the
+        host puts `system_prompt_block()` into the system prompt itself."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False
+        return str(mem.get("provider") or "").strip().lower() == "chronicle"
+
     def list_identity_candidates(self, status="pending", kind="", limit=50) -> list[dict[str, Any]]:
         """Identity split/merge candidates awaiting adjudication (§E7, issue #8).
 

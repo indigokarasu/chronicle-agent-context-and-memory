@@ -24,7 +24,7 @@ import os
 # Last-resort literal, used only when plugin.yaml is missing or unreadable at
 # import time (e.g. the package was vendored without its manifest). plugin.yaml
 # is the single source of truth — do not treat this as a second one.
-_VERSION_FALLBACK = "5.8.26"
+_VERSION_FALLBACK = "5.8.27"
 
 
 def _read_version_from_plugin_yaml() -> str:
@@ -170,11 +170,21 @@ def register(ctx) -> None:
     if hasattr(ctx, "register_system_prompt_section"):
         try:
             def memory_block_factory(session_info):
+                # One copy, under one rule. When Chronicle is the host's memory
+                # provider, the host already puts the provider's
+                # system_prompt_block() into the prompt; this section repeated
+                # it -- and without leaving out the agent's own notes, which
+                # the host injects itself (612 characters of stale copies in
+                # every production system prompt). It serves only a host that
+                # runs Chronicle as the context engine alone.
+                if mp_cls is not None and mp_cls._host_serves_this_provider():
+                    return ""
                 core = _active_core()
                 if core is None:
                     return ""
                 principal = session_info.get("principal_id", "default") if isinstance(session_info, dict) else "default"
-                return core.retrieval.static_block(principal)
+                own = not (mp_cls is not None and mp_cls._host_injects_agent_memory())
+                return core.retrieval.static_block(principal, include_agent_own=own)
 
             ctx.register_system_prompt_section(
                 "chronicle.memory-guidelines",

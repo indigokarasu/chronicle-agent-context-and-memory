@@ -3,6 +3,20 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.27
+
+**One copy of the static block, under one rule.** The plugin also registers a
+system-prompt section, `chronicle.memory-guidelines`, which renders the static
+block. Hermes renders that section and also puts the memory provider's own
+`system_prompt_block()` into the prompt. With Chronicle as the memory provider
+the block went in twice, and the section's copy did not leave out the agent's
+own notes, which the host injects itself. 5.8.16 had removed them from the
+provider's copy only: every production system prompt still carried 612
+characters of stale copies, one cut off mid-sentence. The section now renders
+nothing when Chronicle is the host's memory provider. It serves a host running
+Chronicle as the context engine alone, and then follows the same
+agent's-own-notes rule.
+
 ## 5.8.26
 
 **The agent can call Chronicle's memory tools.** Hermes routes a memory
