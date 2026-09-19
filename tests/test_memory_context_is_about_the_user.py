@@ -63,7 +63,8 @@ class TestInjectedMemoryLeavesOutAutomation(_Case):
 
     def test_prefetch_serves_what_the_user_said_and_not_the_job(self):
         prov = ChronicleMemoryProvider()
-        prov.initialize(CHAT, hermes_home=self.home, principal_id="default", config=CFG)
+        prov.initialize("20260918_090000_bb22cc", hermes_home=self.home, principal_id="default",
+                        config=CFG)             # a later conversation, recalling CHAT
         ctx = prov.prefetch("Fake Izakaya reservation")
         self.assertIn("Fake Izakaya", ctx)
         self.assertNotIn("re-detection loop", ctx)

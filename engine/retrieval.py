@@ -530,6 +530,18 @@ _GATE_EMBED_ITEM_CHARS = 240
 _GATE_EMBED_ITEMS = 3
 
 
+def _folded_copy(ev) -> bool:
+    """Is this observed event the copy the context engine wrote when it folded
+    a message out of the live window (source_type context_eviction)?"""
+    p = (ev or {}).get("payload")
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except ValueError:
+            return False
+    return isinstance(p, dict) and p.get("source_type") == "context_eviction"
+
+
 def _belief_source(row) -> str:
     """A belief row's provenance source_type ("" when unreadable)."""
     try:
@@ -2387,7 +2399,7 @@ class RetrievalEngine:
     # -- context assembly (§18.5) -----------------------------------------
 
     def _pref_pack_fill(self, groups, parts, emitted_headers, seen_excerpts,
-                        remaining_chars, *, principal, route, keep=None):
+                        remaining_chars, *, principal, route, keep=None, live_session=None):
         """F5 preference packing's fill: every USER turn first, assistant halves last.
 
         Replaces BOTH of get_context's normal fill phases on the preference
@@ -2424,7 +2436,8 @@ class RetrievalEngine:
                 if g["sid"] == "(no session)":
                     continue
                 expanded = self._expand_session_window(
-                    g["sid"], principal, seen_excerpts, limit=max_events)
+                    g["sid"], principal, seen_excerpts, limit=max_events,
+                    only_folded=bool(live_session) and g["sid"] == live_session)
                 if keep is not None:
                     # the injection relevance gate (get_context passes it): given
                     # the row, the text to carry, or None to leave the turn out
@@ -2488,7 +2501,7 @@ class RetrievalEngine:
     def _expand_session_window(self, session_id: str, principal: str,
                                existing_excerpts: set, limit: int = 60,
                                around_seq=None, rank_order=None,
-                               existing_event_ids=None) -> list[dict]:
+                               existing_event_ids=None, only_folded=False) -> list[dict]:
         """Observed turns of one session that context does not already carry.
 
         ONE query per session, capped IN SQL: `type='observed'` and `LIMIT` are
@@ -2554,6 +2567,8 @@ class RetrievalEngine:
             if existing_event_ids is not None and ev["event_id"] in existing_event_ids:
                 continue
             p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
+            if only_folded and p.get("source_type") != "context_eviction":
+                continue                     # the live session: its window already has it
             excerpt = (self._reader_excerpt(ev, p.get("excerpt") or "") or "").strip()
             if not excerpt or excerpt in existing_excerpts:
                 continue
@@ -2958,7 +2973,7 @@ class RetrievalEngine:
 
     def get_context(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
                     principal=None, epistemic=None, now=None, exclude_automation=False,
-                    relevance_gate=False) -> str:
+                    relevance_gate=False, live_session=None) -> str:
         """Assemble a reader-facing context block (§18). Wrapper for the A0c
         wrong-dimension scope; the body is `_get_context_inner`, and the count
         lands in `last_context_debug["vectors_skipped_wrong_dim"]`."""
@@ -2967,7 +2982,7 @@ class RetrievalEngine:
                                           include_directives=include_directives, purpose=purpose,
                                           principal=principal, epistemic=epistemic, now=now,
                                           exclude_automation=exclude_automation,
-                                          relevance_gate=relevance_gate)
+                                          relevance_gate=relevance_gate, live_session=live_session)
             if isinstance(self.last_context_debug, dict):
                 # exact count, not the bounded identity sample -- see answer()
                 self.last_context_debug["vectors_skipped_wrong_dim"] = \
@@ -2976,7 +2991,7 @@ class RetrievalEngine:
 
     def _get_context_inner(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
                            principal=None, epistemic=None, now=None, exclude_automation=False,
-                           relevance_gate=False) -> str:
+                           relevance_gate=False, live_session=None) -> str:
         """Assemble a reader-facing context block for `hint` (§18).
 
         §L8 r1 priority rule, enforced STRUCTURALLY, not by convention: raw
@@ -3087,8 +3102,11 @@ class RetrievalEngine:
             """A ONE-word match: kept when the item is near the message in
             meaning (see retrieval.prefetch_min_similarity) -- its stored vector,
             or, for a short item with none of this model, its text embedded now
-            (a few per turn). Without a floor, a query vector or either of those,
-            the lexical rule stands alone."""
+            (a few per turn). With no floor (an unmeasured model) the word rule
+            stands; with one, a match nothing can vouch for -- the embedder busy
+            or down, a long item never embedded -- is left out: on the
+            production store 71 of 75 one-word matches were coincidences, and
+            a busy embedder used to let every one of them back in."""
             if floor is None:
                 return True
             if not query_vec:
@@ -3103,9 +3121,9 @@ class RetrievalEngine:
                     vec = embeds["made"][key] = _embed(text, False)
             if not vec or len(vec) != len(q or ()):
                 gate_drop.setdefault("one_word", []).append(
-                    {"word": word, "similarity": None, "kept": True, "text": text[:80],
+                    {"word": word, "similarity": None, "kept": False, "text": text[:80],
                      "why": "no vector" if q else "no query vector"})
-                return True
+                return False
             sim = cosine(q, vec)
             gate_drop.setdefault("one_word", []).append(
                 {"word": word, "similarity": round(sim, 3), "kept": sim >= floor, "text": text[:80]})
@@ -3497,11 +3515,17 @@ class RetrievalEngine:
                 if not excerpt and not eid.startswith("session:"):
                     continue
                 if eid.startswith("session:"):
-                    sid, date = eid.split(":", 1)[1], ""
+                    sid, date, ev = eid.split(":", 1)[1], "", None
                 else:
                     ev = self.store.get_event(eid) or {}
                     sid = ev.get("session_id") or "(no session)"
                     date = (ev.get("occurred_at") or "")[:16]
+                if live_session and sid == live_session and not _folded_copy(ev):
+                    # Per-turn recall of the conversation in progress: the model
+                    # already has these turns -- except what a compaction folded
+                    # out of its window (the context engine's eviction copies).
+                    gate_drop["live_session"] = gate_drop.get("live_session", 0) + 1
+                    continue
                 # E12: "the dominant evidence item FIRST, its immediate session
                 # neighbors for grounding, and nothing else". Phase 1 therefore
                 # contributes exactly one line here — the leading item — and the
@@ -3726,6 +3750,7 @@ class RetrievalEngine:
                     # One query, capped in SQL (see _expand_session_window).
                     expanded = self._expand_session_window(
                         sid, principal, seen_excerpts, limit=max_events,
+                        only_folded=bool(live_session) and sid == live_session,
                         # E12: grounding means the turns AROUND the evidence,
                         # interleaved with this session's other ranked hits.
                         around_seq=precision["seq"] if precision else None,
@@ -3827,7 +3852,7 @@ class RetrievalEngine:
                 remaining_chars = self._pref_pack_fill(
                     groups, parts, emitted_headers, seen_excerpts, remaining_chars,
                     principal=principal, route=route,
-                    keep=None if gate is None else _said)
+                    keep=None if gate is None else _said, live_session=live_session)
                 ctx = "\n".join(_dedupe(parts))
 
         # E12: everything below this line is the "and nothing else" precision
@@ -4632,11 +4657,12 @@ class RetrievalEngine:
                 "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
 
     def _one_word_floor(self):
-        """retrieval.prefetch_min_similarity resolved: a float, or None (off)."""
+        """retrieval.prefetch_min_similarity resolved: a float, or None (off --
+        also for an embedder the gate cannot ask, such as hashing)."""
+        if getattr(self.embedder, "_embed_raw_batch", None) is None:
+            return None
         v = self.cfg.get("retrieval.prefetch_min_similarity", "auto") if self.cfg else "auto"
         if v == "auto":
-            if self.embedder is None:
-                return None
             v = _ONE_WORD_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
         try:
             return float(v) if v is not None else None
