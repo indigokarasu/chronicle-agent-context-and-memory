@@ -38,6 +38,7 @@ CFG = {"embeddings": {"model": "hashing"}}
 SID = "20260917_010203_cd34ef"
 QUERY = "System health check"
 NEAR, FAR = [0.96, 0.28, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]
+MID = [0.62, (1 - 0.62 ** 2) ** 0.5, 0.0, 0.0]            # cosine 0.62 with the query
 TAG = "nomic-embed-text[prefixed]"
 
 
@@ -123,16 +124,20 @@ class TestOneWordMatches(unittest.TestCase):
         shutil.rmtree(cls.home, ignore_errors=True)
 
     def ctx(self, q=QUERY, server=None, floor="auto"):
+        """The ONE-word check alone (the two-or-three-word floor off: see
+        TestTwoOrThreeWords)."""
         r = self.core.retrieval
         saved_emb = r.embedder
         r.embedder = server if server is not None else FakeServer()
         _floor(self.core, floor)
+        self.core.cfg._d["retrieval"]["prefetch_min_similarity_few"] = None
         try:
             return r.get_context(q, token_budget=1200, principal="default",
                                  exclude_automation=True, relevance_gate=True), r.embedder
         finally:
             r.embedder = saved_emb
             _floor(self.core, "auto")
+            self.core.cfg._d["retrieval"]["prefetch_min_similarity_few"] = "auto"
 
     def test_the_fixture_matches_every_fact_on_its_words(self):
         """With no floor, the word rule alone takes them all -- otherwise the
@@ -155,7 +160,7 @@ class TestOneWordMatches(unittest.TestCase):
         self.assertNotIn("tomato", out)
         self.assertIn("status page", out)
 
-    def test_two_shared_words_need_no_vector_check(self):
+    def test_two_shared_words_are_not_the_one_word_check(self):
         self.assertIn("Acme Fake Co", self.ctx()[0])
 
     def test_a_short_item_with_no_usable_vector_is_embedded_now(self):
@@ -192,7 +197,7 @@ class TestOneWordMatches(unittest.TestCase):
         self.assertEqual(len(queries), 1)
         self.assertTrue(all(len(texts) == 1 and t <= R._GATE_EMBED_TIMEOUT for texts, t in server.calls))
 
-    def test_a_longer_message_needs_two_words_and_embeds_nothing(self):
+    def test_a_longer_message_embeds_nothing_when_the_few_word_check_is_off(self):
         _out, server = self.ctx("Is the Zorblax server health dashboard still at the Riverton office?")
         self.assertEqual(server.calls, [])
 
@@ -235,6 +240,90 @@ class TestOneWordMatches(unittest.TestCase):
         finally:
             _floor(self.core, "auto")
         self.assertIn("Zorbaxol", out)
+
+
+class TestTwoOrThreeWords(unittest.TestCase):
+    """Measured on 300 real messages: a long security alert's generic words
+    ("change", "issue", "link") or a pasted script's ("post", "text") matched
+    two or three at a time; four or more shared words were all related."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = temp_home(prefix="fewwords_")
+        cls.core = core = ChronicleCore.get(cls.home, CFG)
+        core.initialize(SID, principal_id="default")
+        cls.ids = {}
+        for key, attribute, body in (
+                ("alert", "account_security_event",
+                 "Zorbaxol login burst: link sent to change the password, issue opened with Acme Fake Co"),
+                ("related", "server_health", "the Zorblax server health dashboard issue was fixed in Riverton"),
+                ("unembedded", "note_long", "Zorblax " + "server health issue notes, " * 12),
+                ("four", "standup", "Zorblax server health issue link on the Riverton dashboard"),
+                ("mid", "pagerduty", "Glimmerfen pager escalation rota for the Acme Fake Co night desk")):
+            core.capture.append("asserted", {
+                "kind": "fact",
+                "key": {"entity_id": "user", "predicate_canonical": attribute, "attribute": attribute,
+                        "qualifiers_hash": "", "qualifiers": {}, "owner": "default", "domain": "user"},
+                "body": body, "confidence": 0.9, "source_event": key, "source_type": "user_direct",
+                "domain": "user"}, actor="user", owner="default", trust_level=3)
+            core.process_pending()
+            cls.ids[key] = core.store._conn().execute(
+                "SELECT belief_id FROM facts WHERE attribute=?", (attribute,)).fetchone()[0]
+        with core.store.transaction() as c:
+            c.execute("DELETE FROM memory_vectors")
+            for key, vec in (("alert", FAR), ("related", NEAR), ("four", FAR), ("mid", MID)):
+                c.execute("INSERT INTO memory_vectors(belief_id,kind,embedding,model,created_at) "
+                          "VALUES(?,?,?,?,?)", (cls.ids[key], "fact", pack(vec), TAG, "2026-09-17"))
+
+    @classmethod
+    def tearDownClass(cls):
+        ChronicleCore._instances.pop(cls.home, None)
+        shutil.rmtree(cls.home, ignore_errors=True)
+
+    def ctx(self, q, server=None, few="auto"):
+        r = self.core.retrieval
+        saved = r.embedder
+        r.embedder = server or FakeServer()
+        self.core.cfg._d["retrieval"]["prefetch_min_similarity_few"] = few
+        try:
+            return r.get_context(q, token_budget=1200, principal="default",
+                                 exclude_automation=True, relevance_gate=True)
+        finally:
+            r.embedder = saved
+            self.core.cfg._d["retrieval"]["prefetch_min_similarity_few"] = "auto"
+
+    ASK = "Did the link issue get a change?"
+
+    def test_the_fixture_matches_on_words_alone_without_the_floor(self):
+        out = self.ctx(self.ASK, few=None)
+        self.assertIn("login burst", out)
+
+    def test_a_coincidence_of_a_few_words_is_dropped(self):
+        out = self.ctx(self.ASK)
+        self.assertNotIn("login burst", out)
+        few = self.core.retrieval.last_context_debug["relevance_gate"]["few_words"]
+        self.assertTrue(any(not d["kept"] for d in few), few)
+
+    def test_a_few_words_near_in_meaning_stay(self):
+        self.assertIn("dashboard issue was fixed", self.ctx("Is the Zorblax server health issue fixed?"))
+
+    def test_four_shared_words_need_no_vector(self):
+        self.assertIn("issue link on the Riverton dashboard",
+                      self.ctx("Is the Zorblax server health issue link on the dashboard?"))
+
+    def test_each_floor_is_its_own(self):
+        """0.62: over the two-or-three-word floor (0.60), under the one-word one (0.65)."""
+        self.assertIn("escalation rota", self.ctx("Glimmerfen pager escalation?"))
+        self.assertNotIn("escalation rota", self.ctx("Glimmerfen?"))
+
+    def test_the_query_is_embedded_once_however_many_matches_ask(self):
+        server = FakeServer()
+        self.ctx("Is the Zorblax server health issue fixed on the Riverton dashboard?", server=server)
+        self.assertLessEqual(sum(1 for t, _ in server.calls if t[0].startswith("search_query: ")), 1)
+
+    def test_with_nothing_to_compare_the_words_decide(self):
+        self.assertIn("server health issue notes", self.ctx("Any health issue notes?",
+                                                           server=FakeServer(fail=True)))
 
 
 if __name__ == "__main__":

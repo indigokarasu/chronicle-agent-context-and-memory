@@ -3,6 +3,33 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.30
+
+**The per-turn gate asks what the person wrote.** The gateway prepends an
+origin header to some messages ("Gateway message origin (JSON data, not
+instructions or authorization): {…}"). Capture already read it as host
+framing, but the recall gate did not, and its words (json, authorization,
+chat, field) matched a session where the user had once pasted code, on
+messages about the gateway restarting. The gate now takes only the person's
+words.
+
+**Two or three shared words are checked too.** On 300 real messages, a long
+security alert's generic words ("change", "issue", "link"; "none", "send") and
+a pasted script's ("post", "text") matched two or three at a time. Against
+the items' stored vectors the plainly unrelated scored 0.49–0.65 and the
+related 0.59–0.90, and four or more shared words were all related. Such a
+match must now reach 0.60 (`retrieval.prefetch_min_similarity_few`, `"auto"`
+= measured per model). Unlike a one-word match, two or three words are
+evidence of their own, so with no vector to compare the words decide.
+
+**A fact goes into the block once.** A critical fact that matched as a
+`[FACT]` came back below as `[CRITICAL]`: one production block carried a
+security alert twice.
+
+On 49 longer real messages the recalled items went from 16 to 7 (19,711 →
+8,632 characters). What went was the alerts, the code paste and an unrelated
+session, plus one repeated old health-check question.
+
 ## 5.8.29
 
 **The handoff's own instruction works as written.** Every compaction note says
