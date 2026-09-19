@@ -21,7 +21,7 @@ import datetime
 import json
 import logging
 
-from . import access
+from . import access, sweeps
 from .config import INFERENCE_TRUST
 
 logger = logging.getLogger("chronicle.derivation")
@@ -170,6 +170,10 @@ class DerivationEngine:
         self.cfg = cfg
         self.append = append_fn        # capture.append, to emit `derived` events
         self.rules: dict[str, Rule] = {r.rule_id: r for r in _STARTER_RULES}
+        # Mirrors RetrievalEngine.active_principal, kept in step by
+        # ChronicleCore.set_active_principal: explain() is a read surface and
+        # needs a principal to filter by when a caller passes none (A1).
+        self.active_principal = "default"
 
     def seed_rules(self):
         for r in self.rules.values():
@@ -199,12 +203,21 @@ class DerivationEngine:
                     self._materialize(payload)
         return derived
 
-    def materialize_all(self, principal: str = "default", max_subjects: int = 500):
+    def materialize_all(self, principal: str = "default", max_subjects=None):
         """The `derive` curation task: materialize high-value rules over affected
-        subjects, bounded by fanout (never full closure, I24e)."""
-        subjects = self._affected_subjects(max_subjects)
-        for subj in subjects:
+        subjects, bounded by fanout (never full closure, I24e).
+
+        The fanout bound stays — full closure is the invariant this must not
+        violate. What changes in §A9 is that the bound is now a PACE rather than
+        a ceiling: the 500 subjects are the next 500 after a persisted cursor,
+        so consecutive `derive`/`consolidate` jobs materialize the whole store
+        instead of re-deriving the same head of `facts` forever. `max_subjects`
+        still wins when a caller names one; otherwise the pace is
+        `sweeps.budgets.derive_subjects`."""
+        page = self._affected_subjects_page(max_subjects)
+        for subj in page.rows:
             self.derive_for_subject(subj, principal, materialize=True)
+        return sweeps.commit(self.store, page)
 
     def _materialize(self, payload: dict):
         scope = payload.get("scope_entity")
@@ -224,18 +237,73 @@ class DerivationEngine:
             actor="curator", owner=payload["owner"], trust_level=INFERENCE_TRUST)
         self._bump_precision(payload["rule_id"], fired=True)
 
-    def _affected_subjects(self, limit):
-        seen, out = set(), []
+    def _affected_subjects_page(self, limit=None):
+        """The next page of entities carrying a fact some enabled rule reads.
+
+        §A9. The old loop ran one `query_beliefs(..., limit=500)` PER antecedent
+        predicate — an unordered prefix each time, with no cursor — so the
+        subjects it found were whichever ones happened to sit at the head of
+        `facts` for those predicates, identically on every run. Entities past
+        that prefix were never derived over, and `materialize_all` returned as
+        though it had covered the store.
+
+        One DISTINCT-entity page over all antecedent predicates replaces N
+        prefixes: it is resumable, it is one query instead of one per predicate,
+        and the deduplication the old code did in Python is now the DISTINCT.
+        No enabled rules means no antecedents, hence an empty page rather than
+        a scan of every fact in the store.
+
+        A15's DETERMINISM FIX LIVES HERE, not in the shim below, and saying so
+        is the point: A15 fixed `for pred in preds` (a set, therefore a
+        PYTHONHASHSEED-dependent order, therefore a PYTHONHASHSEED-dependent
+        order of the `derived` events `materialize_all` appends, their seq and
+        their prev_head) by sorting at the boundary where the set stops being a
+        membership test and becomes a sequence. A9 then replaced the per-
+        predicate loop with one DISTINCT page, and the naive merge -- take the
+        paged body, drop the sorted() -- would have resolved every conflict
+        marker and silently reverted A15.
+
+        Both halves are therefore kept, and they are NOT redundant:
+          * `sorted(...)` below orders the predicates. In the paged form they
+            reach SQL as `IN (?, ?, ...)` parameters, where order does not
+            change the result -- so this is now the belt, not the braces, and
+            it stays because a future edit that turns `preds` back into an
+            iterated sequence must not have to rediscover the bug.
+          * `next_distinct_page` -> `store.scan_distinct_after` carries
+            `ORDER BY v`, a TOTAL order on the grouping value. That is what
+            actually makes the subject order process-stable now, and it is
+            strictly stronger than A15's original guarantee: A15 ordered the
+            predicates and inherited each predicate's unordered row prefix,
+            while this orders the subjects themselves.
+          * The resume cursor is that same value, so a paged walk visits
+            subjects in one total order across pages as well as within one.
+
+        Pinned by tests/test_precision_packing.py::
+        TestDeterminismSiblingsAreProcessStable::
+        test_the_derive_task_visits_subjects_in_one_order, which runs the whole
+        thing in five subprocesses under five PYTHONHASHSEEDs."""
         preds = set()
         for r in self.enabled_rules():
             preds.update(r.antecedent_predicates())
-        for pred in preds:
-            for f in self.store.query_beliefs("facts", "predicate_canonical=? AND status='active'",
-                                              (pred,), limit=limit):
-                if f["entity_id"] not in seen:
-                    seen.add(f["entity_id"])
-                    out.append(f["entity_id"])
-        return out
+        preds = sorted(p for p in preds if p)
+        # An explicit `max_subjects` is a caller naming its own batch and wins
+        # outright; otherwise the pace is config, defaulting to the documented 500.
+        budget = (max(1, int(limit)) if limit is not None
+                  else sweeps.sweep_budget(self.cfg, "derive_subjects", default=500))
+        if not preds:
+            # None, not "": for a group cursor "" already means "the ''-group is
+            # done", and a rule set that is merely disabled today must not leave
+            # a cursor that skips a group when the rules come back.
+            return sweeps.SweepPage("derive_subjects", [], None, None, 0, budget, True, 0)
+        marks = ",".join("?" * len(preds))
+        return sweeps.next_distinct_page(
+            self.store, self.cfg, "derive_subjects", "facts", "entity_id",
+            "status='active' AND predicate_canonical IN (%s)" % marks,
+            tuple(preds), budget=budget)
+
+    def _affected_subjects(self, limit=None):
+        """Back-compat shim: just the ids of the next page."""
+        return list(self._affected_subjects_page(limit).rows)
 
     def _bump_precision(self, rule_id, fired=True, correct=True):
         row = self.store.get_derivation_rule(rule_id)
@@ -248,19 +316,37 @@ class DerivationEngine:
             "precision_n": (row["precision_n"] or 0) + (1 if fired else 0),
             "precision_correct": (row["precision_correct"] or 0) + (1 if correct else 0)})
 
-    def explain(self, belief_id: str) -> dict:
-        """Audit a derived belief (§9.4 safety): premises + rule + conclusion."""
+    def explain(self, belief_id: str, principal: str = "") -> dict:
+        """Audit a derived belief (§9.4 safety): premises + rule + conclusion.
+
+        ACL-filtered at the same access.can_read choke point every retrieval
+        channel uses (A1). An unreadable belief returns the SAME shape a
+        missing one does — belief ids are content hashes that surface in
+        contradiction rows and tool output, so a distinguishable refusal would
+        make this an existence oracle. The premise list is filtered too: a
+        justification names another belief, and naming it is a disclosure even
+        when its body is not returned."""
+        principal = principal or self.active_principal
         found = self.store.find_belief(belief_id)
         if not found:
             return {"error": "not_found"}
         _table, row = found
+        if not access.can_read(row.get("read_acl"), row.get("owner"), principal):
+            return {"error": "not_found"}
         justs = self.store.get_justifications(belief_id)
         return {
             "belief_id": belief_id, "body": row.get("value") or row.get("body"),
             "source_type": json.loads(row.get("provenance") or "{}").get("source_type"),
             "rule_id": row.get("rule_id"),
-            "premises": [j["support"] for j in justs if j["support_kind"] == "belief"],
+            "premises": [j["support"] for j in justs
+                         if j["support_kind"] == "belief" and self._premise_readable(j["support"], principal)],
             "confidence": row.get("confidence"), "status": row.get("status")}
+
+    def _premise_readable(self, support: str, principal: str) -> bool:
+        found = self.store.find_belief(support or "")
+        if not found:
+            return True   # dangling premise id names no content
+        return access.can_read(found[1].get("read_acl"), found[1].get("owner"), principal)
 
 
 def _active_facts(store, subject, predicate, principal) -> list[dict]:

@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.egg-info/
 dist/
+# The dashboard plugin UI is loaded straight from dashboard/dist by the Hermes
+# dashboard, with no build step on the host, so the built bundles ship in the repo.
+!dashboard/dist/
 build/
 .venv/
 venv/
@@ -21,3 +24,20 @@ htmlcov/
 .DS_Store
 Thumbs.db
 s_ctx100.json
+
+# A13: nothing that is a COPY of a tracked file, or a run artifact, may be
+# committed again. dashboard/plugin_api.py.bak (a stale duplicate of a live
+# module, 8.5K of divergent routes), plugin.yaml.bak.20260625_114235 (a manifest
+# with a stale version, next to the manifest that carries the real one) and
+# ctx_eval_r2.log (one gate run's output) were all tracked and would all have
+# shipped in a release tarball.
+*.bak
+*.bak.*
+*.orig
+*.rej
+*.log
+
+# scripts/bench_a5_vectors.py's default store, now that its default is inside
+# the repo rather than an absolute path in one developer's home directory.
+.a5bench/
+dashboard/web/node_modules/

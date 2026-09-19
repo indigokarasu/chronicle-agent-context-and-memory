@@ -29,11 +29,12 @@ Fixtures are obviously fake throughout (Pat Testley, Acme Fake Co).
 import json
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 sys.path.insert(0, str(Path(__file__).parent))
 
 from engine import access, doc2query
@@ -67,7 +68,7 @@ class _H2Case(unittest.TestCase):
     piggyback = True
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="h2-")
+        self.home = temp_home(prefix="h2-")
         config = {"embeddings": {"model": "hashing"}}
         if self.piggyback is not None:
             config["host_model"] = {"piggyback": self.piggyback}
@@ -684,7 +685,7 @@ class TestExtractFactsEndToEnd(_H2Case):
 class TestExcerptTier(unittest.TestCase):
 
     def make_core(self, excerpts):
-        home = tempfile.mkdtemp(prefix="h2x-")
+        home = temp_home(prefix="h2x-")
         self.addCleanup(shutil.rmtree, home, True)
         core = ChronicleCore(home, {"embeddings": {"model": "hashing",
                                                    "doc2query": {"excerpts": excerpts}}})

@@ -20,11 +20,12 @@ Contents:
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine import identity
 from engine.config import Config
@@ -36,7 +37,7 @@ _FACT_KEY = {"entity_id": "ent_pat_testley", "entity_name": "Pat Testley",
 
 
 def make_core(overrides=None):
-    home = tempfile.mkdtemp(prefix="l9-integ-")
+    home = temp_home(prefix="l9-integ-")
     cfg = {"embeddings": {"model": "hashing"}}
     if overrides:
         cfg.update(overrides)
@@ -238,7 +239,7 @@ class TestLadder9ConfigDefaults(_CoreCase):
         self.assertEqual(cfg.get("retrieval.rerank_blend"), 0.5)                # E3
         self.assertEqual(cfg.get("retrieval.rerank_top_k"), 50)                 # E3
         self.assertEqual(cfg.get("curation.supersede_similarity"), 0.82)        # E4
-        self.assertEqual(cfg.get("curation.dup_similarity"), 0.95)              # E5
+        self.assertIsNone(cfg.get("curation.dup_similarity"))                   # E5: deleted
         self.assertEqual(cfg.get("curation.topic_shift_threshold"), 0.35)       # E6
         self.assertEqual(cfg.get("identity.split_below"), 0.30)                 # E7
         self.assertEqual(cfg.get("identity.merge_above"), 0.90)                 # E7
@@ -248,17 +249,20 @@ class TestLadder9ConfigDefaults(_CoreCase):
         self.assertIsNone(cfg.get("retrieval.abstain_distance"))                # E10
         self.assertEqual(cfg.get("retrieval.support_threshold"), 0.55)          # E11
         self.assertTrue(cfg.get("context.precision_packing"))                   # E12
+        # Restated with the estimator's unit, twice; the measured quantity
+        # (~6 000 chars) is unchanged: 2000 tok x 3 = 6000 = 1500 tok x 4.
         self.assertEqual(cfg.get("context.precision_budget"), 1500)             # E12
         self.assertEqual(cfg.get("context.precision_concentration"), 0.60)      # E12
         self.assertEqual(cfg.get("context.precision_margin"), 0.0)              # E12 (secondary)
         self.assertFalse(cfg.get("host_model.piggyback"))                       # H1
 
-    def test_the_two_similarity_floors_stay_ordered(self):
-        """E4's supersede floor must sit strictly BELOW E5's merge floor: they
-        are two rungs on one cosine scale, and inverting them would make every
-        supersede candidate a merge instead."""
-        self.assertLess(self.core.cfg.get("curation.supersede_similarity"),
-                        self.core.cfg.get("curation.dup_similarity"))
+    def test_the_merge_has_no_cosine_floor_to_order(self):
+        """E5's 0.95 merge floor used to sit above E4's 0.82 supersede floor on
+        one cosine scale. The merge is now exact-content only, so the key is
+        gone from DEFAULTS rather than left declared and unread."""
+        from engine.config import DEFAULTS
+        self.assertNotIn("dup_similarity", DEFAULTS["curation"])
+        self.assertEqual(self.core.cfg.get("curation.supersede_similarity"), 0.82)
 
 
 if __name__ == "__main__":

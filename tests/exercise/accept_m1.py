@@ -59,15 +59,16 @@ from engine.core import ChronicleCore                                          #
 from engine.config import Config                                               # noqa: E402
 from engine.embeddings import (                                                # noqa: E402
     HashingEmbedder, OpenAICompatEmbedder, estimate_tokens,
-    clamp_max_input_tokens, cosine,
+    EMBED_INPUT, clamp_max_input_tokens, cosine,
 )
 
-HARNESS = os.environ.get("CHRONICLE_LME_HARNESS", "/private/tmp/claude-501/"
-                         "-Users-evaluser-temp/3d6d860f-71ee-406d-9aef-b68dfd0642d1/"
-                         "scratchpad/lme_recall.py")
-ORACLE = os.environ.get("CHRONICLE_LME_ORACLE", "/private/tmp/claude-501/"
-                        "-Users-evaluser-temp/3d6d860f-71ee-406d-9aef-b68dfd0642d1/"
-                        "scratchpad/oracle.json")
+# The LongMemEval harness and oracle live OUTSIDE the repo (they are a
+# multi-hundred-MB dataset). Point these at your copy. There is deliberately
+# no default path: the previous one was an absolute scratchpad path carrying a
+# machine-local home directory and a session UUID, which is both unrunnable
+# for anyone else and not something a public repo should carry.
+HARNESS = os.environ.get("CHRONICLE_LME_HARNESS", "")
+ORACLE = os.environ.get("CHRONICLE_LME_ORACLE", "")
 BASELINE_UNION_AT_1 = 65.0
 TOLERANCE = 3.0
 
@@ -188,10 +189,17 @@ def _make_cap_checking_server(max_input_tokens):
             texts = inp if isinstance(inp, list) else [inp]
             type(self).request_count += 1
             for t in texts:
-                if estimate_tokens(t) > type(self).cap:
+                # A10b: judge the request with the SAME margin the clamp
+                # promises (EMBED_INPUT), not the bare estimate. This server
+                # stands in for a model with a hard context boundary, and the
+                # guarantee under test is the conservative one; measuring it
+                # with the bare estimate would quietly accept a third more
+                # input than the clamp actually allows and stop testing the
+                # incident this file exists for.
+                if estimate_tokens(t, margin=EMBED_INPUT) > type(self).cap:
                     type(self).over_cap_seen = True
                     print(f"    !! server saw an OVER-CAP request: "
-                          f"{estimate_tokens(t)} tokens > {type(self).cap}")
+                          f"{estimate_tokens(t, margin=EMBED_INPUT)} tokens > {type(self).cap}")
             if isinstance(inp, list):
                 rows = [{"index": i, "embedding": self._vec_for(t)} for i, t in enumerate(texts)]
             else:
@@ -361,8 +369,9 @@ def _union_at_1(out):
 
 
 def check6_harness_unchanged():
-    if not (Path(HARNESS).exists() and Path(ORACLE).exists()):
-        print(f"SKIP: check6 — harness/oracle not found ({HARNESS}, {ORACLE})")
+    if not (HARNESS and ORACLE and Path(HARNESS).exists() and Path(ORACLE).exists()):
+        print("SKIP: check6 — set CHRONICLE_LME_HARNESS and CHRONICLE_LME_ORACLE "
+              f"to your dataset copy (got {HARNESS!r}, {ORACLE!r})")
         return True
     env = dict(os.environ, CHRONICLE_DIR=str(ROOT), CHRONICLE_EMBED_MODEL="hashing")
     p = subprocess.run([sys.executable, HARNESS, ORACLE], env=env,

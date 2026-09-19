@@ -22,11 +22,12 @@ These tests are scoped to what R10 itself changes:
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.core import ChronicleCore
 from context import ChronicleContextEngine
@@ -59,12 +60,15 @@ class PreflightWatermarkGateTests(unittest.TestCase):
     """When preflight is allowed to act at all (§R10 gate)."""
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r10_")
+        self.home = temp_home(prefix="r10_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r10-s1", hermes_home=self.home, principal_id="pat", config=CFG)
         self.assertIsNotNone(self.eng.core, "test setup expected the real (non-heuristic) engine")
-        self.eng.update_model("test-model", context_length=2000)  # HIGH=1500, LOW=1100
+        self.eng.update_model("test-model", context_length=1500)  # HIGH=1125, LOW=825
+        # A10b units restatement: 2000 tok x 3 chars = 6000 = 1500 tok x 4 chars; the watermarks
+        # this fixture is built around are unchanged in chars: LOW 1100x3 = 3300 = 825x4,
+        # HIGH 1500x3 = 4500 = 1125x4.
 
     def tearDown(self):
         ChronicleCore._instances.pop(self.home, None)
@@ -77,14 +81,14 @@ class PreflightWatermarkGateTests(unittest.TestCase):
 
     def test_false_below_low_watermark(self):
         """No pressure yet -- nothing worth prepping for."""
-        messages = _messages(22)  # ~981 tokens, under the 1100 LOW watermark
+        messages = _messages(22)  # ~749 tokens, under the 825 LOW watermark
         self.assertFalse(self.eng.should_compress_preflight(messages))
         self.assertEqual(_durability_events(self.core, "r10-s1"), [],
                           "preflight must not do fold-candidate work below the low watermark")
 
     def test_false_at_or_above_high_watermark(self):
         """Already due -- should_compress() owns this pass now, not preflight."""
-        messages = _messages(40)  # ~1791 tokens, over the 1500 HIGH watermark
+        messages = _messages(40)  # ~1361 tokens, over the 1125 HIGH watermark
         self.assertGreaterEqual(sum(self._tokens(m) for m in messages), self.eng.threshold_tokens)
         self.assertFalse(self.eng.should_compress_preflight(messages))
 
@@ -105,12 +109,15 @@ class PreflightDoesTheWorkTests(unittest.TestCase):
     """In the LOW..HIGH gap, preflight actually rescues + pre-durabilizes (§R10)."""
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r10_")
+        self.home = temp_home(prefix="r10_")
         self.core = ChronicleCore.get(self.home, CFG)
         self.eng = ChronicleContextEngine()
         self.eng.on_session_start("r10-s1", hermes_home=self.home, principal_id="pat", config=CFG)
-        self.eng.update_model("test-model", context_length=2000)  # HIGH=1500, LOW=1100
-        self.messages = _messages(28)  # ~1251 tokens: squarely inside the gap
+        self.eng.update_model("test-model", context_length=1500)  # HIGH=1125, LOW=825
+        # A10b units restatement: 2000 tok x 3 chars = 6000 = 1500 tok x 4 chars; the watermarks
+        # this fixture is built around are unchanged in chars: LOW 1100x3 = 3300 = 825x4,
+        # HIGH 1500x3 = 4500 = 1125x4.
+        self.messages = _messages(28)  # ~953 tokens: squarely inside the 825..1125 gap
 
     def tearDown(self):
         ChronicleCore._instances.pop(self.home, None)
@@ -159,7 +166,7 @@ class PreflightBudgetTests(unittest.TestCase):
     """capture.precompress.budget_ms actually bounds the work done (§R10)."""
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="r10_budget_")
+        self.home = temp_home(prefix="r10_budget_")
 
     def tearDown(self):
         ChronicleCore._instances.pop(self.home, None)
@@ -174,7 +181,7 @@ class PreflightBudgetTests(unittest.TestCase):
         core = ChronicleCore.get(self.home, cfg)
         eng = ChronicleContextEngine()
         eng.on_session_start("r10-budget-s1", hermes_home=self.home, principal_id="pat", config=cfg)
-        eng.update_model("test-model", context_length=2000)
+        eng.update_model("test-model", context_length=1500)
         self.assertEqual(core.cfg.get("capture.precompress.budget_ms"), 0)
 
         messages = _messages(28)  # same in-gap fixture as above
@@ -192,7 +199,7 @@ class PreflightBudgetTests(unittest.TestCase):
         core = ChronicleCore.get(self.home, cfg)
         eng = ChronicleContextEngine()
         eng.on_session_start("r10-budget-s2", hermes_home=self.home, principal_id="pat", config=cfg)
-        eng.update_model("test-model", context_length=2000)
+        eng.update_model("test-model", context_length=1500)
         self.assertEqual(core.cfg.get("capture.precompress.budget_ms"), 5000)
 
         messages = _messages(28)
