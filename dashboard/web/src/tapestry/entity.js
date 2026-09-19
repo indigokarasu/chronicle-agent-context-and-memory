@@ -29,7 +29,7 @@ function Facts({ title, rows, onOpenProvenance }) {
           f.src_event
             ? h("button", {
                 className: "atl-link", title: "Where this came from",
-                onClick: () => onOpenProvenance({ event_id: f.src_event }),
+                onClick: () => onOpenProvenance({ event_id: f.src_event, seq: f.src_seq }),
               }, "provenance")
             : null))));
 }
@@ -58,7 +58,7 @@ function Mentions({ rows, onOpenProvenance }) {
             h("span", { className: "tap-when" }, when(m.when)),
             h("span", { className: "tap-who" },
               "spoken by " + (m.speakers && m.speakers.length
-                ? m.speakers.map((s) => SPEAKER_LABEL[s] || s).join(", ")
+                ? m.speakers.map((s) => (Object.hasOwn(SPEAKER_LABEL, s) ? SPEAKER_LABEL[s] : s)).join(", ")
                 : "an unrecorded speaker")),
             h("span", { className: "tap-src" }, m.source || ""),
             h("button", {

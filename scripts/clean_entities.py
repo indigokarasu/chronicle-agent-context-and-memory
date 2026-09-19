@@ -84,6 +84,11 @@ def plan(conn) -> list:
     referenced = {r[0] for r in conn.execute(
         "SELECT DISTINCT entity_id FROM facts WHERE entity_id IS NOT NULL AND entity_id != '' "
         "AND status IN ('active','draft')")}
+    # A live relationship holds both of its endpoints open too.
+    referenced |= {r[0] for r in conn.execute(
+        "SELECT source_id FROM relationships WHERE status IN ('active','draft') "
+        "UNION SELECT target_id FROM relationships WHERE status IN ('active','draft')")
+        if r[0]}
     named = {r[0]: r[1] for r in conn.execute(
         "SELECT entity_id, value FROM facts WHERE predicate_canonical='name' AND status='active'")}
 
@@ -146,6 +151,11 @@ def apply(conn, repairs) -> dict:
                              "(SELECT fact_count FROM entities WHERE belief_id=?) "
                              "WHERE belief_id=?", (bid, keep))
                 conn.execute("UPDATE justifications SET belief_id=? WHERE belief_id=?", (keep, bid))
+                # Anything that pointed at the merged-away row now points at the
+                # survivor: facts by entity_id, relationships by either endpoint.
+                conn.execute("UPDATE facts SET entity_id=? WHERE entity_id=?", (keep, bid))
+                conn.execute("UPDATE relationships SET source_id=? WHERE source_id=?", (keep, bid))
+                conn.execute("UPDATE relationships SET target_id=? WHERE target_id=?", (keep, bid))
                 conn.execute("DELETE FROM entities WHERE belief_id=?", (bid,))
             elif rep["action"] == "clear_type":
                 conn.execute("UPDATE entities SET type='' WHERE belief_id=?", (bid,))

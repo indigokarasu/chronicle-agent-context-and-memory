@@ -9,6 +9,8 @@ host. They define only what the adapters touch.
 
 from __future__ import annotations
 
+from typing import Any, Dict, List, Optional, Tuple
+
 
 class MemoryProvider:
     name = "base"
@@ -54,18 +56,23 @@ class ContextEngine:
         self.last_total_tokens = 0
         self.compression_count = 0
 
-    def prune_tool_results_only(self, messages, current_tokens=None):
+    def prune_tool_results_only(self, messages: List[Dict[str, Any]],
+                                current_tokens: Optional[int] = None
+                                ) -> Tuple[List[Dict[str, Any]], int]:
         return messages, 0
 
-    def has_content_to_compress(self, messages) -> bool:
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         return True
 
-    def should_defer_preflight_to_real_usage(self, rough_tokens) -> bool:
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         return False
 
-    def select_context(self, request_messages, *, conversation_messages=None,
-                       incoming_message=None, budget_tokens=0):
+    def select_context(self, request_messages: List[Dict[str, Any]], *,
+                       conversation_messages: Optional[List[Dict[str, Any]]] = None,
+                       incoming_message: Optional[Dict[str, Any]] = None,
+                       budget_tokens: int = 0) -> Optional[List[Dict[str, Any]]]:
         return None
 
-    def on_turn_complete(self, messages, usage=None, **kwargs) -> None:
+    def on_turn_complete(self, messages: List[Dict[str, Any]],
+                         usage: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         return None

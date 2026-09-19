@@ -13,7 +13,7 @@ const { useState, useEffect, useRef, useCallback } = hooks;
 const POLL_MS = 10000;
 const SUMMARY_MS = 300000;   // the server caches it for 5 minutes too
 
-export function LogView({ focusEvent }) {
+export function LogView({ focusSeq }) {
   const hostRef = useRef(null);
   const modelRef = useRef(null);
   const canvasRef = useRef(null);
@@ -123,6 +123,14 @@ export function LogView({ focusEvent }) {
     onEvent: (k) => select({ kind: "event", seq: modelRef.current.seq[k] }),
     onLane: (lane) => select({ kind: "lane", lane }),
   };
+
+  // Opened from a fact or a mention: select and centre the event it cites,
+  // once the log holding it has loaded. A seq the log does not hold (a pruned
+  // event) leaves the view unselected rather than guessing.
+  useEffect(() => {
+    if (focusSeq == null || !progress.done || !modelRef.current) return;
+    if (modelRef.current.indexOfSeq(focusSeq) >= 0) select({ kind: "event", seq: focusSeq, focus: true });
+  }, [focusSeq, progress.done, select]);
 
   const onBelief = useCallback((id) => select({ kind: "belief", id }), [select]);
   const onEventSeq = useCallback((seq) => select({ kind: "event", seq, focus: true }), [select]);
