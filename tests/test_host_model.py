@@ -27,11 +27,17 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
+import tempfile        # A11 converted every call site it SAW to temp_home();
+                      # the sites below are class-scoped (temp_home's dirs are
+                      # reaped after each TEST, which would delete a setUpClass
+                      # home mid-class) or have their own try/finally cleanup.
+                      # conftest still sandboxes TMPDIR, so nothing escapes.
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.hostmodel import (  # noqa: E402
@@ -43,11 +49,12 @@ from engine.hostmodel import (  # noqa: E402
     parse_reply,
     render_request,
 )
+from engine.embeddings import embedder_model_tag  # noqa: E402
 from engine.store import SCHEMA_VERSION, MemoryStore, _has_col, _has_table  # noqa: E402
 # The dump's exclusion list and turn fixture, imported rather than restated: the
 # emptiness assertions below are DERIVED from the exclusion list, so that
 # excluding a row-bearing table can never pass silently.
-from h1_store_dump import H1_TABLES, TURNS  # noqa: E402
+from h1_store_dump import ADDED_NULL_COLUMNS, DELIBERATE_MODEL_COLUMNS, H1_TABLES, TURNS  # noqa: E402
 from provider import ChronicleMemoryProvider  # noqa: E402
 
 # The tree this one must be byte-identical to at default config.
@@ -62,11 +69,55 @@ from provider import ChronicleMemoryProvider  # noqa: E402
 #
 # The claim H1 actually makes -- "with piggyback off, the store is what it was
 # WITHOUT H1" -- is isolated by diffing against the integration commit
-# immediately before this merge. That is a git worktree pinned at `L9 E7`; see
-# the integration notes. Override with CHRONICLE_BASE_TREE to point elsewhere.
+# immediately before this merge. That was a git worktree pinned at `L9 E7`
+# (`v560_preH1`).
+#
+# Ladder 10 A4 RE-BASELINES that worktree, for a reason worth stating rather
+# than just doing. A4 removed the `uuid.uuid4` pin from h1_store_dump.py --
+# the pin existed to hide the very defect A4 fixed -- and with it gone the
+# pre-A4 tree cannot produce the same dump TWICE: `extractions.id` and
+# `identity_candidates.id` were minted per run, and two consecutive probes of
+# `v560_preH1` differ on exactly those four rows (measured). A tree that
+# disagrees with itself is not a baseline. A4 also intentionally changes those
+# same two id columns (uuid4 -> content hash), so even a stable pre-A4 dump
+# would report an intended change as an H1 regression -- exactly the reason
+# v550 stopped being the baseline at the top of this comment.
+#
+# The pin is therefore a worktree at A4's own commit, L10_A4_base. The v5.7.0
+# integration uses that ONE baseline for all three inertness probes (this one
+# and the two in tests/test_acl_topology.py).
+#
+# A6 is the first post-H1 task that deliberately changes what a DEFAULT capture
+# flow writes: the heuristic floor now captures multiple facts per sentence,
+# reaches real email addresses, and refuses to file a first-person preference as
+# an always-inject norm. Diffing against the bare pin would therefore report
+# A6's intended effect as a regression, proving nothing either way.
+#
+# Re-pinning cannot fix that, because the baseline this test needs is
+# "everything in this tree EXCEPT the thing under test", and no commit carries
+# A6's extraction without H1 -- H1 landed first. So the pin stays and A6's two
+# files are OVERLAID onto a scratch copy of it (BASE_OVERLAY below). Base and
+# head then differ by everything except A6's extraction, and since that
+# everything is asserted here to be inert, the dumps must match.
+#
+# The overlay is well defined, and it was re-verified when the pin moved:
+# `engine/extraction.py` and `engine/criticality.py` are byte-identical at
+# `L9 E7` (65cfa12), at v5.6.0 (c7ca775) and at A4 (1e2b3c2, = L10_A4_base),
+# so copying this tree's copies in really is applying A6's patch to the base.
+# This tree's extraction.py additionally carries A2's allow_remote guard, which
+# is inert at defaults -- and that it is inert is not assumed here, it is what
+# this test measured green at every integration step BEFORE A6 landed.
+#
+# What the assertion therefore says now, at full strength: A6 is the ONLY thing
+# in the entire ladder-10 merge that changes the default capture flow.
+# Override with CHRONICLE_BASE_TREE to point elsewhere.
 BASE_TREE = Path(os.environ.get("CHRONICLE_BASE_TREE")
-                 or (Path(__file__).parent.parent.parent / "v560_preH1"))
+                 or (Path(__file__).parent.parent.parent / "L10_A4_base"))
 PROBE = Path(__file__).parent / "h1_store_dump.py"
+# The files A6 changes. Kept explicit and short: an overlay wide enough to carry
+# H1 itself would make the test vacuous, so it may only ever list files whose
+# base revision this tree's commit is a direct descendant of.
+BASE_OVERLAY = ("engine/extraction.py", "engine/criticality.py")
 
 
 def fenced(obj) -> str:
@@ -80,7 +131,7 @@ class _ProviderCase(unittest.TestCase):
     piggyback = True
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="h1-")
+        self.home = temp_home(prefix="h1-")
         config = {"embeddings": {"model": "hashing"}}
         if self.piggyback is not None:
             config["host_model"] = {"piggyback": self.piggyback}
@@ -550,6 +601,67 @@ class TestDisabledByDefaultIsInert(_ProviderCase):
         self.assertTrue(self.core.store.iter_memory_vectors())
         self.assertTrue(self.facts())
 
+    def test_deliberate_model_columns_carry_the_active_tag(self):
+        """The assertion that LICENSES the dump's DELIBERATE_MODEL_COLUMNS.
+
+        A column excluded from the byte-identity dump is only allowed there if
+        something asserts its value directly; otherwise excluding it would hide
+        whatever it holds. Derived from the dump's own tuple, for the same
+        reason the H1_TABLES check above is: naming session_index.model here
+        instead would leave the list unguarded, and a second entry could be
+        added with nothing checking it.
+
+        The claim asserted is STRONGER than byte-identity could be. Byte
+        identity can only say "this cell matches the base tree's cell", and the
+        base tree has no such cell. This says the cell equals
+        embedder_model_tag() of the embedder that actually ran -- the A0e
+        contract itself -- for every vectored row the flow wrote."""
+        for user, assistant in TURNS:
+            self.provider.sync_turn(user, assistant, session_id="s-h1")
+            self.core.process_pending()
+        # The dump probe's flow ends the session; session_index is written by
+        # the session_summarize job that ending queues, so without this the
+        # table is empty and the assertion below would be vacuous.
+        self.provider.on_session_end([])
+        self.core.process_pending()
+
+        self.assertTrue(DELIBERATE_MODEL_COLUMNS,
+                        "the exclusion tuple is empty; nothing is being guarded")
+        active = embedder_model_tag(self.core.embedder)
+        self.assertTrue(active, "fixture has no embedder to stamp with")
+        conn = self.core.store._conn()
+        for table, column in DELIBERATE_MODEL_COLUMNS:
+            self.assertTrue(_has_col(conn, table, column),
+                            "%s.%s is excluded from the dump but does not exist"
+                            % (table, column))
+            rows = conn.execute("SELECT %s FROM %s WHERE embedding IS NOT NULL "
+                                "AND length(embedding)>0" % (column, table)).fetchall()
+            self.assertTrue(rows, "%s wrote no vectored rows: the exclusion would be "
+                                  "vacuous" % table)
+            for row in rows:
+                self.assertEqual(row[0], active,
+                                 "%s.%s is hidden from the byte-identity proof and does NOT "
+                                 "carry the active canonical tag" % (table, column))
+
+    def test_added_columns_stay_null_on_the_default_flow(self):
+        """The assertion that LICENSES the dump's ADDED_NULL_COLUMNS: a column
+        hidden from the byte-identity proof must be checked directly, or hiding
+        it would hide whatever it holds."""
+        for user, assistant in TURNS:
+            self.provider.sync_turn(user, assistant, session_id="s-h1")
+            self.core.process_pending()
+        self.assertTrue(ADDED_NULL_COLUMNS, "the exclusion tuple is empty; nothing is being guarded")
+        conn = self.core.store._conn()
+        for table, column in ADDED_NULL_COLUMNS:
+            self.assertTrue(_has_col(conn, table, column),
+                            "%s.%s is excluded from the dump but does not exist" % (table, column))
+            n = conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+            self.assertTrue(n, "%s wrote no rows: the exclusion would be vacuous" % table)
+            filled = conn.execute("SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL"
+                                  % (table, column)).fetchone()[0]
+            self.assertEqual(filled, 0, "%s.%s is hidden from the byte-identity proof and is "
+                                        "NOT null on the default flow" % (table, column))
+
     def test_heuristic_provenance_has_no_source_key_at_all(self):
         """The absence is load-bearing: it is what makes the disabled path
         byte-identical rather than merely equivalent."""
@@ -578,14 +690,153 @@ class TestDisabledMatchesPreH1TreeExactly(unittest.TestCase):
                          "probe failed in %s: %s" % (tree, proc.stderr.decode()[-2000:]))
         return proc.stdout.decode()
 
+    def _this_tree_with_the_a6_patch_backed_out(self, dest: Path) -> Path:
+        """A scratch copy of THIS tree carrying the BASE tree's extraction.
+
+        The overlay runs in this direction, not the other one, and the reason is
+        a merge fact rather than a preference. A6's own version of this test
+        copied THIS tree's `engine/extraction.py` onto a copy of the base. That
+        worked while this tree's extraction.py was "v5.6.0 plus A6". After the
+        v5.7.0 merge it is "v5.6.0 plus A2 plus A6", and A2's guard imports
+        `RemoteEndpointRefused` / `check_endpoint` from `engine.embeddings` --
+        symbols the base tree's embeddings.py does not have, so the base would
+        not even import. Widening BASE_OVERLAY to carry embeddings.py would drag
+        A11b, A0fix and A10b into the "base" and make the comparison vacuous,
+        which is exactly what A6's own rule about this list forbids.
+
+        Backing the patch OUT of a copy of this tree keeps the overlay at two
+        files and keeps every other module the merged one. The claim is
+        unchanged and stated the other way round: with A6's extraction removed,
+        this tree writes byte-for-byte what the baseline writes -- so A6 is the
+        only thing in the whole ladder-10 merge that changes default capture.
+
+        RESTATED after the reconciliation onto published `main`: A6 is the only
+        thing in the ladder-10 MERGE that changes default capture, and upstream's
+        `TransitiveLocationRule` (7bfcf46) is the only thing outside it that
+        does. Both are backed out here; see
+        `_back_out_the_upstream_derivation_rule`. Anything else that appears in
+        this diff is still a regression, wherever it came from.
+        """
+        here = Path(__file__).parent.parent
+        shutil.copytree(str(here), str(dest),
+                        ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc",
+                                                      "*.db", "*.db-wal", "*.db-shm"))
+        for rel in BASE_OVERLAY:
+            self.assertTrue((BASE_TREE / rel).exists(),
+                            "overlay file %s does not exist in the base tree; the pin moved "
+                            "and the overlay is no longer a patch onto it" % rel)
+            shutil.copy2(str(BASE_TREE / rel), str(dest / rel))
+        self._back_out_the_upstream_derivation_rule(dest)
+        return dest
+
+    # The ONLY rows published `main` writes that the pre-H1 base does not, once
+    # A6's extraction and upstream's TransitiveLocationRule are backed out.
+    # Enumerated, not pattern-matched: a list that grows silently is how this
+    # test would stop meaning anything. Adding to it is a deliberate act that
+    # says "upstream changed default capture again, and we looked at it".
+    # observed_user_fts (5.8.2) is a second FTS index over the same observed
+    # rows -- the user's own conversations, read by the per-turn search -- and
+    # its ready flag: derived, additive, and nothing the base wrote changes.
+    UPSTREAM_CAPTURE_ADDITIONS = ("meta\t[\"profile_summary:", "meta\t[\"observed_user_fts_ready\"",
+                                  "observed_user_fts")
+
+    def _assert_only_upstreams_known_capture_additions(self, base_dump, ours_dump):
+        """Byte-identical, EXCEPT for upstream's known capture additions.
+
+        `profile_summary:<owner>` (engine/reducer.py, engine/core.py) exists in
+        published `main` and in neither the pre-H1 base nor the pre-reconciliation
+        v5.7.0 tree, so it is upstream's, it is new, and it is legitimate. It is
+        allowed here BY NAME. Every other difference -- in either direction --
+        still fails, including a base row that stopped being written, which is
+        why this checks both directions rather than just tolerating extra lines.
+        """
+        import difflib
+        base_lines, our_lines = base_dump.splitlines(), ours_dump.splitlines()
+        gone, added = [], []
+        for line in difflib.unified_diff(base_lines, our_lines, lineterm="", n=0):
+            if line.startswith(("+++", "---", "@@")):
+                continue
+            if line.startswith("-"):
+                gone.append(line[1:])
+            elif line.startswith("+"):
+                added.append(line[1:])
+        self.assertEqual(gone, [],
+                         "rows the pre-H1 base writes and this tree no longer does:\n%s"
+                         % "\n".join(gone[:20]))
+        unexpected = [a for a in added
+                      if not any(a.startswith(k) for k in self.UPSTREAM_CAPTURE_ADDITIONS)]
+        self.assertEqual(unexpected, [],
+                         "rows this tree writes that neither the pre-H1 base nor upstream's "
+                         "known additions account for:\n%s" % "\n".join(unexpected[:20]))
+
+    def _back_out_the_upstream_derivation_rule(self, dest: Path) -> None:
+        """Remove `TransitiveLocationRule` from the scratch copy's starter rules.
+
+        The SECOND thing that changes default capture, found when v5.7.0 was
+        reconciled onto published `main`. Upstream 7bfcf46 appended
+        `TransitiveLocationRule()` to `derivation._STARTER_RULES`, a hard-coded
+        list with no config gate (`derivation.enabled` is DORMANT -- derivation
+        cannot be switched off from config), so it fires on the default write
+        path and writes a `transitive_location` belief the pre-H1 base never
+        wrote. That is legitimate NEW UPSTREAM BEHAVIOUR, not a regression, and
+        not something H1 or A6 did -- so the honest repair is to back it out
+        alongside A6's extraction and keep the byte-identical claim, rather than
+        widen the claim until it stops meaning anything.
+
+        Edited as text on the COPY, in the same direction as the A6 backout and
+        for the same reason: the base tree predates the rule and has no version
+        of this file that could be overlaid without dragging the rest of v5.7.0's
+        derivation.py out of the comparison."""
+        f = dest / "engine" / "derivation.py"
+        src = f.read_text(encoding="utf-8")
+        old = "_STARTER_RULES = [WorkplaceLocationRule(), TransitiveLocationRule()]"
+        self.assertIn(old, src,
+                      "the starter-rule list moved; this backout is no longer a patch onto it "
+                      "and the byte-identical claim must be restated, not silently widened")
+        f.write_text(src.replace(old, "_STARTER_RULES = [WorkplaceLocationRule()]", 1),
+                     encoding="utf-8")
+
     def test_store_dump_is_byte_identical_to_the_base_tree(self):
         if not (BASE_TREE / "provider.py").exists():
-            self.skipTest("pre-H1 base tree not available at %s" % BASE_TREE)
-        here = Path(__file__).parent.parent
+            self.skipTest("base tree not available at %s" % BASE_TREE)
         base_dump = self._dump(BASE_TREE)
         self.assertTrue(base_dump.strip(), "base probe produced an empty dump")
-        self.assertEqual(base_dump, self._dump(here),
-                         "H1 at default config changed the store")
+        scratch = tempfile.mkdtemp(prefix="h1-noa6-")
+        try:
+            without_a6 = self._this_tree_with_the_a6_patch_backed_out(Path(scratch) / "tree")
+            self._assert_only_upstreams_known_capture_additions(
+                base_dump, self._dump(without_a6))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_the_overlay_is_what_makes_the_dumps_match(self):
+        """The overlay must not be able to hide a real regression.
+
+        The bare pin (no overlay) is asserted to DIFFER, so this file can never
+        pass by overlaying so much of the tree that the code under test comes
+        along with it: if the two dumps ever agree WITHOUT the A6 patch, the
+        patch stopped changing the default flow and the overlay should be
+        deleted, not kept.
+        """
+        if not (BASE_TREE / "provider.py").exists():
+            self.skipTest("base tree not available at %s" % BASE_TREE)
+        here = Path(__file__).parent.parent
+        self.assertNotEqual(
+            self._dump(BASE_TREE), self._dump(here),
+            "the A6 extraction patch no longer changes the default capture flow; "
+            "drop BASE_OVERLAY and diff the bare pin again")
+
+    def test_the_probe_itself_is_deterministic(self):
+        """Two probes of THIS tree, back to back, with nothing but the capture
+        clock pinned. Before A4 this was false -- extractions.id and
+        identity_candidates.id were fresh uuid4s per run and only the probe's
+        own `uuid.uuid4` monkeypatch hid it -- so the comparison above was
+        measuring a pinned artefact, not the store."""
+        here = Path(__file__).parent.parent
+        first = self._dump(here)
+        self.assertTrue(first.strip())
+        self.assertEqual(first, self._dump(here),
+                         "the default flow still writes a random id somewhere")
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +844,7 @@ class TestDisabledMatchesPreH1TreeExactly(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestSchemaMigration(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp(prefix="h1-mig-")
+        self.dir = temp_home(prefix="h1-mig-")
         self.db = os.path.join(self.dir, "chronicle.db")
 
     def tearDown(self):
@@ -627,9 +878,23 @@ class TestSchemaMigration(unittest.TestCase):
         # H1 claimed 6 when it was built against a v5 store, as did E5 (novelty)
         # and E7 (identity). The ladder-9 integration sequenced them into one
         # chain and host-model plumbing landed at 9; §H2's two drain tables
-        # continued the same chain at 10, and F4c's rerank_hints.owner column
-        # continues it again at 11. See engine/store.py.
-        self.assertEqual(SCHEMA_VERSION, 11)
+        # continued the same chain at 10, F4c's rerank_hints.owner column
+        # continued it at 11, and A0fix's procedures.body -- the column that
+        # actually RECORDS the text a procedure's vector was made of, instead of
+        # leaving re-embeds to rebuild it from the 40-char name -- continues it
+        # again at 12, and A0e's session_index.model -- the column that records
+        # a session-summary vector's geometry, the last embedding-bearing table
+        # that had none -- at 13.
+        #
+        # The v5.7.0 integration continues the SAME chain: six ladder-10 trees
+        # each claimed 12 and/or 13 against v5.6.0's 11, and they are sequenced
+        # into one ladder exactly as E5/E7/H1 were. 14 = A1's
+        # rerank_hints.principal, 15 = A1b's owner/read_acl on goals and
+        # reflections, 16 = A3's maintenance_runs, 17 = A13's narrowed
+        # curation_jobs task CHECK, 18 = A7's queue + vector-census indexes.
+        # Rungs land as their trees merge; the number below is the top of the
+        # chain as it stands in this tree. See engine/store.py.
+        self.assertEqual(SCHEMA_VERSION, 19)
         # Pre-existing data survives, and the new queue is usable immediately.
         self.assertIsNotNone(store.get_event("ev_old"))
         registry = HostModelRegistry(store, _CfgStub({"host_model.piggyback": True}))

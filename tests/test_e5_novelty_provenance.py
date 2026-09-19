@@ -21,7 +21,6 @@ through the real CaptureEngine/Reducer/MemoryStore stack — no mocks.
 """
 
 import json
-import os
 import shutil
 import sqlite3
 import sys
@@ -30,6 +29,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import remove_db, temp_home
 
 from engine.capture import CaptureEngine
 from engine.core import ChronicleCore
@@ -106,7 +107,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 
 def make_core(extra_cfg=None):
-    home = tempfile.mkdtemp()
+    home = temp_home()
     cfg = {"embeddings": {"model": "hashing"}}
     if extra_cfg:
         cfg.update(extra_cfg)
@@ -130,7 +131,7 @@ class TestOldSchemaMigration(unittest.TestCase):
         conn.close()
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_migration_adds_novelty_to_all_belief_tables_without_crashing(self):
         # Opening the store runs _init_db -> _migrate. Before the fix this left
@@ -229,7 +230,7 @@ class TestDistinctFactsGetNovelty(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_second_distinct_fact_gets_populated_novelty(self):
         # Same entity+predicate (so _calculate_novelty has something of the same
@@ -281,7 +282,7 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     def test_fact_stores_with_null_novelty_no_embedder(self):
         key = {"entity_id": "user", "predicate_canonical": "name", "attribute": "name",
@@ -297,7 +298,8 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
 
     def test_second_identical_fact_still_confirms_and_appends_provenance_no_embedder(self):
         # The provenance-merge fix must not depend on an embedder being present —
-        # only the near-duplicate MERGE path (_calculate_novelty) needs one.
+        # nothing on the merge path reads a vector (_exact_duplicate); only the
+        # novelty score does.
         key = {"entity_id": "user", "predicate_canonical": "city", "attribute": "city",
                "qualifiers_hash": "", "qualifiers": {}, "owner": "default", "domain": "user"}
 
@@ -317,8 +319,8 @@ class TestNoEmbedderDegradePath(unittest.TestCase):
 class TestCrossSubjectMergeIsStructurallyImpossible(unittest.TestCase):
     """The critical defect of the second E5 pass: merge candidates for every
     kind WITHOUT a subject column (episode, reference, procedure) were selected
-    on owner+domain alone, so any two same-kind items above dup_similarity
-    merged — and the second one's content was destroyed. Episodes are emitted
+    on owner+domain alone, so any two same-kind items above the (since deleted)
+    0.95 cosine floor merged — and the second one's content was destroyed. Episodes are emitted
     for every turn over 60 characters, so this was the highest-volume write
     path in the system silently eating unrelated content.
 
@@ -349,8 +351,9 @@ class TestCrossSubjectMergeIsStructurallyImpossible(unittest.TestCase):
         from engine.embeddings import cosine
         emb = self.core.embedder
         sim = cosine(emb.embed(self._T1[:400]), emb.embed(self._T2[:400]))
-        # If the fixture ever drops below the threshold the test proves nothing.
-        self.assertGreaterEqual(sim, 0.95, "fixture must exceed dup_similarity")
+        # The pair must be near-identical as VECTORS, or the test would not show
+        # that closeness alone never merges two different items.
+        self.assertGreaterEqual(sim, 0.95, "fixture must be near-identical by cosine")
 
         self.core.capture.append("observed", {"excerpt": self._T1, "session_id": "sess_A"},
                                  actor="user", owner="default")
@@ -488,7 +491,7 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
         self.cap = CaptureEngine(self.store, self.reducer)
 
     def tearDown(self):
-        os.unlink(self.tmp.name)
+        remove_db(self.tmp.name)
 
     @staticmethod
     def _body(i):
@@ -506,20 +509,29 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
                                      "source_type": "user_direct", "domain": "user"},
                         actor="user", owner="default")
 
+    def _note(self, body, src):
+        self.cap.append("asserted", {"kind": "note", "key": {"note_type": "belief", "subject": "pat likes"},
+                                     "body": body, "confidence": 0.9, "source_event": src,
+                                     "source_type": "user_direct", "domain": "user"},
+                        actor="user", owner="default")
+
     def test_duplicate_of_the_newest_item_is_detected_past_the_old_window(self):
+        # Notes: a fact differing only in qualifiers is a different fact (the
+        # qualifiers are part of its natural key), so an exact duplicate of a fact
+        # never reaches the merge; a note under the same subject does.
         for i in range(self.N):
-            self._write("q%03d" % i, self._body(i), "ev%03d" % i)
-        rows = self.store.query_beliefs("facts", "status='active'", (), 500)
+            self._note(self._body(i), "ev%03d" % i)
+        rows = self.store.query_beliefs("notes", "status='active'", (), 500)
         self.assertEqual(len(rows), self.N, "setup items must be pairwise distinct")
 
         newest_body = self._body(self.N - 1)
-        self._write("q_dup", newest_body, "ev_dup")
+        self._note(newest_body, "ev_dup")
 
-        rows = self.store.query_beliefs("facts", "status='active'", (), 500)
+        rows = self.store.query_beliefs("notes", "status='active'", (), 500)
         self.assertEqual(len(rows), self.N,
                          "a duplicate of the NEWEST item was stored again: the candidate "
                          "window is still bounded to the oldest rows")
-        target = [r for r in rows if r["value"] == newest_body]
+        target = [r for r in rows if r["body"] == newest_body]
         self.assertEqual(len(target), 1)
         self.assertEqual(target[0]["occurrence_count"], 2)
         prov = json.loads(target[0]["provenance"])
@@ -553,32 +565,36 @@ class TestNoveltyBeyondTheOldHundredItemWindow(unittest.TestCase):
 class TestMergeLeavesNoOrphanJustification(unittest.TestCase):
     """I5: every justification must support a belief that exists. The merge path
     returned early from _insert_belief without inserting anything, while the
-    caller went on to justify the belief_id that was never written — 1 fact row,
-    2 justifications, 1 of them pointing at nothing."""
+    caller went on to justify the belief_id that was never written — 1 row,
+    2 justifications, 1 of them pointing at nothing.
 
-    A = "skiing in the winter"
-    B = "skiing in the winter months"      # cosine(A, B) = 0.894 under HashingEmbedder
+    Notes, because a fact's exact duplicate under the same key (entity,
+    predicate, qualifiers) is absorbed by _apply_fact_conflict's re-assertion
+    path before the E5 merge sees it. (This fixture used to merge "skiing in the
+    winter" into "skiing in the winter months" under a lowered cosine floor: the
+    data loss the exact rule removes.)"""
+
+    BODY = "Pat Testley goes skiing in the winter"
 
     def setUp(self):
-        self.core, self.home = make_core({"curation": {"dup_similarity": 0.85}})
+        self.core, self.home = make_core()
         self.core.initialize("s1", principal_id="assistant")
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
 
     def test_merged_assertion_justifies_the_surviving_belief(self):
-        for qh, body, src in (("q1", self.A, "ev1"), ("q2", self.B, "ev2")):
-            key = {"entity_id": "pat_testley", "predicate_canonical": "likes", "attribute": "likes",
-                   "qualifiers_hash": qh, "qualifiers": {}, "owner": "default", "domain": "user"}
+        key = {"note_type": "belief", "subject": "pat hobbies"}
+        for src in ("ev1", "ev2"):
             self.core.capture.append(
-                "asserted", {"kind": "fact", "key": key, "body": body, "confidence": 0.85,
+                "asserted", {"kind": "note", "key": key, "body": self.BODY, "confidence": 0.85,
                              "source_event": src, "source_type": "user_direct", "domain": "user"},
                 actor="user", owner="default")
             self.core.process_pending()
 
-        facts = self.core.store.query_beliefs("facts", "status='active'", (), 10)
-        self.assertEqual(len(facts), 1, "fixture must actually merge")
-        survivor = facts[0]["belief_id"]
+        notes = self.core.store.query_beliefs("notes", "status='active'", (), 10)
+        self.assertEqual(len(notes), 1, "fixture must actually merge")
+        survivor = notes[0]["belief_id"]
 
         conn = self.core.store._conn()
         live = set()
@@ -664,7 +680,7 @@ class TestOccurrenceCountForEveryKind(unittest.TestCase):
                                 "%s missing occurrence_count after migration" % t)
             self.assertEqual(store.get_meta("schema_version"), str(SCHEMA_VERSION))
         finally:
-            os.unlink(tmp.name)
+            remove_db(tmp.name)
 
 
 if __name__ == "__main__":

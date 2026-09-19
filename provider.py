@@ -29,6 +29,15 @@ except Exception:  # … else a local stand-in (plugin-package or top-level)
 logger = logging.getLogger("chronicle.provider")
 
 
+def _tools_class():
+    """engine.tools.Tools, dual-mode like every other engine import here."""
+    try:
+        from .engine.tools import Tools  # plugin-package context
+    except ImportError:
+        from engine.tools import Tools  # top-level (dev/tests)
+    return Tools
+
+
 def _load_core():
     try:
         from .engine.core import ChronicleCore  # plugin-package context
@@ -44,6 +53,15 @@ def _load_hostmodel():
     except Exception:
         from engine import hostmodel  # top-level (dev/tests)
     return hostmodel
+
+
+def _speaker():
+    """engine.speaker, dual-mode like every other engine import here."""
+    try:
+        from .engine import speaker  # plugin-package context
+    except Exception:
+        from engine import speaker  # top-level (dev/tests)
+    return speaker
 
 
 def _op_markers():
@@ -125,6 +143,8 @@ class ChronicleMemoryProvider(MemoryProvider):
         self.scope = None
         self._session_id = ""
         self._principal_id = "default"
+        self._host_context = {}
+        self._turn_author = None     # who wrote THIS turn; reset every turn
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -136,14 +156,34 @@ class ChronicleMemoryProvider(MemoryProvider):
         hermes_home = hermes_home or str(Path.home() / ".hermes")
         self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
+        # Hermes calls on_turn_start inside the user's turn: curation runs beside
+        # it, not in it (curation.drain.background).
+        if self.core.cfg.get("curation.drain.background", True):
+            self.core.drain_in_background()
         self._session_id = session_id
         self._principal_id = principal_id
+        # Who is on the user side of this agent (engine/speaker.py). Hermes sends
+        # agent_context "primary" | "subagent" | "cron" | "flush" and the platform;
+        # a host that sends neither is treated as a person typing.
+        self._host_context = {k: str(kw[k]) for k in ("agent_context", "platform")
+                              if kw.get(k)}
         self.scope = self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
         logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
     def shutdown(self):
+        """Nothing to flush; one thing to mirror.
+
+        Capture is durable at append time — every turn is an `append_event` in
+        its own transaction (I12), which is the whole premise of an event-sourced
+        store — so there is no write buffer for shutdown to drain. A
+        `capture.flush_best_effort()` used to be called here and its body was
+        `pass`; A13 removed both halves rather than leave a call that reads like
+        a durability guarantee and is not one.
+
+        `flush_git` stays: the git mirror is a genuinely deferred, out-of-store
+        copy, and this is the last chance to write it.
+        """
         if self.core:
-            self.core.capture.flush_best_effort()
             self.core.flush_git()
 
     # -- config (setup wizard) --------------------------------------------
@@ -174,20 +214,42 @@ class ChronicleMemoryProvider(MemoryProvider):
 
     # -- capture -----------------------------------------------------------
 
-    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+    def _automation_turn(self, session_id="") -> bool:
+        """Is this turn a scheduled job's (a cron_ session, or an automation
+        platform)? A delegated subagent is not: it works on the user's ask."""
+        sid = session_id or self._session_id
+        platform = str(self._host_context.get("platform") or "").strip().lower()
+        return _speaker().is_automation_session(sid) or platform in ("cron", "batch", "curator", "flush")
+
+    def _speaker_context(self, turn_author=None) -> dict:
+        ctx = dict(self._host_context)
+        author = turn_author if isinstance(turn_author, dict) else self._turn_author
+        if isinstance(author, dict):
+            ctx["author"] = author
+        return ctx
+
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None,
+                  turn_author=None):
         if not self.core:
             return
         # MUST be non-blocking — one local append, no network. Unchanged, and it
         # runs FIRST: durable capture never waits on, or is affected by, the
         # optional piggyback below.
+        # `turn_author` is {"id", "name", "is_bot"}; Hermes sends it only to a
+        # sync_turn that accepts it, and only when the turn has a known author.
+        ctx = self._speaker_context(turn_author)
+        sid = session_id or self._session_id
         event_id = self.core.capture.observe(user_content, assistant_content,
-                                             session_id=session_id or self._session_id,
-                                             messages=messages)
+                                             session_id=sid, messages=messages,
+                                             speaker_context=ctx)
         if not self._piggyback_enabled():
             return  # §H1: default OFF — nothing below this line ever runs
+        if _speaker().user_side(agent_context=ctx.get("agent_context", ""),
+                                platform=ctx.get("platform", ""), session_id=sid,
+                                author=ctx.get("author")) != _speaker().HUMAN:
+            return  # enrichment extracts memory about the user; this turn has no user in it
         try:
-            self._host_model_turn(event_id, user_content, assistant_content,
-                                  session_id or self._session_id)
+            self._host_model_turn(event_id, user_content, assistant_content, sid)
         except Exception as e:  # a side channel may never break capture (I12/I18)
             logger.debug("Chronicle host-model piggyback skipped this turn: %s", e)
 
@@ -274,12 +336,28 @@ class ChronicleMemoryProvider(MemoryProvider):
             return ""
         if self.core.has_context_engine:
             return ""  # the Context Engine owns compression when active
-        _, summary = self.core.capture.rescue(messages, session_id=self._session_id)
+        _, summary = self.core.capture.rescue(messages, session_id=self._session_id,
+                                              speaker_context=self._speaker_context())
         return summary
 
     def on_session_end(self, messages):
         if self.core:
             self.core.capture.finalize_session(self._session_id, "clean_exit")
+            # Second maintenance cadence point (§17.4). A session that ends is
+            # the cheapest moment in the whole lifecycle to take a scheduling
+            # decision — no turn is waiting on it — and it is the one hook a
+            # host that never calls on_turn_start still calls. Enqueue only:
+            # the work is drained by the next session's turns.
+            #
+            # Guarded like every other optional side channel in this file
+            # (sync_turn's piggyback: "a side channel may never break capture",
+            # I12/I18). finalize_session has ALREADY succeeded by this line, so
+            # a locked store, a migration mid-flight or an older core with no
+            # `scheduler` must not turn a clean session end into a host error.
+            try:
+                self.core.scheduler.on_hook("session_end")
+            except Exception as e:
+                logger.debug("Chronicle: session_end maintenance hook skipped: %s", e)
 
     def on_memory_write(self, action, target, content, metadata=None):
         if self.core:
@@ -415,6 +493,17 @@ class ChronicleMemoryProvider(MemoryProvider):
             self.on_session_switch(sid, reset=True)
 
     def on_turn_start(self, turn_number, message, **kw):
+        # The host names this turn's author here as well as on sync_turn
+        # (MemoryProvider.on_turn_start: "author_id, author_name, author_is_bot
+        # ... None, None, False without one"), and a shared session carries
+        # several participants. Stashed for the turn's capture, and REPLACED on
+        # every turn including with nothing: a cached gateway agent must never
+        # carry the previous turn's bot author into a person's turn.
+        if "author_id" in kw or "author_name" in kw or "author_is_bot" in kw:
+            author = {"id": kw.get("author_id") or None, "name": kw.get("author_name") or None,
+                      "is_bot": bool(kw.get("author_is_bot"))}
+            self._turn_author = author if (author["id"] or author["name"]
+                                           or author["is_bot"]) else None
         if self.core:
             self.core.capture._touch_session(self._session_id)
             self.core.tick()
@@ -430,15 +519,49 @@ class ChronicleMemoryProvider(MemoryProvider):
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
             return ""
+        if self._automation_turn(session_id) and \
+                not self.core.cfg.get("retrieval.prefetch_automation", False):
+            return ""
+        # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
+        # nothing from a scheduled job's own runs (engine/speaker) -- and only
+        # what is about THIS message: an item must share a content word with
+        # it, and a message with none ("thanks") gets nothing.
         return self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
-            principal=self._principal_id, epistemic=self.core.epistemic)
-
-    def queue_prefetch(self, query, *, session_id=""):
-        pass  # predictive warm-cache hook; no-op in the local build
+            principal=self._principal_id, epistemic=self.core.epistemic,
+            exclude_automation=True,
+            relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)),
+            # The conversation in progress is already in the model's window.
+            live_session=session_id or self._session_id or None)
 
     def system_prompt_block(self) -> str:
-        return self.core.retrieval.static_block(self._principal_id) if self.core else ""
+        if not self.core:
+            return ""
+        return self.core.retrieval.static_block(
+            self._principal_id, include_agent_own=not self._host_injects_agent_memory())
+
+    @staticmethod
+    def _host_injects_agent_memory() -> bool:
+        """Does the host put the agent's own memory file into the system prompt
+        itself (Hermes' built-in memory, `memory.memory_enabled`)? Then
+        Chronicle's copies of the agent's memory writes are older duplicates."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False                  # outside Hermes: Chronicle is the only copy
+        return bool(mem.get("memory_enabled", True))
+
+    @staticmethod
+    def _host_serves_this_provider() -> bool:
+        """Is Chronicle the host's memory provider (`memory.provider`)? Then the
+        host puts `system_prompt_block()` into the system prompt itself."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False
+        return str(mem.get("provider") or "").strip().lower() == "chronicle"
 
     def list_identity_candidates(self, status="pending", kind="", limit=50) -> list[dict[str, Any]]:
         """Identity split/merge candidates awaiting adjudication (§E7, issue #8).
@@ -464,7 +587,13 @@ class ChronicleMemoryProvider(MemoryProvider):
             return []
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return self.core.tools.schemas() if self.core else []
+        # The schemas do not depend on the store, and Hermes routes a memory
+        # tool by the list it gets at add_provider() -- BEFORE initialize().
+        # An empty list there ("Memory provider 'chronicle' registered (0
+        # tools)" on every start) left every chronicle_* tool unroutable while
+        # the model was still offered them later: 77 calls in production, from
+        # chronicle_search to chronicle_remember, every one "Unknown tool".
+        return (self.core.tools if self.core else _tools_class()(None)).schemas()
 
     def handle_tool_call(self, tool_name, args, **kw) -> str:
         if not self.core:

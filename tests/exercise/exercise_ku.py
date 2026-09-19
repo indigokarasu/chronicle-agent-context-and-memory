@@ -32,6 +32,7 @@ numbers are printed as observed, with no pass/fail forced on them.
 
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -45,7 +46,13 @@ from engine.core import ChronicleCore
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("exercise_ku")
 
-KU_PATH = Path("/private/tmp/claude-501/-Users-evaluser-temp/3d6d860f-71ee-406d-9aef-b68dfd0642d1/scratchpad/s_ku20.json")
+# The LongMemEval knowledge-update sample lives OUTSIDE the repo (it is part of the
+# LongMemEval dataset). Point this at your copy. There is deliberately
+# no default path: the previous one was an absolute scratchpad path carrying a
+# machine-local home directory and a session UUID, which is both unrunnable
+# for anyone else and not something a public repo should carry.
+KU_SAMPLE = os.environ.get("CHRONICLE_KU_SAMPLE", "")
+KU_PATH = Path(KU_SAMPLE) if KU_SAMPLE else None
 
 BELIEF_TABLES = ("facts", "notes", "episodes")
 
@@ -103,8 +110,9 @@ def instance_stats(core) -> dict:
 
 
 def main():
-    if not KU_PATH.exists():
-        print(f"ERROR: {KU_PATH} not found")
+    if KU_PATH is None or not KU_PATH.is_file():
+        print("ERROR: set CHRONICLE_KU_SAMPLE to your copy of the "
+              f"LongMemEval knowledge-update sample (got {KU_SAMPLE!r})")
         return 1
 
     instances = json.loads(KU_PATH.read_text())

@@ -14,24 +14,127 @@ derivation, it abstains (I8) rather than fabricates.
 from __future__ import annotations
 
 import datetime as _dt
+import functools
 import hashlib
 import heapq
 import json
 import logging
 import math
 import re
+import unicodedata
+from contextlib import contextmanager
 from itertools import zip_longest
+from time import monotonic as _time_monotonic
 
 from . import access
+from . import credentials as _cred
+from . import speaker as _spk
 from .config import DEFAULTS, check_abstain_gate
-from .embeddings import batch_cosine, cosine, pack, unpack
+from . import embeddings as _embeddings
+from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
+                         estimate_tokens, pack, unpack, wrong_dim_indices)
 from .federated import FederatedChannel
-from .store import KIND_TABLE, now_iso
+from .serialize import belief_id as compute_belief_id
+from .store import KIND_TABLE, now_iso, word_tokens
+from .substance import EVENT_PREDICATES as _EVENT_PREDICATES
 from .trust import Calibrator, confidence_summary
 from .vector_index import MAX_K as KNN_MAX_K
 from .vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.retrieval")
+
+
+class _WrongDimWidth:
+    """A stand-in for a blob whose LENGTH is the only thing anyone reads.
+
+    `wrong_dim_indices` and `_note_wrong_dim_rows` ask a blob exactly two
+    questions -- is it present, and how many bytes is it -- so the ID-ONLY
+    complement query above can answer both from `length(embedding)` without
+    ever loading the bytes. Allocating a real bytes object of that size to
+    satisfy the type would re-introduce, in the DIAGNOSTIC, precisely the
+    memory cost A5 removed from the scan."""
+
+    __slots__ = ("_n",)
+
+    def __init__(self, nbytes: int):
+        self._n = int(nbytes)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+
+# A5: rows per page for every brute-force vector scan. This is THE bound: with
+# a bounded top-k heap downstream, resident vector bytes during a query are
+# `VECTOR_SCAN_PAGE * blob_width`, not `table_rows * blob_width`. At 1000 rows
+# and production's 8192 B blobs that is ~8 MB per scan against the ~750 MB the
+# materialising path paid at 108k rows. Raising it towards the row count walks
+# the memory back to exactly that -- which is what
+# tests/test_a5_streaming_candidates.py's "removing the bound" case asserts.
+#
+# If you came looking for `vector_index.bruteforce_ceiling` (config.py:114):
+# it is declared and read by nothing — one of A12's ~70 dead keys. THIS is the
+# bound on a brute-force scan, and it is a page size, not a row ceiling: a
+# ceiling would have to either refuse to answer above it or silently truncate
+# the corpus, and neither is a thing the read path may do.
+VECTOR_SCAN_PAGE = 1000
+
+
+def _tail_merged(pages, page_size):
+    """Re-chunk a paged scan so no batch is short — unless the ENTIRE scan is
+    one short batch, in which case it is passed through untouched.
+
+    WHY THIS EXISTS (A5, measured — do not remove it as ceremony).
+    `batch_cosine` is not shape-stable. It builds one `(n, d)` float32 matrix
+    and hands `M @ q` to BLAS; on Accelerate (arm64, numpy 2.0.2) the gemv
+    kernel — and with it the accumulation order inside each row's dot product
+    — changes with the matrix shape. Scoring 4,000 unit vectors of d=768 one
+    page at a time, against one 4,000-row call:
+
+        page       1      2     16     32    100    128    256   1000
+        differing  3220   3441   3441   3298   3285     25      0      0
+        max |Δ|   2.2e-8 3.4e-8 3.4e-8 2.2e-8 2.2e-8 1.1e-8      0      0
+
+    Two things follow, and the second is the one that bites:
+
+    1. The crossover is a SHAPE threshold, not a row count — it moves with `d`
+       (d=768 agrees from ~128 rows; d=128 needs ~1000; d=64 needs ~2000).
+       Padding the matrix to a fixed minimum was tried and rejected on the
+       numbers: it fixes d=768 and leaves d=96 wrong. The engine's real widths
+       (768/1024/2048/3072) are all comfortably served by a 1000-row page —
+       verified bit-identical to the single-matrix path for
+       d ∈ {128,256,384,768,1024,2048,3072} × N ∈ {999,1000,1001,1500,2000,
+       2049,3000,5001,12000} at page 1000: zero differing floats in all 63
+       combinations. VECTOR_SCAN_PAGE must not be lowered towards the
+       crossover without re-running that sweep.
+
+    2. The LAST page of any scan is `rows % page` long — routinely a handful
+       of rows, i.e. the one batch that is always under the crossover no
+       matter how large the page is. That is what this function removes: the
+       short tail is folded into its predecessor, so every batch handed to
+       BLAS is at least `page_size` rows, or the scan is a single call that is
+       byte-for-byte the one the materialising path made.
+
+    Nothing downstream resolves 3e-8 (the floors are 0.1/0.15 and RRF is
+    rank-based), and `tests/test_a5_streaming_candidates.py` shows the ranking
+    holds even at page=1 where the scores do drift. But "ranking-identical" is
+    A5's contract, so the contract is met exactly rather than approximately.
+
+    Memory cost: at most two pages resident instead of one.
+    """
+    prev = None
+    for batch in pages:
+        if prev is None:
+            prev = batch
+        elif len(batch) < page_size:
+            prev = prev + batch          # a short tail joins its predecessor
+        else:
+            yield prev
+            prev = batch
+    if prev:
+        yield prev
 
 _STOP = {"the", "a", "an", "is", "are", "what", "who", "where", "when", "how", "do", "does",
          "did", "my", "your", "of", "to", "in", "on", "for", "and", "or", "i", "me", "s",
@@ -250,10 +353,339 @@ def _parse_time_window(text, now=None):
 # session transcript mentions them, so covering them proves nothing (§18.4).
 _GENERIC = {"user", "name", "time", "day", "week", "thing", "info"}
 
+# -- The relevance gate for memory injected UNASKED ---------------------------
+# get_context(relevance_gate=True) is what the provider's per-turn prefetch
+# uses. Measured on the production store after automation sessions were already
+# excluded: every turn got the full ~4,800-char block whether or not anything
+# in memory was about the message -- "what's on my calendar this week" came
+# back with an unrelated chat, a hotel confirmation and a list of contact
+# names. Ranked retrieval always returns SOMETHING (FTS ORs every word of the
+# message, and a vector channel has a nearest neighbour for any query), so for
+# an injection nobody asked for, "ranked" is not "relevant".
+#
+# The rule: an injected item must share a content word with the message. The
+# message's content words are its query tokens minus the filler below -- the
+# usual English function words plus conversational filler ("thanks", "still",
+# "check") that appears in every transcript and so ties anything to anything.
+# A message with none ("thanks!", "ok do it") gets no injection at all.
+# Deliberately lexical: an item related only by embedding similarity is left
+# out of the unasked block and is still found the moment the agent searches.
+# The explicit paths (the agent's own search tool, the context engine's
+# rehydration, every benchmark) never set the flag and are unchanged.
+_GATE_FILLER = frozenset({
+    "able", "about", "above", "absolutely", "actually", "after", "again", "against",
+    "ahead", "all", "already", "alright", "also", "always", "and", "another", "any",
+    "anybody", "anyone", "anything", "anyway", "appreciate", "are", "ask", "asked",
+    "awesome", "back", "bad", "basically", "because", "been", "before", "being",
+    "below", "best", "better", "between", "big", "both", "but", "came", "can",
+    "check", "cheers", "come", "continue", "cool", "could", "course", "definitely",
+    "did", "does", "doing", "done", "down", "during", "each", "either", "else",
+    "enough", "even", "ever", "every", "everyone", "everything", "exactly", "fair",
+    "few", "find", "fine", "first", "fix", "for", "found", "from", "further",
+    "gave", "get", "gets", "getting", "give", "goes", "going", "gone", "gonna",
+    "good", "got", "gotcha", "great", "had", "has", "have", "having", "hello",
+    "help", "her", "here", "hers", "herself", "hey", "him", "himself", "his", "hmm",
+    "how", "instead", "into", "its", "itself", "just", "keep", "kept", "knew",
+    "know", "last", "later", "let", "lets", "like", "little", "look", "lot", "lots",
+    "made", "make", "many", "maybe", "mean", "might", "month", "more", "most",
+    "much", "must", "myself", "need", "needed", "neither", "never", "new", "next",
+    "nice", "nope", "nor", "not", "nothing", "now", "off", "okay", "old", "once",
+    "one", "only", "other", "our", "ours", "ourselves", "out", "over", "own",
+    "perfect", "please", "probably", "proceed", "put", "really", "remember",
+    "remind", "right", "said", "same", "saw", "say", "see", "seen", "shall", "she",
+    "should", "show", "some", "someone", "something", "soon", "sound", "sounds",
+    "still", "stop", "stuff", "such", "sure", "take", "tell", "than", "thank",
+    "thanks", "that", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "these", "they", "thing", "things", "think", "this", "those", "though",
+    "thought", "through", "today", "told", "tomorrow", "tonight", "too", "took",
+    "totally", "tried", "try", "two", "under", "understood", "until", "use", "used",
+    "very", "wait", "wanna", "want", "wanted", "was", "way", "well", "went", "were",
+    "what", "whatever", "when", "where", "which", "while", "who", "whom", "why",
+    "will", "with", "wonderful", "worked", "works", "would", "wrong", "yeah",
+    "year", "yep", "yes", "yesterday", "you", "your", "yours", "yourself",
+    "yourselves", "yup",
+})
+
+
+@functools.lru_cache(maxsize=65536)
+def _gate_stem(tok: str) -> str:
+    """Fold the plural/possessive forms a message and a memory disagree on
+    ("restaurants" / "restaurant", "Robin's" / "Robin")."""
+    if len(tok) > 4 and tok.endswith("ies"):
+        return tok[:-3] + "y"
+    if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+        return tok[:-1]
+    return tok
+
+
+# A URL's pieces ("https", "com", a path's year) are nobody's content words:
+# pasted into a message, they matched half the store.
+_URL_RX = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
+def _strip_urls(text: str) -> str:
+    return _URL_RX.sub(" ", text or "")
+
+
+def _is_content(t: str) -> bool:
+    """A content word: three letters or more, not stop/generic/filler, and
+    not a short number -- a year or a count matches every dated item."""
+    return (len(t) >= 3 and t not in _STOP and t not in _GENERIC and t not in _GATE_FILLER
+            and not (t.isdigit() and len(t) <= 4))
+
+
+def _gate_words(text: str):
+    """Lowercased word tokens outside URLs; a negated contraction ("don't") is
+    no word at all, any other ("Robin's", "what's") is the part before the
+    apostrophe."""
+    for t in word_tokens(_strip_urls(text).lower()):
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+        yield t
+
+
+def relevance_words(text: str) -> frozenset:
+    """The message's content words (stemmed) for the injection relevance gate.
+    Stop/filler words are tested BEFORE stemming -- stemmed, "this" is "thi"."""
+    return frozenset(_gate_stem(t) for t in _gate_words(text) if _is_content(t))
+
+
+# The most content words a gated (per-turn) search looks for. A scheduled
+# job's prompt runs to hundreds: on the production store one 4,400-character
+# cron prompt (210 content words, 234 prefix terms) took 42-84 s -- far past
+# the host's 8 s prefetch timeout, and while that call was stuck the host
+# skipped Chronicle for every turn, the user's included -- and matched nearly
+# everything anyway.
+_GATE_MAX_WORDS = 24
+
+
+def gate_focus(text: str, limit: int = _GATE_MAX_WORDS) -> str:
+    """`text` itself when it has at most `limit` content words; otherwise its
+    `limit` most telling ones -- said most often, capitalised (a name), longest,
+    then first -- joined by spaces, for the gated search to use in its place."""
+    count: dict = {}
+    first: dict = {}
+    named: set = set()
+    for i, raw in enumerate(word_tokens(_strip_urls(text))):
+        t = raw.lower()
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+            raw = raw.split("'", 1)[0]
+        if not _is_content(t):
+            continue
+        stem = _gate_stem(t)
+        count[stem] = count.get(stem, 0) + 1
+        first.setdefault(stem, (i, t))
+        if i > 0 and raw[:1].isupper():
+            named.add(stem)
+    if len(count) <= limit:
+        return text
+    ranked = sorted(count, key=lambda w: (-(count[w] + (2 if w in named else 0)),
+                                          -min(len(w), 12), first[w][0]))
+    return " ".join(first[w][1] for w in ranked[:limit])
+
+
+def relevance_fts_match(text: str) -> str:
+    """The FTS5 expression for the injection gate: the message's content words
+    -- as written and as `_gate_stem` folds them -- each a PREFIX term, OR'd.
+
+    The ordinary query ORs every word of the message ("which", "did" and "I"
+    included), so on the production store it ranked most of the transcript
+    table on every turn (0.77 s a call); the gate then threw away everything
+    that shared no content word. Asking FTS for exactly what the gate keeps is
+    both faster and the same answer. Prefix terms stand in for the stemming
+    the index does not do: "restaurant"* finds "restaurants". "" when the text
+    has no content words (the gate then runs no retrieval at all)."""
+    terms: set = set()
+    for t in _gate_words(text):
+        if _is_content(t):
+            terms.add(t)
+            terms.add(_gate_stem(t))
+    return " OR ".join('"%s"*' % t for t in sorted(terms) if '"' not in t)
+
+
+# What the agent wrote into its OWN memory (Hermes's memory tool, mirrored by
+# provider.on_memory_write). Hermes's built-in memory already puts the current
+# version of that memory into every system prompt; Chronicle's copies are older
+# and include notes the agent has since removed. So the injection into a user's
+# turn -- memory about the USER -- leaves them out: the agent's memory and the
+# user's are kept distinct. Explicit search still finds them.
+_AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
+
+# retrieval.prefetch_min_similarity "auto": the cosine floor a ONE-word gate
+# match must reach, per embedding model (canonical id), measured on the
+# production store's real messages. A model not listed gets no floor.
+_ONE_WORD_FLOOR = {"nomic-embed-text": 0.65}
+# A gate embed is one request inside the user's turn: no retries, never trips
+# the embedder's breaker, gives up after _GATE_EMBED_TIMEOUT, and all of one
+# turn's together stop at _GATE_EMBED_BUDGET seconds. An item with no stored
+# vector is embedded on the spot only when short (a CPU embedder took ~0.45 s
+# for 300 characters), and at most _GATE_EMBED_ITEMS of them per turn.
+# ...and a match on two or three shared words (retrieval.prefetch_min_similarity_few),
+# measured the same way on 300 real messages: the plainly unrelated scored
+# 0.49-0.65 (a security alert's generic words, a pasted script), the related
+# 0.59-0.90; four or more shared words were all related.
+_FEW_WORDS_FLOOR = {"nomic-embed-text": 0.60}
+_FEW_WORDS = 3
+_GATE_EMBED_TIMEOUT = 1.0
+_GATE_EMBED_BUDGET = 1.5
+_GATE_EMBED_ITEM_CHARS = 240
+_GATE_EMBED_ITEMS = 3
+
+
+def _folded_copy(ev) -> bool:
+    """Is this observed event the copy the context engine wrote when it folded
+    a message out of the live window (source_type context_eviction)?"""
+    p = (ev or {}).get("payload")
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except ValueError:
+            return False
+    return isinstance(p, dict) and p.get("source_type") == "context_eviction"
+
+
+def _belief_source(row) -> str:
+    """A belief row's provenance source_type ("" when unreadable)."""
+    try:
+        return (json.loads(row.get("provenance") or "{}") or {}).get("source_type") or ""
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+# The widest page retrieve_raw's FTS channel will fetch while looking for
+# `limit` rows it can use (see _retrieve_raw_inner).
+_FTS_FETCH_MAX = 640
+
+
+def _probe(w: str) -> str:
+    """The letters every token matching `w` STARTS with: its first three (an
+    equal stem, a plural or possessive of it, or a prefix relation between
+    words of four letters or more all share them) -- two for a three-letter
+    "-y" word, whose "-ies" plural shares only those ("fly" / "flies")."""
+    return w[:2] if len(w) == 3 and w.endswith("y") else w[:3]
+
+
+@functools.lru_cache(maxsize=512)
+def _probe_rx(probes: tuple):
+    """Tokens that start with one of `probes`, with word_tokens' boundaries: a
+    token starts at a letter or digit not preceded by one, nor by one plus an
+    apostrophe ("o'reilly" is ONE token, so "reilly" does not start inside it)."""
+    alt = "|".join(re.escape(p) for p in sorted(probes, key=len, reverse=True))
+    return re.compile(r"(?<![^\W_])(?<![^\W_]')(?:%s)[^\W_]*(?:'[^\W_]+)*" % alt)
+
+
+_INFLECTIONS = ("s", "es", "ed", "d", "ing", "er", "ers")
+
+
+def _inflects(a: str, b: str) -> bool:
+    """Are two (stemmed) words one word inflected? Equal; or the longer is the
+    shorter plus an ending ("book"/"booked", "work"/"worker"), with a doubled
+    consonant ("plan"/"planned"), a dropped "e" ("make"/"making") or "y" as
+    "i" ("happy"/"happier") -- between words of four letters or more. Any
+    extension of up to three letters used to count, so "repo" matched
+    "report", "rich" "Richard" and "access" "accessories"."""
+    if a == b:
+        return True
+    s, lng = (a, b) if len(a) <= len(b) else (b, a)
+    if len(s) < 4:
+        return False
+    if lng.startswith(s):
+        suf = lng[len(s):]
+        return suf in _INFLECTIONS or (len(suf) >= 3 and suf[0] == s[-1]
+                                       and suf[1:] in ("ed", "ing", "er", "ers"))
+    if s.endswith("e") and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in ("ing", "ed", "er", "ers")
+    if s.endswith("y") and lng.startswith(s[:-1]):
+        return lng[len(s) - 1:] in ("ied", "ies", "ier", "iest")
+    return False
+
+
+def shared_content_words(words: frozenset | set, text: str) -> set:
+    """Which of `words` does `text` contain -- as written or inflected (see
+    _inflects), outside URLs?
+
+    Only the tokens that START with a word's probe letters are looked at,
+    found by one compiled regex over the text -- measured on the production
+    store, tokenising every word of every candidate excerpt in Python was
+    1.5 s of a per-turn prefetch, and the candidates are exactly the excerpts
+    FTS matched on these words, so a cheaper "does it contain them at all"
+    test could not skip any of them. Every inflection of a word starts with
+    its probe letters."""
+    if not words:
+        return set()
+    low = unicodedata.normalize("NFC", _strip_urls(text)).replace("\u2019", "'").lower()
+    found: set = set()
+    for m in _probe_rx(tuple(sorted({_probe(w) for w in words}))).finditer(low):
+        t = m.group(0)
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+        t = _gate_stem(t)
+        if t in words:
+            found.add(t)
+            continue
+        if len(t) >= 4:
+            for w in words:
+                if w not in found and _inflects(t, w):
+                    found.add(w)
+    return found
+
+
+def shares_content_word(words: frozenset | set, text: str) -> bool:
+    """Does `text` contain one of `words` (see shared_content_words)?"""
+    return bool(shared_content_words(words, text))
+
+
+def gate_needs(words: frozenset | set | None) -> int:
+    """How many of the message's content words an item must share to go into
+    the turn: one for a short message; two once it has more than three, where
+    a single shared word is weak evidence -- on the production store "fire
+    every hour" drew "SF Fire Credit Union" and "suite" every street address
+    with a "Suite B"."""
+    return 1 if len(words or ()) <= 3 else 2
+
+
 # §r6: the most topic-gated standing notes get_context will append from leftover
 # budget. Bounds the tail on a store where a broad focus token ("work") matches
 # dozens of norm notes; the char budget is the other, harder stop.
 _TOPIC_NOTE_CAP = 5
+
+# A16: the marker a DRAFT belief carries into reader-facing output.
+#
+# A draft is by construction not confirmed truth -- it is the losing side of a
+# `flag_for_review` contradiction (reducer._apply_conflict), a high-risk
+# behaviour-changing norm parked for review (curation), or a user-domain
+# inference the derivation layer refuses to assert (derivation.default_status).
+# `_readable` has always admitted `status in ("active", "draft", None)` and the
+# structured channel selects drafts explicitly, so all three reached search(),
+# answer() and the Tier-1 context rendered as a plain `[FACT]`/`[NOTE]` --
+# indistinguishable from a confirmed one.
+#
+# MARKED, not excluded, and the choice is from the code's own intent: three
+# separate producers deliberately write drafts rather than dropping the value,
+# and `_readable` deliberately admits them, so the information is meant to
+# reach a reader; what was missing is the caveat, not the row. `[DRAFT]` leads
+# the line in the same shape as the existing `[CRITICAL]` / `[CONTRADICTION]`
+# tail annotations -- one bracketed word, cheap enough that budget accounting
+# does not notice it. An operator who wants the other policy sets
+# `retrieval.include_drafts` false (see `_include_drafts`), which drops them at
+# the single `_readable` choke point rather than at each render site.
+_DRAFT_TAG = "[DRAFT]"
+
+# Identity sample per width-filtered channel. Tied to the only consumer that
+# shows identities at all -- `vectors_skipped_wrong_dim_detail`, which is
+# itself truncated to 20 -- so nothing downstream can tell the difference.
+_WRONG_DIM_SAMPLE = 20
+
+# A10: what the final trim says when it has to drop something. The old blind
+# `ctx[:max_chars] + "\n… (truncated)"` named neither what was lost nor how
+# much, and cut mid-word / mid-fact to get there.
+_OVER_BUDGET_NOTE = "… ({} item{} dropped: over budget)"
 
 # E12: how many raw candidates the precision gate measures session
 # concentration over. Five is the head a reader's answer actually comes from
@@ -298,6 +730,61 @@ _PRECISION_TIE_EPS = 1e-3
 # embedder, routing disabled, embed failure, or the query is simply closest to
 # it) -- so the factual path is never anything other than today's behavior.
 _ROUTE_KINDS = ("aggregation", "temporal", "preference", "factual")
+
+
+def _rank_key(id_field):
+    """A15: THE tie relation for a ranked candidate list — score DESCENDING,
+    then the candidate's own id ASCENDING.
+
+    Not a new relation. It is the secondary key `_precision_order` already
+    breaks its bucket ties on, lifted out so `retrieve_raw`, `search` and the
+    E3 reranker order equal scores the SAME way the precision gate and its
+    tie-aware head do. Two definitions of "tied" that disagree is exactly the
+    bug F1 fixed inside the gate; this stops the gate and the ranking it reads
+    from re-acquiring it.
+
+    HOW FAR THE ID'S STABILITY GOES, exactly (A15b — A15 said this too widely
+    and it cost a day). `serialize.event_id` hashes
+    (type, payload, parents, actor, **occurred_at**), so:
+
+      * REPLAY of one log — truncate_projection + rebuild, a restore, a second
+        process reading the same store — keeps every id, because it keeps every
+        `occurred_at`. This is the property the tie-break is chosen for and it
+        holds: measured, one store queried under 8 hash seeds returns
+        byte-identical `get_context` output.
+      * RE-RECORDING the same turns — a fixture or a benchmark harness that
+        calls `capture.observe` again — does NOT. `occurred_at` defaults to
+        `now_iso()`, a millisecond wall-clock reading, so every id moves and
+        this key becomes a fresh random permutation of each tied bucket. A15
+        wrote "the same recorded turn keeps the same id across store rebuilds";
+        that is true of the first kind of rebuild and false of the second.
+
+    The consequence is a measurement hazard, not a retrieval one: any harness
+    that re-records its own store and then measures something order-sensitive
+    is drawing from a distribution rather than repeating an experiment. Such a
+    harness must stamp `occurred_at` itself — `test_precision_packing`'s
+    FREEZE_PREAMBLE and `test_token_margins`'s `_stamp` are the two in this
+    tree, and the second one's class docstring carries the measurement (five
+    distinct byte counts from 40 builds at ONE fixed PYTHONHASHSEED).
+
+    Why an id and not "whatever order the pool arrived in": `retrieve_raw`
+    fills `scored` from an FTS pass, then drains a heap whose internal array
+    order is an implementation detail, then may add ANN, session, projection
+    and doc2query tiers; `search` fills `ranked` across six channels. Python's
+    sort is stable, so a bare `key=score` hands every tie to that filling
+    order — which A5's paged scan can change by re-batching the same rows, and
+    which the CHANGELOG (F5) already records shuffling ranks 4 and 5 on v560
+    against one unchanged store.
+
+    NOT a change for a pool with no ties: sorting is total, so a strict score
+    ordering is untouched, and every score comparison downstream (the
+    confidence gate, abstention, MMR relevance) reads the same numbers.
+
+    `id_field` is "event_id" for the raw tier and "belief_id" for Tier 1.
+    Coerced through str() and defaulted to "" so a malformed row cannot raise
+    a TypeError out of the one sort every query passes through.
+    """
+    return lambda c: (-c["score"], str(c.get(id_field) or ""))
 
 # Words generic enough to appear across every question kind (articles, copulas,
 # pronouns, the ambiguous "what"/"which") -- left in they dilute the bag-of-
@@ -368,7 +855,7 @@ def _route_tokens(text: str) -> str:
     on both sides is what lets "when did I go kayaking in Sacramento" match a
     bank of "when did this happen" -- shared noise words never get in the way
     of the one or two content words that actually mark the question kind."""
-    return " ".join(t for t in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+    return " ".join(t for t in word_tokens((text or "").lower())
                     if t not in _ROUTE_STOP)
 
 
@@ -441,6 +928,18 @@ class RetrievalEngine:
         # eval can attribute an answer to the packing that produced it. Defined
         # here so it is readable before any context has been assembled.
         self.last_context_debug: dict = {}
+        # A0c: identities of stored vectors this query had to SKIP because their
+        # blob width does not match the active embedder's. Keyed by row identity
+        # (not counted per scan) so the number a caller sees is "how many rows of
+        # your memory were invisible to this query", not "how many times some
+        # scan loop tripped over them" -- the same row is scanned by several
+        # channels within one query.
+        self._wrong_dim_seen: dict = {}
+        # (channel, table) -> EXACT count, for the width-filtered channels whose
+        # identities are only sampled. Assignment (never +=) keeps a channel read
+        # twice in one query idempotent, exactly as the identity dict did.
+        self._wrong_dim_counts: dict = {}
+        self._wrong_dim_depth = 0
         min_obs = cfg.get("calibration.min_obs", 50) if cfg else 50
         self.calibrator = Calibrator(store, min_obs)
         self._rrf_k = cfg.get("retrieval.rrf_k", 60) if cfg else 60
@@ -501,7 +1000,7 @@ class RetrievalEngine:
         calls focus (§18.4): long enough to discriminate, and not generic."""
         return [t for t in self._tokens(query) if len(t) > 3 and t not in _GENERIC]
 
-    def query_understanding(self, query: str) -> dict:
+    def query_understanding(self, query: str, *, embed: bool = True) -> dict:
         # F1: THE EXPANSION IS AN ORDERED LIST, NOT A SET, because a few lines
         # below it is `" ".join(...)`-ed into the text handed to the embedder.
         #
@@ -539,14 +1038,14 @@ class RetrievalEngine:
                     seen.add(syn)
                     expansions.append(syn)
         emb = None
-        if self.embedder is not None:
+        if embed and self.embedder is not None:
             # embed_query() is the E1 query-side path (prepends "search_query: "
             # for prefix models). Duck-typed embedders that predate E1 expose
             # only embed(); calling the missing method would raise, get swallowed
             # below, and silently drop the ENTIRE vector channel -- fusion, the
             # E3 reranker and MMR all degrade to lexical-only with no signal that
             # anything broke. Same defensive resolution E1 used for
-            # model_with_prefix_marker() in health.py. A non-conforming embedder
+            # embedder_model_tag()'s duck-typed resolution. A non-conforming embedder
             # has no prefixing to begin with, so falling back to embed() cannot
             # mix a bare query against prefixed documents.
             embed_query = getattr(self.embedder, "embed_query", None)
@@ -683,9 +1182,161 @@ class RetrievalEngine:
 
     # -- Tier 1 (§18.1) ----------------------------------------------------
 
-    def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None):
+    # -- wrong-dimension read diagnostics (A0c) -----------------------------
+
+    @contextmanager
+    def _query_diagnostics(self):
+        """Scope one TOP-LEVEL query's wrong-dimension accounting.
+
+        Depth-counted because answer() calls search() and retrieve_raw(), each
+        of which opens this too: only the outermost entry clears the set, so
+        one answer() reports one number over all of its channels instead of the
+        last channel's. The set survives after the outermost exit so the caller
+        can read it (see `last_wrong_dim_skipped`)."""
+        if self._wrong_dim_depth == 0:
+            self._wrong_dim_seen = {}
+            self._wrong_dim_counts = {}
+        self._wrong_dim_depth += 1
+        try:
+            yield self._wrong_dim_seen
+        finally:
+            self._wrong_dim_depth = max(0, self._wrong_dim_depth - 1)
+
+    def last_wrong_dim_skipped(self) -> int:
+        """Distinct stored vectors the most recent top-level query could not
+        score because their width does not match the active embedder.
+
+        Two sources, because the identities behind this number stopped being
+        affordable to hold. A width-filtered channel contributes an EXACT
+        `COUNT(*)` (`_wrong_dim_counts`) and keeps only a 20-row identity
+        sample; a channel that scans rows itself still contributes distinct
+        identities (`_wrong_dim_seen`), which its own paging already bounds.
+        Channels of the first kind are excluded from the identity tally so
+        their sample cannot be added on top of their count."""
+        counted_channels = {ch for ch, _table in self._wrong_dim_counts}
+        identity_only = sum(1 for ch, _ident in self._wrong_dim_seen
+                            if ch not in counted_channels)
+        return sum(self._wrong_dim_counts.values()) + identity_only
+
+    def _note_wrong_dim_table(self, query_emb, table, id_col, channel,
+                              extra_where: str = "", extra_params=()):
+        """The ID-ONLY complement of a width-filtered scan (A0 x A5).
+
+        THE CANCELLATION THIS EXISTS FOR. A0c made a present-but-incomparable
+        vector LOUD on read: `_note_wrong_dim_rows` recorded its identity per
+        query and `batch_cosine` raised the process-wide counter and the
+        one-shot WARNING. A5 then pushed `length(embedding) = ?` into SQL so a
+        scan stops hauling ~88% of production's vector bytes into Python to be
+        scored 0.0 and thrown away. Each is a measured fix; composed naively
+        they ANNIHILATE, because the rows A0 reports are exactly the rows A5's
+        predicate removes -- the scan never sees them, so nothing is counted,
+        the WARNING never fires, and an 88%-mismatched store reads clean again.
+        A5 named this hazard in `iter_memory_vectors_paged`'s docstring and left
+        the call to A0; this is that call.
+
+        The resolution is to ask the COMPLEMENTARY question, exactly as A7's
+        census does for the heal: the scan keeps `width=` and scores only
+        comparable rows, and the diagnostic runs one ID-ONLY query for the rows
+        the scan deliberately skipped --
+            SELECT <id>, length(embedding) FROM <table>
+             WHERE embedding IS NOT NULL AND length(embedding) != ?
+        -- inside the SAME `_query_diagnostics` scope, so one top-level query
+        still reports one number over every channel.
+
+        WHY IDENTITY AND NOT COUNT(*). A0 dedupes across tiers: `answer()` runs
+        `search()` and `retrieve_raw()`, and `query_proxy_vectors` is read twice
+        per query (beliefs then excerpts). Summed COUNT(*)s would double-count;
+        `_wrong_dim_seen` is keyed by (channel, id), so identities are idempotent
+        and the reported number stays the number of DISTINCT unreadable vectors.
+
+        NO BLOBS ARE READ. `length(embedding)` is answerable from
+        `idx_{ov,mv,qpv}_model_width` (store._VECTOR_CENSUS_INDEX_DDLS), and the
+        width sentinel below carries only that integer, so this is strictly
+        cheaper than the pre-A5 code it replaces -- which materialised every one
+        of those blobs.
+
+        A scan that is NOT width-filtered must not call this: it still sees the
+        rows itself and `_note_wrong_dim_rows` still reports them, and calling
+        both would be correct but redundant. Passing `width=None` to re-enable
+        the old path is the one thing that silently reverts A5, so it is never
+        done here."""
+        if not query_emb:
+            return
+        want = len(query_emb) * 4
+        # COUNT first, identities second and BOUNDED. The pre-bound code asked
+        # for every wrong-width identity and built one object per row, once per
+        # channel, five to six times per top-level query, and held them until
+        # the next one -- on an 88%-mismatched production store that is ~93k
+        # rows a channel, i.e. A5's bound undone by the diagnostic that A5's
+        # own docstring asked for. The number stays exact because it now comes
+        # from SQL rather than from len() of the identities.
+        total = self.store.wrong_dim_vector_count(table, id_col, want,
+                                                  extra_where, extra_params)
+        if not total:
+            return
+        pairs = self.store.wrong_dim_vector_ids(table, id_col, want,
+                                                extra_where, extra_params,
+                                                limit=_WRONG_DIM_SAMPLE)
+        if not pairs:
+            return
+        # The process-wide counter and the once-per-process WARNING used to be
+        # raised by batch_cosine seeing the blob. It no longer does, so they are
+        # raised here -- through the MODULE, not a from-import, so the A0c
+        # mutation guard (which patches embeddings.note_wrong_dim) still turns
+        # the whole signal off and keeps proving that this file is what makes it
+        # loud. tests/test_wrong_dim_read_refusal.py is that guard.
+        _embeddings.note_wrong_dim(total, "%s (%s)" % (table, channel))
+        # The count goes through `_note_wrong_dim_rows` rather than straight into
+        # `_wrong_dim_counts`, so this channel still reports through the ONE
+        # choke point tests/test_wrong_dim_read_refusal.py's mutation guard
+        # patches. A count recorded beside that guard rather than behind it
+        # would be a third reporting path the guard does not cover, and the
+        # guard exists precisely to prove there is no such path.
+        self._note_wrong_dim_rows(
+            query_emb, [{id_col: ident, "embedding": _WrongDimWidth(nbytes)}
+                        for ident, nbytes in pairs],
+            id_col, channel, table=table, exact_count=total)
+
+    def _note_wrong_dim_rows(self, query_emb, rows, id_key, channel,
+                             table=None, exact_count=None):
+        """Record which of `rows` are present-but-incomparable, by identity.
+
+        Cheap: one length comparison per row, over blobs the scan already holds.
+        The per-scan COUNT (and the once-per-process WARNING) is raised inside
+        embeddings.batch_cosine / cosine; this adds the per-query, per-row
+        identity a caller can act on."""
+        if not query_emb or not rows:
+            return
+        if exact_count is not None:
+            # A width-filtered channel: `rows` is a bounded SAMPLE, so its length
+            # is not the answer. Assignment, never +=, so the same channel read
+            # twice in one query stays idempotent exactly as the identity dict is.
+            self._wrong_dim_counts[(channel, table)] = exact_count
+        for i in wrong_dim_indices(len(query_emb), [r.get("embedding") for r in rows]):
+            ident = rows[i].get(id_key)
+            if ident is not None:
+                self._wrong_dim_seen[(channel, ident)] = len(rows[i]["embedding"]) // 4
+
+    def search(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
+               fts_match=None, lexical_only=False):
+        """Fused FTS + vector + graph + structured search (§18). Thin wrapper:
+        the body is `_search_inner`; this opens the A0c wrong-dimension scope so
+        one top-level query reports one number across every channel."""
+        with self._query_diagnostics():
+            return self._search_inner(query, limit=limit, domain=domain, purpose=purpose,
+                                      principal=principal, now=now, fts_match=fts_match,
+                                      lexical_only=lexical_only)
+
+    def _search_inner(self, query, *, limit=10, domain=None, purpose="*", principal=None, now=None,
+                      fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
-        q = self.query_understanding(query)
+        q = self.query_understanding(query, embed=not lexical_only)
+        if fts_match is not None:
+            # The injection gate's search: the structured channel scans facts
+            # once per token (an unindexable LIKE) and the graph channel seeds
+            # entities by token, so both take the message's content words only
+            # -- "which" is not worth a scan of the facts table, or an entity.
+            q = dict(q, tokens=[t for t in q["tokens"] if relevance_words(t)])
         ranked: dict[str, dict] = {}
         # R12: entities carry no vector of their own (names are not semantic
         # content, §R12), so a purely SEMANTIC entity match can only ever surface
@@ -727,7 +1378,8 @@ class RetrievalEngine:
             entry["why"].add(channel)
 
         of = self.cfg_overfetch()
-        for i, r in enumerate(self.store.fts_search_beliefs(query, limit=limit * of)):
+        for i, r in enumerate(self.store.fts_search_beliefs(
+                query, limit=limit * of, **({"match": fts_match} if fts_match is not None else {}))):
             add(r["belief_id"], _table_of_kind(r["kind"]), i + 1, "fts")
         if q["embedding"] is not None:
             for i, (bid, kind, _s) in enumerate(self._vector_beliefs(q["embedding"], limit * of)):
@@ -741,6 +1393,26 @@ class RetrievalEngine:
             # content and provenance do (§E2 "never surfaces the proxy text").
             for i, (bid, kind, _s) in enumerate(self._vector_proxies(q["embedding"], limit * of)):
                 add(bid, _table_of_kind(kind), i + 1, "vector_proxy")
+        # Structured channel: substring hits on a fact's value/attribute/
+        # predicate — one unindexable `LIKE '%tok%'` scan per token, which A5
+        # names as a hot spot. MEASURED at 100k facts, 6-token query, before
+        # changing anything: 20-25 ms when the tokens match, 143-155 ms when
+        # none of them do (six complete scans). Two result-identical
+        # restructures were built and measured against that, and BOTH were
+        # rejected on the numbers:
+        #   - one combined scan with per-token buckets and early exit when all
+        #     buckets fill: 97 ms in the nothing-matches case (better) but
+        #     217 ms in the common case (10x WORSE) — a per-token `LIMIT` stops
+        #     its own scan after N hits, and that early exit is worth far more
+        #     than cutting six scans to one;
+        #   - narrowing `SELECT *` to `SELECT belief_id`: 24.4 vs 25.5 ms and
+        #     147 vs 143 ms — noise. SQLite already skips undecoded columns;
+        #     the cost is the LIKE itself.
+        # No index can serve a leading `%` (a partial index on `status` reorders
+        # rows under LIMIT, which WOULD change results), so the only real fix is
+        # the audit's own: back this channel with `belief_fts` (or a trigram FTS
+        # mirror). Both change WHICH rows match, so they belong to a
+        # behaviour-changing task, not to A5's ranking-identical optimisation.
         for tok in q["tokens"]:
             for r in self.store.query_beliefs(
                     "facts", "status IN ('active','draft') AND (value LIKE ? OR attribute LIKE ? "
@@ -818,10 +1490,20 @@ class RetrievalEngine:
         # changes which items survive the [:limit] cut when there are more
         # candidates than room. No embedder / no query vector (offline FTS-only
         # mode, or an embed() failure) -> exactly today's score-order top-N.
+        #
+        # A15: ordered BEFORE selection, not only after it. `ranked` is a dict
+        # filled across six channels (fts, vector, vector_proxy, structured,
+        # graph, host_hint), and MMR reads `out` as given: its eligibility
+        # window is `sorted(..., key=score)[:window]` (stable, so ties fall to
+        # the fill order) and its greedy argmax keeps the FIRST candidate on a
+        # tie. Both therefore inherited whichever channel happened to insert a
+        # tied belief first. One sort here fixes the input to selection, the
+        # window, the argmax and the returned order at once.
+        out.sort(key=_rank_key("belief_id"))
         if self.embedder is not None and q["embedding"] is not None and len(out) > limit:
             keep = set(self._mmr_select(out, limit, self._mmr_lambda))
             out = [c for c in out if c["belief_id"] in keep]
-        out.sort(key=lambda x: x["score"], reverse=True)
+        out.sort(key=_rank_key("belief_id"))
         out = self._rerank(out, q["embedding"])
         out = out[:limit]
         self._offer_rerank(query, out)
@@ -864,6 +1546,12 @@ class RetrievalEngine:
         rerank verdict recorded for one owner cannot reorder, even by a little,
         a different owner's textually similar query -- store-global rerank
         hints were an ordering-only but real cross-owner leak.
+
+        Sandbox-scoped (ladder-10 A1): owner-scoping alone cannot close the
+        sandbox case, because a sandboxed agent shares its owner with exactly
+        the siblings it must not reach. A hint authored by a sandboxed
+        principal is therefore skipped for every OTHER principal (its own
+        queries still use it -- a sandbox denies INBOUND reads, not its own).
         """
         if self.cfg is not None and not self.cfg.get("host_model.rerank_hints.enabled", True):
             return {}
@@ -882,8 +1570,18 @@ class RetrievalEngine:
             return {}
         floor = _clamp_cfg_float(self.cfg, "host_model.rerank_hints.similarity", 0.6, 0.0, 1.0)
         mine = set(toks)
+        topo = access.active_topology()
         out: dict = {}
         for row in rows:
+            # A1: owner-scoping (F4c) cannot see the sandbox, because a
+            # sandboxed agent shares its OWNER with the very siblings it must
+            # not reach. A sandbox denies inbound reads absolutely, and a hint
+            # that re-weights someone else's ranking is an inbound read of the
+            # sandbox's verdict, so it is dropped here — by principal, at the
+            # same topology the can_read choke point consults.
+            author = row.get("principal") or ""
+            if topo is not None and author != principal and topo.is_sandboxed(author):
+                continue
             if row["query_key"] == key:
                 overlap = 1.0
             else:
@@ -1004,7 +1702,11 @@ class RetrievalEngine:
             return candidates  # blend separates nothing → keep fusion order
         for c, b in zip(head, blended):
             c["score"] = lo + (b - blo) / (bhi - blo) * span
-        head.sort(key=lambda x: x["score"], reverse=True)
+        # A15: the blend can tie two candidates that the fusion score
+        # separated, and a stable `key=score` sort would then order them by
+        # their OLD scores — an ordering the new scores no longer support.
+        # Same relation as everywhere else (`_rank_key`).
+        head.sort(key=_rank_key("belief_id"))
         return head + tail
 
     def _rerank_blend(self):
@@ -1177,15 +1879,105 @@ class RetrievalEngine:
         except (TypeError, ValueError):
             return None
 
-    def retrieve_raw(self, query, *, limit=20, principal=None, now=None):
+    def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False,
+                     fts_match=None, lexical_only=False):
+        """Raw observed/session/projection tier. Wrapper for the A0c scope; the
+        body is `_retrieve_raw_inner`.
+
+        `exclude_automation`: leave out everything from an automation session
+        (a scheduled job's own run). Set by the callers that inject memory into
+        the user's conversation unasked — the provider's per-turn prefetch and
+        the context engine's rehydration — and left off for an explicit search,
+        where the agent may be asking about its own work. On the production
+        store 7,817 of 7,924 indexed sessions were cron runs, and the per-turn
+        block was serving their tool JSON and operational narratives as memory
+        about the user."""
+        with self._query_diagnostics():
+            return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now,
+                                            exclude_automation=exclude_automation,
+                                            fts_match=fts_match, lexical_only=lexical_only)
+
+    @staticmethod
+    def _from_automation(ev: dict | None) -> bool:
+        """Whether an event was written by automation (engine/speaker): an
+        automation session, or a turn whose user side capture recorded as
+        automation -- a subagent, a background review, a non-primary agent, a
+        bot author. The session prefix alone misses those: on the production
+        store cron prompts sat in sessions with no `cron_` prefix."""
+        if not ev:
+            return False
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            p = {}
+        if ((p.get("attribution") or {}).get("user_side") == _spk.AUTOMATION):
+            return True
+        sid = ev.get("session_id") or p.get("source_ref") or ""
+        return _spk.is_automation_session(sid)
+
+    def _reader_excerpt(self, ev, stored):
+        """What a reader is handed for observed event `ev`: its excerpt with the
+        host framing taken out (speaker.reader_text) -- an earlier compaction's
+        handoff, a system note, Chronicle's own <memory-context> injection. The
+        stored text still carries them byte-for-byte, because the event id is a
+        hash of it; spans mark them, and extraction has always skipped them, but
+        recall used to serve them back as conversation.
+
+        `stored` is the text the channel already holds (the FTS row, the payload
+        excerpt) and is returned AS IS whenever nothing in the event is framing,
+        so every excerpt without framing is byte-identical to before. None means
+        the event was nothing but framing: the caller leaves it out."""
+        if not ev:
+            return stored
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            return stored
+        base = p.get("excerpt") or ""
+        text = _spk.reader_text(p, actor=ev.get("actor") or "")
+        if text == base:
+            return stored
+        return text if text.strip() else None
+
+    def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
+                            exclude_automation=False, fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
-        q = self.query_understanding(query)
+        q = self.query_understanding(query, embed=not lexical_only)
         scored: dict[str, dict] = {}
-        for i, r in enumerate(self.store.fts_search_observed(query, limit=limit)):
-            ev = self.store.get_event(r["event_id"])
-            if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
-                scored.setdefault(r["event_id"], {"excerpt": r["excerpt"], "score": 0.0,
-                                                  "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
+        # Fetched in widening pages and cut at `limit` ADMITTED rows, so rows
+        # left out below (automation, nothing but host framing) do not cost a
+        # real one its place -- however many of them rank first. With nothing
+        # left out it is one fetch and exactly the first `limit` rows, as before.
+        fetch = 2 * limit
+        while True:
+            # The two narrowing arguments only when they narrow: an explicit
+            # search calls the store exactly as it always has.
+            narrow = {}
+            if fts_match is not None:
+                narrow["match"] = fts_match
+            if exclude_automation:
+                narrow["exclude_session_prefixes"] = _spk.AUTOMATION_SESSION_PREFIXES
+            fts_rows = self.store.fts_search_observed(query, limit=fetch, **narrow)
+            scored = {}
+            admitted = 0
+            for i, r in enumerate(fts_rows):
+                if admitted >= limit:
+                    break
+                ev = self.store.get_event(r["event_id"])
+                if exclude_automation and self._from_automation(ev):
+                    continue
+                if ev and access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
+                    excerpt = self._reader_excerpt(ev, r["excerpt"])
+                    if excerpt is None:
+                        continue            # nothing but host framing
+                    admitted += 1
+                    scored.setdefault(r["event_id"], {"excerpt": excerpt, "score": 0.0,
+                                                      "owner": ev["owner"]})["score"] += self._fts_w / (self._rrf_k + i + 1)
+            if admitted >= limit or len(fts_rows) < fetch or fetch >= _FTS_FETCH_MAX:
+                break
+            fetch *= 4
         # limit <= 0 has no top-k to fill (baseline returned [] via out[:limit]) and
         # would index an empty heap, so the vector scan is skipped outright.
         if q["embedding"] is not None and limit > 0:
@@ -1230,6 +2022,7 @@ class RetrievalEngine:
                 #     the KNN window loses its ENTIRE vector contribution and
                 #     drops out of the top-k the paged path returns it in.
                 vrows = self.store.get_observed_vectors_by_ids(list(scored))
+                self._note_wrong_dim_rows(q["embedding"], list(vrows.values()), "event_id", "raw")
                 fids = [eid for eid in scored if eid in vrows]
                 fsims = batch_cosine(q["embedding"], [vrows[eid]["embedding"] for eid in fids])
                 for eid, sim in zip(fids, fsims):
@@ -1287,10 +2080,16 @@ class RetrievalEngine:
                     if len(wider) <= pos:
                         break  # vec0 has nothing more to offer
                     knn_results, pos = wider, 0
+            elif self._raw_from_cache(q["embedding"], scored, vec_heap, limit, principal,
+                                      exclude_automation):
+                pass   # the in-memory float16 copy served the scan (vector_cache.py)
             else:
                 # Paged brute-force scan (§24.3) — the default, and the fallback
                 # whenever the ANN path is unavailable or came back empty.
-                for batch in self.store.iter_observed_vectors_paged(batch_size=1000):
+                self._note_wrong_dim_table(q["embedding"], "observed_vectors",
+                                           "event_id", "raw")
+                for batch in self.store.iter_observed_vectors_paged(
+                        batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4):
                     osims = batch_cosine(q["embedding"], [v["embedding"] for v in batch])
                     for i, v in enumerate(batch):
                         if osims[i] <= 0.1:
@@ -1305,8 +2104,16 @@ class RetrievalEngine:
                         if len(vec_heap) >= limit and contribution <= vec_heap[0][0]:
                             continue  # can't displace the current floor; skip the event fetch
                         ev = self.store.get_event(eid)
+                        if exclude_automation and self._from_automation(ev):
+                            continue
                         p = json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str) else (ev or {}).get("payload", {})
-                        entry = (contribution, seq, eid, p.get("excerpt", ""), v.get("owner"))
+                        # Judged BEFORE it takes a top-k slot: an event that is
+                        # nothing but host framing would otherwise displace a
+                        # real turn and then be dropped, leaving the slot empty.
+                        excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+                        if excerpt is None:
+                            continue
+                        entry = (contribution, seq, eid, excerpt, v.get("owner"))
                         seq += 1
                         if len(vec_heap) < limit:
                             heapq.heappush(vec_heap, entry)
@@ -1319,9 +2126,14 @@ class RetrievalEngine:
             # ids are namespaced "session:" so they never collide with event ids.
             sess_heap: list[tuple] = []  # (score, seq, session_id, summary, owner)
             seq = 0
-            for batch in self.store.iter_session_vectors_paged(batch_size=1000):
+            self._note_wrong_dim_table(q["embedding"], "session_index",
+                                       "session_id", "session")
+            for batch in self.store.iter_session_vectors_paged(
+                    batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4):
                 for s in batch:
                     if not s.get("embedding"):
+                        continue
+                    if exclude_automation and _spk.is_automation_session(s.get("session_id")):
                         continue
                     sim = cosine(q["embedding"], unpack(s["embedding"]))
                     if sim <= 0.15 or not access.can_read(access.DEFAULT_ACL, s.get("owner"), principal):
@@ -1340,7 +2152,10 @@ class RetrievalEngine:
             # "proj:<provider>:<external_id>" so they never collide with event or session ids.
             proj_heap: list[tuple] = []  # (score, seq, proj_id, excerpt, owner)
             seq = 0
-            for batch in self.store.iter_projection_vectors_paged(batch_size=1000):
+            self._note_wrong_dim_table(q["embedding"], "projection_vectors",
+                                       "external_id", "projection")
+            for batch in self.store.iter_projection_vectors_paged(
+                    batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4):
                 psims = batch_cosine(q["embedding"], [v["embedding"] for v in batch])
                 for i, v in enumerate(batch):
                     if psims[i] <= 0.15:
@@ -1380,7 +2195,10 @@ class RetrievalEngine:
                         continue
                     p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) \
                         else (ev["payload"] or {})
-                    scored[eid] = {"excerpt": p.get("excerpt", ""), "score": contribution,
+                    excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+                    if excerpt is None:
+                        continue        # nothing but host framing
+                    scored[eid] = {"excerpt": excerpt, "score": contribution,
                                    "owner": ev["owner"]}
         # Temporal channel (§18.6): a query naming a date/month/year reranks the
         # survivors by whether they OCCURRED then. Post-heap on ≤2·limit rows, so
@@ -1401,12 +2219,43 @@ class RetrievalEngine:
                     continue
                 v["score"] *= (1.0 + tb) if lo <= occ <= hi else max(0.0, 1.0 - tb * 0.5)
         out = [{"event_id": k, "excerpt": v["excerpt"], "score": v["score"]} for k, v in scored.items()]
-        out.sort(key=lambda x: x["score"], reverse=True)
+        # A15: `scored` is a dict filled by the FTS pass, then a heap drain,
+        # then optionally the ANN/session/projection/doc2query tiers, and a
+        # bare `key=score` sort is STABLE — so equal-scoring candidates came
+        # back in that filling order, i.e. in an implementation detail. Ordered
+        # on the same (score desc, id asc) relation the precision gate breaks
+        # its own ties with; see `_rank_key`.
+        out.sort(key=_rank_key("event_id"))
         return out[:limit]
 
     # -- read-and-answer (§18.4, I23) -------------------------------------
 
     def answer(self, query, *, read_budget=4000, purpose="*", principal=None, now=None) -> dict:
+        """Answer `query` (§18). Wrapper: opens the A0c wrong-dimension scope
+        over BOTH tiers and stamps the per-query count into the debug field.
+
+        `vectors_skipped_wrong_dim` counts DISTINCT stored vectors this query
+        could not score because their blob width does not match the active
+        embedder -- memory that was silently invisible before A0c. Non-zero
+        means part of the store was written by a different embedding model;
+        health's `vectors_wrong_dim` has the store-wide total and
+        scripts/migrate_vectors.py is the fix."""
+        with self._query_diagnostics() as seen:
+            ans = self._answer_inner(query, read_budget=read_budget, purpose=purpose,
+                                     principal=principal, now=now)
+            dbg = ans.get("debug")
+            dbg = dict(dbg) if isinstance(dbg, dict) else {}
+            # NOT len(seen): `seen` is a bounded identity SAMPLE for the
+            # width-filtered channels. The number is exact and comes from
+            # `last_wrong_dim_skipped`.
+            dbg["vectors_skipped_wrong_dim"] = self.last_wrong_dim_skipped()
+            if seen:
+                dbg["vectors_skipped_wrong_dim_detail"] = sorted(
+                    ("%s:%s" % (ch, ident)) for ch, ident in seen)[:20]
+            ans["debug"] = dbg
+            return ans
+
+    def _answer_inner(self, query, *, read_budget=4000, purpose="*", principal=None, now=None) -> dict:
         principal = principal or self.active_principal
         q = self.query_understanding(query)
         # E9 (§18.2): classification is read-only and never changes answer()'s
@@ -1450,14 +2299,23 @@ class RetrievalEngine:
         # non-empty on 30/30 unanswerable LongMemEval questions, which were then
         # answered at median confidence 0.600. Gate Tier 1 before the confident
         # path; see _support_gate and scripts/sweep_abstain.py.
-        # A16: drafts are rendered with a [DRAFT] tag but excluded from the
-        # confident answer path — a draft is not yet verified and should not
-        # be presented as a confident answer. Respects retrieval.include_drafts.
-        _include_drafts = bool(self.cfg.get("retrieval.include_drafts", False)) if self.cfg else False
-        t1_active = t1 if _include_drafts else [
-            c for c in t1
-            if (self.store.get_belief(c["table"], c["belief_id"]) or {}).get("status") != "draft"
-        ]
+        # A16, reconciled with upstream 7b83049. A belief may be READABLE
+        # (`include_drafts`, default true, rendered `[DRAFT]`) and still be
+        # unfit to back a CONFIDENT answer. Two questions, two keys -- see
+        # config.confident_answer_from_drafts for why one key cannot serve both.
+        # `status` is already on the candidate row (`_readable` reads it), so
+        # the common path costs no query; `get_belief` is only a fallback for a
+        # row that somehow lacks it, rather than upstream's per-candidate fetch.
+        if not (self.cfg and bool(self.cfg.get("retrieval.confident_answer_from_drafts", False))):
+            t1_active = []
+            for _c in t1:
+                _st = _c.get("status")
+                if _st is None:
+                    _st = (self.store.get_belief(_c["table"], _c["belief_id"]) or {}).get("status")
+                if _st != "draft":
+                    t1_active.append(_c)
+        else:
+            t1_active = t1
         supported = self._support_gate(t1_active, q)
         if supported and self._confident(t1_active):
             self.store.log_retrieval(query, "*", top)
@@ -1551,7 +2409,7 @@ class RetrievalEngine:
     # -- context assembly (§18.5) -----------------------------------------
 
     def _pref_pack_fill(self, groups, parts, emitted_headers, seen_excerpts,
-                        remaining_chars, *, principal, route):
+                        remaining_chars, *, principal, route, keep=None, live_session=None):
         """F5 preference packing's fill: every USER turn first, assistant halves last.
 
         Replaces BOTH of get_context's normal fill phases on the preference
@@ -1588,7 +2446,13 @@ class RetrievalEngine:
                 if g["sid"] == "(no session)":
                     continue
                 expanded = self._expand_session_window(
-                    g["sid"], principal, seen_excerpts, limit=max_events)
+                    g["sid"], principal, seen_excerpts, limit=max_events,
+                    only_folded=bool(live_session) and g["sid"] == live_session)
+                if keep is not None:
+                    # the injection relevance gate (get_context passes it): given
+                    # the row, the text to carry, or None to leave the turn out
+                    expanded = [dict(x, excerpt=said) for x in expanded
+                                for said in (keep(x),) if said is not None]
                 if not expanded:
                     continue
                 sessions_expanded += 1
@@ -1647,7 +2511,7 @@ class RetrievalEngine:
     def _expand_session_window(self, session_id: str, principal: str,
                                existing_excerpts: set, limit: int = 60,
                                around_seq=None, rank_order=None,
-                               existing_event_ids=None) -> list[dict]:
+                               existing_event_ids=None, only_folded=False) -> list[dict]:
         """Observed turns of one session that context does not already carry.
 
         ONE query per session, capped IN SQL: `type='observed'` and `LIMIT` are
@@ -1713,12 +2577,14 @@ class RetrievalEngine:
             if existing_event_ids is not None and ev["event_id"] in existing_event_ids:
                 continue
             p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
-            excerpt = (p.get("excerpt") or "").strip()
+            if only_folded and p.get("source_type") != "context_eviction":
+                continue                     # the live session: its window already has it
+            excerpt = (self._reader_excerpt(ev, p.get("excerpt") or "") or "").strip()
             if not excerpt or excerpt in existing_excerpts:
                 continue
             date = (ev.get("occurred_at") or "")[:16]
             expanded.append({"excerpt": excerpt, "date": date, "event_id": ev["event_id"],
-                             "seq": ev.get("seq")})
+                             "seq": ev.get("seq"), "payload": p, "actor": ev.get("actor") or ""})
             existing_excerpts.add(excerpt)
             if existing_event_ids is not None:
                 existing_event_ids.add(ev["event_id"])
@@ -1782,12 +2648,20 @@ class RetrievalEngine:
         So order on a QUANTIZED score instead (`_precision_tie_buckets`), and
         break bucket ties by event id — which is a content hash of the event
         (type, payload, actor, occurred_at), so the same recorded turn keeps the
-        same id across store rebuilds, where insertion order does not.
+        same id across a replay of one log, where insertion order does not.
+        (A15b: across a RE-RECORDING of the same turns it does not, because
+        `occurred_at` is hashed too — `_rank_key` has the whole statement.)
 
         The grid has edges, and a score sitting on one would cross it if scores
         ever moved; what this buys is that the ORDERING and the HEAD BOUNDARY
         share that edge (both read `_precision_tie_buckets`), so they can never
         disagree about which candidates are tied.
+
+        A15: the id half of this relation is now `_rank_key`, and `retrieve_raw`
+        / `search` / `_rerank` break their own ties with it — so the pool this
+        gate is handed no longer arrives in one order and get re-read in
+        another. The BUCKET half stays here: quantizing is what the gate needs
+        and what user-visible ranking must not have.
 
         NOT a change to user-visible ranking: `retrieve_raw` and `search` keep
         returning what they always returned. This ordering is applied only
@@ -2108,7 +2982,30 @@ class RetrievalEngine:
         return _clamp_cfg_float(self.cfg, "context.precision_margin", 0.0, 0.0, 1.0)
 
     def get_context(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
-                    principal=None, epistemic=None, now=None) -> str:
+                    principal=None, epistemic=None, now=None, exclude_automation=False,
+                    relevance_gate=False, live_session=None) -> str:
+        """Assemble a reader-facing context block (§18). Wrapper for the A0c
+        wrong-dimension scope; the body is `_get_context_inner`, and the count
+        lands in `last_context_debug["vectors_skipped_wrong_dim"]`."""
+        with self._query_diagnostics():
+            out = self._get_context_inner(hint, token_budget=token_budget,
+                                          include_directives=include_directives, purpose=purpose,
+                                          principal=principal, epistemic=epistemic, now=now,
+                                          exclude_automation=exclude_automation,
+                                          relevance_gate=relevance_gate, live_session=live_session)
+            if relevance_gate:
+                # Put into a turn unasked: never a credential's value (the
+                # agent's own search still finds the message that held it).
+                out = _cred.redact(out)
+            if isinstance(self.last_context_debug, dict):
+                # exact count, not the bounded identity sample -- see answer()
+                self.last_context_debug["vectors_skipped_wrong_dim"] = \
+                    self.last_wrong_dim_skipped()
+            return out
+
+    def _get_context_inner(self, hint, *, token_budget=1500, include_directives=True, purpose="*",
+                           principal=None, epistemic=None, now=None, exclude_automation=False,
+                           relevance_gate=False, live_session=None) -> str:
         """Assemble a reader-facing context block for `hint` (§18).
 
         §L8 r1 priority rule, enforced STRUCTURALLY, not by convention: raw
@@ -2139,17 +3036,239 @@ class RetrievalEngine:
         store order, uncapped in config), and directives + open contradictions
         + critical facts combined may never claim more than ~15% of max_chars,
         however much is left over.
+
+        A10 -- THE BUDGET IS NOW HONEST, in three ways it was not:
+
+        1. ONE estimator. `max_chars` was `token_budget * 4` while every
+           consumer of this output (context.py's compress()/rehydration, the
+           checkpoint digest cap, every test that checks a budget) counted
+           tokens as `estimate_tokens`. So `get_context(1500)` returned up
+           to 6000 chars and the caller that asked for 1500 then hard-cut it.
+           Both sides now go through `budget_chars`/`estimate_tokens`
+           (engine.embeddings), exact inverses of ONE estimate -- see the
+           measured basis note there. The emitted block therefore satisfies
+           `estimate_tokens(ctx) <= token_budget`, which is what the
+           parameter has always claimed and never guaranteed.
+
+           A10b: this site converts under the CONTEXT_BUDGET margin, i.e.
+           NO headroom. A10 shipped one estimator but priced a safety margin
+           into it (chars/3), so a 12k-token caller was handed ~36 000 chars
+           where ~48 000 fit -- the budget was honest about its own units and
+           still a third short of what was asked for. The margin that a hard
+           model boundary genuinely needs now lives at that boundary
+           (EMBED_INPUT), not in every caller's evidence budget.
+
+        2. THE TIER-1 BLOCK IS BUDGETED. It was explicitly "unbudgeted here"
+           (limit=10 was the only bound), so ten long belief renders could
+           exhaust and overrun the budget before the raw fill was reached --
+           and the blind final cut then bisected whichever belief straddled
+           the boundary. It now stops at the first line that does not fit,
+           which is also what makes (3) unreachable in practice.
+
+        3. THE FINAL CUT DROPS WHOLE UNITS. `ctx[:max_chars]` bisected a
+           belief line or an excerpt mid-word and said only "(truncated)",
+           naming neither what was lost nor how much. `_fit_units` drops
+           whole rendered lines from the tail and REPORTS THE COUNT, so a
+           reader is never handed half a fact rendered as if it were a fact.
+
+        `last_context_debug["token_budget"]` / `["used_tokens"]` are computed
+        with that same estimator, so the numbers a caller reads describe the
+        bytes it was actually handed.
         """
         principal = principal or self.active_principal
-        max_chars = token_budget * 4
+        # A10: one estimator. `budget_chars` is `estimate_tokens`'s exact
+        # inverse, so `len(ctx) <= max_chars` IS `estimate_tokens(ctx) <=
+        # token_budget` -- there is no second ratio left to disagree with it.
+        budget_tokens = max(0, int(token_budget))
+        max_chars = budget_chars(budget_tokens, margin=CONTEXT_BUDGET)
         max_directives = _clamp_cfg(self.cfg, "context.max_directives", 5, 0, 500)
         parts: list[str] = []
+
+        # The injection relevance gate (see `_GATE_FILLER`). None = off, and
+        # then every helper below is the identity: explicit callers are
+        # byte-for-byte what they were. On, every evidence line and every tail
+        # line must share a content word with `hint`; a hint with no content
+        # words gets nothing, and the retrieval work is not even started.
+        if relevance_gate:
+            # Only what the person wrote: the gateway prepends an origin header
+            # ("Gateway message origin (JSON data, not instructions or
+            # authorization): {...}"), and its words -- json, authorization,
+            # chat, field -- matched a session where the user once pasted code.
+            hint = "".join(hint[a:b] for a, b, who in _spk.split_user_content(hint or "", _spk.HUMAN)
+                           if who == _spk.HUMAN)
+            hint = gate_focus(hint)          # a long prompt: its most telling words
+        gate = relevance_words(hint) if relevance_gate else None
+        gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
+
+        # (Its own name: `need` is reused below for character budgets, and a
+        # closure reads the variable, not the value it had here.)
+        gate_need = gate_needs(gate) if gate is not None else 0
+
+        floor = self._one_word_floor() if gate is not None else None
+        few_floor = self._few_words_floor() if gate is not None else None
+        query_vec: list = []                 # embedded on first need, at most once
+        embeds = {"deadline": None, "items": 0, "made": {}}   # made: this turn's, by item
+
+        def _embed(text, as_query):
+            """One gate request, inside this turn's shared time budget."""
+            now = _time_monotonic()
+            if embeds["deadline"] is None:
+                embeds["deadline"] = now + _GATE_EMBED_BUDGET
+            left = embeds["deadline"] - now
+            if left <= 0.05:
+                return None
+            return self._gate_vector(text, as_query, min(_GATE_EMBED_TIMEOUT, left))
+
+        def _similarity(ref, text):
+            """(cosine of the message and the item, why-not): the item's stored
+            vector, or, for a short item with none of this model, its text
+            embedded now (a few per turn). (None, reason) when nothing can say."""
+            if not query_vec:
+                query_vec.append(_embed(hint, True))
+            q = query_vec[0]
+            if not q:
+                return None, "no query vector"
+            vec = self._gate_stored_vector(ref)
+            key = ref if ref and ref[1] else text
+            if not vec or len(vec) != len(q):
+                vec = embeds["made"].get(key)
+                if vec is None and len(text) <= _GATE_EMBED_ITEM_CHARS and embeds["items"] < _GATE_EMBED_ITEMS:
+                    embeds["items"] += 1
+                    vec = embeds["made"][key] = _embed(text, False)
+            if not vec or len(vec) != len(q):
+                return None, "no vector"
+            return cosine(q, vec), None
+
+        def _close_enough(ref, words, text):
+            """A match on ONE shared word (retrieval.prefetch_min_similarity) or
+            on two or three (…_few): kept when the item is near the message in
+            meaning. With no floor (an unmeasured model) the words decide alone.
+            One word nothing can vouch for -- the embedder busy or down, a long
+            item never embedded -- is left out: on the production store 71 of 75
+            one-word matches were coincidences, and a busy embedder used to let
+            every one back in. Two or three shared words are evidence of their
+            own, so there the words decide when the vectors cannot."""
+            bar = floor if len(words) == 1 else few_floor
+            if bar is None:
+                return True
+            sim, why = _similarity(ref, text)
+            kept = (len(words) > 1) if sim is None else sim >= bar
+            rec = {"similarity": None if sim is None else round(sim, 3), "kept": kept, "text": text[:80]}
+            if why:
+                rec["why"] = why
+            if len(words) == 1:
+                gate_drop.setdefault("one_word", []).append(dict(rec, word=words[0]))
+            else:
+                gate_drop.setdefault("few_words", []).append(dict(rec, words=list(words)))
+            return kept
+
+        def _relevant(text, kind, ref=None):
+            if gate is None:
+                return True
+            shared = shared_content_words(gate, text)
+            if len(shared) >= gate_need and (len(shared) > _FEW_WORDS
+                                             or _close_enough(ref, sorted(shared), text)):
+                return True
+            gate_drop[kind] += 1
+            return False
+
+        metas: dict = {}
+
+        def _said(row):
+            """A raw row's text as the gated injection carries it, or None to
+            leave it out. What was SAID: not a tool's output (a file read that
+            mentions "calendar" is not about the user's calendar), not the
+            agent's own memory (see _AGENT_OWN_SOURCES), and not the unlabelled
+            opening of a later chunk of a long turn -- it starts mid-message,
+            and on the production store 473 of the 651 interactive transcript
+            events were such chunks, stored without spans that could say whose
+            words they are."""
+            eid = row.get("event_id")
+            if isinstance(row.get("payload"), dict):     # the session window already read it
+                p = row["payload"]
+                meta = {"payload": p, "actor": row.get("actor") or "",
+                        "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+            else:
+                if eid not in metas:
+                    metas[eid] = self._event_meta(eid)
+                meta = metas[eid]
+            if meta.get("source_type") in _AGENT_OWN_SOURCES:
+                gate_drop["excerpts"] += 1
+                return None
+            later_chunk = (meta.get("source_type") == "session_transcript"
+                           and (meta.get("chunk_index") or 0) > 0)
+            if meta.get("payload") is not None:
+                # From the event itself: its spans are what say which lines are
+                # a tool's (an evicted tool result has no label to go by) and
+                # which "User:" lines are really the user.
+                said = _spk.reader_text(meta["payload"], actor=meta.get("actor") or "",
+                                        drop_tools=True, drop_unlabeled=later_chunk)
+            else:
+                said = _spk.strip_framing(row.get("excerpt") or "", drop_tools=True,
+                                          drop_unlabeled=later_chunk)
+            if not said.strip() or not _relevant(_users_part(said, meta), "excerpts", ("event", eid)):
+                return None
+            return said
+
+        def _users_part(said, meta):
+            """What the USER said in an excerpt: the gate asks it, not the
+            assistant's replies. A briefing or a status report shares a word
+            with almost anything, and on the production store such replies
+            filled the block for a question they had nothing to do with. The
+            excerpt is still shown whole -- the reply is context for what the
+            user said. An unlabelled excerpt is one message, whoever wrote it."""
+            lead = _spk.HUMAN if (meta.get("actor") or "") == "user" else _spk.UNKNOWN
+            return _spk.human_text(_spk.parse_labeled(said, _spk.HUMAN, lead))
+
+        # The gate keeps only rows that share a content word, so FTS is asked
+        # for exactly those (relevance_fts_match); None = the ordinary query.
+        fts_match = relevance_fts_match(hint) if gate else None
+        # ...and it runs no embedding at all. Measured on the production store
+        # with the embedder live: the same three gated blocks, line for line,
+        # with and without the vector channels -- the gate keeps only items that
+        # share a content word, and FTS already finds those -- at 7.4 / 4.1 /
+        # 1.1 s with vectors and 2.0 / 2.5 / 0.2 s without. The query embed is a
+        # request to a CPU-bound server inside the user's turn.
+        lexical = gate is not None
+
+        def _raw(limit):
+            rows = self.retrieve_raw(hint, limit=limit, principal=principal, now=now,
+                                     exclude_automation=exclude_automation, fts_match=fts_match,
+                                     lexical_only=lexical)
+            if gate is None:
+                return rows
+            kept = []
+            for r in rows:
+                said = _said(r)
+                if said is None:
+                    continue
+                if said is not r.get("excerpt"):
+                    r = dict(r, excerpt=said)
+                if (r.get("event_id") or "").startswith("session:"):
+                    # A session-channel row's excerpt is the WHOLE session: one
+                    # matching turn would carry every unrelated one with it. It
+                    # nominates the session; the session window below then
+                    # contributes that session's turns one by one, each gated.
+                    r = dict(r, excerpt="")
+                kept.append(r)
+            return kept
+
+        if gate is not None and not gate:
+            self.last_context_debug = {
+                "route": None, "precision": False, "pref_pack": False, "breadth_floor": None,
+                "token_budget": budget_tokens, "used_tokens": 0,
+                "relevance_gate": {"words": [], **gate_drop}}
+            return self._emit("", max_chars, budget_tokens)
 
         # E9 (§18.2): route the hint through nearest-centroid classification.
         # "factual" (no embedder, routing disabled, or simply the nearest
         # match) takes none of the branches below and reproduces today's
         # get_context byte-for-byte -- the acceptance bar for this task.
-        route_info = self.classify_route(hint, now=now)
+        # The gated per-turn path is LEXICAL (see `lexical` below): routing
+        # embeds the message to find its nearest centroid, so it is skipped and
+        # the default route taken -- the per-turn block is short and plain.
+        route_info = ({"route": "factual", "scores": {}} if gate is not None
+                      else self.classify_route(hint, now=now))
         route = route_info["route"]
 
         # -- E12 PRECISION PACKING (§issue-8) ---------------------------------
@@ -2214,16 +3333,17 @@ class RetrievalEngine:
         precision_order = None
         if (precision_on and route == "factual"
                 and self._raw_route(route_info.get("scores") or {}) == "factual"
-                and self.embedder is not None):
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now)
+                and self.embedder is not None and gate is None):
+            raw_probe = _raw(20)
             precision_order = self._precision_order(raw_probe)
             precision = self._precision_decision(precision_order)
         if precision:
             # Never MORE than the caller asked for: precision packing is a
             # reduction, so a caller who already asked for less than the
             # precision budget keeps their own tighter budget.
-            max_chars = min(token_budget,
-                            _clamp_cfg(self.cfg, "context.precision_budget", 1500, 1, 1000000)) * 4
+            budget_tokens = min(budget_tokens,
+                                _clamp_cfg(self.cfg, "context.precision_budget", 1500, 1, 1000000))
+            max_chars = budget_chars(budget_tokens, margin=CONTEXT_BUDGET)
 
         # -- F5 PREFERENCE PACKING --------------------------------------------
         # The preference route's mirror of E12, and it exists because the two
@@ -2273,11 +3393,12 @@ class RetrievalEngine:
             route == "preference"
             and (self.cfg.get("context.preference_packing", True) if self.cfg else True))
         if pref_pack:
-            raw_probe = self.retrieve_raw(hint, limit=20, principal=principal, now=now)
+            raw_probe = _raw(20)
             pref_pack = bool(raw_probe)
         if pref_pack:
-            max_chars = min(token_budget,
-                            _clamp_cfg(self.cfg, "context.preference_budget", 1500, 1, 1000000)) * 4
+            budget_tokens = min(budget_tokens,
+                                _clamp_cfg(self.cfg, "context.preference_budget", 3000, 1, 1000000))
+            max_chars = budget_chars(budget_tokens, margin=CONTEXT_BUDGET)
 
         # The decision, exposed for evals to attribute an answer to (§E12
         # "expose the decision in the debug field"): route + precision flag,
@@ -2291,8 +3412,22 @@ class RetrievalEngine:
             "precision_margin": (precision or {}).get("margin"),
             "precision_session": (precision or {}).get("sid"),
             "precision_event_id": (precision or {}).get("event_id"),
-            "token_budget": max_chars // 4,
+            # A18: the breadth floor's decision, filled in by the raw fill
+            # below when it applies. None means "no per-session ceiling was in
+            # force" -- the factual and preference routes always, and any
+            # breadth route whose candidates grouped into a single session or
+            # whose floor is configured off.
+            "breadth_floor": None,
+            # A10: the budget this call actually enforced, in the SAME unit
+            # `estimate_tokens` counts in -- it used to be `max_chars // 4`,
+            # a third estimator, reporting 2000 for a 1500-token request.
+            "token_budget": budget_tokens,
+            "used_tokens": 0,          # rewritten at every return point below
         }
+        if gate is not None:
+            # the same dict object, so the counts below land here as they grow
+            self.last_context_debug["relevance_gate"] = gate_drop
+            gate_drop["words"] = sorted(gate)
 
         # -- EVIDENCE FIRST (r1) ---------------------------------------------
         # Tier-1: ranked beliefs fused across fts/vector/structured/graph
@@ -2312,9 +3447,18 @@ class RetrievalEngine:
         # -grade noise (measured: 57-78 active facts per haystack over ~8
         # attributes, none preference-shaped), so they are pure volume in front
         # of a reader whose whole job is to notice what the user likes.
+        tier1_chars = 0
+        shown_beliefs: set = set()           # a belief goes into the block once
         for b in ([] if precision or pref_pack else
-                  self.search(hint, limit=10, purpose=purpose, principal=principal, now=now)):
-            ann = epistemic.annotate(b) if epistemic else ""
+                  self.search(hint, limit=10, purpose=purpose, principal=principal, now=now,
+                              fts_match=fts_match, lexical_only=lexical)):
+            if gate is not None:
+                if b.get("source_type") in _AGENT_OWN_SOURCES:
+                    gate_drop["beliefs"] += 1
+                    continue
+                if not _relevant(self._gate_text(b), "beliefs", ("belief", b.get("belief_id"), b.get("kind"))):
+                    continue
+            ann = epistemic.annotate(b, principal) if epistemic else ""
             line = self._render(b) + (f"  ({ann})" if ann else "")
             # Ladder 9 E4 (§issue-8): a matched fact with recorded supersede
             # candidates gets its chain appended, oldest-first with dates, so a
@@ -2336,16 +3480,32 @@ class RetrievalEngine:
                     for c in chain:
                         row = self.store.get_belief("facts", c["belief_id"])
                         if row and self._readable(row, principal, purpose, None):
-                            visible.append(c)
+                            # A16: a chain point may be a DRAFT (this loop's
+                            # own comment says so), and the chain renders bare
+                            # `value (date)`, so carry the status down to
+                            # `_chain_point` rather than re-reading the row.
+                            visible.append(dict(c, status=row.get("status")))
                     if len(visible) > 1:
                         line += "  [history: " + " -> ".join(
-                            "{} ({})".format(c["value"], (c["created_at"] or "")[:10])
-                            for c in visible) + "]"
+                            self._chain_point(c) for c in visible) + "]"
+            # A10: the tier-1 block is BUDGETED. It used to be the one block
+            # that "spends budget without being checked against it" (its own
+            # comment), so a handful of long belief renders could push `ctx`
+            # past `max_chars` before the raw fill even ran, and the blind
+            # final cut then sliced whichever line straddled the boundary.
+            # Whole-unit: a line that does not fit is not shortened, it ends
+            # the block -- ranked order means everything after it is weaker,
+            # and the raw fill below re-checks the budget itself.
+            if tier1_chars + len(line) + 1 > max_chars:
+                break
             parts.append(line)
+            shown_beliefs.add(b.get("belief_id"))
+            tier1_chars += len(line) + 1
         ctx = "\n".join(_dedupe(parts))
 
         # Fill remaining budget with raw evidence grouped BY SESSION and headed
-        # by the session's date (~4 chars/token). Orphan excerpts strip the two
+        # by the session's date (chars/token per engine.embeddings, A10). Orphan
+        # excerpts strip the two
         # things a reader needs most: WHEN it was said (temporal reasoning is
         # impossible without it) and what else was said in the same conversation.
         # Excerpts are appended whole or truncated at a sentence/newline/word
@@ -2385,18 +3545,23 @@ class RetrievalEngine:
             # at None, so the reused rows are exactly the rows this call would
             # have fetched. None whenever neither feature is eligible, and then
             # this is exactly the call that was always here.
-            for raw in (raw_probe if raw_probe is not None else
-                        self.retrieve_raw(hint, limit=raw_limit, principal=principal, now=now)):
+            for raw in (raw_probe if raw_probe is not None else _raw(raw_limit)):
                 excerpt = (raw.get("excerpt") or "").strip()
                 eid = raw.get("event_id") or ""
                 if not excerpt and not eid.startswith("session:"):
                     continue
                 if eid.startswith("session:"):
-                    sid, date = eid.split(":", 1)[1], ""
+                    sid, date, ev = eid.split(":", 1)[1], "", None
                 else:
                     ev = self.store.get_event(eid) or {}
                     sid = ev.get("session_id") or "(no session)"
                     date = (ev.get("occurred_at") or "")[:16]
+                if live_session and sid == live_session and not _folded_copy(ev):
+                    # Per-turn recall of the conversation in progress: the model
+                    # already has these turns -- except what a compaction folded
+                    # out of its window (the context engine's eviction copies).
+                    gate_drop["live_session"] = gate_drop.get("live_session", 0) + 1
+                    continue
                 # E12: "the dominant evidence item FIRST, its immediate session
                 # neighbors for grounding, and nothing else". Phase 1 therefore
                 # contributes exactly one line here — the leading item — and the
@@ -2469,32 +3634,135 @@ class RetrievalEngine:
             # against every other group's BEFORE anything is emitted, so it
             # cannot use this single streaming pass. It runs its own fill
             # below, after phase 2, and this loop and phase 2 both stand down.
+            # -- A18 BREADTH FLOOR -------------------------------------
+            # The fill below is a STREAMING pass: it spends the whole budget
+            # on group 1 before it looks at group 2. That is right when the
+            # budget holds every group and wrong when it does not, and which
+            # of the two obtains is a function of the budget -- measured over
+            # the 58-instance ctx_eval corpus (scripts/ctx_eval_probe.py,
+            # scripts/a18_ab.py):
+            #
+            #   budget | aggregation route      | multi-gold instances
+            #    1 500 |  1.6 sessions, top  99% |  1.6 sessions, top 100%
+            #    4 000 |  4.1 sessions, top  56% |  3.6 sessions, top  58%
+            #   12 000 | 12.2 sessions, top  19% | 11.4 sessions, top  19%
+            #
+            # ("top" = share of the raw-evidence fill claimed by the largest
+            # single session, median.) At 1 500 tokens the median fill is ONE
+            # session at ~100% of it -- 13 of 28 aggregation-route instances
+            # emit a single session header -- while the budget is 99.9%
+            # saturated; 13 of 33 multi-gold instances carry NO gold session,
+            # 12 of them with <=2 sessions emitted. At 12 000 the effect is
+            # gone. So the packer does not have a breadth bug, it has a
+            # tight-budget breadth/depth PRIORITY fixed at "depth, always" --
+            # and an aggregation question ("how many plants did I acquire
+            # last month") cannot be answered out of the one session that
+            # happened to match hardest.
+            #
+            # E9's aggregation route already caps how many EXCERPTS one
+            # session may contribute here (query_routing_aggregation_session_
+            # cap, default 3). That cap is denominated in items and an excerpt
+            # runs to capture.max_excerpt_chars = 4 000, so three of them walk
+            # straight through a 6 000-char budget. This is the same cap in
+            # the unit that is actually scarce.
+            #
+            # THE RESERVATION. Group i of the first N gets `remaining //
+            # (N - i)` chars: the first session may claim a third of the fill,
+            # the second half of what is then left, the Nth and everything
+            # after it all of it. So no session can spend the budget before
+            # the next has been offered its share, and nothing is reserved and
+            # then wasted -- a group that takes less than its share hands the
+            # surplus straight to the next divisor. N = 1 is arithmetically
+            # the pre-A18 fill (`remaining // 1`), which is why the knob's
+            # floor is 1 rather than 0.
+            #
+            # It rations phase 1 ONLY. Phase 2 -- the session-window expansion
+            # -- is pure depth, and it runs after every group has already been
+            # offered its share, so what it spends is by construction what
+            # breadth did not need. (Measured the other way too: rationing
+            # phase 2 as well left a 12 000-char budget 2 700 chars unspent on
+            # a store with one long session and three short ones.)
+            #
+            # OFF on the factual route BY CONSTRUCTION (see `breadth_routes`):
+            # a factual question is answered by one session and E12 precision
+            # packing depends on concentrating there. The preference route is
+            # excluded too -- `_pref_pack_fill` already weighs every group
+            # against every other before emitting anything, which is this same
+            # idea carried further, and running both would ration twice.
+            breadth_routes = ((self.cfg.get("context.breadth_floor_routes", None) if self.cfg
+                               else None) or ["aggregation", "temporal"])
+            breadth_n = None
+            if (not precision and not pref_pack
+                    and route in breadth_routes
+                    and (self.cfg.get("context.breadth_floor", True) if self.cfg else True)):
+                # Only groups with something to emit count toward the floor:
+                # reserving a share for a group that contributes nothing is how
+                # a floor turns into budget held back and never spent.
+                filled = sum(1 for g in groups if g["excerpts"])
+                n = min(filled, _clamp_cfg(
+                    self.cfg, "context.breadth_floor_sessions", 5, 1, 100))
+                if n > 1:
+                    breadth_n = n
+                    # The decision, in the field evals already read (§E12
+                    # "expose the decision"), so a moved instance is
+                    # attributable to this and not to the estimator or the
+                    # route. `share_chars` is the FIRST group's share; later
+                    # groups' shares are recomputed from what is actually left.
+                    self.last_context_debug["breadth_floor"] = {
+                        "route": route, "sessions": n, "groups": filled,
+                        "share_chars": remaining_chars // n}
+
             emitted_headers: dict[str, str] = {}
+            offered = 0
             for g in ([] if pref_pack else groups):
                 if not g["excerpts"]:
                     continue
                 header = "[SESSION {}{}]".format(g["sid"], " @ " + g["date"] if g["date"] else "")
                 block_open = False
+                # This group's share of what is left. `room` IS
+                # `remaining_chars` whenever no floor applies (`// 1`) -- same
+                # value, decremented on exactly the same lines -- so every
+                # route the floor does not cover takes byte-for-byte the path
+                # it took before A18.
+                room = (remaining_chars if breadth_n is None
+                        else remaining_chars // max(1, breadth_n - offered))
+                offered += 1
                 for excerpt in g["excerpts"]:
                     need = (0 if block_open else len(header) + 1) + len(excerpt) + 1
-                    if remaining_chars - need <= 0:
-                        budget = remaining_chars - (0 if block_open else len(header) + 1) - 1
+                    if room - need <= 0:
+                        budget = room - (0 if block_open else len(header) + 1) - 1
                         piece = _truncate_at_boundary(excerpt, budget) if budget > 0 else ""
                         if piece:
                             if not block_open:
                                 parts.append(header)
                                 emitted_headers[g["sid"]] = header
                                 block_open = True
+                                # A10: charge the header. This branch appended
+                                # it and then decremented by the PIECE only, so
+                                # the session-window expansion below (and the
+                                # noise tail after it) ran with `len(header)+1`
+                                # of budget that had already been spent -- the
+                                # emitted block came out over `max_chars` and
+                                # the blind final cut hid it by slicing. Found
+                                # by asserting the final trim never has to drop
+                                # anything; the other three truncating branches
+                                # (`_pref_pack_fill` and both phase-2 arms)
+                                # already charged it correctly.
+                                remaining_chars -= len(header) + 1
+                                room -= len(header) + 1
                             parts.append(piece)
                             remaining_chars -= len(piece) + 1
+                            room -= len(piece) + 1
                         break
                     if not block_open:
                         parts.append(header)
                         emitted_headers[g["sid"]] = header
                         remaining_chars -= len(header) + 1
+                        room -= len(header) + 1
                         block_open = True
                     parts.append(excerpt)
                     remaining_chars -= len(excerpt) + 1
+                    room -= len(excerpt) + 1
                 if remaining_chars <= 0:
                     break
             ctx = "\n".join(_dedupe(parts))
@@ -2518,6 +3786,7 @@ class RetrievalEngine:
                     # One query, capped in SQL (see _expand_session_window).
                     expanded = self._expand_session_window(
                         sid, principal, seen_excerpts, limit=max_events,
+                        only_folded=bool(live_session) and sid == live_session,
                         # E12: grounding means the turns AROUND the evidence,
                         # interleaved with this session's other ranked hits.
                         around_seq=precision["seq"] if precision else None,
@@ -2535,6 +3804,9 @@ class RetrievalEngine:
                         # acceptance bar is byte-identity with a tree that has
                         # no E12 in it at all.
                         existing_event_ids=seen_event_ids if precision else None)
+                    if gate is not None:
+                        expanded = [dict(x, excerpt=said) for x in expanded
+                                    for said in (_said(x),) if said is not None]
                     if not expanded:
                         continue
                     sessions_expanded += 1
@@ -2555,6 +3827,16 @@ class RetrievalEngine:
                     if header is None:
                         date = g["date"] or (expanded[0].get("date") or "")
                         header = "[SESSION {}{}]".format(sid, " @ " + date if date else "")
+                    # A18 does not ration this phase, and that is the point of
+                    # putting the floor in phase 1: by the time the first
+                    # session EXPANDS here, every group phase 1 could reach has
+                    # already been offered its share, so whatever budget is
+                    # still unspent is budget breadth did not need. Rationing
+                    # it again would only leave it unspent -- measured on a
+                    # store with one long session and three short ones, a
+                    # ceiling here too delivered 8 722 chars of a 12 000-char
+                    # budget (the short sessions had nothing left to spend
+                    # their shares on, and the long one was not allowed to).
                     # Append the expanded excerpts that weren't in the top-ranked list
                     for exp in expanded:
                         if remaining_chars <= 0:
@@ -2605,7 +3887,8 @@ class RetrievalEngine:
             if pref_pack:
                 remaining_chars = self._pref_pack_fill(
                     groups, parts, emitted_headers, seen_excerpts, remaining_chars,
-                    principal=principal, route=route)
+                    principal=principal, route=route,
+                    keep=None if gate is None else _said, live_session=live_session)
                 ctx = "\n".join(_dedupe(parts))
 
         # E12: everything below this line is the "and nothing else" precision
@@ -2632,7 +3915,7 @@ class RetrievalEngine:
         # that is actually relevant to the query: as the user's own words, from
         # the sessions retrieval ranked for THIS question.
         if precision or pref_pack:
-            return ctx if len(ctx) <= max_chars else ctx[:max_chars] + "\n… (truncated)"
+            return self._emit(ctx, max_chars, budget_tokens)
 
         # -- BOUNDED NOISE TAIL (§L8) ------------------------------------------
         # Directives, open contradictions, and critical facts, in that order —
@@ -2658,10 +3941,15 @@ class RetrievalEngine:
             return True
 
         if include_directives and max_directives > 0:
-            for d in self.store.query_beliefs(
-                    "notes", "always_inject=1 AND status='active'", (), max_directives):
+            for d in self.directive_rows(principal, max_directives, purpose):
                 body = d.get("body")
                 if not body:
+                    continue
+                # Gated: a standing directive already reaches every turn through
+                # the system prompt (static_block); repeated here only when it
+                # is about this message and not already on the page as a [NOTE].
+                if gate is not None and (body in ctx or not _relevant(body, "tail",
+                                                                     ("belief", d.get("belief_id"), "note"))):
                     continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
@@ -2670,8 +3958,10 @@ class RetrievalEngine:
                 noise_spent += len(line) + 1
                 ctx = "\n".join(_dedupe(parts))
 
-        for c in self.store.get_open_contradictions(3):
+        for c in self.open_contradictions(3, principal):
             line = f"[CONTRADICTION] {c.get('detail','') or c.get('belief_a','')}"
+            if gate is not None and not _relevant(line, "tail"):
+                continue
             if not _fits(line):
                 break
             parts.append(line)
@@ -2679,9 +3969,11 @@ class RetrievalEngine:
             ctx = "\n".join(_dedupe(parts))
 
         for c in self.store.query_beliefs("facts", "criticality!='normal' AND status='active'", (), 5):
-            if not self._readable(c, principal, purpose, None):
-                continue
+            if not self._readable(c, principal, purpose, None) or c.get("belief_id") in shown_beliefs:
+                continue                     # already on the page as a [FACT]
             line = f"[CRITICAL] {c.get('attribute','')}: {c['value']}"
+            if gate is not None and not _relevant(line, "tail", ("belief", c.get("belief_id"), "fact")):
+                continue
             if not _fits(line):
                 break
             parts.append(line)
@@ -2695,7 +3987,9 @@ class RetrievalEngine:
         # space nothing else claimed (§r1 priority rule: evidence first).
         used_chars = len(ctx)
         if used_chars < max_chars:
-            for e in self._graph_seeds(self._tokens(hint))[:3]:
+            seed_tokens = self._tokens(hint) if gate is None else [
+                t for t in self._tokens(hint) if shares_content_word(gate, t)]
+            for e in self._graph_seeds(seed_tokens)[:3]:
                 for d in self.store.query_beliefs(
                         "notes", "note_type='belief' AND subject=? AND status='active'",
                         (f"digest:{e}",), 1):
@@ -2722,6 +4016,8 @@ class RetrievalEngine:
                 added = 0
                 for hit in self.federated.query(focus, principal, self.active_principal):
                     line = "[FEDERATED %s] %s" % (hit["provider"], hit["block"])
+                    if gate is not None and not _relevant(line, "tail"):
+                        continue
                     if remaining_chars - len(line) - 1 <= 0:
                         break
                     parts.append(line)
@@ -2752,20 +4048,28 @@ class RetrievalEngine:
             focus = self._focus_tokens(hint)
             # Bodies already on a line of their own. An epistemic annotation is
             # appended to the [NOTE] render, so compare by prefix, not equality.
-            emitted = [p.split(" ", 1)[1] for p in parts
-                       if p.startswith(("[DIRECTIVE] ", "[NOTE] "))]
+            # A16: a drafted note renders `[DRAFT] [NOTE] body`, so strip the
+            # marker before the prefix test — otherwise a body already on the
+            # page as a draft reads as absent and gets re-added below as a bare
+            # `[DIRECTIVE]`, i.e. the same claim twice, once marked and once not.
+            emitted = []
+            for p_ in parts:
+                line = p_[len(_DRAFT_TAG) + 1:] if p_.startswith(_DRAFT_TAG + " ") else p_
+                if line.startswith(("[DIRECTIVE] ", "[NOTE] ")):
+                    emitted.append(line.split(" ", 1)[1])
             added = 0
-            for d in (self.store.query_beliefs(
-                        "notes", "always_inject=1 AND status='active'", (), 200) if focus else []):
+            for d in (self.directive_rows(principal, 200, purpose) if focus else []):
                 if added >= _TOPIC_NOTE_CAP:
                     break
                 body = (d.get("body") or "").strip()
-                if not body or not self._readable(d, principal, purpose, None):
+                if not body:
                     continue
                 if any(e.startswith(body) for e in emitted):
                     continue
                 low = body.lower()
                 if not any(t in low for t in focus):
+                    continue
+                if gate is not None and not _relevant(body, "tail", ("belief", d.get("belief_id"), "note")):
                     continue
                 line = f"[DIRECTIVE] {body}"
                 if not _fits(line):
@@ -2776,25 +4080,107 @@ class RetrievalEngine:
                 ctx = "\n".join(_dedupe(parts))
                 added += 1
 
-        return ctx if len(ctx) <= max_chars else ctx[:max_chars] + "\n… (truncated)"
+        return self._emit(ctx, max_chars, budget_tokens)
 
-    def get_directives(self) -> str:
-        ds = self.store.query_beliefs("notes", "always_inject=1 AND status='active'", (), 50)
+    def _emit(self, ctx, max_chars, budget_tokens) -> str:
+        """The ONE exit from get_context: fit, then report what was emitted.
+
+        A10. Two things used to be wrong at this line and both were reported
+        as if they were right:
+
+          * the cut was `ctx[:max_chars]`, a blind slice through whatever
+            line straddled the boundary, labelled "(truncated)" with no count
+            and no indication that a rendered fact had been left half-said;
+          * `last_context_debug["token_budget"]` was `max_chars // 4` -- a
+            THIRD ratio, neither the `* 4` this function budgeted with nor the
+            `/ 3` every consumer measured with -- and there was no "used"
+            figure at all, so nothing ever compared the claim to the bytes.
+            `used_chars`/`budget_chars` (A10b) report the same decision in
+            chars, so a caller can check the delivered size against the
+            enforced one without knowing the estimator at all.
+
+        Now the trim drops whole units (`_fit_units`) and both numbers come
+        out of the same estimator the budget was built from, so
+        `used_tokens <= token_budget` holds exactly, not within a fudge
+        factor. `dropped_units` is 0 on every path where each section checked
+        the budget before appending, which is now all of them.
+        """
+        text, dropped = _fit_units(ctx, max_chars)
+        debug = self.last_context_debug
+        if isinstance(debug, dict):
+            debug["token_budget"] = budget_tokens
+            debug["used_tokens"] = estimate_tokens(text, margin=CONTEXT_BUDGET)
+            debug["used_chars"] = len(text)
+            # A10b: the char budget this call actually enforced, so the margin
+            # in force is visible to a caller (and to a test) as a number,
+            # not inferred from the estimator's current constant.
+            debug["budget_chars"] = max_chars
+            debug["dropped_units"] = dropped
+        return text
+
+    # -- ACL-filtered read surfaces (A1) -----------------------------------
+    #
+    # THE one place each of these store reads lives. Before A1 the directive
+    # block, get_directives() (→ static_block → provider.system_prompt_block →
+    # every system prompt), chronicle_list_directives and every contradiction
+    # listing queried the store directly and rendered whatever came back — so a
+    # directive authored by a SANDBOXED agent, or by another user, reached a
+    # principal that access.can_read denies. Routing all of them through these
+    # two methods puts them on the same choke point the retrieval channels
+    # already use, and leaves exactly one place a future surface has to reuse.
+
+    def directive_rows(self, principal=None, limit: int = 50, purpose: str = "*") -> list:
+        """Active always-inject notes THIS principal may read (§15, A1)."""
+        principal = principal or self.active_principal
+        return [d for d in self.store.query_beliefs(
+                    "notes", "always_inject=1 AND status='active'", (), limit)
+                if self._readable(d, principal, purpose, None)]
+
+    def open_contradictions(self, limit: int = 50, principal=None) -> list:
+        """Open contradictions BOTH of whose sides this principal may read (A1).
+
+        A contradiction row is a disclosure in itself — it names two belief ids
+        and spells the conflict out in `detail` — so one unreadable side drops
+        the whole row (core.py:232-234: existence is a disclosure). The SQL
+        limit is deliberately NOT widened to compensate: over-fetching to
+        backfill a restricted principal's listing would make the row count
+        itself report on rows it may not see."""
+        principal = principal or self.active_principal
+        return [c for c in self.store.get_open_contradictions(limit)
+                if self._ref_readable(c.get("belief_a"), principal)
+                and self._ref_readable(c.get("belief_b"), principal)]
+
+    def get_directives(self, principal=None, include_agent_own: bool = True) -> str:
+        ds = self.directive_rows(principal, 50)
+        if not include_agent_own:
+            ds = [d for d in ds if _belief_source(d) not in _AGENT_OWN_SOURCES]
         if not ds:
             return ""
         return "\n".join(["=== CHRONICLE DIRECTIVES ==="] + [f"- {d['body']}" for d in ds if d.get("body")])
 
-    def static_block(self, principal: str) -> str:
+    def static_block(self, principal: str, include_agent_own: bool = True) -> str:
+        """The block for every system prompt. `include_agent_own=False` leaves
+        out the notes the agent wrote with its own memory tool: a host that
+        injects the agent's memory file itself (Hermes' built-in memory) has
+        the CURRENT version -- on the production store Chronicle's copies were
+        older and one was cut off mid-sentence."""
         lines = []
-        d = self.get_directives()
+        d = self.get_directives(principal, include_agent_own=include_agent_own)
         if d:
             lines.append(d)
-        crit = [c for c in self.store.query_beliefs("facts", "criticality='critical' AND status='active'", (), 5)
+        # In every system prompt, so only what must never be acted against:
+        # safety (an allergy, anaphylaxis, a DNR). "Critical" also covers
+        # medical facts, so they never decay -- on the production store that
+        # put a prescription refill, a lab visit and a past procedure into every
+        # agent's prompt, cron jobs included ("Quest Diagnostics" is critical by
+        # its name). They still surface when a message is about them.
+        crit = [c for c in self.store.query_beliefs(
+                    "facts", "criticality='critical' AND criticality_reason='safety' AND status='active'", (), 5)
                 if self._readable(c, principal, "*", None)]
         if crit:
             lines.append("=== CRITICAL ===")
             lines += [f"- {c.get('attribute','')}: {c['value']}" for c in crit]
-        con = self.store.get_open_contradictions(5)
+        con = self.open_contradictions(5, principal)
         if con:
             lines.append("=== OPEN CONTRADICTIONS ===")
             lines += [f"- {c.get('detail','')}" for c in con]
@@ -2808,6 +4194,10 @@ class RetrievalEngine:
                 if self._readable(r, principal, "*", None)]
         for r in sorted(rows, key=lambda x: -(x.get("confidence") or 0)):
             attr = r.get("attribute") or ""
+            # Who the user is, not what happened to them: an event ("attended
+            # a birthday", "purchased ...") is not a standing attribute.
+            if (r.get("predicate_canonical") or attr) in _EVENT_PREDICATES or attr in _EVENT_PREDICATES:
+                continue
             if attr and attr not in seen and r.get("value"):
                 seen.add(attr)
                 prof.append(f"- {attr}: {r['value']}")
@@ -2949,13 +4339,23 @@ class RetrievalEngine:
         return [{"title": r["title"], "occurred_at": r["occurred_at"], "summary": r.get("summary")}
                 for r in rows if self._readable(r, principal, "*", None)]
 
-    def history(self, belief_id):
+    def history(self, belief_id, *, principal=None):
+        """Supersession chain, ACL-filtered at every link (A1).
+
+        An unreadable link ends the walk exactly the way a MISSING one does —
+        same empty-or-short chain, no error, no marker. Belief ids are content
+        hashes that leak into contradiction rows and tool output, so "you have
+        to know the id" was never the access control; refusing loudly here
+        would turn a guessed id into an existence oracle."""
+        principal = principal or self.active_principal
         chain, cur, guard = [], belief_id, 0
         while cur and guard < 100:
             found = self.store.find_belief(cur)
             if not found:
                 break
             row = found[1]
+            if not self._readable_unstatused(row, principal):
+                break
             chain.append({"belief_id": cur, "value": row.get("value") or row.get("body"),
                           "status": row.get("status"), "valid_from": row.get("valid_from"),
                           "valid_until": row.get("valid_until")})
@@ -2963,31 +4363,49 @@ class RetrievalEngine:
             guard += 1
         return chain
 
-    def as_of(self, world=None, knowledge=None) -> list[dict]:
+    def as_of(self, world=None, knowledge=None, *, principal=None) -> list[dict]:
         """Bitemporal query (§7.4): as-known-at `knowledge`, as-true-at `world`.
 
-        Uses iter_events_since for memory-safe streaming (no 100k cap)."""
+        Uses iter_events_since for memory-safe streaming (no 100k cap).
+
+        ACL-filtered twice, because a reconstructed fact has two owners to
+        answer to (A1): the EVENT it was asserted by (events carry an owner and
+        no read_acl — that is what stops a sandboxed agent's or another user's
+        assertions from being replayed into this listing), and, when the belief
+        the event minted still exists, that row's own read_acl (which is what
+        an owner_only belief is recorded in — the event log never carries it).
+        Both go through access.can_read; neither restates its rules."""
+        principal = principal or self.active_principal
         stream = self.store.iter_events_since(0) if not knowledge else self.store.get_events_as_of(knowledge)
         facts = {}
         for ev in stream:
             if ev["type"] != "asserted":
+                continue
+            if not access.can_read(None, ev.get("owner"), principal):
                 continue
             p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else ev["payload"]
             if p.get("kind") != "fact":
                 continue
             k = p["key"]
             facts[(k.get("entity_id"), k.get("predicate_canonical"))] = {
-                "value": p.get("body"), "valid_from": p.get("valid_from") or ev["occurred_at"]}
+                "value": p.get("body"), "valid_from": p.get("valid_from") or ev["occurred_at"],
+                "belief_id": compute_belief_id(
+                    "fact", k, [p.get("source_event") or ev["event_id"]])}
         out = []
         for (ent, pred), v in facts.items():
             if world and v["valid_from"] and v["valid_from"] > world:
                 continue
+            found = self.store.find_belief(v["belief_id"])
+            if found and not self._readable_unstatused(found[1], principal):
+                continue
             out.append({"entity_id": ent, "predicate": pred, "value": v["value"]})
         return out
 
-    def changes_since(self, ts: str) -> list[dict]:
+    def changes_since(self, ts: str, *, principal=None) -> list[dict]:
+        principal = principal or self.active_principal
         rows = self.store.query_beliefs("facts", "created_at > ?", (ts,), 100, order="created_at")
-        return [{"belief_id": r["belief_id"], "value": r["value"], "status": r["status"]} for r in rows]
+        return [{"belief_id": r["belief_id"], "value": r["value"], "status": r["status"]}
+                for r in rows if self._readable_unstatused(r, principal)]
 
     # -- helpers -----------------------------------------------------------
 
@@ -3029,23 +4447,60 @@ class RetrievalEngine:
         return bool(t1) and t1[0]["score"] >= (self._fts_w + self._vec_w) / (self._rrf_k + 1) * 0.9
 
     def _vector_beliefs(self, query_emb, limit):
-        heap: list[tuple] = []  # (sim, seq, belief_id, kind)
-        seq = 0
-        for batch in self.store.iter_memory_vectors_paged(batch_size=1000):
+        """Top-`limit` (belief_id, kind, cosine) over memory_vectors — STREAMED
+        (A5).
+
+        What this replaced: `iter_memory_vectors()` — `SELECT * FROM
+        memory_vectors` into a list of dicts — on every single `search()`.
+        Measured at production shape (108,581 rows, mostly 8192 B blobs) that
+        is ~750 MB of resident Python and ~0.7 s per query, nearly all of it
+        scored 0.0 by `batch_cosine`'s width guard (A0) and thrown away. It was
+        the single largest runtime cost in the engine.
+
+        The replacement is the shape `nearest_memory_vectors` and
+        `retrieve_raw`'s observed scan already use: page by rowid, score each
+        page with the same vectorised `batch_cosine`, keep a bounded min-heap
+        of the best `limit`. Resident vector bytes are `VECTOR_SCAN_PAGE *
+        width`, independent of table size.
+
+        RANKING IS BYTE-IDENTICAL, and that is a requirement, not a hope:
+        - the scan order is unchanged (rowid order is what the un-ORDERed
+          `SELECT *` already returned), and the heap key carries `-pos` so
+          equal cosines break the same way the old stable `sort` broke them —
+          first row seen wins;
+        - `batch_cosine` is bit-identical under paging ONLY once the short
+          final page is merged away. The first draft of this function assumed
+          per-row independence made paging free; it does not — Accelerate
+          picks a different gemv kernel for small `n`, and a 3e-8 drift showed
+          up the moment the differential test swept page sizes. `_tail_merged`
+          (see its docstring for the measured table) is what makes the claim
+          true rather than plausible;
+        - the `length(embedding) = ?` prefilter restates in SQL the rule
+          `batch_cosine` already applies in Python — a wrong-width blob scores
+          a hard 0.0, and 0.0 never clears the `> 0.1` floor below. Wrong-width
+          rows are therefore invisible to this function before AND after, and
+          `tests/test_a5_streaming_candidates.py` pins that equivalence rather
+          than trusting it.
+        """
+        limit = int(limit)
+        if limit <= 0 or query_emb is None or len(query_emb) == 0:
+            return []
+        self._note_wrong_dim_table(query_emb, "memory_vectors", "belief_id", "belief")
+        heap: list = []          # min-heap of (sim, -pos, belief_id, kind), len <= limit
+        pos = 0
+        for batch in _tail_merged(self.store.iter_memory_vectors_paged(
+                batch_size=VECTOR_SCAN_PAGE, width=len(query_emb) * 4), VECTOR_SCAN_PAGE):
             sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
-            for i, v in enumerate(batch):
-                sim = sims[i]
+            for row, sim in zip(batch, sims):
+                here, pos = pos, pos + 1
                 if sim <= 0.1:
                     continue
-                entry = (sim, seq, v["belief_id"], v["kind"])
-                seq += 1
+                entry = (sim, -here, row["belief_id"], row["kind"])
                 if len(heap) < limit:
                     heapq.heappush(heap, entry)
-                elif entry[0] > heap[0][0]:
+                elif entry > heap[0]:
                     heapq.heapreplace(heap, entry)
-        scored = [(bid, kind, sim) for sim, _seq, bid, kind in heap]
-        scored.sort(key=lambda x: x[2], reverse=True)
-        return scored
+        return [(bid, kind, sim) for sim, _neg, bid, kind in sorted(heap, reverse=True)]
 
     def _vector_proxies(self, query_emb, limit):
         """E2 doc2query: brute-force scan of query_proxy_vectors, same shape
@@ -3068,21 +4523,51 @@ class RetrievalEngine:
         on goal: search()'s RRF sums a fresh 1/(k+rank) contribution per add()
         call, so returning every matching proxy un-deduped would let proxy
         COUNT, not match quality, decide the ranking (measured regression:
-        ctx_eval recall@1500 dropped ~12pt before this reduction)."""
-        best: dict = {}
-        for batch in self.store.iter_query_proxy_vectors_paged(is_not_kind="observed", batch_size=1000):
+        ctx_eval recall@1500 dropped ~12pt before this reduction).
+
+        A5: STREAMED, and the kind filter is SQL's now rather than a Python
+        list comprehension over a full copy of the table — this reader and
+        _observed_proxies split `query_proxy_vectors` between them and each
+        used to materialise the whole thing to keep its own half.
+
+        The best-per-belief reduction keeps a dict of SCORES (never blobs), so
+        what survives a page is O(distinct beliefs above the floor) of small
+        ints and strings — bounded by the belief count, not by the ~150 MB of
+        blob this table holds at production size. It is deliberately not capped
+        to `limit` as well: a bounded candidate set can evict a belief's FIRST
+        qualifying row, and first-row order is exactly what breaks ties in the
+        ordering below, so capping it would be a rare, silent ranking change.
+        The blob bound is the one that mattered here."""
+        limit = int(limit)
+        if limit <= 0 or query_emb is None or len(query_emb) == 0:
+            return []
+        self._note_wrong_dim_table(query_emb, "query_proxy_vectors", "belief_id",
+                                   # MUST match store.iter_query_proxy_vectors_paged's
+                                   # exclude_kind predicate exactly: this call reports the
+                                   # COMPLEMENT of that scan, and a bare `kind != ?` here
+                                   # drops NULL-kind rows the COALESCE'd scan keeps -- so a
+                                   # NULL-kind wrong-width row would be neither scored nor
+                                   # counted, and the store would read cleaner than it is.
+                                   "proxy", "COALESCE(kind, '') != ?", ("observed",))
+        best: dict = {}          # belief_id -> [best_sim, kind_of_best, first_pos]
+        pos = 0
+        for batch in _tail_merged(self.store.iter_query_proxy_vectors_paged(
+                batch_size=VECTOR_SCAN_PAGE, width=len(query_emb) * 4,
+                exclude_kind="observed"), VECTOR_SCAN_PAGE):
             sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
-            for i, r in enumerate(batch):
-                sim = sims[i]
+            for row, sim in zip(batch, sims):
+                here, pos = pos, pos + 1
                 if sim <= 0.1:
                     continue
-                bid = r["belief_id"]
-                cur = best.get(bid)
-                if cur is None or sim > cur[2]:
-                    best[bid] = (bid, r["kind"], sim)
-        scored = list(best.values())
-        scored.sort(key=lambda x: x[2], reverse=True)
-        return scored[:limit]
+                cur = best.get(row["belief_id"])
+                if cur is None:
+                    best[row["belief_id"]] = [sim, row["kind"], here]
+                elif sim > cur[0]:
+                    cur[0], cur[1] = sim, row["kind"]
+        # (sim desc, first_pos asc) is precisely what a stable sort by sim over
+        # a first-seen-ordered dict used to produce.
+        ranked = sorted(best.items(), key=lambda kv: (kv[1][0], -kv[1][2]), reverse=True)
+        return [(bid, v[1], v[0]) for bid, v in ranked[:limit]]
 
     def _observed_proxies(self, query_emb, limit):
         """§H2.4: the raw-tier half of _vector_proxies — doc2query proxies whose
@@ -3099,27 +4584,55 @@ class RetrievalEngine:
         scan would find nothing, since the flag is also what writes the rows).
         Same best-per-parent reduction as the belief tier, for the same measured
         reason — several proxies on one parent must not out-vote one strong
-        direct match purely by count."""
-        best: dict = {}
-        for batch in self.store.iter_query_proxy_vectors_paged(kind_filter="observed", batch_size=1000):
+        direct match purely by count.
+
+        A5: streamed, kind filtered in SQL, same bounded-blob and exact-order
+        contract as _vector_proxies."""
+        limit = int(limit)
+        if limit <= 0 or query_emb is None or len(query_emb) == 0:
+            return []
+        self._note_wrong_dim_table(query_emb, "query_proxy_vectors", "belief_id",
+                                   "excerpt_proxy", "kind = ?", ("observed",))
+        best: dict = {}          # event_id -> [best_sim, first_pos]
+        pos = 0
+        for batch in _tail_merged(self.store.iter_query_proxy_vectors_paged(
+                batch_size=VECTOR_SCAN_PAGE, width=len(query_emb) * 4,
+                kind="observed"), VECTOR_SCAN_PAGE):
             sims = batch_cosine(query_emb, [v["embedding"] for v in batch])
-            for i, r in enumerate(batch):
-                sim = sims[i]
+            for row, sim in zip(batch, sims):
+                here, pos = pos, pos + 1
                 if sim <= 0.1:
                     continue
-                eid = r["belief_id"]        # an EVENT id in this table's excerpt role
-                if sim > best.get(eid, 0.0):
-                    best[eid] = sim
-        if not best:
-            return []
-        scored = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
-        return scored[:limit]
+                eid = row["belief_id"]        # an EVENT id in this table's excerpt role
+                cur = best.get(eid)
+                if cur is None:
+                    best[eid] = [sim, here]
+                elif sim > cur[0]:
+                    cur[0] = sim
+        ranked = sorted(best.items(), key=lambda kv: (kv[1][0], -kv[1][1]), reverse=True)
+        return [(eid, v[0]) for eid, v in ranked[:limit]]
 
     def _readable(self, row, principal, purpose, domain) -> bool:
-        if row.get("status") not in ("active", "draft", None):
+        status = row.get("status")
+        if status not in ("active", "draft", None):
+            return False
+        # A16: drafts are readable and MARKED by default (see `_render` /
+        # `_include_drafts`); `retrieval.include_drafts=false` drops them here,
+        # at the one choke point every channel already passes through.
+        if status == "draft" and not self._include_drafts():
             return False
         if not access.can_read(row.get("read_acl"), row.get("owner"), principal):
             return False
+        return self._readable_envelope(row, purpose, domain)
+
+    def _readable_envelope(self, row, purpose, domain) -> bool:
+        """The non-ACL half of _readable (domain / purpose_scope / info_label).
+
+        Split out so the audit-shaped paths (A1: history/as_of/changes_since)
+        can call the ACL choke point WITHOUT also inheriting _readable's
+        status gate, which would silently change what a bitemporal or
+        supersession-chain query returns. Nothing else about the rule moves:
+        access.can_read stays the one place the ACL decision is made."""
         if domain and row.get("domain") and row["domain"] != domain:
             return False
         ps = row.get("purpose_scope")
@@ -3132,17 +4645,244 @@ class RetrievalEngine:
                 pass
         return not (row.get("info_label") == "secret" and purpose != "secret")
 
+    def _readable_unstatused(self, row, principal, purpose="*", domain=None) -> bool:
+        """_readable for rows whose STATUS must not gate visibility (A1).
+
+        history()/as_of()/changes_since() exist precisely to surface
+        superseded and retracted rows, so the status gate cannot apply there —
+        but the ACL must. Same choke point (access.can_read), same envelope,
+        one policy difference, stated once."""
+        if not access.can_read(row.get("read_acl"), row.get("owner"), principal):
+            return False
+        return self._readable_envelope(row, purpose, domain)
+
+    def _ref_readable(self, ref, principal) -> bool:
+        """May `principal` see the thing a bare id points at? (A1)
+
+        Contradiction rows carry belief ids on both sides, and one side may be
+        an EVENT id (reducer._on_contradicted stores `conflicting_event`
+        there). Both resolve to an owner, so both go through the same choke
+        point. An id that resolves to neither names no content and gates on
+        nothing — refusing it would only turn the listing into an existence
+        oracle in the other direction."""
+        ref = (ref or "").strip()
+        if not ref:
+            return True
+        found = self.store.find_belief(ref)
+        if found:
+            return self._readable_unstatused(found[1], principal)
+        ev = self.store.get_event(ref)
+        if ev:
+            return access.can_read(None, ev.get("owner"), principal)
+        return True
+
+    def _event_meta(self, event_id: str | None) -> dict:
+        """An observed event's payload, actor, source_type and chunk_index ({}
+        for a session or projection row, or an event that is not there)."""
+        if not event_id or event_id.startswith(("session:", "proj:")):
+            return {}
+        ev = self.store.get_event(event_id)
+        if not ev:
+            return {}
+        raw = ev.get("payload")
+        try:
+            p = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except ValueError:
+            return {}
+        return {"payload": p, "actor": ev.get("actor") or "",
+                "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+
+    def _observed_cache(self):
+        """The store's ObservedVectorCache, created on first use; None when
+        retrieval.observed_vector_cache is off."""
+        on = self.cfg.get("retrieval.observed_vector_cache", True) if self.cfg else True
+        if not on:
+            return None
+        cache = getattr(self.store, "_observed_vector_cache", None)
+        if cache is None:
+            from .vector_cache import ObservedVectorCache
+            cap = (self.cfg.get("retrieval.observed_vector_cache_max_rows", 250000)
+                   if self.cfg else 250000)
+            cache = ObservedVectorCache(self.store, max_rows=int(cap))
+            self.store._observed_vector_cache = cache
+        return cache
+
+    def _raw_from_cache(self, query, scored, vec_heap, limit, principal, exclude_automation) -> bool:
+        """The raw tier's vector pass from the in-memory copy: the same result the
+        paged scan below produces (same floor, ACL, exclusions and top-k heap),
+        with candidates visited best-first so the scan stops as soon as nothing
+        left can enter the heap. False when the cache cannot serve; the caller
+        then pages the table as before."""
+        cache = self._observed_cache()
+        got = cache.scores(query) if cache is not None else None
+        if got is None:
+            return False
+        ids, owners, sims, index = got
+        import numpy as np
+        # FTS hits: credited whatever their rank, exactly as the paged scan does.
+        for eid in list(scored):
+            i = index.get(eid)
+            if i is None or sims[i] <= 0.1:
+                continue
+            if access.can_read(access.DEFAULT_ACL, owners[i], principal):
+                scored[eid]["score"] += self._vec_w * float(sims[i])
+        cand = np.nonzero(sims > 0.1)[0]
+        order = cand[np.argsort(-sims[cand], kind="stable")]
+        seq = 0
+        for i in order:
+            eid = ids[i]
+            if eid in scored:
+                continue
+            contribution = self._vec_w * float(sims[i])
+            if len(vec_heap) >= limit and contribution <= vec_heap[0][0]:
+                break          # best-first: nothing after this can displace the floor
+            if not access.can_read(access.DEFAULT_ACL, owners[i], principal):
+                continue
+            ev = self.store.get_event(eid)
+            if exclude_automation and self._from_automation(ev):
+                continue
+            p = (json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str)
+                 else (ev or {}).get("payload", {}))
+            excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+            if excerpt is None:
+                continue
+            entry = (contribution, seq, eid, excerpt, owners[i])
+            seq += 1
+            if len(vec_heap) < limit:
+                heapq.heappush(vec_heap, entry)
+            else:
+                heapq.heapreplace(vec_heap, entry)
+        return True
+
+    def _one_word_floor(self):
+        """retrieval.prefetch_min_similarity resolved: a float, or None (off --
+        also for an embedder the gate cannot ask, such as hashing)."""
+        if getattr(self.embedder, "_embed_raw_batch", None) is None:
+            return None
+        v = self.cfg.get("retrieval.prefetch_min_similarity", "auto") if self.cfg else "auto"
+        if v == "auto":
+            v = _ONE_WORD_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _few_words_floor(self):
+        """retrieval.prefetch_min_similarity_few resolved: a float, or None."""
+        if getattr(self.embedder, "_embed_raw_batch", None) is None:
+            return None
+        v = self.cfg.get("retrieval.prefetch_min_similarity_few", "auto") if self.cfg else "auto"
+        if v == "auto":
+            v = _FEW_WORDS_FLOOR.get(_embeddings.canonical_model_id(getattr(self.embedder, "model", "")))
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _gate_vector(self, text, as_query, timeout):
+        """A vector for the one-word check, or None. One request with a short
+        timeout: this runs inside the user's turn, so it neither retries nor
+        trips the embedder's breaker (that would stop background embedding
+        too), and it is skipped while the breaker is already open."""
+        emb = self.embedder
+        raw = getattr(emb, "_embed_raw_batch", None)
+        if raw is None or getattr(emb, "_open_until", 0.0) > _time_monotonic():
+            return None
+        prefix = ""
+        if getattr(emb, "use_task_prefixes", False):
+            prefix = "search_query: " if as_query else "search_document: "
+        try:
+            vec = raw([prefix + (text or "")[:2000]], timeout)[0]
+        except Exception as e:  # noqa: BLE001 -- no vector: the lexical rule alone
+            logger.debug("gate embed skipped: %s", e)
+            return None
+        return vec or None
+
+    def _gate_stored_vector(self, ref):
+        """The stored vector for ("belief", id, kind) or ("event", id), when it
+        was made by the embedder in use; else None."""
+        if not ref or not ref[1]:
+            return None
+        if ref[0] == "belief":
+            row = self.store._conn().execute(
+                "SELECT embedding, model FROM memory_vectors WHERE belief_id=? AND kind=?",
+                (ref[1], ref[2] or "")).fetchone()
+        else:
+            row = self.store._conn().execute(
+                "SELECT embedding, model FROM observed_vectors WHERE event_id=?", (ref[1],)).fetchone()
+        if not row or row[1] != _embeddings.embedder_model_tag(self.embedder):
+            return None
+        return unpack(row[0])
+
+    def _gate_text(self, b) -> str:
+        """What the injection relevance gate reads for a ranked belief: its
+        attribute and value, plus the NAME of the entity a fact is about -- a
+        fact renders as `attribute: value`, so "what does Robin like" would
+        otherwise never match Robin's own facts."""
+        text = "{} {}".format(b.get("attribute") or "", b.get("value") or "")
+        eid = b.get("entity_id")
+        if eid and eid != "user":
+            ent = self.store.get_belief("entities", eid) or {}
+            text += " {} {}".format(ent.get("name") or "", ent.get("aliases") or "")
+        return text
+
     def _render(self, b):
-        draft = b.get("status") == "draft"
-        prefix = "[DRAFT] " if draft else ""
+        """The ONE reader-facing render of a ranked belief (A16).
+
+        Every packing path that puts a belief in front of a reader comes
+        through here -- get_context's Tier-1 block and answer()'s
+        `_answer_from_beliefs` text -- so the draft marker goes here and
+        nowhere else. Precision packing and preference packing skip the
+        Tier-1 block entirely and emit only raw session excerpts, which are
+        verbatim transcript turns and carry no belief status at all, so those
+        two paths cannot leak an unmarked draft by construction; the raw-fill
+        path shares this function with them.
+        """
+        prefix = _DRAFT_TAG + " " if b.get("status") == "draft" else ""
         if b["kind"] == "fact":
             tag = "DERIVED" if b.get("source_type") == "inference" else "FACT"
-            return f"{prefix}[{tag}] {b.get('attribute') or ''}: {b.get('value')} (conf {round(b.get('confidence') or 0, 2)})"
+            return (f"{prefix}[{tag}] {b.get('attribute') or ''}: {b.get('value')} "
+                    f"(conf {round(b.get('confidence') or 0, 2)})")
         if b["kind"] == "note":
             return f"{prefix}[NOTE] {b.get('value')}"
         if b["kind"] == "episode":
             return f"{prefix}[EPISODE] {b.get('value')}"
         return f"{prefix}[{b['kind'].upper()}] {b.get('value')}"
+
+    @staticmethod
+    def _chain_point(c) -> str:
+        """One `value (date)` point of a rendered supersession chain (A16).
+
+        Marked when the point is a draft: `latest wins` is the rule a reader
+        applies to this chain, and a chain whose LAST point is an unconfirmed
+        draft says the opposite of what an unmarked one says."""
+        mark = _DRAFT_TAG + " " if c.get("status") == "draft" else ""
+        return "{}{} ({})".format(mark, c["value"], (c["created_at"] or "")[:10])
+
+    def _include_drafts(self) -> bool:
+        """A16: may a DRAFT belief reach a reader at all? Default yes, MARKED.
+
+        The audit offered mark-or-exclude; the code's intent settles it.
+        `_readable` has always admitted drafts, the structured channel selects
+        them by name, the supersession-chain walk exists partly to surface
+        them, and three separate producers write a draft precisely so a value
+        is NOT lost while it waits for review. Excluding by default would
+        silently delete the losing side of every flagged contradiction and
+        every high-risk norm from the reader's view -- a bigger honesty
+        problem than the one A16 names, in the other direction. So: included
+        and labelled, with this key as the off-switch for a deployment that
+        wants only confirmed truth in front of its reader.
+
+        Read at the SINGLE `_readable` choke point, so turning it off drops
+        drafts from every channel (fts, vector, structured, graph), every
+        packing path and every tool surface at once -- not at each render
+        site, where the next new surface would forget it."""
+        if not self.cfg:
+            return True
+        try:
+            return bool(self.cfg.get("retrieval.include_drafts", True))
+        except Exception:
+            return True
 
     def _render_fact(self, r):
         return {"belief_id": r["belief_id"], "attribute": r["attribute"], "value": r["value"],
@@ -3175,7 +4915,7 @@ def _clamp(v, lo=0.0, hi=1.0):
 
 
 def _content_tokens(text):
-    return {w for w in re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+    return {w for w in word_tokens((text or "").lower())
                if len(w) > 3 and w not in _STOP}
 
 
@@ -3218,11 +4958,11 @@ def query_tokens(query: str) -> list:
     delegates here, and engine.hostmodel's rerank drain calls it directly, so
     the key a hint is FILED under and the key it is LOOKED UP by cannot drift
     apart across two modules."""
-    return [t for t in re.findall(r"[A-Za-z0-9']+", (query or "").lower())
+    return [t for t in word_tokens((query or "").lower())
             if t not in _STOP and len(t) > 1]
 
 
-def hint_signature(query: str):
+def hint_signature(query: str) -> tuple[str, list]:
     """(key, tokens) identifying a query for §H2 rerank-hint purposes.
 
     The key is a hash of the query's DISTINCTIVE tokens, sorted and deduped —
@@ -3261,6 +5001,43 @@ def _truncate_at_boundary(text, max_len):
     if cut == -1:
         cut = window.rfind(" ")
     return window[:cut + 1].rstrip() if cut != -1 else ""
+
+
+def _fit_units(text, max_chars):
+    """Trim `text` to `max_chars` by dropping WHOLE lines from the tail (A10).
+
+    The unit of context assembly is a rendered line: a belief with its
+    confidence and supersession chain, a `[SESSION ...]` header, one excerpt
+    already boundary-truncated by `_truncate_at_boundary`. The old final cut
+    was `ctx[:max_chars]`, which bisects whichever of those straddles the
+    boundary -- a fact whose value stops mid-word, a confidence that lost its
+    closing paren -- and reports it as the bare word "(truncated)". Half a
+    fact rendered in the same shape as a whole one is exactly the honesty
+    defect this file keeps closing everywhere else.
+
+    So: drop whole lines from the END (ranked order, so the tail is the
+    weakest evidence) until what is left PLUS its own drop notice fits, and
+    say how many went. The notice is counted against `max_chars` too -- a
+    report that itself overruns the budget would be one more wrong number.
+
+    Returns `(fitted_text, n_dropped)`. `n_dropped == 0` means the text was
+    already inside the budget and is returned byte-identical, which is the
+    normal case: every section of `get_context` now checks the budget before
+    it appends, so this is a guard, not the mechanism.
+    """
+    if len(text) <= max_chars:
+        return text, 0
+    units = text.split("\n")
+    for keep in range(len(units) - 1, -1, -1):
+        dropped = len(units) - keep
+        note = _OVER_BUDGET_NOTE.format(dropped, "" if dropped == 1 else "s")
+        # `keep` body lines cost their own chars plus `keep` newline
+        # separators (keep-1 between them, one before the notice).
+        if sum(len(u) for u in units[:keep]) + keep + len(note) <= max_chars:
+            return "\n".join(units[:keep] + [note]), dropped
+    # Not even the notice fits. Emitting it anyway would overrun the budget to
+    # announce that the budget was overrun.
+    return "", len(units)
 
 
 def _is_bare_role_prefix(piece: str) -> bool:

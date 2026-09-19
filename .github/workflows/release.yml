@@ -41,7 +41,9 @@ jobs:
           mkdir -p dist/chronicle/dashboard
           cp __init__.py _base.py context.py provider.py plugin.yaml LICENSE README.md dist/chronicle/
           cp -R engine dist/chronicle/
-          cp dashboard/manifest.json dashboard/plugin_api.py dist/chronicle/dashboard/
+          cp dashboard/manifest.json dashboard/plugin_api.py dashboard/tapestry_api.py dist/chronicle/dashboard/
+          # the UI the manifest names (dist/index.js) and the Tapestry bundle it loads
+          cp -R dashboard/dist dist/chronicle/dashboard/dist
           find dist -type f -name '*.pyc' -delete
           (cd dist && zip -qr "chronicle-${version}.zip" chronicle)
           (cd dist && shasum -a 256 "chronicle-${version}.zip" > "chronicle-${version}.zip.sha256")

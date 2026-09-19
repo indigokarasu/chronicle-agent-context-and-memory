@@ -4,11 +4,12 @@ Chronicle — tests for health.py and criticality.py (§20.1, §21).
 
 import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from _tmp_support import temp_home
 
 from engine.criticality import _RULES, classify
 from engine.health import HealthEngine
@@ -86,7 +87,7 @@ class TestHealthEngine(unittest.TestCase):
     def setUp(self):
         from engine.core import ChronicleCore
 
-        self.home = tempfile.mkdtemp()
+        self.home = temp_home()
         self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
         self.core.initialize("s1", principal_id="assistant")
         self.health = HealthEngine(self.core)

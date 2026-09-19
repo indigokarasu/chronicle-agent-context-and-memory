@@ -80,9 +80,24 @@ def _count(db_path: Path, table: str, where: str = "") -> int:
 def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
     """Return embedding coverage for every content table.
 
-    Mirrors the actual embedding pipeline (see scripts/enrich_embeddings.py and
-    chronicle_daily_embed.py):
-      - documents: rows with an abstract -> memory_vectors kind='document'
+    Mirrors the engine's own embedding pipeline (engine/reducer.py writes the
+    vectors; engine/curation.py `_task_embed` drains the queued ones). An
+    earlier version of this docstring credited two scripts that are NOT in this
+    tree -- `scripts/enrich_embeddings.py` and `chronicle_daily_embed.py` -- as
+    the pipeline being mirrored. They were out-of-tree operator scripts writing
+    into the same database, and describing them here made an unaudited writer
+    look like part of Chronicle. Nothing in this repo runs them, and this
+    dashboard is not evidence that anything does (that pair of scripts is the
+    same class of out-of-tree writer as the one that sent excerpts off-host
+    before the A2 guard existed).
+      - documents: the `document` row below counts `memory_vectors kind='document'`,
+        and THE ENGINE NEVER WRITES THAT KIND. `_table_of_kind` has no
+        'document' table and no writer emits it, so on a store written only by
+        Chronicle this row reads 0 of N, permanently. A non-zero count here
+        means something outside this tree wrote those rows. The query is left
+        in place deliberately: it is the only place that fact is visible, and
+        inventing a `kind='document'` writer to make the row green would be
+        implementing a feature to satisfy a dashboard label.
       - notes/episodes/facts: ONLY status='active' rows are embedded
       - events: type='observed' rows; vectors live in observed_vectors, NOT
         memory_vectors (so the old kind='event' count was always 0)
@@ -252,12 +267,38 @@ def _jobs_breakdown(db_path):
     return out
 
 
+def _maintenance(db_path):
+    """Maintenance-scheduler watermarks (§17.4): when each schedule entry last
+    fired. Read straight from the table rather than through the engine, like
+    every other panel here. An older store has no such table — that is a store
+    that predates the scheduler, not an error — so it reports empty."""
+    out = {"entries": []}
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=10)
+        rows = conn.execute(
+            "SELECT entry, task, payload, last_fire_at, last_enqueued_at, enqueues, decisions "
+            "FROM maintenance_runs ORDER BY entry").fetchall()
+        conn.close()
+        out["entries"] = [
+            {"entry": r[0], "task": r[1], "payload": r[2], "last_fire_at": r[3],
+             "last_enqueued_at": r[4], "enqueues": r[5], "decisions": r[6]} for r in rows]
+    except Exception:
+        pass
+    return out
+
+
 def _outstanding_extractions(db_path):
     try:
         conn = sqlite3.connect(str(db_path), timeout=10)
         n = conn.execute(
+            # `type='observed'` because that is what the EXTRACTOR selects
+            # (engine/curation.py: "type='observed' AND event_id NOT IN ...").
+            # Without it this counts asserted and derived events too, which no
+            # extraction will ever cover, so the number could never reach zero
+            # however long the queue ran.
             "SELECT COUNT(*) FROM events e LEFT JOIN extractions ext "
-            "ON ext.observed_event = e.event_id WHERE ext.observed_event IS NULL").fetchone()[0]
+            "ON ext.observed_event = e.event_id "
+            "WHERE ext.observed_event IS NULL AND e.type='observed'").fetchone()[0]
         conn.close()
         return n
     except Exception:
@@ -280,11 +321,15 @@ def get_status():
         "documents": _count(db_path, "documents"),
         "pending_jobs": _count(db_path, "curation_jobs", "status='pending'"),
         "jobs": _jobs_breakdown(db_path),
+        "maintenance": _maintenance(db_path),
         "extractions_outstanding": _outstanding_extractions(db_path),
-        # what the enqueue button would actually find; 0 means it is a no-op
+        # what POST /enqueue-extractions would actually find; 0 means it is a
+        # no-op. Same query as _outstanding_extractions above and as the
+        # endpoint's own SELECT, so the number the button shows is the number
+        # the button acts on.
         "enqueue_candidates": _count(
             db_path, "events e LEFT JOIN extractions ext ON ext.observed_event = e.event_id",
-            "ext.observed_event IS NULL"),
+            "ext.observed_event IS NULL AND e.type='observed'"),
     }
     return {
         "plugin": "chronicle",
@@ -295,33 +340,72 @@ def get_status():
     }
 
 
-@router.post("/process-embeddings")
-def process_embeddings():
-    """Enqueue curation jobs for unprocessed events."""
+def _now_iso() -> str:
+    """store.now_iso()'s format, restated rather than imported.
+
+    This module is mounted BY FILE PATH by the dashboard plugin host, so there
+    is no parent package to import the engine from, and putting the plugin root
+    on sys.path would shadow generically named modules (`context`, `provider`,
+    `_base`) for the whole dashboard process — see _resolve_version. So the one
+    thing this file writes has to reproduce the store's timestamp format here.
+
+    It is not cosmetic. `datetime('now')` — what this used to write — yields
+    "2026-09-10 12:34:56": a space instead of 'T', no milliseconds, no 'Z'. Rows
+    are compared and ordered as TEXT, so a job stamped that way sorts BEFORE
+    every job the engine ever wrote, and any window filter of the form
+    created_at >= '<iso>' silently excludes it.
+    """
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
+
+
+@router.post("/enqueue-extractions")
+def enqueue_extractions(limit: int = Query(500, ge=1, le=5000)):
+    """Queue an `extract` curation job for every observed event that has none.
+
+    Renamed in A13. It was POST /process-embeddings, which was wrong twice over:
+    it embeds nothing (extraction is what produces the beliefs that are later
+    embedded, by a different task), and a button labelled "process embeddings"
+    that enqueues extractions is a control an operator cannot reason about.
+
+    The rows it writes are now indistinguishable from `store.enqueue_curation`'s:
+
+      * canonical payload — json.dumps(payload, sort_keys=True), the exact
+        string enqueue_curation stores, so its (task, payload) dedupe probe and
+        the idx_jobs_dedupe partial index see this row;
+      * the same dedupe rule — collapse an identical (task, payload) already
+        pending OR running. The old LIKE '%"<event_id>"%' probe checked only
+        pending, so a job the worker had already claimed was enqueued a second
+        time, and it matched any payload containing that id as a substring;
+      * `now_iso()`'s timestamp format, not `datetime('now')`.
+
+    A job written here is therefore claimable and runnable by the ordinary
+    CurationWorker, which is the property tests/test_dashboard_endpoint.py pins.
+    """
     db_path = _get_db_path()
     if not db_path:
         return {"ok": False, "error": "no_database"}
     try:
         conn = sqlite3.connect(str(db_path), timeout=30)
-        unembedded = conn.execute(
-            """SELECT e.event_id FROM events e
+        unextracted = conn.execute(
+            """SELECT e.event_id, e.session_id FROM events e
                LEFT JOIN extractions ext ON ext.observed_event = e.event_id
-               WHERE ext.observed_event IS NULL
-               ORDER BY e.seq ASC LIMIT 500"""
+               WHERE ext.observed_event IS NULL AND e.type='observed'
+               ORDER BY e.seq ASC LIMIT ?""", (int(limit),)
         ).fetchall()
         enqueued = 0
-        for (event_id,) in unembedded:
-            existing = conn.execute(
-                "SELECT id FROM curation_jobs WHERE status='pending' AND payload LIKE ?",
-                (f'%"{event_id}"%',),
-            ).fetchone()
-            if not existing:
-                import json as _json
-                conn.execute(
-                    "INSERT INTO curation_jobs (task, payload, status, created_at) VALUES (?, ?, 'pending', datetime('now'))",
-                    ("extract", _json.dumps({"event_id": event_id})),
-                )
-                enqueued += 1
+        for event_id, session_id in unextracted:
+            payload = json.dumps({"event_id": event_id, "session_id": session_id},
+                                 sort_keys=True)
+            dup = conn.execute(
+                "SELECT id FROM curation_jobs WHERE task='extract' "
+                "AND status IN ('pending','running') AND payload=?", (payload,)).fetchone()
+            if dup is not None:
+                continue
+            conn.execute(
+                "INSERT INTO curation_jobs(task, payload, status, created_at) "
+                "VALUES('extract', ?, 'pending', ?)", (payload, _now_iso()))
+            enqueued += 1
         conn.commit()
         conn.close()
         return {"ok": True, "enqueued": enqueued}
@@ -387,3 +471,30 @@ def get_facts(
         return {"facts": [dict(r) for r in rows], "count": len(rows)}
     except Exception:
         return {"facts": [], "count": 0}
+
+
+# --------------------------------------------------------------------------
+# Tapestry (memory navigator) routes, from the sibling tapestry_api.py.
+#
+# Loaded by path for the same reason this file is: the host mounts plugin_api.py
+# with no parent package, so a relative import has nothing to resolve against.
+# A failure here costs the Tapestry tab its data, never the rest of the dashboard.
+# --------------------------------------------------------------------------
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+
+
+def _mount_tapestry():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "tapestry_api.py"
+    spec = importlib.util.spec_from_file_location("chronicle_dashboard_tapestry", str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.register(router, _get_db_path, _hermes_home, Query)
+
+
+try:
+    _mount_tapestry()
+except Exception as _atlas_err:  # pragma: no cover - defensive
+    log.warning("chronicle: Tapestry routes unavailable (%s)", _atlas_err)
