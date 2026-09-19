@@ -18,11 +18,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # actions/checkout can only write inside the workspace, and the plugin
+      # directory being validated IS the workspace: left there, the validator's
+      # own repository is scanned as part of this plugin (4,282 findings, all in
+      # Hermes's tests, docs and .mailmap). Move it out before validating.
+      - name: Move the validator out of the plugin tree
+        run: mv .hermes-validator "$RUNNER_TEMP/hermes-validator"
       - name: Install validator dependency
-        run: python -m pip install pyyaml
+        run: python -m pip install pyyaml packaging
       - name: Validate against the Hermes plugin admission checks
         env:
-          HERMES_VALIDATOR: .hermes-validator
+          HERMES_VALIDATOR: ${{ runner.temp }}/hermes-validator
         run: |
           python - <<'PY'
           import json
@@ -34,6 +40,21 @@ jobs:
           from hermes_cli.plugin_validate import validate_plugin_dir
 
           report = validate_plugin_dir(Path("."))
-          print(json.dumps(report.to_dict(), indent=2))
+          d = report.to_dict()
+          # A failing check's detail can be enormous (the security scan lists
+          # every finding in one string) and the Actions log drops everything
+          # after such a line. Print details capped, then each failing check's
+          # findings one per line, at most 200.
+          for check in d.get("checks", []):
+              full = str(check.get("detail", ""))
+              check["detail"] = full if len(full) <= 300 else full[:300] + " ... (%d chars)" % len(full)
+          print(json.dumps(d, indent=2))
+          for check in report.to_dict().get("checks", []):
+              if not check.get("ok", True):
+                  parts = str(check.get("detail", "")).split(", ")
+                  print("FAILED CHECK: %s (%d findings)" % (check.get("name"), len(parts)))
+                  for part in parts[:200]:
+                      print("   ", part[:200])
+          sys.stdout.flush()
           raise SystemExit(report.exit_code)
           PY
