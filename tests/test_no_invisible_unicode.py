@@ -20,8 +20,10 @@ TEXT_SUFFIXES = (".py", ".md", ".js", ".mjs", ".yaml", ".yml", ".toml", ".json",
 class TestNoInvisibleUnicodeInSource(unittest.TestCase):
     def test_tracked_text_files(self):
         try:
-            files = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
-                                   text=True, check=True).stdout.split()
+            # -z: NUL-separated, so a tracked path with a space stays one path
+            files = [f for f in subprocess.run(["git", "ls-files", "-z"], cwd=ROOT,
+                                               capture_output=True, text=True,
+                                               check=True).stdout.split("\0") if f]
         except (OSError, subprocess.CalledProcessError):
             self.skipTest("not a git checkout")
         hits = []

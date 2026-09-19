@@ -5,21 +5,20 @@ scan returns (same events, scores within float16 error), stays current as the
 table changes underneath it, and steps aside whenever it cannot serve.
 """
 
+import importlib.util
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.core import ChronicleCore  # noqa: E402
 
-try:
-    import numpy  # noqa: F401
-    HAVE_NUMPY = True
-except ImportError:          # the cache needs numpy; without it the paged scan serves
-    HAVE_NUMPY = False
+# The cache needs numpy; without it the paged scan serves.
+HAVE_NUMPY = importlib.util.find_spec("numpy") is not None
 _needs_numpy = unittest.skipUnless(HAVE_NUMPY, "the float16 cache needs numpy")
 
 TOPICS = ("kayaking on Fake Lake", "the Acme Fake Co quarterly budget", "Pat Testley's birthday party",
@@ -161,20 +160,10 @@ class TestWithoutNumpyThePagedScanAnswers(_Case):
     paged scan gives the same answer it always did."""
 
     def test_fallback(self):
-        import builtins
-        real_import = builtins.__import__
-
-        def no_numpy(name, *a, **k):
-            if name == "numpy" or name.startswith("numpy."):
-                raise ImportError("numpy hidden for this test")
-            return real_import(name, *a, **k)
         want = _run(self.core, "kayaking", False)
         self.assertTrue(want)
-        builtins.__import__ = no_numpy
-        try:
+        with mock.patch.dict(sys.modules, {"numpy": None}):   # `import numpy` now raises
             got = _run(self.core, "kayaking", True)
-        finally:
-            builtins.__import__ = real_import
         self.assertEqual(got, want)
 
 
