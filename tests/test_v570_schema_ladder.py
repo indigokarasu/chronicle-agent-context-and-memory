@@ -239,6 +239,7 @@ class TestTheFixtureIsReallyV11(_LadderCase):
         self.assertNotIn("principal", {c[1] for c in _table_info(conn, "rerank_hints")})
         self.assertNotIn("owner", {c[1] for c in _table_info(conn, "goals")})
         self.assertNotIn("maintenance_runs", _table_names(conn))
+        self.assertNotIn("pointer", {c[1] for c in _table_info(conn, "events")})
         conn.close()
 
     def test_the_planted_rows_are_there(self):
@@ -257,7 +258,7 @@ class TestTheWalkReachesTheTop(_LadderCase):
     def test_1_the_stamp_is_the_top_of_the_merged_ladder(self):
         store = self._upgraded()
         self.assertEqual(store.get_meta("schema_version"), str(SCHEMA_VERSION))
-        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(SCHEMA_VERSION, 19)
 
     def test_2_every_column_rung_landed_with_its_declared_shape(self):
         self._upgraded()
@@ -269,8 +270,9 @@ class TestTheWalkReachesTheTop(_LadderCase):
                     return {"type": c[2], "notnull": c[3], "default": c[4]}
             return None
 
-        # 12 / 13: no default, nullable -- the legacy-NULL rule.
-        for table, name in (("procedures", "body"), ("session_index", "model")):
+        # 12 / 13 / 19: no default, nullable -- the legacy-NULL rule.
+        for table, name in (("procedures", "body"), ("session_index", "model"),
+                            ("events", "pointer")):
             c = col(table, name)
             self.assertIsNotNone(c, "%s.%s missing" % (table, name))
             self.assertEqual(c["type"], "TEXT")
@@ -384,7 +386,7 @@ class TestCurationJobsRung17(_LadderCase):
         self.assertTrue(raw, "nothing recorded the retirement")
         rec = json.loads(raw)
         self.assertEqual(str(rec.get("schema_version")), str(SCHEMA_VERSION))
-        self.assertEqual(str(rec.get("schema_version")), "18")
+        self.assertEqual(str(rec.get("schema_version")), "19")
 
     def test_the_depends_on_edge_still_resolves(self):
         dep_id = self.fixture_ids["extract:dependent"]
