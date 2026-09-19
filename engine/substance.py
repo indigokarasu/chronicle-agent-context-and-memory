@@ -78,6 +78,22 @@ _SCAFFOLDING = frozenset("""a an the your you my our we us it its this that new 
     tomorrow and or for from with to of on at in is are was were has have been be
     i he she they them their there here""".split())
 
+# The vocabulary of a notification ABOUT something ("Your order has shipped",
+# "Payment received", "Delivery delayed"): words that announce that a thing
+# exists elsewhere without naming it. A lower-case phrase built only from these
+# is still a subject line; one with any other content word ("bought dog food",
+# "went to the gym") is someone saying what happened.
+_NOTICE = frozenset("""order orders ordered shipped shipping shipment delivered delivery
+    delayed delay package parcel item items message messages notification notifications
+    update updated updates account password balance statement summary available
+    confirmed confirmation receipt payment payments received reminder alert alerts
+    activity visit request details information info change changes changed security
+    login sign verification code invoice bill subscription renewal newsletter digest
+    result results linked activate earlier later pending processed processing
+    canceled cancelled expired expiring status notice notices tracking label return
+    returns returned drop dropoff off pickup pick refund refunds issued arriving
+    arrived arrives ready""".split())
+
 _QUOTED = re.compile(r"[\"“”']([^\"“”']{4,})[\"“”']")
 _WORD = re.compile(r"[A-Za-z][\w'&-]*")
 # An explicit date. A bare digit is deliberately not enough — see _names_a_thing.
@@ -139,6 +155,16 @@ def _names_a_thing(text: str) -> bool:
     return bool(_QUOTED.search(text) or _DATE.search(text))
 
 
+def _says_it_plainly(words: list) -> bool:
+    """A short lower-case account of what happened: "bought dog food", "went to
+    the gym". Nothing in it is capitalised, so _names_anything cannot see a
+    referent, but a word outside the notification vocabulary is one. The
+    module's own rule is to keep what it cannot rule out."""
+    if len(words) < 2:
+        return False
+    return any(len(w) >= 3 and w.lower().strip(".,!?") not in _NOTICE for w in words)
+
+
 def _names_anything(text: str, words: list) -> bool:
     """Is there any specific referent at all?
 
@@ -167,7 +193,7 @@ def states_what_happened(value: object, predicate: str = "") -> bool:
         return False                     # a subject line
     if _COUNTED.search(text):
         return False                     # counts items without naming one
-    return _names_anything(text, words)
+    return _names_anything(text, words) or _says_it_plainly(words)
 
 
 def refusal(value: object, predicate: str = "") -> str:

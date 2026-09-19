@@ -3,6 +3,46 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.32
+
+**The AI review threads on #20 and #23 that were real bugs, fixed.** Each has a
+test in `tests/test_review_fixes_5832.py`, mutation-checked.
+
+* **A hot rollback journal is never read `immutable`.** The write-back reader
+  and the Tapestry read model fell back to `immutable=1` when a read-only open
+  failed, checking only for WAL frames; a non-empty `-journal` needs a rollback
+  that an immutable open skips, so they could read a half-written file. Both
+  now refuse instead.
+* **Tapestry read model:** an unreviewed people-store contact is counted as
+  unclassified instead of being guessed to be a person; a merge cycle
+  (A -> B -> A) lists its entity once under the smallest id instead of hiding
+  every id in it; a fact history orders a version before the one that replaced
+  it even when the replacement carries an earlier timestamp (a topological
+  order, time breaking ties); the log opened from a fact or mention selects and
+  centres the event it cites (facts now carry `src_seq`); speaker labels are
+  looked up as own properties only; the place/concept counting is one helper.
+* **`scripts/clean_entities.py`:** a live relationship keeps both of its
+  endpoints (an entity only a relationship used could be dropped), and a merge
+  moves relationship endpoints and fact `entity_id`s to the survivor.
+* **An event fact written plainly is kept.** "bought dog food" and "went to the
+  gym" were refused because nothing in them is capitalised. A short lower-case
+  account with any word outside the notification vocabulary is kept; "Payment
+  received", "Delivery delayed" and "Your order has shipped!" still are not.
+* **Startup recovery is latched only when it succeeds.** A recovery that raised
+  was marked done, so the rest of the process skipped it.
+* **Folded attachments get distinct ids.** Two photos with the same caption
+  flattened to the same text and so the same fold id; a message with parts is
+  hashed as its full structure (a plain string keeps its old id).
+* **The `/compress` preflight asks about what the next pass would touch.** After
+  a compaction it looked at the settled prefix too, and could report content
+  to compress when an extending pass had none. It now shares compress()'s own
+  extend-or-rebase decision (`_settled_prefix`).
+* **`migrate_vectors` stops counting framing-only sessions as unrecoverable**
+  (no summary and no vector), agreeing with the health census, so such a store
+  no longer fails every migration.
+* Duplicate `ographer` suffix and a doubled `[` in a strip set removed; the
+  context-engine stand-ins in `_base.py` are type-annotated.
+
 ## 5.8.31
 
 **Merged with published `main` and the release branch.** This branch now

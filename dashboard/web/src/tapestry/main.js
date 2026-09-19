@@ -121,7 +121,7 @@ export function Tapestry() {
       h("div", { className: "tap-crumb" },
         h("button", { className: "atl-link", onClick: () => setProvenance(null) }, "← Back to memory"),
         h("span", { className: "chr-quiet" }, "Provenance: every event in the log, and this one in it")),
-      h(LogView, { focusEvent: provenance.event_id || provenance.seq || null }));
+      h(LogView, { focusSeq: provenance.seq == null ? null : Number(provenance.seq) }));
   }
 
   return h("div", { className: "tap" },

@@ -367,6 +367,15 @@ def _open_ro(path, static=False):
         first = e
     wal = Path(str(path) + "-wal")
     wal_frames = wal.exists() and wal.stat().st_size > 0
+    # A non-empty rollback journal is HOT: recovery needs a write, so mode=ro
+    # fails, and immutable=1 would read the half-written main file without
+    # rolling it back. Only a read-write open can recover it.
+    journal = Path(str(path) + "-journal")
+    hot_journal = journal.exists() and journal.stat().st_size > 0
+    if static and hot_journal:
+        raise Refused("cannot read %s read-only: %s. It has a hot rollback journal an "
+                      "immutable open would ignore; open it read-write once so SQLite "
+                      "rolls it back, then re-run." % (path, first))
     if static and not wal_frames:
         try:
             return _connect_probed(uri + "&immutable=1")
