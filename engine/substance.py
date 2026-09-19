@@ -85,9 +85,34 @@ _DATE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"
                    r"|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b", re.I)
 
 
+# Where a value came from, appended to it by an importer: " | from <sender>"
+# and the message's own sent-time ("Thu, 17 Sep 2026 20:16:22 +0000"). Neither
+# says what happened -- but a quoted sender and a sent-date passed the
+# quoted-title and explicit-date tests below, so every subject line an email
+# importer wrote this way was kept ("Delivered 1 item: Skin Care | from
+# "Amazon.com" | Thu, 17 Sep 2026 23:43:31 +0000"). A plain event date in its
+# own segment ("Dinner at Fake Izakaya | 2026-09-12") is content and stays.
+_PROVENANCE = re.compile(
+    r"^(?:from\s.+|(?:mon|tue|wed|thu|fri|sat|sun)\w*,?\s+\d{1,2}\s+\w+\s+\d{4}\s+"
+    r"\d{1,2}:\d{2}(?::\d{2})?(?:\s*[+-]\d{4})?(?:\s*\(\w+\))?.*)$", re.I)
+
+
+# A count of items as the object -- "Delivered 1 item: Clothing", "Shipped: 3 Pet
+# items", "Ordered 3 items: Appliances, Health Care, and more" -- counts what
+# happened without naming it; the capitalised store category is not a
+# referent. Only a count in the first few words: "Refund issued for Acme Fake
+# Switch... and 3 other items" names the thing first.
+_COUNTED = re.compile(r"^\W*(?:[A-Za-z]+\W+){0,3}?\d+\s+[^.|\n]{0,60}?\bitems?\b", re.I)
+
+
 def normalise(value: object) -> str:
-    """The text a rule should look at: bidi marks gone, unicode folded."""
-    return unicodedata.normalize("NFKC", str(value or "").translate(_BIDI)).strip()
+    """The text a rule should look at: bidi marks gone, unicode folded, and
+    any provenance segments an importer appended (see _PROVENANCE) off."""
+    text = unicodedata.normalize("NFKC", str(value or "").translate(_BIDI)).strip()
+    parts = [p.strip() for p in text.split(" | ")]
+    while len(parts) > 1 and _PROVENANCE.match(parts[-1]):
+        parts.pop()
+    return " | ".join(parts)
 
 
 def _significant(text: str) -> list:
@@ -140,6 +165,8 @@ def states_what_happened(value: object, predicate: str = "") -> bool:
         return True                      # a quoted title or a date outranks the shape
     if _is_title_cased(words):
         return False                     # a subject line
+    if _COUNTED.search(text):
+        return False                     # counts items without naming one
     return _names_anything(text, words)
 
 
@@ -152,4 +179,6 @@ def refusal(value: object, predicate: str = "") -> str:
         return "empty value"
     if _is_title_cased(_significant(text)):
         return "a subject line, not a fact: %r" % text[:80]
+    if _COUNTED.search(text):
+        return "counts items without naming one: %r" % text[:80]
     return "says something happened but not what: %r" % text[:80]

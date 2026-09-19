@@ -505,7 +505,7 @@ class TestAMergedPersonIsOnePerson(unittest.TestCase):
         src = [r[0] for r in self.core.store._conn().execute(
             "SELECT event_id FROM events WHERE type='observed' ORDER BY seq")][0]
         _fact(self.core, "user", "had_appointment", "Dentist — 2026-03-10", "user", 0.9, CHAT, src)
-        _fact(self.core, self.OTHER, "purchased", "Shipped: 1 Drugstore item", "user", 0.9, CHAT, src)
+        _fact(self.core, self.OTHER, "purchased", "Shipped: \"Acme Fake Toothpaste\" 2-pack", "user", 0.9, CHAT, src)
         conn = self.core.store._conn()
         for bid, name in (("user", "user"), (self.OTHER, "Pat Testley")):
             conn.execute("INSERT OR REPLACE INTO entities(belief_id, name, normalized_name, "
@@ -541,7 +541,7 @@ class TestAMergedPersonIsOnePerson(unittest.TestCase):
         self.assertEqual(d["name"], "You")
         values = [f["value"] for f in d["current"]]
         self.assertTrue(any("Dentist" in v for v in values), values)
-        self.assertTrue(any("Drugstore" in v for v in values), values)
+        self.assertTrue(any("Acme Fake Toothpaste" in v for v in values), values)
 
     def test_the_people_store_record_survives_the_merge(self):
         """`user` is Chronicle's own name for the principal and is in no other

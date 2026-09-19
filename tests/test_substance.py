@@ -43,6 +43,12 @@ NOISE = (
     "You have a new balance",
     "Your order has shipped!",
     "Delivery delayed",
+    # A count as the object: the store category after it is not a referent.
+    "Delivered 1 item: Clothing",
+    "Shipped: 3 Pet items",
+    "Ordered 3 items: Appliances, Health Care, and more",
+    "Ordered: \u206617\u2069 Lighting & Fans, Kitchen Tools, and other items",
+    "Your Subscription Renewal",
 )
 
 # Also from the production store, or shaped exactly like what the calendar
@@ -56,6 +62,9 @@ FACTS = (
     "Robin Placeholder's birthday — 2026-03-06",
     "Acme Fake Co Labs — 2025-06-06",
     "Sam Vimes just got you tickets to the Fake Dyeing Workshop",
+    # Named first, counted after: the count is not the object.
+    "Refund issued for Acme Fake 8-Port Switch... and 3 other items.",
+    'Delivered: "Acme Fake Widget Bulb..." and 12 more items',
 )
 
 
@@ -95,6 +104,25 @@ class TestTheRule(unittest.TestCase):
         """Gmail wraps subject fragments in bidi isolates. Without stripping
         them the patterns below see nothing and everything is accepted."""
         self.assertFalse(sub.states_what_happened("⁦New Message⁩", "purchased"))
+
+    def test_where_a_value_came_from_does_not_say_what_happened(self):
+        """An email importer appended the sender and the sent-time to every
+        value. A quoted sender passed the quoted-title test and the sent-time
+        the explicit-date test, so every subject line it wrote was kept."""
+        tail = ' | from "Acme Fake Co" | Sun, 6 Sep 2026 07:04:28 +0000'
+        for value in ("Delivered 1 item: Clothing", "Your Subscription Renewal",
+                      "Your return drop off confirmation"):
+            with self.subTest(value=value):
+                self.assertFalse(sub.states_what_happened(value + tail, "purchased"))
+        self.assertFalse(sub.states_what_happened(
+            "Your Subscription Renewal | from Acme Fake Co | Sun, 6 Sep 2026 07:04:28 +0000 (GMT)",
+            "purchased"))
+        self.assertTrue(sub.states_what_happened(
+            "Advance refund issued for Acme Fake Dental Powder" + tail, "purchased"))
+
+    def test_an_event_date_is_content_not_provenance(self):
+        self.assertTrue(sub.states_what_happened("Dinner at Fake Izakaya | 2026-09-12", "dined_at"))
+        self.assertTrue(sub.states_what_happened("Fake Dyeing Workshop | Sun, 6 Sep 2026", "attended_event"))
 
     def test_an_empty_value_is_not_a_memory(self):
         self.assertFalse(sub.states_what_happened("", "purchased"))
