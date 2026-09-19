@@ -37,6 +37,8 @@ REDACTED = "[redacted]"
 
 
 def _looks_secret(label: str, value: str) -> bool:
+    if value.startswith(REDACTED):
+        return False                     # already masked
     v = value.strip(".,;:!?)]}")
     if label.lower().endswith(_NUMERIC_LABELS) and v.isdigit():
         return len(v) >= 4
