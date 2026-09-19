@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.8.22.
+Version: 5.8.23.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -168,8 +168,11 @@ past exchange are asked; URLs, short numbers, host framing, tool output and
 the agent's own memory writes never count. A scheduled job's turn gets none
 (`retrieval.prefetch_automation`). Nor does it repeat the conversation in
 progress: the live session's turns are already in the model's window, so only
-what a compaction folded out of it can come back. Explicit search,
-`chronicle_answer` and the context engine's recall are not gated.
+what a compaction folded out of it can come back. A credential's value (a
+password, API key or token the user handed the agent) is never injected, and
+never stored in a belief: the fold masks it, and only the transcript keeps it.
+Explicit search, `chronicle_answer` and the context engine's recall are not
+gated.
 
 **Maintenance runs on those hooks, not on cron.** There is no daemon, no timer
 and no background thread: on a hook call the `Scheduler` (`engine/scheduler.py`)

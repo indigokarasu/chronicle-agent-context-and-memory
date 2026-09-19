@@ -23,6 +23,7 @@ from . import identity
 from .config import TRUST_CEILING  # noqa: F401  (back-compat for tests)
 from . import sweeps
 from . import speaker as spk
+from . import credentials as _cred
 from . import substance as sub
 from .criticality import classify as classify_criticality
 from .embeddings import EmbeddingsUnavailable, cosine, embedder_model_tag, pack, unpack
@@ -629,6 +630,7 @@ class Reducer:
         raw = p.get("confidence", base_confidence(source_type, self.cfg))
         confidence = clamp_to_ceiling(raw, trust, cfg=self.cfg)
 
+        key, body = _without_credentials(key, body)
         b_id = compute_belief_id(kind, key, [source_event])
         if kind == "entity":
             # An entity IS its token: the id facts reference (`entity_id`) and the
@@ -710,7 +712,7 @@ class Reducer:
         b_id = p.get("belief_id")
         if not b_id:
             return
-        new_body = p.get("new_body")
+        new_body = _cred.redact(p.get("new_body") or "")
         if new_body:
             found = self.store.find_belief(b_id)
             if found:
@@ -804,8 +806,7 @@ class Reducer:
     def _on_derived(self, event):
         p = _payload(event)
         kind = p.get("kind", "fact")
-        key = p.get("key", {})
-        body = p.get("body", "")
+        key, body = _without_credentials(p.get("key", {}), p.get("body", ""))
         rule_id = p.get("rule_id", "")
         premises = p.get("premises", [])
         confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2, cfg=self.cfg)  # C(inference)=0.75
@@ -1850,6 +1851,17 @@ class Reducer:
 
 
 # -- module helpers -------------------------------------------------------
+
+def _without_credentials(key, body):
+    """A belief's key and body with any credential value masked
+    (engine/credentials.py). A login the user handed the agent is not a memory
+    about them; a belief would carry it into later prompts unasked. The belief
+    itself stays -- an appointment whose meeting link carries `?pwd=` is still
+    an appointment -- and the transcript keeps the message. In the fold, so a
+    rebuild masks the ones already asserted too (I3)."""
+    key = {k: (_cred.redact(v) if isinstance(v, str) else v) for k, v in (key or {}).items()}
+    return key, _cred.redact(body) if isinstance(body, str) else body
+
 
 def _payload(event) -> dict:
     p = event.get("payload", "{}")
