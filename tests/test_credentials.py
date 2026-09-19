@@ -48,6 +48,13 @@ class TestTheShape(unittest.TestCase):
                 self.assertFalse(C.contains_secret(text))
                 self.assertEqual(C.redact(text), text)
 
+    def test_masking_is_final(self):
+        for text in (SAID, "https://meet.example.invalid/j/1?pwd=AbC123xyz", "my password is hunter2"):
+            with self.subTest(text=text):
+                once = C.redact(text)
+                self.assertFalse(C.contains_secret(once))
+                self.assertEqual(C.redact(once), once)
+
     def test_only_the_value_goes(self):
         self.assertEqual(C.redact(SAID),
                          "Zorblax share login: Username: robin_fake_123 Password: [redacted]")
