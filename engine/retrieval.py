@@ -2080,6 +2080,9 @@ class RetrievalEngine:
                     if len(wider) <= pos:
                         break  # vec0 has nothing more to offer
                     knn_results, pos = wider, 0
+            elif self._raw_from_cache(q["embedding"], scored, vec_heap, limit, principal,
+                                      exclude_automation):
+                pass   # the in-memory float16 copy served the scan (vector_cache.py)
             else:
                 # Paged brute-force scan (§24.3) — the default, and the fallback
                 # whenever the ANN path is unavailable or came back empty.
@@ -4688,6 +4691,68 @@ class RetrievalEngine:
             return {}
         return {"payload": p, "actor": ev.get("actor") or "",
                 "source_type": p.get("source_type") or "", "chunk_index": p.get("chunk_index")}
+
+    def _observed_cache(self):
+        """The store's ObservedVectorCache, created on first use; None when
+        retrieval.observed_vector_cache is off."""
+        on = self.cfg.get("retrieval.observed_vector_cache", True) if self.cfg else True
+        if not on:
+            return None
+        cache = getattr(self.store, "_observed_vector_cache", None)
+        if cache is None:
+            from .vector_cache import ObservedVectorCache
+            cap = (self.cfg.get("retrieval.observed_vector_cache_max_rows", 250000)
+                   if self.cfg else 250000)
+            cache = ObservedVectorCache(self.store, max_rows=int(cap))
+            self.store._observed_vector_cache = cache
+        return cache
+
+    def _raw_from_cache(self, query, scored, vec_heap, limit, principal, exclude_automation) -> bool:
+        """The raw tier's vector pass from the in-memory copy: the same result the
+        paged scan below produces (same floor, ACL, exclusions and top-k heap),
+        with candidates visited best-first so the scan stops as soon as nothing
+        left can enter the heap. False when the cache cannot serve; the caller
+        then pages the table as before."""
+        cache = self._observed_cache()
+        got = cache.scores(query) if cache is not None else None
+        if got is None:
+            return False
+        ids, owners, sims, index = got
+        import numpy as np
+        # FTS hits: credited whatever their rank, exactly as the paged scan does.
+        for eid in list(scored):
+            i = index.get(eid)
+            if i is None or sims[i] <= 0.1:
+                continue
+            if access.can_read(access.DEFAULT_ACL, owners[i], principal):
+                scored[eid]["score"] += self._vec_w * float(sims[i])
+        cand = np.nonzero(sims > 0.1)[0]
+        order = cand[np.argsort(-sims[cand], kind="stable")]
+        seq = 0
+        for i in order:
+            eid = ids[i]
+            if eid in scored:
+                continue
+            contribution = self._vec_w * float(sims[i])
+            if len(vec_heap) >= limit and contribution <= vec_heap[0][0]:
+                break          # best-first: nothing after this can displace the floor
+            if not access.can_read(access.DEFAULT_ACL, owners[i], principal):
+                continue
+            ev = self.store.get_event(eid)
+            if exclude_automation and self._from_automation(ev):
+                continue
+            p = (json.loads(ev["payload"]) if ev and isinstance(ev["payload"], str)
+                 else (ev or {}).get("payload", {}))
+            excerpt = self._reader_excerpt(ev, p.get("excerpt", ""))
+            if excerpt is None:
+                continue
+            entry = (contribution, seq, eid, excerpt, owners[i])
+            seq += 1
+            if len(vec_heap) < limit:
+                heapq.heappush(vec_heap, entry)
+            else:
+                heapq.heapreplace(vec_heap, entry)
+        return True
 
     def _one_word_floor(self):
         """retrieval.prefetch_min_similarity resolved: a float, or None (off --

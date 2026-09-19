@@ -619,6 +619,13 @@ DEFAULTS: dict[str, Any] = {
         # floor measured for the embedding model (none known -> no check); a
         # number = that floor; null = off. No query vector, or an item with no
         # vector of this model, keeps the lexical rule alone.
+        # The raw tier's vector scan reads every observed vector. With this on,
+        # each process keeps them in memory as float16 (engine/vector_cache.py)
+        # and scores a query against all of them at once instead of paging the
+        # table from disk on every search. Rows over the cap fall back to the
+        # paged scan: at 768 dims a row costs ~1.5 KB, so 250,000 is ~400 MB.
+        "observed_vector_cache": True,
+        "observed_vector_cache_max_rows": 250000,
         "prefetch_min_similarity": "auto",
         # The same check for a match on two or three shared words ("send" and
         # "none" in a security alert's text), measured separately: "auto" =
