@@ -3,6 +3,26 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — Phase D: a standing local benchmark
+
+`deploy570/bench.py` (outside the repo, with the other harnesses) runs the
+provider and the compaction against a COPY of the production store and writes
+one JSON record: recall (items, characters, seconds, how many one-word and
+few-word matches the floors judged), compaction (tokens in/out, messages,
+seconds, exact literals still on the page, restorability), and the shared
+score's distribution over a fixed sample. Pass a previous record and it prints
+the deltas, so a change has to say what it did to the numbers before it earns
+a default.
+
+The first record is kept at `deploy570/bench_baseline.json`: 34 real messages
+-> 246 items / 93,149 characters in 8.5 s; one real session 93,473 -> 29,595
+tokens with 278 of 1,497 literals still on the page; mean keep score 0.1422.
+
+What the record is not: it is not production. The store copy predates the live
+retractions and repairs, and recall is asked with no live session to exclude,
+so it returns more than a real turn does. The similarity floors are inert
+under the offline hashing embedder and report zero checks by design.
+
 ## Unreleased — Phase B: what may be summarised, and what only pointed at
 
 **A cut for budget no longer spends itself on the prose.** Compaction's one
