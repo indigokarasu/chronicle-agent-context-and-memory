@@ -3,6 +3,29 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.33
+
+**`chronicle_search`'s raw tier scores from memory.** The raw tier's vector pass
+read every observed vector from SQLite a page at a time on every query; on the
+production store that was ~3.0 of `chronicle_search`'s 3.4 s. Each process now
+keeps them as a float16 matrix (`engine/vector_cache.py`, ~100 MB for 66k
+768-wide rows) and scores a query against all of them at once. On a local
+synthetic store of that size: paged scan 0.19 s, warm cache 0.064 s, first
+build 0.39 s, identical top results. (Not measured on the production box: no
+VPS work while deploys are frozen.)
+
+* The result is the paged scan's: the same 0.1 floor, ACL check, automation
+  exclusion and framing check, the same top-k heap; FTS hits are credited
+  whatever their rank. Candidates are visited best-first, so the scan stops
+  once nothing left can enter the heap. Scores differ from float32 by ~1e-3.
+* Never stale: every use checks the table's row count and max rowid at the
+  query's width. New rows are appended; a delete or a re-embed rebuilds.
+* `retrieval.observed_vector_cache` (default on) and
+  `retrieval.observed_vector_cache_max_rows` (250,000; above it, the paged
+  scan). No numpy, or any error in the cache, also falls back to the scan.
+* Not sqlite-vec: its index is filled only by new writes and never backfilled,
+  so enabling it over a populated store hides every existing vector.
+
 ## 5.8.32
 
 **The AI review threads on #20 and #23 that were real bugs, fixed.** Each has a
