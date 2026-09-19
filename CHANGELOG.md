@@ -3,6 +3,16 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.29
+
+**The handoff's own instruction works as written.** Every compaction note says
+to restore a folded turn with `chronicle_expand` "by its [fold_…] id". The
+tool's description still pointed the model at "the first token after
+'[FOLD'", a stub format 5.8 retired. An id passed the way the note shows it,
+in brackets, was unknown. The description now names the note's id format, and
+the tool accepts the id bracketed or bare. Tested through the host's call
+shape with an id taken from a real handoff.
+
 ## 5.8.28
 
 **`chronicle_search` searches what was said, as its description promised.** The
