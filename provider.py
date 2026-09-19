@@ -29,6 +29,15 @@ except Exception:  # … else a local stand-in (plugin-package or top-level)
 logger = logging.getLogger("chronicle.provider")
 
 
+def _tools_class():
+    """engine.tools.Tools, dual-mode like every other engine import here."""
+    try:
+        from .engine.tools import Tools  # plugin-package context
+    except ImportError:
+        from engine.tools import Tools  # top-level (dev/tests)
+    return Tools
+
+
 def _load_core():
     try:
         from .engine.core import ChronicleCore  # plugin-package context
@@ -567,7 +576,13 @@ class ChronicleMemoryProvider(MemoryProvider):
             return []
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return self.core.tools.schemas() if self.core else []
+        # The schemas do not depend on the store, and Hermes routes a memory
+        # tool by the list it gets at add_provider() -- BEFORE initialize().
+        # An empty list there ("Memory provider 'chronicle' registered (0
+        # tools)" on every start) left every chronicle_* tool unroutable while
+        # the model was still offered them later: 77 calls in production, from
+        # chronicle_search to chronicle_remember, every one "Unknown tool".
+        return (self.core.tools if self.core else _tools_class()(None)).schemas()
 
     def handle_tool_call(self, tool_name, args, **kw) -> str:
         if not self.core:
