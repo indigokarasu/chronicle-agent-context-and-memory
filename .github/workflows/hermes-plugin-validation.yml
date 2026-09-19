@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install validator dependency
-        run: python -m pip install pyyaml
+        run: python -m pip install pyyaml packaging
       - name: Validate against the Hermes plugin admission checks
         env:
           HERMES_VALIDATOR: .hermes-validator
