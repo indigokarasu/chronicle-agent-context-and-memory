@@ -103,7 +103,7 @@ class TestTheRule(unittest.TestCase):
     def test_bidi_marks_do_not_hide_the_text(self):
         """Gmail wraps subject fragments in bidi isolates. Without stripping
         them the patterns below see nothing and everything is accepted."""
-        self.assertFalse(sub.states_what_happened("⁦New Message⁩", "purchased"))
+        self.assertFalse(sub.states_what_happened("\u2066New Message\u2069", "purchased"))
 
     def test_where_a_value_came_from_does_not_say_what_happened(self):
         """An email importer appended the sender and the sent-time to every

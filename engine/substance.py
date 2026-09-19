@@ -67,7 +67,7 @@ EVENT_PREDICATES = {
 
 # Bidi isolates: Gmail wraps subject fragments in them, and they hide the text
 # from every pattern below unless they come off first.
-_BIDI = dict.fromkeys(map(ord, "⁦⁧⁨⁩‎‏‪‫‬"), None)
+_BIDI = dict.fromkeys(map(ord, "\u2066\u2067\u2068\u2069\u200e\u200f\u202a\u202b\u202c"), None)
 
 # A composed sentence is long. Below this, the value is short enough to be a
 # subject line and has to earn its place.
