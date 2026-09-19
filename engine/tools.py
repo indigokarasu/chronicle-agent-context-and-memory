@@ -239,8 +239,27 @@ class Tools:
 
     # reads
     def _t_search(self, principal, a):
-        return {"results": self.core.retrieval.search(a.get("query", ""), limit=a.get("limit", 10),
-                                                      principal=principal)}
+        """Both tiers, as the schema says: `results` (beliefs) and `said` (what
+        was said, from the transcript, with its session and date). Beliefs
+        alone missed most of what a user tells the agent -- on the production
+        store the transcript is most of the memory about them."""
+        query = a.get("query", "")
+        try:
+            limit = max(1, min(50, int(a.get("limit", 10) or 10)))
+        except (TypeError, ValueError):
+            limit = 10
+        r = self.core.retrieval
+        said = []
+        for row in r.retrieve_raw(query, limit=limit, principal=principal):
+            eid = row.get("event_id") or ""
+            ev = self.core.store.get_event(eid) if eid and not eid.startswith(("session:", "proj:")) else None
+            text = row.get("excerpt") or ""
+            if len(text) > 1500:             # ten of them stay a readable tool result
+                text = text[:1500].rsplit(" ", 1)[0] + " …"
+            said.append({"excerpt": text, "event_id": eid,
+                         "session_id": (ev or {}).get("session_id") or (eid.split(":", 1)[1] if eid.startswith("session:") else ""),
+                         "when": ((ev or {}).get("occurred_at") or "")[:16]})
+        return {"results": r.search(query, limit=limit, principal=principal), "said": said}
 
     def _t_answer(self, principal, a):
         return self.core.retrieval.answer(a.get("query", ""), principal=principal,

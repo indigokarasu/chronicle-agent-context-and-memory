@@ -3,6 +3,17 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.28
+
+**`chronicle_search` searches what was said, as its description promised.** The
+tool is described as "Search the belief store + raw events (dual-tier)" but
+searched only beliefs. On the production store most of the memory about the
+user is the transcript: a search for something the user only ever said came
+back empty, while per-turn recall found it. Now that the agent can call the
+tool at all (5.8.26), it returns `results` (beliefs) and `said` (transcript
+excerpts with their session and date, each at most 1,500 characters). Live:
+ten of each in 2–4 s.
+
 ## 5.8.27
 
 **One copy of the static block, under one rule.** The plugin also registers a
