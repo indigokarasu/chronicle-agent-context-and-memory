@@ -82,6 +82,17 @@ class TestToolsRouteFromTheStart(unittest.TestCase):
         self.assertNotIn("Unknown tool", found)
         self.assertIn("Zorblax", found)
 
+    def test_search_finds_what_the_user_said(self):
+        """The schema promises both tiers; beliefs alone missed everything a
+        user only ever said."""
+        self.prov.core.capture.observe("We moved the Zorblax standup to Thursdays at the Riverton office.",
+                                       "Noted.", session_id=SID)
+        self.prov.core.process_pending()
+        found = json.loads(self.host.handle_tool_call("chronicle_search", {"query": "Zorblax standup"}))
+        said = found.get("said") or []
+        self.assertTrue(any("Thursdays" in s["excerpt"] for s in said), found)
+        self.assertTrue(all(s["session_id"] == SID and s["when"] for s in said if "Thursdays" in s["excerpt"]))
+
     def test_a_call_before_initialize_says_so(self):
         early = ChronicleMemoryProvider()
         self.assertIn("not initialized", early.handle_tool_call("chronicle_search", {"query": "x"}))
