@@ -3,6 +3,30 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.31
+
+**Merged with published `main` and the release branch.** This branch now
+contains everything on `main` and on `release/v5.7.0`, so #23 and #20 can merge
+without replaying anything.
+
+* **`events.pointer`, from `main` (dada805), is schema rung 19.** An event can
+  carry a skill reference (`weave:<person_id>`, `scout:<subject_id>`,
+  `rally:<ticker>`) instead of a copy of what it points at;
+  `CaptureEngine.append(pointer=...)` sets it. `main` numbered it 12, which this
+  ladder already uses (procedures.body), the same collision rungs 14-17 had.
+  Additive and nullable: every existing event reads NULL.
+* **`main`'s "stale lock recovery" is not taken.** It unlinked `-wal` and `-shm`
+  every time a store opened. A WAL holds committed transactions until they are
+  checkpointed, and SQLite replays it on the next open, so deleting it first
+  discards them; and the production store is opened by several live processes
+  at once, so a removed `-shm` corrupts the others' view. The one sidecar removal
+  stays `_unlink_sidecars()`, after `journal_mode=DELETE` has proven exclusive
+  access. `tests/test_events_pointer_and_wal.py` fails if deletion comes back.
+* **`release/v5.7.0`'s squash of #21 is already here.** Its tree equals this
+  branch's 69fc157 plus the four `fix/speaker-attribution` commits
+  (`retract_misattributed`: write-lock retries, one sequential pass, a bounded
+  event cache, a streamed report), which are merged in with it.
+
 ## 5.8.30
 
 **The per-turn gate asks what the person wrote.** The gateway prepends an

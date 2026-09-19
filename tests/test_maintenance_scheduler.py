@@ -997,7 +997,7 @@ class TestSchemaLadder12(unittest.TestCase):
         # on. The v5.7.0 integration renumbered A3's rung to 16 and the top of
         # the merged ladder to 18, so the assertion is on the CONSTANT, not on a
         # literal this test would have to chase every time a rung lands.
-        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(SCHEMA_VERSION, 19)
         self.assertIsNotNone(store.get_event("ev_old_a3"))
         # The new table is usable immediately.
         store.record_maintenance_run("health", task="health", payload={},
