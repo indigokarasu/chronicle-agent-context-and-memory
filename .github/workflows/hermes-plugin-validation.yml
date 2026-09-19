@@ -35,5 +35,13 @@ jobs:
 
           report = validate_plugin_dir(Path("."))
           print(json.dumps(report.to_dict(), indent=2))
+          # A failing check's detail can be one very long line (the security
+          # scan lists every finding in it), which the Actions log truncates.
+          # Repeat each failing check one finding per line so it is readable.
+          for check in report.to_dict().get("checks", []):
+              if not check.get("ok", True):
+                  print("FAILED CHECK:", check.get("name"))
+                  for part in str(check.get("detail", "")).split(", "):
+                      print("   ", part)
           raise SystemExit(report.exit_code)
           PY
