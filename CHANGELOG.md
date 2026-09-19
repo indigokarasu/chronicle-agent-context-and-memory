@@ -3,6 +3,15 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.34
+
+**CI green again.** The 5.8.33 cache tests assumed numpy; the CI runner has
+none, so the cache (correctly) stepped aside and five tests failed. They now
+skip without numpy, and a new test checks that without it the paged scan gives
+the same answer. The Hermes plugin-validation workflow also installs
+`packaging`, which the upstream validator imports (that job was already failing
+on `main` before the merge).
+
 ## 5.8.33
 
 **`chronicle_search`'s raw tier scores from memory.** The raw tier's vector pass
