@@ -29,6 +29,15 @@ except Exception:  # … else a local stand-in (plugin-package or top-level)
 logger = logging.getLogger("chronicle.provider")
 
 
+def _tools_class():
+    """engine.tools.Tools, dual-mode like every other engine import here."""
+    try:
+        from .engine.tools import Tools  # plugin-package context
+    except ImportError:
+        from engine.tools import Tools  # top-level (dev/tests)
+    return Tools
+
+
 def _load_core():
     try:
         from .engine.core import ChronicleCore  # plugin-package context
@@ -147,6 +156,10 @@ class ChronicleMemoryProvider(MemoryProvider):
         hermes_home = hermes_home or str(Path.home() / ".hermes")
         self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
+        # Hermes calls on_turn_start inside the user's turn: curation runs beside
+        # it, not in it (curation.drain.background).
+        if self.core.cfg.get("curation.drain.background", True):
+            self.core.drain_in_background()
         self._session_id = session_id
         self._principal_id = principal_id
         # Who is on the user side of this agent (engine/speaker.py). Hermes sends
@@ -200,6 +213,13 @@ class ChronicleMemoryProvider(MemoryProvider):
         cfg_path.write_text(json.dumps(values, indent=2))
 
     # -- capture -----------------------------------------------------------
+
+    def _automation_turn(self, session_id="") -> bool:
+        """Is this turn a scheduled job's (a cron_ session, or an automation
+        platform)? A delegated subagent is not: it works on the user's ask."""
+        sid = session_id or self._session_id
+        platform = str(self._host_context.get("platform") or "").strip().lower()
+        return _speaker().is_automation_session(sid) or platform in ("cron", "batch", "curator", "flush")
 
     def _speaker_context(self, turn_author=None) -> dict:
         ctx = dict(self._host_context)
@@ -499,12 +519,49 @@ class ChronicleMemoryProvider(MemoryProvider):
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
             return ""
+        if self._automation_turn(session_id) and \
+                not self.core.cfg.get("retrieval.prefetch_automation", False):
+            return ""
+        # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
+        # nothing from a scheduled job's own runs (engine/speaker) -- and only
+        # what is about THIS message: an item must share a content word with
+        # it, and a message with none ("thanks") gets nothing.
         return self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
-            principal=self._principal_id, epistemic=self.core.epistemic)
+            principal=self._principal_id, epistemic=self.core.epistemic,
+            exclude_automation=True,
+            relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)),
+            # The conversation in progress is already in the model's window.
+            live_session=session_id or self._session_id or None)
 
     def system_prompt_block(self) -> str:
-        return self.core.retrieval.static_block(self._principal_id) if self.core else ""
+        if not self.core:
+            return ""
+        return self.core.retrieval.static_block(
+            self._principal_id, include_agent_own=not self._host_injects_agent_memory())
+
+    @staticmethod
+    def _host_injects_agent_memory() -> bool:
+        """Does the host put the agent's own memory file into the system prompt
+        itself (Hermes' built-in memory, `memory.memory_enabled`)? Then
+        Chronicle's copies of the agent's memory writes are older duplicates."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False                  # outside Hermes: Chronicle is the only copy
+        return bool(mem.get("memory_enabled", True))
+
+    @staticmethod
+    def _host_serves_this_provider() -> bool:
+        """Is Chronicle the host's memory provider (`memory.provider`)? Then the
+        host puts `system_prompt_block()` into the system prompt itself."""
+        try:
+            from hermes_cli.config import load_config
+            mem = (load_config() or {}).get("memory") or {}
+        except Exception:
+            return False
+        return str(mem.get("provider") or "").strip().lower() == "chronicle"
 
     def list_identity_candidates(self, status="pending", kind="", limit=50) -> list[dict[str, Any]]:
         """Identity split/merge candidates awaiting adjudication (§E7, issue #8).
@@ -530,7 +587,13 @@ class ChronicleMemoryProvider(MemoryProvider):
             return []
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return self.core.tools.schemas() if self.core else []
+        # The schemas do not depend on the store, and Hermes routes a memory
+        # tool by the list it gets at add_provider() -- BEFORE initialize().
+        # An empty list there ("Memory provider 'chronicle' registered (0
+        # tools)" on every start) left every chronicle_* tool unroutable while
+        # the model was still offered them later: 77 calls in production, from
+        # chronicle_search to chronicle_remember, every one "Unknown tool".
+        return (self.core.tools if self.core else _tools_class()(None)).schemas()
 
     def handle_tool_call(self, tool_name, args, **kw) -> str:
         if not self.core:

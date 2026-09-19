@@ -176,7 +176,11 @@ logger = logging.getLogger("chronicle.store")
 # is the LAST statement of _migrate, so a store at ANY prior version -- or one
 # stamped 12/13 by a DIFFERENT ladder-10 tree than the one that owns the number
 # here -- converges by running all of them.
-SCHEMA_VERSION = 18
+# 19 = events + pointer (main dada805, which claimed 12 in its own tree -- the
+#     same collision as 14-17). A skill reference such as `weave:<person_id>`
+#     stored beside an event instead of a copy of the payload it points at.
+#     Additive: NULL for every event written before it.
+SCHEMA_VERSION = 19
 
 # SQLite busy timeouts, milliseconds.
 #
@@ -609,6 +613,14 @@ class MemoryStore:
     # -- schema ------------------------------------------------------------
 
     def _init_db(self):
+        # NOT here: deleting `-wal`/`-shm` at startup (main dada805's "stale lock
+        # recovery"). A WAL can hold COMMITTED transactions not yet checkpointed
+        # into the main file, and SQLite replays it on the next open; unlinking it
+        # discards them. The store is also opened by several live processes at
+        # once (gateway, dashboard, cron jobs), so "at startup nothing else holds
+        # it" is false and removing a live -shm corrupts the others' view. The
+        # only sidecar removal is _unlink_sidecars(), after journal_mode=DELETE
+        # has proven exclusive access.
         # Bounded by the start-up timeout: a store opened while another process
         # holds the write lock (the live 2026-08-02 case was a concurrent
         # migration) must fail in seconds so its caller can degrade and retry,
@@ -618,6 +630,10 @@ class MemoryStore:
             self._migrate(conn)
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('projection_seq','0')")
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('head_event_id','')")
+            # observed_user_fts is complete from birth on a new store; an older
+            # one keeps using the filtered main index until a backfill says so.
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('observed_user_fts_ready', "
+                         "CASE WHEN EXISTS(SELECT 1 FROM observed_fts) THEN '0' ELSE '1' END)")
             # Seed the monotonic event_seq counter (used by append_event's atomic
             # UPDATE...RETURNING). Omitting this left fresh DBs with no event_seq row,
             # so the first append_event crashed with "NoneType is not subscriptable".
@@ -687,6 +703,9 @@ class MemoryStore:
         if not _has_col(conn, "link_candidates", "provider"):
             logger.info("schema migration: link_candidates + provider")
             conn.execute("ALTER TABLE link_candidates ADD COLUMN provider TEXT")
+        if not _has_col(conn, "events", "pointer"):
+            logger.info("schema migration: events + pointer (skill pointer references)")
+            conn.execute("ALTER TABLE events ADD COLUMN pointer TEXT")
         # novelty (schema_version 6, E5): CREATE TABLE IF NOT EXISTS in _SCHEMA added
         # `novelty REAL` to all 6 BELIEF_TABLES, but that DDL is a no-op on a table
         # that already exists — an existing store never got the column and crashed
@@ -1158,14 +1177,15 @@ class MemoryStore:
             ).fetchone()[0]
             conn.execute(
                 """INSERT INTO events(event_id,seq,order_key,type,payload,parents,actor,owner,
-                   trust_level,session_id,branch_id,occurred_at,recorded_at,prev_head,sig)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   trust_level,session_id,branch_id,occurred_at,recorded_at,prev_head,sig,pointer)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (eid, seq, event.get("order_key"), event["type"],
                  _as_json(event["payload"]), _as_json(event.get("parents", [])),
                  event["actor"], event["owner"], event.get("trust_level", 2),
                  event.get("session_id"), event.get("branch_id") or event.get("session_id"),
                  event["occurred_at"], event.get("recorded_at") or now_iso(),
-                 event.get("prev_head"), event.get("sig")))
+                 event.get("prev_head"), event.get("sig"),
+                 event.get("pointer")))
             conn.execute("UPDATE meta SET value=? WHERE key='head_event_id'", (eid,))
             conn.execute("INSERT INTO git_queue(event_id,created_at) VALUES(?,?)",
                          (eid, event.get("recorded_at") or now_iso()))
@@ -1258,19 +1278,69 @@ class MemoryStore:
 
     # -- raw FTS (§8.6) — keyed by event_id so forbidden can delete --------
 
-    def fts_index_observed(self, event_id: str, excerpt: str):
+    def fts_index_observed(self, event_id: str, excerpt: str, *, user: bool = False):
+        """Index an observed event's text -- once: the reducer reaches here only
+        for a newly appended event or, in a rebuild, after the index was
+        emptied. The DELETE this used to run first matched on an UNINDEXED
+        column, i.e. read the whole index (67k rows, 0.2 s on the production
+        box) on every capture. `user` also puts it in the index of the user's
+        own conversations, which the per-turn search reads (see
+        fts_search_observed)."""
         with self.transaction() as conn:
-            conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
             conn.execute("INSERT INTO observed_fts(event_id, excerpt) VALUES(?,?)", (event_id, excerpt))
+            if user:
+                conn.execute("INSERT INTO observed_user_fts(event_id, excerpt) VALUES(?,?)",
+                             (event_id, excerpt))
 
-    def fts_search_observed(self, query: str, limit: int = 20) -> list[dict]:
-        q = _fts_query(query)
+    # The session prefixes observed_user_fts leaves out (engine/speaker's
+    # AUTOMATION_SESSION_PREFIXES; the store does not import the speaker model).
+    USER_FTS_EXCLUDES = ("cron_",)
+
+    def user_fts_ready(self) -> bool:
+        """Does observed_user_fts hold every user-side row? A new store is born
+        complete; an upgraded one is until a backfill says so (meta)."""
+        try:
+            row = self._conn().execute(
+                "SELECT value FROM meta WHERE key='observed_user_fts_ready'").fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return bool(row and row[0] == "1")
+
+    def fts_search_observed(self, query: str, limit: int = 20, *, match: str | None = None,
+                            exclude_session_prefixes: tuple = ()) -> list[dict]:
+        """`match` is a ready FTS5 expression (the relevance gate's content
+        words) used instead of sanitizing `query`. `exclude_session_prefixes`
+        drops rows from those sessions IN the query, before the LIMIT: on the
+        production store ~98% of transcript rows are cron runs, and filtering
+        them afterwards meant re-running the whole ranked match to find
+        `limit` rows that were left."""
+        q = match if match is not None else _fts_query(query)
         if not q:
             return []
         try:
-            rows = self._conn().execute(
-                "SELECT event_id, excerpt, rank FROM observed_fts WHERE observed_fts MATCH ? "
-                "ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+            if exclude_session_prefixes and tuple(exclude_session_prefixes) == self.USER_FTS_EXCLUDES \
+                    and self.user_fts_ready():
+                # The user's own conversations are ~2% of the transcript rows
+                # on the production store; ranking the other 98% only to drop
+                # them was most of a per-turn search.
+                rows = self._conn().execute(
+                    "SELECT event_id, excerpt, rank FROM observed_user_fts "
+                    "WHERE observed_user_fts MATCH ? ORDER BY rank LIMIT ?", (q, limit)).fetchall()
+                return [dict(r) for r in rows]
+            if exclude_session_prefixes:
+                cond = " AND ".join("COALESCE(e.session_id, '') NOT LIKE ? ESCAPE '\\'"
+                                    for _ in exclude_session_prefixes)
+                likes = [p.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                         for p in exclude_session_prefixes]
+                rows = self._conn().execute(
+                    "SELECT f.event_id, f.excerpt, f.rank FROM observed_fts f "
+                    "LEFT JOIN events e ON e.event_id = f.event_id "
+                    "WHERE observed_fts MATCH ? AND " + cond + " ORDER BY f.rank LIMIT ?",
+                    (q, *likes, limit)).fetchall()
+            else:
+                rows = self._conn().execute(
+                    "SELECT event_id, excerpt, rank FROM observed_fts WHERE observed_fts MATCH ? "
+                    "ORDER BY rank LIMIT ?", (q, limit)).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError:
             return []
@@ -1278,11 +1348,13 @@ class MemoryStore:
     def fts_delete_observed(self, event_id: str):
         with self.transaction() as conn:
             conn.execute("DELETE FROM observed_fts WHERE event_id=?", (event_id,))
+            conn.execute("DELETE FROM observed_user_fts WHERE event_id=?", (event_id,))
 
     # -- belief FTS (Tier-1, §18.1) ---------------------------------------
 
-    def fts_search_beliefs(self, query: str, limit: int = 20) -> list[dict]:
-        q = _fts_query(query)
+    def fts_search_beliefs(self, query: str, limit: int = 20, *,
+                           match: str | None = None) -> list[dict]:
+        q = match if match is not None else _fts_query(query)
         if not q:
             return []
         try:
@@ -2090,7 +2162,23 @@ class MemoryStore:
                 [belief[c] for c in cols])
             kind, text = _belief_fts_text(table, belief)
             if kind:
-                self._fts_index_belief(conn, belief["belief_id"], kind, text)
+                if belief.get("status") in _INACTIVE_STATUSES:
+                    conn.execute("DELETE FROM belief_fts WHERE belief_id=?", (belief["belief_id"],))
+                else:
+                    self._fts_index_belief(conn, belief["belief_id"], kind, text)
+
+    def _belief_fts_follow_status(self, conn, table: str, belief_id: str, status):
+        """Only a belief search can return is in belief_fts. On the production
+        store 97,790 of its 101,188 rows were retracted beliefs, ranked on every
+        search and then thrown away."""
+        if status in _INACTIVE_STATUSES:
+            conn.execute("DELETE FROM belief_fts WHERE belief_id=?", (belief_id,))
+        elif status is not None:
+            row = conn.execute(f"SELECT * FROM {table} WHERE belief_id=?", (belief_id,)).fetchone()
+            if row is not None:
+                kind, text = _belief_fts_text(table, dict(row))
+                if kind:
+                    self._fts_index_belief(conn, belief_id, kind, text)
 
     def update_belief(self, table: str, belief_id: str, **fields):
         if not fields:
@@ -2099,6 +2187,8 @@ class MemoryStore:
             sets = ",".join(f"{k}=?" for k in fields)
             conn.execute(f"UPDATE {table} SET {sets} WHERE belief_id=?",
                          [*fields.values(), belief_id])
+            if "status" in fields:
+                self._belief_fts_follow_status(conn, table, belief_id, fields["status"])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
             self.delete_query_proxy_vectors(belief_id)
@@ -2113,8 +2203,10 @@ class MemoryStore:
         with self.transaction() as conn:
             for t in BELIEF_TABLES:
                 if all(_has_col(conn, t, k) for k in fields):
-                    conn.execute(f"UPDATE {t} SET {sets} WHERE belief_id=?",
-                                 [*fields.values(), belief_id])
+                    cur = conn.execute(f"UPDATE {t} SET {sets} WHERE belief_id=?",
+                                       [*fields.values(), belief_id])
+                    if cur.rowcount and "status" in fields:
+                        self._belief_fts_follow_status(conn, t, belief_id, fields["status"])
         if fields.get("status") in _INACTIVE_STATUSES:
             self.delete_memory_vector(belief_id)
             self.delete_query_proxy_vectors(belief_id)
@@ -2382,6 +2474,34 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("UPDATE contradictions SET status='resolved' WHERE id=?", (contradiction_id,))
 
+    def resolve_contradictions_without_two_active(self) -> int:
+        """Close every open contradiction that no longer names two active beliefs.
+
+        The companion of `resolve_contradictions_for` for rows opened before it
+        existed: one production store held 1,550 of them after a cleanup. A
+        belief id that names no row at all counts as not active — the belief is
+        gone, so the pair cannot be in conflict."""
+        active = " UNION ALL ".join(
+            "SELECT belief_id FROM %s WHERE status='active'" % t for t in BELIEF_TABLES)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE contradictions SET status='resolved' WHERE status='open' "
+                "AND (belief_a NOT IN (%s) OR belief_b NOT IN (%s))" % (active, active))
+            return cur.rowcount or 0
+
+    def resolve_contradictions_for(self, belief_id: str) -> int:
+        """Close every open contradiction naming `belief_id`. Returns the count.
+
+        Called when a belief stops being active: a contradiction is two beliefs
+        the store cannot both hold, so with one of them gone the pair is no
+        longer a question. Nothing is deleted — the row keeps its detail and its
+        date, and only its status changes."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE contradictions SET status='resolved' "
+                "WHERE status='open' AND (belief_a=? OR belief_b=?)", (belief_id, belief_id))
+            return cur.rowcount or 0
+
     # -- supersede candidates (Ladder 9 E4, §issue-8) -----------------------
 
     def add_supersede_candidate(self, new_belief_id: str, old_belief_id: str, similarity: float,
@@ -2624,8 +2744,10 @@ class MemoryStore:
             if dup is not None:
                 return None
             # Check for done/failed job with same payload and re-arm it
-            old_job = conn.execute("SELECT id FROM curation_jobs WHERE task='embed' AND "
-                                   "status IN ('done','failed') AND payload=?", (payload,)).fetchone()
+            old_job = conn.execute(
+                "SELECT id FROM curation_jobs WHERE task='embed' AND status IN ('done','failed') "
+                "AND json_extract(payload, '$.target_id')=? AND payload=?",
+                (target_id, payload)).fetchone()
             if old_job is not None:
                 # Re-arm: reset to pending with attempts=0 and run_after=NULL
                 conn.execute("UPDATE curation_jobs SET status='pending', attempts=0, run_after=NULL, "
@@ -3441,7 +3563,10 @@ class MemoryStore:
             for t in PROJECTION_TABLES:
                 conn.execute(f"DELETE FROM {t}")
             conn.execute("DELETE FROM observed_fts")
+            conn.execute("DELETE FROM observed_user_fts")
             conn.execute("DELETE FROM belief_fts")
+            # The replay that follows indexes every user-side row again.
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('observed_user_fts_ready','1')")
             if self.vector_index:
                 try:
                     self.vector_index.prune_observed_vectors(conn, set())  # keep nothing -- full rebuild
@@ -3586,6 +3711,25 @@ _JOBS_INDEX_DDLS = (
     # A7. Serves prune_curation_jobs' age cutoff over terminal rows.
     ("CREATE INDEX IF NOT EXISTS idx_jobs_terminal ON curation_jobs(finished_at, id) "
     "WHERE status IN ('done','failed');"),
+    # Serves enqueue_embed_job's RE-ARM probe ("is there a finished job for this
+    # same work?"). idx_jobs_dedupe is partial on pending/running, so that probe
+    # had no index and walked every terminal row comparing payload TEXT. Measured
+    # on a production store that retention had never pruned (182,230 job rows,
+    # 31,299 finished embeds): about a second per enqueue, and compress() queues
+    # one per span it writes — 90 enqueues, 97 s, inside one compaction.
+    # Keyed on the target id rather than the payload itself: an embed payload
+    # carries the full text, so indexing it would copy kilobytes a row; the
+    # target id is ~70 bytes and all but unique, and the query still compares the
+    # whole payload after the index narrows it.
+    ("CREATE INDEX IF NOT EXISTS idx_jobs_embed_done_target ON curation_jobs("
+     "json_extract(payload, '$.target_id')) "
+     "WHERE task='embed' AND status IN ('done','failed');"),
+    # Serves directive_rows (`always_inject=1 AND status='active'`), which the
+    # context block runs twice per call. idx_notes_directive covers
+    # always_inject alone, and on the production store the attribution cleanup
+    # left ~30k RETRACTED always-inject notes behind it: 0.4 s a call to find
+    # ten active ones. Two equalities, so the planner prefers this one.
+    ("CREATE INDEX IF NOT EXISTS idx_notes_directive_active ON notes(always_inject, status);"),
     # v5.7.0 review §8. The ONLY index on the referencing side of
     # `depends_on REFERENCES curation_jobs(id)`, and it is a deploy-cost fix, not
     # a query-plan nicety. SQLite verifies an enforced foreign key on every
@@ -3804,7 +3948,8 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, parents TEXT NOT NULL DEFAULT '[]',
     actor TEXT NOT NULL CHECK(actor IN ('user','agent','curator','system')),
     owner TEXT NOT NULL, trust_level INTEGER NOT NULL, session_id TEXT, branch_id TEXT,
-    occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL, prev_head TEXT, sig TEXT);
+    occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL, prev_head TEXT, sig TEXT,
+    pointer TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_recorded ON events(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, seq);
@@ -3967,6 +4112,7 @@ CREATE TABLE IF NOT EXISTS extractions (
     UNIQUE(observed_event, extractor_version));
 
 CREATE VIRTUAL TABLE IF NOT EXISTS observed_fts USING fts5(event_id UNINDEXED, excerpt);
+CREATE VIRTUAL TABLE IF NOT EXISTS observed_user_fts USING fts5(event_id UNINDEXED, excerpt);
 CREATE VIRTUAL TABLE IF NOT EXISTS belief_fts USING fts5(belief_id UNINDEXED, kind UNINDEXED, text);
 
 CREATE TABLE IF NOT EXISTS observed_vectors (

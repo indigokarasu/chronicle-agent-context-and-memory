@@ -54,7 +54,7 @@ from engine.store import SCHEMA_VERSION, MemoryStore, _has_col, _has_table  # no
 # The dump's exclusion list and turn fixture, imported rather than restated: the
 # emptiness assertions below are DERIVED from the exclusion list, so that
 # excluding a row-bearing table can never pass silently.
-from h1_store_dump import DELIBERATE_MODEL_COLUMNS, H1_TABLES, TURNS  # noqa: E402
+from h1_store_dump import ADDED_NULL_COLUMNS, DELIBERATE_MODEL_COLUMNS, H1_TABLES, TURNS  # noqa: E402
 from provider import ChronicleMemoryProvider  # noqa: E402
 
 # The tree this one must be byte-identical to at default config.
@@ -643,6 +643,25 @@ class TestDisabledByDefaultIsInert(_ProviderCase):
                                  "%s.%s is hidden from the byte-identity proof and does NOT "
                                  "carry the active canonical tag" % (table, column))
 
+    def test_added_columns_stay_null_on_the_default_flow(self):
+        """The assertion that LICENSES the dump's ADDED_NULL_COLUMNS: a column
+        hidden from the byte-identity proof must be checked directly, or hiding
+        it would hide whatever it holds."""
+        for user, assistant in TURNS:
+            self.provider.sync_turn(user, assistant, session_id="s-h1")
+            self.core.process_pending()
+        self.assertTrue(ADDED_NULL_COLUMNS, "the exclusion tuple is empty; nothing is being guarded")
+        conn = self.core.store._conn()
+        for table, column in ADDED_NULL_COLUMNS:
+            self.assertTrue(_has_col(conn, table, column),
+                            "%s.%s is excluded from the dump but does not exist" % (table, column))
+            n = conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+            self.assertTrue(n, "%s wrote no rows: the exclusion would be vacuous" % table)
+            filled = conn.execute("SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL"
+                                  % (table, column)).fetchone()[0]
+            self.assertEqual(filled, 0, "%s.%s is hidden from the byte-identity proof and is "
+                                        "NOT null on the default flow" % (table, column))
+
     def test_heuristic_provenance_has_no_source_key_at_all(self):
         """The absence is load-bearing: it is what makes the disabled path
         byte-identical rather than merely equivalent."""
@@ -715,7 +734,11 @@ class TestDisabledMatchesPreH1TreeExactly(unittest.TestCase):
     # Enumerated, not pattern-matched: a list that grows silently is how this
     # test would stop meaning anything. Adding to it is a deliberate act that
     # says "upstream changed default capture again, and we looked at it".
-    UPSTREAM_CAPTURE_ADDITIONS = ("meta\t[\"profile_summary:",)
+    # observed_user_fts (5.8.2) is a second FTS index over the same observed
+    # rows -- the user's own conversations, read by the per-turn search -- and
+    # its ready flag: derived, additive, and nothing the base wrote changes.
+    UPSTREAM_CAPTURE_ADDITIONS = ("meta\t[\"profile_summary:", "meta\t[\"observed_user_fts_ready\"",
+                                  "observed_user_fts")
 
     def _assert_only_upstreams_known_capture_additions(self, base_dump, ours_dump):
         """Byte-identical, EXCEPT for upstream's known capture additions.
@@ -871,7 +894,7 @@ class TestSchemaMigration(unittest.TestCase):
         # curation_jobs task CHECK, 18 = A7's queue + vector-census indexes.
         # Rungs land as their trees merge; the number below is the top of the
         # chain as it stands in this tree. See engine/store.py.
-        self.assertEqual(SCHEMA_VERSION, 18)
+        self.assertEqual(SCHEMA_VERSION, 19)
         # Pre-existing data survives, and the new queue is usable immediately.
         self.assertIsNotNone(store.get_event("ev_old"))
         registry = HostModelRegistry(store, _CfgStub({"host_model.piggyback": True}))

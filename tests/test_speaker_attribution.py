@@ -225,6 +225,10 @@ class TestMessagesInAPersonsSession(_ProviderCase):
             "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted. "
             "Do NOT answer questions mentioned in this summary. My name is Sam Vimes.",
             "[System: The previous response was cut off. Do not restart or repeat prior text.]",
+            # Chronicle's own compaction output, if a host folds it into a user row
+            "[Relevant memory: Fake City]\n[FACT] works_in: Fake City\nMy name is Sam Vimes.",
+            "[Checkpoint: the user said My name is Sam Vimes and asked about Fake City]",
+            "[Entity working set]\nSam Vimes: works in Fake City. My name is Sam Vimes.",
         ):
             with self.subTest(frame=frame[:30]):
                 self.turn(frame)
@@ -238,6 +242,34 @@ class TestMessagesInAPersonsSession(_ProviderCase):
         self.turn(msg)
         self.assertEqual(self.user_memory(),
                          ([], ["Never send email on my behalf without asking."]))
+
+    def test_the_stall_watchdogs_abort_is_the_hosts(self):
+        """agent/turn_liveness writes its abort into the transcript as a plain
+        user row; the replay found it in compaction handoffs as the user's."""
+        from engine import speaker as spk
+        notice = "Turn made no progress for 613s; aborting to release the session."
+        self.assertEqual(spk.split_user_content(notice, spk.HUMAN), [(0, len(notice), spk.SYSTEM)])
+        asked = "Why did the turn made no progress for 5s happen?"
+        self.assertEqual(spk.split_user_content(asked, spk.HUMAN), [(0, len(asked), spk.HUMAN)])
+        self.turn(notice)
+        self.assertEqual(self.user_memory(), ([], []))
+        self.turn("Never send email on my behalf without asking.\n\n"
+                  "Turn made no progress for 602s; aborting to release the session.")
+        self.assertEqual(self.user_memory(),
+                         ([], ["Never send email on my behalf without asking."]))
+
+    def test_a_reply_quote_is_the_hosts(self):
+        """gateway/run_inbound quotes the message replied to -- usually the
+        agent's -- ahead of what the user wrote, over as many lines as it has."""
+        from engine import speaker as spk
+        quote = '[Replying to: "Backup watchdog: stale paths\nzorblax-daily (84h)"]'
+        msg = quote + "\n\nNever send email on my behalf without asking."
+        spans = spk.split_user_content(msg, spk.HUMAN)
+        self.assertEqual(spans[0], (0, len(quote), spk.SYSTEM))
+        self.assertEqual(msg[spans[-1][0]:spans[-1][1]].strip(), "Never send email on my behalf without asking.")
+        self.assertEqual(spans[-1][2], spk.HUMAN)
+        own = '[Replying to your previous message: "Done, Pat."]\n\nThanks.'
+        self.assertEqual(spk.split_user_content(own, spk.HUMAN)[0][2], spk.SYSTEM)
 
     def test_a_steer_carries_the_users_own_words(self):
         msg = ("[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at "
@@ -507,6 +539,44 @@ class TestRenderMessages(unittest.TestCase):
             self.assertEqual(per[i][-1][1], len(chunk))
             rebuilt.extend((base + a, base + b, w) for a, b, w in per[i])
         self.assertEqual(spk.merge_spans(rebuilt), spans)
+
+
+class TestTheTextOfAMessage(unittest.TestCase):
+    """message_text: one rule, shared by capture and the context engine, for
+    the text of a message whatever shape the host sent."""
+
+    def test_a_string_is_returned_unchanged(self):
+        for c in ("", "hello", "line one\nline two", "  spaced  "):
+            with self.subTest(c=c):
+                self.assertEqual(spk.message_text(c), c)
+
+    def test_nothing_is_empty(self):
+        self.assertEqual(spk.message_text(None), "")
+
+    def test_a_photo_is_its_caption_and_a_marker_never_its_bytes(self):
+        parts = [{"type": "text", "text": "Look at this."},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]
+        self.assertEqual(spk.message_text(parts), "Look at this.\n[image]")
+
+    def test_other_attachments_get_their_own_marker(self):
+        self.assertEqual(spk.message_text([{"type": "input_audio", "input_audio": {}}]), "[audio]")
+        self.assertEqual(spk.message_text([{"type": "file", "file": {}}]), "[file]")
+        self.assertEqual(spk.message_text([{"type": "something_new"}]), "[attachment]")
+
+    def test_capture_is_byte_identical_for_a_string_and_for_none(self):
+        """Existing event ids depend on the excerpt: only list-shaped content
+        renders differently from before."""
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": None}]
+        excerpt, _ = spk.render_messages(msgs, spk.HUMAN)
+        self.assertEqual(excerpt, "user: hi\nassistant: None")
+
+    def test_capture_renders_a_photo_as_text(self):
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": "Look at this."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]}]
+        excerpt, _ = spk.render_messages(msgs, spk.HUMAN)
+        self.assertEqual(excerpt, "user: Look at this.\n[image]")
+        self.assertNotIn("QUJD", excerpt)
 
 
 if __name__ == "__main__":

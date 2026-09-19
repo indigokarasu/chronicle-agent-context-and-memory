@@ -1,5 +1,5 @@
-// The Atlas event model: the whole log as typed arrays, one row per event,
-// decoded from /atlas/events chunks and grown in place as live events arrive.
+// The Tapestry event model: the whole log as typed arrays, one row per event,
+// decoded from /tapestry/log/events chunks and grown in place as live events arrive.
 
 import { fetchJSON, API } from "../common.js";
 
@@ -78,7 +78,7 @@ export class EventModel {
     this.cap = cap;
   }
 
-  /** Decode one /atlas/events chunk and append it. Returns the number added. */
+  /** Decode one /tapestry/log/events chunk and append it. Returns the number added. */
   append(ch) {
     if (!ch || !ch.n) return 0;
     this._grow(ch.n);
@@ -207,7 +207,7 @@ export async function loadEvents(model, total, onProgress, signal) {
     if (signal && signal.aborted) return;
     let ch;
     try {
-      ch = await fetchJSON(API + "/atlas/events?after_seq=" + after + "&limit=50000");
+      ch = await fetchJSON(API + "/tapestry/log/events?after_seq=" + after + "&limit=50000");
     } catch (e) {
       throw new Error("loading events after seq " + after + " failed: " + ((e && e.message) || e));
     }
@@ -221,7 +221,7 @@ export async function loadEvents(model, total, onProgress, signal) {
 
 export async function pollEvents(model) {
   const before = model.n;
-  const ch = await fetchJSON(API + "/atlas/events?after_seq=" + model.lastSeq + "&limit=50000");
+  const ch = await fetchJSON(API + "/tapestry/log/events?after_seq=" + model.lastSeq + "&limit=50000");
   if (ch.error || !ch.n) return 0;
   model.append(ch);
   model.orderLanes(true);

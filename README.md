@@ -12,7 +12,7 @@
 [![MIT License](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 [![No required services](https://img.shields.io/badge/required_services-none-6f42c1.svg)](#why-chronicle)
 
-Version: 5.7.2.
+Version: 5.8.33.
 
 Chronicle gives your Hermes agent durable long-term memory and safer working-memory
 compression in one install. Names, preferences, decisions, and prior work stay on
@@ -115,7 +115,67 @@ Both plugins share a process-singleton `ChronicleCore` that owns:
 - **Reducer**: folds events into the belief store (facts, entities, episodes)
 - **RetrievalEngine**: dual-tier recall: FTS5 + structured lookup over beliefs, plus raw event access
 
-The context engine hooks into `on_pre_compress` and owns compression when active. The memory provider hooks into `on_session_end`, `on_turn_start`, `on_delegation`, and `on_memory_write`.
+When the context engine is selected, Hermes hands it compaction: it calls the engine's `compress()` and `prune_tool_results_only()` itself (the memory provider's `on_pre_compress` then returns nothing, so nothing is summarised twice). The memory provider hooks into `on_session_end`, `on_turn_start`, `on_delegation`, and `on_memory_write`.
+
+### How a compaction works
+
+- **It follows your `compression:` settings.** Hermes does not pass its policy
+  to a plugin engine, so Chronicle reads it: it compacts at `threshold` of the
+  window, down to twice `threshold × target_ratio`, keeps `protect_first_n`
+  and `protect_last_n` messages, and also folds down to half of
+  `hygiene_hard_message_limit` when the gateway compacts on message count.
+  Explicit `context_engine.high_watermark_percent` / `low_watermark_percent`
+  still win.
+- **What it keeps.** The protected head and tail, the user's newest request
+  (even behind a long tool loop), pinned spans and the user's own
+  "never/always/must" instructions, then the best-scoring older turns that fit.
+  A tool call and its results are kept or folded together, never split. When
+  even the protected spans do not fit, the newest turn wins, then the user's
+  newest request, then the rest of the tail newest first; a turn's stale
+  recall block (Hermes' `api_content` sidecar) goes before the user's words,
+  and a span shortened to fit says how to restore it.
+- **What it leaves in their place.** One message where the folded turns were,
+  in a conversation role (a mid-conversation `system` message would become
+  the system prompt on Anthropic's API):
+  `[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle folded …`, listing the
+  user's folded requests verbatim, one line per folded tool step (the command
+  and its output or error), facts stated in them, memory recalled for a focus
+  (or passed by Hermes as `memory_context`), and the ids of anything there was
+  no room to show.
+- **Nothing is lost.** Every folded message is archived first;
+  `chronicle_expand(span_id)` restores it byte for byte.
+- **Cache-friendly.** A pass extends the settled prefix byte for byte while it
+  is small; once it is most of the budget, the next pass rebases into one
+  consolidated handoff (one cache break, as Hermes' own compressor pays).
+- **Inspectable.** `chronicle_context_status` reports the policy in force, the
+  passes so far and what the handoff carries; each pass logs one
+  `chronicle compaction:` line.
+
+### What goes into a turn unasked
+
+The memory provider's per-turn recall is memory about the user and about the
+message just sent: an item must share a content word with it — as written or
+inflected (book/booked, city/cities), not merely as a prefix — and a message
+with more than three content words needs two of them in an item. A shorter
+message's single shared word is often a coincidence ("system health check" and
+a prescription's `health_event`), so such a match must also be near the
+message in meaning: the item's stored vector against the message's (a short
+item with none is embedded on the spot, a few per turn), within a second and a
+half of quick requests to the embedder (`retrieval.prefetch_min_similarity`;
+measured per model, 0.65 for nomic-embed-text); a match nothing can vouch for,
+with the embedder busy or down, is left out. Two or three shared words get the
+same check at their own floor (0.60), and there the words decide when there is
+no vector to compare. The gate reads only the person's words, not the host's
+framing around them. Only the user's own words in a past exchange are asked;
+URLs, short numbers, host framing, tool output and the agent's own memory
+writes never count. A scheduled job's turn gets none
+(`retrieval.prefetch_automation`). Nor does it repeat the conversation in
+progress: the live session's turns are already in the model's window, so only
+what a compaction folded out of it can come back. A credential's value (a
+password, API key or token the user handed the agent) is never injected, and
+never stored in a belief: the fold masks it, and only the transcript keeps it.
+Explicit search, `chronicle_answer` and the context engine's recall are not
+gated.
 
 **Maintenance runs on those hooks, not on cron.** There is no daemon, no timer
 and no background thread: on a hook call the `Scheduler` (`engine/scheduler.py`)
@@ -314,6 +374,11 @@ Option | Default | Purpose
 `domains.<domain>.contradiction_policy` | per domain | What happens when a new value contradicts a stored one
 `identity.schedule` | `0 5 * * *` | Cron (UTC) for the exact-name identity sweep; `""` disables
 `learning.max_active_deltas` | `8` | Max concurrent self-improvement deltas
+`context_engine.high_watermark_percent` | host `threshold`, else `0.75` | Compact when the prompt passes this share of the window
+`context_engine.low_watermark_percent` | `2 × threshold × target_ratio`, else `0.55` | What a compaction folds down to
+`retrieval.prefetch_relevance_gate` | `true` | Per-turn recall only for items that share content words with the message
+`retrieval.prefetch_automation` | `false` | Per-turn recall on scheduled-job (cron) turns too
+`embeddings.exclude_session_prefixes` | `[]` | Session prefixes never embedded (e.g. `cron_`); still full-text searchable
 
 ### New in 5.7.0
 
@@ -477,28 +542,34 @@ Chronicle ships a Hermes dashboard tab (`dashboard/`) with two views.
 **Overview** shows store counts, embedding coverage, recent activity, and a
 button that queues extraction for turns that have none.
 
-**Atlas** is a navigator for the memory itself. Every event in the log is drawn
-as a point on the row of whatever wrote it: a cron job, a chat session, or a
-background process such as the curator. The chart above it counts events over
-time; drag across it to zoom to a range. Click a point, a row, or an item in
-the lists below the chart, and the side panel shows where it came from and
-what it produced:
+**Tapestry** is how the memory itself is browsed, by what it is about rather
+than by how it arrived. The rail counts what Chronicle holds — people, places,
+things, events, ideas, and whatever it cannot classify — and picking one lists
+them, biggest first. An entity's page shows what memory says about it now, what
+it used to say, the events it appears in, and every captured turn that names it,
+each labelled with who was speaking in that turn (you, a scheduled job, the
+assistant, a tool, the host), so nothing reads as yours that was not.
 
-- an **event** shows its text, its writer and run, the turn an assertion was
-  extracted from, and the beliefs that cite it;
-- a **run** shows its summary, its events in order, and the beliefs formed from it;
-- a **belief** shows its status and confidence, the events it cites, what it
-  replaced and what replaced it, what contradicts it, and how many identical
-  active copies exist.
+Above it, the **weave** puts the dated events on one time axis with a thread per
+entity they involve: a knot on your thread and on the person's, joined where an
+event names them both. Threads are ordered by how much of your memory runs
+through them, and the quieter ones are counted rather than drawn a pixel high.
 
-The lists below the chart are open **contradictions**, **replaced facts**
-(each fact's values over time) and **duplicate notes**. New events appear
-while the tab is open.
+Classification comes from the sources, never from a guess: an entity's kind from
+its own recorded type or its predicates, a contact's person-or-company from the
+people store that owns that record (an unreviewed row stays "unreviewed"), and
+an event's date from the date the importer wrote into its title.
 
-The Atlas reads the store with a `mode=ro` SQLite connection per request, so it
+**Provenance is a drill-down, not the way in.** From any fact or mention,
+"provenance" opens the log: every event drawn as a point on the row of whatever
+wrote it — a cron job, a chat session, the curator — with the chart above
+counting events over time, inspectors for an event, a run or a belief, and
+lenses for open contradictions, replaced facts and duplicate notes.
+
+The Tapestry reads the store with a `mode=ro` SQLite connection per request, so it
 cannot write memory and never holds a read transaction open. Drawing is done on
 the GPU with deck.gl, which keeps the whole log (hundreds of thousands of events)
-interactive. The deck.gl bundle (`dist/atlas.js`) is loaded only when the Atlas
+interactive. The deck.gl bundle (`dist/tapestry.js`) is loaded only when the Tapestry
 tab is opened.
 
 The UI is built from `dashboard/web/src`, and the built files in
@@ -568,8 +639,8 @@ chronicle/             # installs to ~/.hermes/plugins/chronicle/
   dashboard/           # Hermes dashboard tab
     manifest.json      # tab registration
     plugin_api.py      # FastAPI routes: status, recent activity, extraction queue
-    atlas_api.py       # read-only Atlas routes (event stream, inspectors, lenses)
-    dist/              # built UI the dashboard loads (index.js, atlas.js); committed
+    tapestry_api.py       # read-only Tapestry routes (event stream, inspectors, lenses)
+    dist/              # built UI the dashboard loads (index.js, tapestry.js); committed
     web/               # UI source + build script + local harness
   tests/
     test_build.py      # Unit + property tests P1–P21 + worked examples B.1–B.6

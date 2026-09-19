@@ -1,14 +1,14 @@
 """
-Chronicle — dashboard/atlas_api.py, the data behind the Atlas memory navigator.
+Chronicle — dashboard/tapestry_api.py, the data behind the Tapestry memory navigator.
 
-The Atlas is a reader of the production store while Hermes writes it, so the
+The Tapestry is a reader of the production store while Hermes writes it, so the
 properties pinned here are the ones a wrong implementation would get away with
 silently:
 
   * the delta-encoded event stream decodes to EXACTLY the log (seq, time, type,
     writer), across chunk boundaries;
   * every function is read-only: the store's bytes are unchanged afterwards and
-    a write through the Atlas connection is refused by SQLite itself;
+    a write through the Tapestry connection is refused by SQLite itself;
   * inspectors connect a belief to the events that justify it, to what it
     replaced and what replaced it, and to what contradicts it — through the
     store's own tables, not a heuristic;
@@ -82,7 +82,7 @@ def _load(name, path, routes=None):
     return mod
 
 
-A = _load("chronicle_atlas_under_test", _DASH / "atlas_api.py")
+A = _load("chronicle_tapestry_under_test", _DASH / "tapestry_api.py")
 
 
 def _fact(core, entity, predicate, body, domain, confidence, session_id, src):
@@ -104,10 +104,10 @@ def _files_sha(db):
     return h.hexdigest()
 
 
-class _AtlasCase(unittest.TestCase):
+class _TapestryCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.home = temp_home(prefix="atlas-")
+        cls.home = temp_home(prefix="tapestry-")
         core = ChronicleCore(cls.home, {"embeddings": {"model": "hashing"}})
         core.initialize(CRON, principal_id="assistant")
         core.capture.observe("Pat Testley said the Acme Fake Co offsite moved to Denver.",
@@ -142,6 +142,19 @@ class _AtlasCase(unittest.TestCase):
                     "'Do not refactor unrelated code', 'default', 'general', 'active', "
                     "'2026-09-01T00:00:00.000Z', '{\"source_type\": \"rescue_extraction\"}')",
                     (bid, subject))
+        # A person the calendar names, and the calendar fact that names them: the
+        # entity read model reads both, and each test must see them whatever
+        # order the suite runs in.
+        core.capture.append("asserted", {
+            "kind": "entity", "key": {"entity_type": "person", "type": "person",
+                                      "name": "Robin Placeholder",
+                                      "normalized_name": "robin placeholder",
+                                      "owner": "default", "domain": "user"},
+            "body": "Robin Placeholder", "confidence": 0.7, "source_event": "ev_seed",
+            "source_type": "session_transcript"}, actor="curator")
+        core.process_pending()
+        _fact(core, "user", "attended_event", "Robin Placeholder's birthday — 2026-03-06",
+              "user", 0.7, CHAT, "sands:1")
         cls.db = core.store.db_path
         cls.core = core
 
@@ -170,7 +183,7 @@ class _AtlasCase(unittest.TestCase):
         return out
 
 
-class TestEventStream(_AtlasCase):
+class TestEventStream(_TapestryCase):
     def test_one_chunk_decodes_to_the_log(self):
         ch = A.events_chunk(self.db, 0)
         self.assertTrue(ch["done"])
@@ -215,7 +228,7 @@ class TestEventStream(_AtlasCase):
         self.assertIn("session:" + CHAT, lanes)
 
 
-class TestInspectors(_AtlasCase):
+class TestInspectors(_TapestryCase):
     def _belief_id(self, table, where, params=()):
         c = sqlite3.connect(self.db)
         r = c.execute("SELECT belief_id FROM %s WHERE %s" % (table, where), params).fetchone()
@@ -282,7 +295,7 @@ class TestInspectors(_AtlasCase):
         self.assertFalse(A.event_detail(self.db, 10 ** 9)["found"])
 
 
-class TestLenses(_AtlasCase):
+class TestLenses(_TapestryCase):
     def test_contradictions(self):
         c = A.contradictions(self.db)
         self.assertGreaterEqual(c["total"], 1)
@@ -294,6 +307,38 @@ class TestLenses(_AtlasCase):
         works = [i for i in h["items"] if i["predicate"] == "works_at"]
         self.assertEqual(len(works), 1)
         self.assertEqual([v["value"] for v in works[0]["versions"]], ["Acme Fake Co", "Globex Fake Inc"])
+
+    def test_a_history_reads_forwards_when_the_clock_ties(self):
+        """Two versions written in the same millisecond: the replaced one comes
+        first. (The tie-break used to be the belief id, a hash, which made
+        test_fact_histories fail about one run in eight.)"""
+        import sqlite3 as _sq
+        c = _sq.connect(self.db)
+        was = c.execute("SELECT belief_id, created_at FROM facts "
+                        "WHERE predicate_canonical='works_at'").fetchall()
+        c.execute("UPDATE facts SET created_at='2026-09-01T00:00:00.000Z' "
+                  "WHERE predicate_canonical='works_at'")
+        c.commit()
+        try:
+            h = A.fact_histories(self.db)
+            works = [i for i in h["items"] if i["predicate"] == "works_at"]
+            self.assertEqual([v["value"] for v in works[0]["versions"]],
+                             ["Acme Fake Co", "Globex Fake Inc"])
+        finally:                          # the class shares this store
+            c.executemany("UPDATE facts SET created_at=? WHERE belief_id=?",
+                          [(at, bid) for bid, at in was])
+            c.commit()
+            c.close()
+
+    def test_a_tie_is_broken_by_what_replaced_what_not_by_the_id(self):
+        """Ids chosen so that id order is the WRONG order: belief ids differ on
+        every build, so the store-level test above only catches this on the
+        builds whose hashes happen to fall the wrong way."""
+        at = "2026-09-01T00:00:00.000Z"
+        rows = [("b_aaa", "Globex Fake Inc", "active", at, None, None, None),
+                ("b_zzz", "Acme Fake Co", "superseded", at, None, None, "b_aaa")]
+        self.assertEqual([r[1] for r in A._in_supersession_order(rows)],
+                         ["Acme Fake Co", "Globex Fake Inc"])
 
     def test_duplicate_notes(self):
         d = A.duplicate_notes(self.db)
@@ -307,8 +352,77 @@ class TestLenses(_AtlasCase):
         self.assertGreaterEqual(s["contradictions_open"], 1)
 
 
-class TestReadOnly(_AtlasCase):
-    def test_nothing_the_atlas_does_changes_the_store(self):
+class TestTheEntityReadModel(_TapestryCase):
+    """What the Tapestry opens on: the things memory is about, not the machinery."""
+
+    def _index(self, people=None):
+        return A.entity_index(self.db, people=people)
+
+    def test_entities_are_listed_with_their_kind(self):
+        idx = self._index()
+        by_id = {i["id"]: i for i in idx["items"]}
+        # Nothing named this row, so it carries the id the facts reference: a
+        # reader sees what memory actually holds, not a guess at capitalisation.
+        self.assertEqual(by_id["pat_testley"]["name"], "pat_testley")
+        self.assertEqual(by_id["pat_testley"]["origin"], "entity")
+        self.assertGreaterEqual(by_id["pat_testley"]["facts"], 2)
+        self.assertEqual(sum(idx["kinds"].values()), len(idx["items"]))
+
+    def test_a_calendar_fact_is_an_event_with_its_own_date(self):
+        items = [i for i in self._index()["items"] if i["kind"] == "event"]
+        got = [i for i in items if i["name"].startswith("Robin Placeholder")]
+        self.assertEqual(len(got), 1, items)
+        self.assertEqual(got[0]["when"], "2026-03-06")
+        self.assertEqual(got[0]["name"], "Robin Placeholder's birthday")  # the date tail is the date
+        self.assertEqual(got[0]["origin"], "fact")
+
+    def test_an_event_links_to_the_person_it_names(self):
+        idx = self._index()
+        ev = [i for i in idx["items"] if i["kind"] == "event"
+              and i["name"].startswith("Robin Placeholder")][0]
+        self.assertEqual(ev.get("participants"), ["robin_placeholder"])
+
+    def test_a_person_reads_as_their_facts_history_and_mentions(self):
+        d = A.entity_detail(self.db, "pat_testley")
+        self.assertEqual(d["name"], "pat_testley")   # nothing named this row; see above
+        current = {(f["predicate_canonical"], f["value"]) for f in d["current"]}
+        self.assertIn(("works_at", "Globex Fake Inc"), current)
+        self.assertIn(("works_at", "Acme Fake Co"),
+                      {(f["predicate_canonical"], f["value"]) for f in d["past"]})
+        named = A.entity_detail(self.db, "robin_placeholder")
+        self.assertTrue(named["mentions"], "the captured turn naming Robin Placeholder is not shown")
+        # That turn is a cron job's, and says so: a mention is never dressed up
+        # as something the user said (engine/speaker.py).
+        self.assertEqual(named["mentions"][0]["speakers"], ["assistant", "automation"])
+        self.assertIn("Robin Placeholder", named["mentions"][0]["excerpt"])
+
+    def test_the_user_is_you(self):
+        self.assertEqual(A.entity_detail(self.db, "user")["name"], "You")
+
+    def test_the_people_store_says_who_is_a_person_and_who_is_a_company(self):
+        people = {"pat_testley": {"name": "Pat Testley", "is_company": 0, "occupation": "nurse"},
+                  "acme": {"name": "Acme Fake Co", "is_company": 1},
+                  "unknown_one": {"name": "Sam Vimes", "is_company": None}}
+        A._cache.clear()
+        by_id = {i["id"]: i for i in self._index(people=people)["items"]}
+        self.assertEqual((by_id["pat_testley"]["kind"], by_id["pat_testley"]["subtype"]),
+                         ("person", "contact"))
+        d = A.entity_detail(self.db, "pat_testley", people=people)
+        self.assertEqual(d["people_store"],
+                         {"name": "Pat Testley", "is_company": 0, "occupation": "nurse"})
+
+    def test_an_unreviewed_contact_is_not_called_a_company_or_a_person_silently(self):
+        people = {"pat_testley": {"name": "Pat Testley", "is_company": None}}
+        A._cache.clear()
+        by_id = {i["id"]: i for i in self._index(people=people)["items"]}
+        self.assertEqual(by_id["pat_testley"]["subtype"], "contact (unreviewed)")
+
+    def test_a_missing_people_store_is_normal(self):
+        self.assertEqual(A.people_store(Path(self.home) / "nowhere"), {})
+
+
+class TestReadOnly(_TapestryCase):
+    def test_nothing_the_tapestry_does_changes_the_store(self):
         before = _files_sha(self.db)
         A.summary(self.db)
         A.events_chunk(self.db, 0)
@@ -328,20 +442,20 @@ class TestReadOnly(_AtlasCase):
             conn.close()
 
 
-class TestPluginApiMountsTheAtlas(unittest.TestCase):
+class TestPluginApiMountsTheTapestry(unittest.TestCase):
     def test_routes_are_registered_when_loaded_by_path(self):
         routes = []
-        _load("chronicle_plugin_api_atlas", _DASH / "plugin_api.py", routes)
+        _load("chronicle_plugin_api_tapestry", _DASH / "plugin_api.py", routes)
         paths = {p for _m, p in routes}
-        for p in ("/atlas/summary", "/atlas/events", "/atlas/event", "/atlas/session",
-                  "/atlas/belief", "/atlas/contradictions", "/atlas/histories",
-                  "/atlas/duplicates", "/atlas/lanes", "/status"):
+        for p in ("/tapestry/log/summary", "/tapestry/log/events", "/tapestry/log/event", "/tapestry/log/session",
+                  "/tapestry/log/belief", "/tapestry/log/contradictions", "/tapestry/log/histories",
+                  "/tapestry/log/duplicates", "/tapestry/log/lanes", "/status"):
             self.assertIn(p, paths)
 
 
 class TestAwkwardPaths(unittest.TestCase):
     def test_a_store_whose_path_has_uri_characters(self):
-        d = temp_home(prefix="atlas-uri-")
+        d = temp_home(prefix="tapestry-uri-")
         self.addCleanup(shutil.rmtree, d, True)
         odd = Path(d) / "weird #1 ?dir"
         odd.mkdir()
@@ -358,13 +472,97 @@ class TestAwkwardPaths(unittest.TestCase):
 
 class TestCronNames(unittest.TestCase):
     def test_reads_names_and_tolerates_absence(self):
-        d = temp_home(prefix="atlas-cron-")
+        d = temp_home(prefix="tapestry-cron-")
         self.addCleanup(shutil.rmtree, d, True)
         self.assertEqual(A.cron_job_names(d), {})
         (Path(d) / "cron").mkdir()
         (Path(d) / "cron" / "jobs.json").write_text(
             '{"jobs": [{"id": "abc123def456", "name": "Acme Fake Co digest"}]}')
         self.assertEqual(A.cron_job_names(d), {"abc123def456": "Acme Fake Co digest"})
+
+
+class TestAMergedPersonIsOnePerson(unittest.TestCase):
+    """One person, one line. A production store held its principal twice —
+    `user` with 366 facts and the people store's uuid for them with 273 — and
+    the read model listed both, because nothing here looked at
+    `entities.merged_into`.
+
+    The uuid-keyed row is written directly, which is how the production store
+    holds it: those rows predate the naming rules and `clean_entities.py` later
+    gave them the name the log already carried. This is a test of the READ
+    model, not of how the row was created.
+    """
+
+    OTHER = "5734393e-cc34-5920-a7a8-09951cf2ce0c"
+
+    def setUp(self):
+        self.home = temp_home(prefix="tapestry-merge-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+        self.core.initialize(CHAT, principal_id="assistant")
+        self.core.capture.observe("I moved house last spring.", "Noted.", session_id=CHAT)
+        self.core.process_pending()
+        src = [r[0] for r in self.core.store._conn().execute(
+            "SELECT event_id FROM events WHERE type='observed' ORDER BY seq")][0]
+        _fact(self.core, "user", "had_appointment", "Dentist — 2026-03-10", "user", 0.9, CHAT, src)
+        _fact(self.core, self.OTHER, "purchased", "Shipped: \"Acme Fake Toothpaste\" 2-pack", "user", 0.9, CHAT, src)
+        conn = self.core.store._conn()
+        for bid, name in (("user", "user"), (self.OTHER, "Pat Testley")):
+            conn.execute("INSERT OR REPLACE INTO entities(belief_id, name, normalized_name, "
+                         "aliases, type, domain, owner) "
+                         "VALUES(?,?,?,'[]','','user','default')",
+                         (bid, name, name.lower()))
+        conn.commit()
+        self.db = self.core.store.db_path
+
+    def _merge(self, frm=None, into="user"):
+        self.core.capture.append("merged", {"from_entity": frm or self.OTHER, "into_entity": into},
+                                 actor="user", owner="default")
+        self.core.process_pending()
+
+    def test_before_the_merge_they_are_two(self):
+        ids = {i["id"] for i in A.entity_index(self.db)["items"]}
+        self.assertIn("user", ids)
+        self.assertIn(self.OTHER, ids)
+
+    def test_the_merged_row_stops_being_its_own_line_and_its_facts_move(self):
+        before = {i["id"]: i for i in A.entity_index(self.db)["items"]}["user"]["facts"]
+        self._merge()
+        idx = A.entity_index(self.db)
+        items = {i["id"]: i for i in idx["items"]}
+        self.assertNotIn(self.OTHER, items, "a merged row must not be listed as a second person")
+        self.assertGreater(items["user"]["facts"], before, "its facts belong to the survivor now")
+        self.assertEqual(sum(idx["kinds"].values()), len(idx["items"]))
+
+    def test_opening_the_merged_id_answers_with_the_person_they_are_now(self):
+        self._merge()
+        d = A.entity_detail(self.db, self.OTHER)
+        self.assertEqual(d["id"], "user")
+        self.assertEqual(d["name"], "You")
+        values = [f["value"] for f in d["current"]]
+        self.assertTrue(any("Dentist" in v for v in values), values)
+        self.assertTrue(any("Acme Fake Toothpaste" in v for v in values), values)
+
+    def test_the_people_store_record_survives_the_merge(self):
+        """`user` is Chronicle's own name for the principal and is in no other
+        store, so the profile has to be found through the id that was merged."""
+        self._merge()
+        people = {self.OTHER: {"name": "Pat Testley", "is_company": 0, "city": "San Francisco"}}
+        d = A.entity_detail(self.db, "user", people=people)
+        self.assertEqual(d.get("people_store", {}).get("city"), "San Francisco")
+
+    def test_an_unmerged_person_is_two_again(self):
+        self._merge()
+        self.core.capture.append("unmerged", {"from_entity": self.OTHER},
+                                 actor="user", owner="default")
+        self.core.process_pending()
+        ids = {i["id"] for i in A.entity_index(self.db)["items"]}
+        self.assertIn(self.OTHER, ids)
+
+    def test_a_merge_cycle_does_not_hang(self):
+        self._merge()
+        self._merge(frm="user", into=self.OTHER)
+        A.entity_index(self.db)          # must return rather than loop forever
 
 
 if __name__ == "__main__":

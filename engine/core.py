@@ -32,7 +32,7 @@ from .reasoning import EpistemicModel, ReasoningLayer
 from .reducer import Reducer
 from .retrieval import RetrievalEngine
 from .scheduler import Scheduler
-from .store import MemoryStore, now_iso
+from .store import MemoryStore, StoreClosed, now_iso
 from .tools import Tools
 from .vector_index import VectorIndex
 
@@ -67,6 +67,13 @@ class ChronicleCore:
         access.configure_topology(self.cfg.get("principals"))
         self.has_memory_provider = False
         self.has_context_engine = False
+        self._startup_recovered = False   # on_startup_recovery: once per process
+        self._startup_recovering = False
+        # The background drain (drain_in_background): off until a host asks.
+        self._drain_in_background = False
+        self._drain_kick = threading.Event()
+        self._drain_thread: threading.Thread | None = None
+        self._drain_thread_lock = threading.Lock()
         self.active_principal = "default"
 
         db_path = self.cfg.get("db_path") or str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
@@ -242,10 +249,35 @@ class ChronicleCore:
             return False
 
     def on_startup_recovery(self):
-        # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
-        if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
-            self.reaper.startup_recovery()
-        self.process_pending()         # drain crash-recovered extraction (I13)
+        """Crash recovery (I13): once per PROCESS, and bounded.
+
+        initialize() runs on every session start — every conversation and every
+        cron agent run on a gateway — and this used to run all of it each time,
+        ending in process_pending(): a synchronous drain of up to 1,000 queued
+        jobs before the session could begin. The queue holds embed jobs, and on a
+        CPU-throttled host whose embedding server times out that was minutes per
+        session start (measured: 320 s and 830 s for one engine init against the
+        production store).
+
+        Recovery is bookkeeping about a previous process, so it happens once per
+        core. The drain that follows is one ordinary turn's slice
+        (curation.drain.per_turn); every later turn drains another, which is the
+        path the rest of the queue already takes."""
+        if self._startup_recovered or self._startup_recovering:
+            return
+        # Latched only once it has SUCCEEDED: a recovery that raises is retried
+        # at the next session start instead of being skipped for the rest of
+        # the process. The in-progress flag stops a re-entrant call (a hook the
+        # drain triggers) from starting a second recovery inside the first.
+        self._startup_recovering = True
+        try:
+            # §A12: both `reaper.enabled` and `reaper.startup_recovery` gate this.
+            if self.reaper_enabled and self.cfg.get("reaper.startup_recovery", True):
+                self.reaper.startup_recovery()
+            self._drain_slice()        # one turn's slice of crash-recovered extraction (I13)
+            self._startup_recovered = True
+        finally:
+            self._startup_recovering = False
 
     def start_sources(self):
         if self.cfg.get("sources.ocas_journals.enabled") in (True, "auto"):
@@ -288,8 +320,44 @@ class ChronicleCore:
         handful of integer comparisons (measured: well under 1ms, no SQLite at
         all). maintenance.budget_ms bounds the TICK only; the drain above is
         bounded by curation.drain.per_turn and by A7's per-class quotas."""
-        self.curation.drain()
+        self._drain_slice()
         self.scheduler.on_hook("turn")
+
+    def drain_in_background(self) -> None:
+        """Take the per-turn curation slice off the caller's thread from now on.
+
+        A host calls this before initialize(): Hermes calls on_turn_start --
+        and so tick() -- synchronously, before the model, so every job in the
+        slice ran inside the user's turn. An embed job against the CPU-bound
+        embedding server could hold that turn for the whole request timeout,
+        and with that timeout raised so a long excerpt can embed at all, it
+        would hold it for minutes. The jobs are the same, durable and claimed
+        atomically; only the thread changes. One worker per core, woken by
+        each tick; kicks that arrive while it drains are coalesced into one
+        more pass."""
+        self._drain_in_background = True
+
+    def _drain_slice(self) -> None:
+        if not self._drain_in_background:
+            self.curation.drain()
+            return
+        with self._drain_thread_lock:
+            if self._drain_thread is None or not self._drain_thread.is_alive():
+                self._drain_thread = threading.Thread(target=self._drain_loop,
+                                                      name="chronicle-curation", daemon=True)
+                self._drain_thread.start()
+        self._drain_kick.set()
+
+    def _drain_loop(self) -> None:
+        while True:
+            self._drain_kick.wait()
+            self._drain_kick.clear()
+            try:
+                self.curation.drain()
+            except StoreClosed:
+                return                 # the core was closed under us: nothing left to drain
+            except Exception:          # noqa: BLE001 -- a bad job must not kill the worker
+                logger.exception("Chronicle: background curation drain failed")
 
     def maintenance_status(self) -> dict:
         """Last run / next due, per maintenance schedule entry, plus the tasks

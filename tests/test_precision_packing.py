@@ -1905,6 +1905,14 @@ class TestTheTieBreakOnlyEverMovesTies(unittest.TestCase):
             self.core.initialize(sid, principal_id="assistant")
             self.core.capture.observe(
                 "The quarterly budget review covered vendor discounts.", "ok", session_id=sid)
+        # The ties live in SESSION summaries, which exist once a session ends.
+        # This fixture used to get that for free: every initialize() re-ran the
+        # reaper, which finalized the sessions before it. Startup recovery now
+        # runs once per process (it was draining up to 1,000 jobs on every
+        # session start), so the sessions are ended here, the way a real one
+        # ends — on_session_end, or the reaper on its own schedule.
+        for sid in ("s0", "s1", "s2", "s3", "zt", "ys", "xr", "wq"):
+            self.core.capture.finalize_session(sid, "clean_exit")
         self.core.process_pending()
 
     def tearDown(self):

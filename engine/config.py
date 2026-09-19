@@ -388,7 +388,15 @@ DEFAULTS: dict[str, Any] = {
                    "allow_remote": False,
                    "exclude_session_prefixes": [], "max_input_tokens": 2048, "overflow": "truncate",
                    "task_prefixes": "auto",
-                   "doc2query": {"beliefs": True, "excerpts": False}},
+                   "doc2query": {"beliefs": True, "excerpts": False},
+                   # Seconds one embed request may take OFF the critical path:
+                   # the deferred embed job and a session summary. The request
+                   # timeout the live paths use is short so a turn never waits
+                   # on a busy server; a background job has nobody waiting, and
+                   # on a CPU-bound host a long excerpt needs more than that
+                   # (measured: ~7 s for 200 words on the production VPS).
+                   # Clamped to [10, 600] (engine/curation.py).
+                   "background_timeout": 120},
     # A12: `bruteforce_ceiling` was declared here and read by nothing. There is
     # exactly one index backend (engine/vector_index.py brute force); a ceiling
     # past which a nonexistent ANN backend takes over is not a knob, it is a
@@ -597,6 +605,39 @@ DEFAULTS: dict[str, Any] = {
         # unaffected, today's plain score-order top-N.
         "mmr_lambda": 0.7,
         "prefetch_budget": 1200,
+        # The per-turn injection's relevance gate (retrieval._GATE_FILLER):
+        # an item goes into the user's turn unasked only if it shares a
+        # content word with the message. false = the pre-5.7.5 behaviour,
+        # which fills the whole budget with the nearest items whatever they are.
+        "prefetch_relevance_gate": True,
+        # A message with three content words or fewer passes the gate on ONE
+        # shared word -- and one word is a coincidence as often as not
+        # ("system health check" -> a prescription refill's `health_event`,
+        # "fix all the issues" -> "refund issued", "every 10 mins" -> a contact
+        # named Min). Such a one-word match is kept only when the item's STORED
+        # vector is at least this close (cosine) to the message's. "auto" = the
+        # floor measured for the embedding model (none known -> no check); a
+        # number = that floor; null = off. No query vector, or an item with no
+        # vector of this model, keeps the lexical rule alone.
+        # The raw tier's vector scan reads every observed vector. With this on,
+        # each process keeps them in memory as float16 (engine/vector_cache.py)
+        # and scores a query against all of them at once instead of paging the
+        # table from disk on every search. Rows over the cap fall back to the
+        # paged scan: at 768 dims a row costs ~1.5 KB, so 250,000 is ~400 MB.
+        "observed_vector_cache": True,
+        "observed_vector_cache_max_rows": 250000,
+        "prefetch_min_similarity": "auto",
+        # The same check for a match on two or three shared words ("send" and
+        # "none" in a security alert's text), measured separately: "auto" =
+        # 0.60 for nomic-embed-text. Unlike one word, two or three are evidence
+        # of their own, so with no vector to compare the words decide.
+        "prefetch_min_similarity_few": "auto",
+        # A scheduled job's turn (a cron_ session, or an automation platform)
+        # gets no per-turn recall: nobody asked, the "message" is the job's own
+        # prompt, and on the production box those turns were ~98% of all turns
+        # -- up to 4,800 characters of the user's memory each, and a search
+        # that ran past the host's timeout. true = recall on those turns too.
+        "prefetch_automation": False,
         # A12 DELETED this key and A13 KEPT it with a dormant declaration. Both
         # for the same measured reason -- its only consumer would have been
         # provider.queue_prefetch, whose body was `pass` (A13 removed that dead
@@ -1022,7 +1063,15 @@ DEFAULTS: dict[str, Any] = {
                  "drain": {"per_turn": 16,
                            "share_write_path": 0.5,
                            "share_embed": 0.3,
-                           "share_maintenance": 0.2},
+                           "share_maintenance": 0.2,
+                           # Run the per-turn slice on ONE background thread
+                           # per core instead of inside the turn. Hermes calls
+                           # on_turn_start synchronously before the model, and
+                           # an embed job on a busy server could hold a user's
+                           # turn for the whole request timeout. Applies when a
+                           # host drives the core (provider / context engine);
+                           # a core used directly drains where it is called.
+                           "background": True},
 
                  # -- job leases (§A7) -------------------------------------
                  # A claimed job is marked 'running' with a started_at stamp.
@@ -1262,6 +1311,18 @@ DEFAULTS: dict[str, Any] = {
         # everything compression has folded out this session; oldest lines
         # drop first once a refresh would push it over this.
         "checkpoint_digest_max_tokens": 300,
+        # Proactive tool-output trim — the host's prune_tool_results_only hook.
+        # Hermes calls it on a LOWER trigger than full compaction; its built-in
+        # compressor implements it and a plugin engine inherits a no-op, so
+        # without this, switching to Chronicle silently stopped trimming old
+        # tool output. Deterministic, no model, no embedder. `at_percent` of the
+        # window starts it; `min_reclaim_tokens` is what a trim must save to be
+        # worth breaking the provider's prompt cache; old results over
+        # `min_chars` keep their first `keep_head_chars` and last
+        # `keep_tail_chars`.
+        "prune_tool_results": {"enabled": True, "at_percent": 0.5, "min_chars": 2000,
+                               "keep_head_chars": 500, "keep_tail_chars": 300,
+                               "min_reclaim_tokens": 1500},
     },
 }
 

@@ -292,7 +292,10 @@ class TestItDoesNotHoldBudgetBack(unittest.TestCase):
         off_ctx = off.retrieval.get_context(BREADTH_Q, token_budget=4000)
         cap = core.retrieval.last_context_debug["budget_chars"]
         self.assertLess(len(ctx), len(off_ctx))          # it really does under-spend
-        self.assertGreater(len(ctx), 0.90 * cap)         # and only ever slightly
+        # ...and only ever slightly. (84% since 5.8.12: this fixture's turns
+        # open with a request -- "Tell me about kayaking trip 3." -- which an
+        # episode no longer includes, so the store simply holds less text.)
+        self.assertGreater(len(ctx), 0.80 * cap)
 
     def test_the_budget_contract_still_holds_exactly(self):
         """A10's invariant: nothing the floor does may push the emitted block
