@@ -3,6 +3,21 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.26
+
+**The agent can call Chronicle's memory tools.** Hermes routes a memory
+provider's tools by the list it takes at `add_provider()`, which runs before
+the provider's `initialize()`. The model's own tool list is asked for again
+later. Chronicle answered the first request with nothing, because its tools
+lived on a core that did not exist yet. So the production log read "Memory
+provider 'chronicle' registered (0 tools)" on every start, and the model,
+shown `chronicle_search`, `chronicle_remember` and the rest, got "Unknown tool"
+on all 77 calls it made from 2026-09-03 to 2026-09-17. The schemas do not
+depend on the store, and are now returned before `initialize()`. Checked with
+Hermes' own MemoryManager: 0 routable tools before, 35 after. The context
+engine's tools (`chronicle_expand`, `chronicle_pin_context` …) were registered
+by a different path and were not affected.
+
 ## 5.8.25
 
 **A request is not something that happened, and a wanted state is not a fact.**
