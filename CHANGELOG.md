@@ -3,6 +3,30 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.23
+
+**A credential is not a memory.** Users hand the agent logins to use. On the
+production store the extractor turned two such messages, a site login and a
+file-sharing account ("Username: … Password: …"), into episodes. Those are
+beliefs, which per-turn recall puts into later prompts unasked and the
+dashboard shows. Now (`engine/credentials.py`):
+
+- The fold masks any credential value in a belief's key and body, on assert,
+  derive and correct. The belief stays, masked: an appointment whose meeting
+  link carries `?pwd=` is still an appointment. Being in the fold, a rebuild
+  masks the ones already stored.
+- Per-turn recall masks them in what it injects unasked.
+- The transcript keeps the message, and the agent's own explicit search still
+  finds it.
+
+Detection is by shape. A labelled value counts (password, passcode, PIN, API
+key, token, secret, private key, auth code, OTP, then `:`, `=` or "is", then
+something that looks like a secret), as does a key-shaped token (`sk-…`,
+`ghp_…`, `AKIA…` and similar). "The full password is not in the log" and
+"Your password has been updated" name no value and are left alone. On the
+production store one active belief held one: an appointment's meeting
+passcode.
+
 ## 5.8.22
 
 **An importer's sender and sent-date no longer vouch for a subject line.** The
