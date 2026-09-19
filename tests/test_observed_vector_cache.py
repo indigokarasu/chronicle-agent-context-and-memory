@@ -15,6 +15,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from engine.core import ChronicleCore  # noqa: E402
 
+try:
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:          # the cache needs numpy; without it the paged scan serves
+    HAVE_NUMPY = False
+_needs_numpy = unittest.skipUnless(HAVE_NUMPY, "the float16 cache needs numpy")
+
 TOPICS = ("kayaking on Fake Lake", "the Acme Fake Co quarterly budget", "Pat Testley's birthday party",
           "a sourdough starter that will not rise", "renewing a Fakeland passport",
           "tuning the office Wi-Fi", "the Fake Izakaya reservation", "a squeaky bicycle chain")
@@ -48,6 +55,7 @@ class _Case(unittest.TestCase):
         return getattr(self.core.store, "_observed_vector_cache", None)
 
 
+@_needs_numpy
 class TestSameAnswerAsThePagedScan(_Case):
     def test_queries(self):
         for q in ("kayaking", "quarterly budget for Acme", "sourdough starter",
@@ -63,6 +71,7 @@ class TestSameAnswerAsThePagedScan(_Case):
         self.assertGreaterEqual(self.cache().rebuilds, 1)
 
 
+@_needs_numpy
 class TestItStaysCurrent(_Case):
     def test_a_new_turn_is_found_without_a_rebuild(self):
         _run(self.core, "kayaking", True)
@@ -88,6 +97,7 @@ class TestItStaysCurrent(_Case):
         self.assertGreater(self.cache().rebuilds, rebuilds)
 
 
+@_needs_numpy
 class TestItStepsAside(_Case):
     def test_over_the_row_cap(self):
         _run(self.core, "kayaking", True)
@@ -108,6 +118,7 @@ class TestItStepsAside(_Case):
         self.core.cfg._d["retrieval"]["observed_vector_cache"] = True
 
 
+@_needs_numpy
 class TestTheCachePathKeepsThePagedRules(unittest.TestCase):
     """_raw_from_cache alone, over a stub cache: the top-k fills to `limit`, and
     a row the principal cannot read never enters it."""
@@ -143,6 +154,28 @@ class TestTheCachePathKeepsThePagedRules(unittest.TestCase):
     def test_an_unreadable_row_never_enters(self):
         self.assertEqual(self._run(lambda acl, owner, principal: owner != "other"),
                          ["ev_0", "ev_1", "ev_3"])
+
+
+class TestWithoutNumpyThePagedScanAnswers(_Case):
+    """No numpy (a bare CI runner, a minimal venv): the cache declines and the
+    paged scan gives the same answer it always did."""
+
+    def test_fallback(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def no_numpy(name, *a, **k):
+            if name == "numpy" or name.startswith("numpy."):
+                raise ImportError("numpy hidden for this test")
+            return real_import(name, *a, **k)
+        want = _run(self.core, "kayaking", False)
+        self.assertTrue(want)
+        builtins.__import__ = no_numpy
+        try:
+            got = _run(self.core, "kayaking", True)
+        finally:
+            builtins.__import__ = real_import
+        self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
