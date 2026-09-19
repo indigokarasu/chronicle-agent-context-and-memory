@@ -3,6 +3,15 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.24
+
+**Masking is final.** 5.8.23 read its own `[redacted]` marker as a credential
+value: masking text that was already masked trimmed the marker's closing
+bracket and masked it again, so per-turn recall showed a belief the fold had
+masked as `pwd=[redacted]]`. The detector also reported the masked text as
+still holding a credential. A masked value is now never a credential, and
+masking twice changes nothing.
+
 ## 5.8.23
 
 **A credential is not a memory.** Users hand the agent logins to use. On the
