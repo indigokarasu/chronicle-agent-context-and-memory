@@ -58,9 +58,21 @@ production store (124 messages, 93,473 → ~29,600 tokens):
 * what the handoff can carry is the real ceiling: 25 step lines at 220
   characters, holding 285 of the 289 surviving literals.
 
-So the flag stays off: a 4% win is not a win worth defaulting. The lever this
-measurement points at is not the cut but the handoff's room and how densely a
-folded unit's literals are packed into its line.
+Re-measured afterwards against the LIVE store (read-only), where only two
+genuine sessions still hold enough turns to compact: 484 of 1,750 literals
+against 473 (27.7% vs 27.0%), tokens slightly lower (55,311 vs 55,668). One of
+those sessions gains 11 literals and the other is unchanged.
+
+A third session did gain 9 points (83.1% → 92.1%) — but it is one of the
+scratch sessions a harness leaked into the store on 2026-09-18, a copy of a
+real transcript rather than a real one, so it is excluded from the figures
+above. It does show the mechanism bites when messages are moderate-sized
+rather than thousands of characters each.
+
+So the flag stays off: under a point of aggregate gain is not a win worth
+defaulting. The lever this measurement points at is not the cut but the
+handoff's room and how densely a folded unit's literals are packed into its
+line.
 
 ## Unreleased — Phase A: one importance model
 
