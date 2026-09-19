@@ -34,6 +34,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from . import tiers as _tiers
 from .store import word_tokens
 
 _STOP = {"the", "a", "an", "is", "are", "what", "who", "where", "when", "how", "do", "does",
@@ -329,8 +330,14 @@ def keep_score(text: str, focus, recency: float = 1.0, weights: dict | None = No
 
     Dimensions: recency (position, 0.0 oldest to 1.0 newest), relevance (any
     focus facet appears), salience (high-value keywords), criticality
-    (urgent/must-do). Pinning is deliberately NOT one: a pinned span never
-    reaches a score, it is hard-protected before that.
+    (urgent/must-do), and -- when the host asks for it -- involatile: the span
+    carries exact literals (a port, a path, an id, the command that failed)
+    that no summary can reconstruct. That last weight is 0.0 by default, so
+    the score is what it always was until someone turns it on; its cost (the
+    shape scan in engine/tiers.py) is only paid when it is non-zero.
+
+    Pinning is deliberately NOT a dimension: a pinned span never reaches a
+    score, it is hard-protected before that.
     """
     w = weights or {}
     content = (text or "").lower()
@@ -341,6 +348,9 @@ def keep_score(text: str, focus, recency: float = 1.0, weights: dict | None = No
         score += w.get("salience", 0.20)
     if _CRITICALITY_RX.search(content):
         score += w.get("criticality", 0.20)
+    involatile = w.get("involatile", 0.0)
+    if involatile and _tiers.involatile_spans(text or ""):
+        score += involatile
     return min(1.0, score)
 
 

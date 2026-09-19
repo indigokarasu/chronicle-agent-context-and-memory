@@ -3,6 +3,37 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — Phase B: what may be summarised, and what only pointed at
+
+**A cut for budget no longer spends itself on the prose.** Compaction's one
+lossy step shortens a span that will not fit and leaves the id that restores
+it; cutting the head keeps whatever happens to be first, which on these
+transcripts is the sentence introducing the work, while the port number, the
+path, the container id and the failing command sit further in and go.
+`engine/tiers.py` classifies by shape — involatile (exact literals), critical,
+context, pointer — and spends the same budget on the literals first, in the
+cut path and in the handoff's step lines. A credential is the one literal that
+does not survive: engine/credentials.py masks it first.
+
+Behind `context_engine.keep_literals`, **default off**, and
+`keep_weights.involatile`, **default 0.0**: with both at their defaults the
+compaction is byte-for-byte what 5.8.35 produced (full gate, four modes).
+
+Measured, not assumed. Replaying the largest real session out of a copy of the
+production store (124 messages, 93,473 → ~29,600 tokens):
+
+* literal-first cutting keeps **289 of 1,497 exact literals against 278**
+  (19.3% vs 18.6%) at the same budget — +11, about 4% more;
+* the `involatile` keep-weight changed **nothing at any value** (0.15 to 0.9),
+  because 100 of 101 middle units on this corpus contain a literal: presence
+  is not scarce enough to rank by, so a flat bump lifts everything;
+* what the handoff can carry is the real ceiling: 25 step lines at 220
+  characters, holding 285 of the 289 surviving literals.
+
+So the flag stays off: a 4% win is not a win worth defaulting. The lever this
+measurement points at is not the cut but the handoff's room and how densely a
+folded unit's literals are packed into its line.
+
 ## Unreleased — Phase A: one importance model
 
 **Recall and compaction score importance with one model.** The per-turn recall
