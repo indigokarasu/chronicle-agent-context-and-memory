@@ -55,6 +55,11 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
 
         estimate_tokens = budget_chars = _no_estimator
 
+try:  # which spans may be summarised and which only pointed at (Phase B) …
+    from .engine import tiers as _tiers  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import tiers as _tiers
+
 try:  # the one importance model recall and compaction share (Phase A) …
     from .engine import salience as _salience  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -124,9 +129,17 @@ def _is_legacy_artifact(m) -> bool:
     return isinstance(c, str) and c.startswith(_LEGACY_ARTIFACT_PREFIXES)
 
 
-def _one_line(text: str, cap: int) -> str:
+def _one_line(text: str, cap: int, keep_literals: bool = False) -> str:
+    """One line of at most `cap` characters. `keep_literals` spends it on the
+    exact literals first (engine/tiers.py): these lines are the ONLY trace a
+    folded turn leaves on the page, so what they drop is what the reader has
+    to restore a span to see."""
     t = " ".join((text or "").split())
-    return t if len(t) <= cap else t[:max(0, cap - 1)].rstrip() + "…"
+    if len(t) <= cap:
+        return t
+    if keep_literals:
+        return _tiers.shorten_keeping_literals(t, cap)
+    return t[:max(0, cap - 1)].rstrip() + "…"
 
 
 _FOLD_REF = re.compile(r"\[(fold_[0-9a-f]{12})\]")
@@ -195,28 +208,29 @@ def _loads(text):
     return text if isinstance(text, (dict, list)) else None
 
 
-def _args_brief(arguments, width: int) -> str:
+def _args_brief(arguments, width: int, keep: bool = False) -> str:
     """A tool call's arguments as one short line: the telling one's value when
     it has one ("journalctl -xn 50"), not the JSON around it."""
     d = _loads(arguments)
     if isinstance(d, dict):
         key = next((k for k in _ARG_KEYS if isinstance(d.get(k), str) and d[k].strip()), None)
         if key is not None:
-            return _one_line(d[key], width)
-        return _one_line(json.dumps(d, ensure_ascii=False, separators=(",", ":")), width)
-    return _one_line(arguments if isinstance(arguments, str) else "", width)
+            return _one_line(d[key], width, keep)
+        return _one_line(json.dumps(d, ensure_ascii=False, separators=(",", ":")), width, keep)
+    return _one_line(arguments if isinstance(arguments, str) else "", width, keep)
 
 
-def _result_brief(text: str, width: int) -> str:
+def _result_brief(text: str, width: int, keep: bool = False) -> str:
     """A tool result as one short line: its error if it has one, else its
     output, and a non-zero exit code -- not the envelope ({"output": "...",
     "exit_code": 0, "error": null}) that took most of the line."""
     d = _loads(text)
     if not isinstance(d, dict):
-        return _one_line(text, width)
+        return _one_line(text, width, keep)
     err = d.get("error")
     if err:
-        return _one_line("error: %s" % (err if isinstance(err, str) else json.dumps(err, default=str)), width)
+        return _one_line("error: %s" % (err if isinstance(err, str) else json.dumps(err, default=str)),
+                         width, keep)
     out = next((d[k] for k in _RESULT_KEYS if d.get(k) not in (None, "", [], {})), None)
     body = out if isinstance(out, str) else (json.dumps(out, ensure_ascii=False, default=str)
                                               if out is not None else "")
@@ -225,7 +239,7 @@ def _result_brief(text: str, width: int) -> str:
     code = d.get("exit_code")
     if isinstance(code, int) and code != 0:
         body = ("exit %d: %s" % (code, body)) if body else "exit %d" % code
-    return _one_line(body or json.dumps(d, ensure_ascii=False, default=str), width)
+    return _one_line(body or json.dumps(d, ensure_ascii=False, default=str), width, keep)
 
 
 def _tool_units(pairs: list) -> list:
@@ -306,6 +320,21 @@ _NEVER_EVICT_KW = ["always", "never", "must not", "do not", "don't", "[directive
 
 # The keep/evict score and its keyword sets live in engine/salience.py, the one
 # importance model recall and compaction share (Phase A).
+def _cut_text(text: str, chars: int, keep_literals: bool = False) -> str:
+    """`text` shortened to `chars`. The head of it by default, which is what
+    every release up to 5.8.35 kept; with `context_engine.keep_literals` on,
+    the budget goes to the exact literals first (engine/tiers.py). A cut by
+    length alone is indifferent to what it cuts, so the port number, the path
+    and the failing command go as readily as the prose around them -- and a
+    reader can only get those back by restoring the span.
+    """
+    if chars <= 0:
+        return (text or "")[:max(0, chars)]
+    if len(text or "") <= chars:
+        return text
+    return _tiers.shorten_keeping_literals(text, chars) if keep_literals else text[:chars]
+
+
 _SALIENCE_RX = _salience._SALIENCE_RX
 _CRITICALITY_RX = _salience._CRITICALITY_RX
 
@@ -919,8 +948,10 @@ class ChronicleContextEngine(ContextEngine):
         # wins, then the user's newest request, the rest of the tail newest
         # first, then the head -- whole tool units or none of one -- and a span
         # shortened to fit says so and stays recoverable.
+        keep_literals = self._keep_literals()
         fitted, used_req, dropped_req = self._fit_required(
-            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units)
+            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units,
+            keep_literals)
         fitted_content = dict(fitted)
         fresh_system = [(i, fitted_content[i]) for i, _m in fresh_system if i in fitted_content]
         head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
@@ -929,7 +960,8 @@ class ChronicleContextEngine(ContextEngine):
         never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
         never_flat = [p for u in never_units for p in u]
         never_budget = max(0, fresh_budget - used_req - reserve)
-        fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget)
+        fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget,
+                                                                          keep_literals)
         kept_never = dict(fitted_never)
 
         used = used_locked + used_req + used_never
@@ -1140,6 +1172,7 @@ class ChronicleContextEngine(ContextEngine):
         return out
 
     def _note_folded_unit(self, msgs, span_ids) -> None:
+        keep = self._keep_literals()
         """Record one folded unit for the handoff: a user request verbatim
         (its framing removed), or one line saying what the step did."""
         # The unit is named by a span that has content to restore -- a call
@@ -1159,18 +1192,19 @@ class ChronicleContextEngine(ContextEngine):
             calls = []
             for tc in first.get("tool_calls") or []:
                 fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                calls.append("%s(%s)" % (fn.get("name") or "tool", _args_brief(fn.get("arguments"), 70)))
-            said = _one_line(_text(first), 120)
-            results = [_result_brief(_text(r), 110) for r in msgs[1:]]
+                calls.append("%s(%s)" % (fn.get("name") or "tool",
+                                         _args_brief(fn.get("arguments"), 70, keep)))
+            said = _one_line(_text(first), 120, keep)
+            results = [_result_brief(_text(r), 110, keep) for r in msgs[1:]]
             line = "called " + ", ".join(calls)
             if said:
-                line = _one_line(said, 120) + " — " + line
+                line = _one_line(said, 120, keep) + " — " + line
             if results:
                 line += " → " + " | ".join(r for r in results if r)
-            self._handoff_steps.append("%s %s" % (ref, _one_line(line, 360)))
+            self._handoff_steps.append("%s %s" % (ref, _one_line(line, 360, keep)))
             return
         role = first.get("role") or "?"
-        body = _one_line(_text(first), 220)
+        body = _one_line(_text(first), 220, keep)
         if body:
             self._handoff_steps.append("%s %s: %s" % (ref, role, body))
 
@@ -1584,7 +1618,7 @@ class ChronicleContextEngine(ContextEngine):
         return max(0, min(int(remaining_tokens), int(cfg_default)))
 
     @staticmethod
-    def _fit_within_budget(items, budget):
+    def _fit_within_budget(items, budget, keep_literals=False):
         """Fit `items` -- an ordered list of `(idx, msg)` pairs, highest
         priority first -- into `budget` tokens total (§R2: the
         compress()-output-<=-budget guarantee, for the required-but-fresh
@@ -1628,15 +1662,16 @@ class ChronicleContextEngine(ContextEngine):
             # §R5 requires a protected span to be shortened-but-present or
             # durably archived, never blanked-but-present, and
             # test_compression_fidelity asserts these bytes.
-            clipped = content[:budget_chars(max(0, remaining - _calls_cost(m)),
-                                            margin=COMPRESSION_BUDGET)]
+            clipped = _cut_text(content, budget_chars(max(0, remaining - _calls_cost(m)),
+                                                      margin=COMPRESSION_BUDGET), keep_literals)
             # A shortened message loses its sidecar too: replayed, the sidecar
             # would send the whole original again.
             kept.append((idx, _without_sidecar(dict(m, content=clipped)) if clipped != content else m))
             used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET) + _calls_cost(m)
         return kept, used, dropped
 
-    def _fit_required(self, system, head_units, tail_units, budget, request_units=()):
+    def _fit_required(self, system, head_units, tail_units, budget, request_units=(),
+                      keep_literals=False):
         """Fit the spans compress() must not score away -- system messages,
         the protected head and tail, the user's newest request -- into
         `budget`, most important first: system, the newest unit, the request
@@ -1650,7 +1685,7 @@ class ChronicleContextEngine(ContextEngine):
         order = ([[p] for p in system] + newest_first[:1] + list(request_units)
                  + newest_first[1:] + list(head_units))
         for unit in order:
-            got, cost, lost = self._fit_within_budget(unit, budget - used)
+            got, cost, lost = self._fit_within_budget(unit, budget - used, keep_literals)
             if lost:
                 dropped.extend(unit)
                 continue
@@ -1661,13 +1696,18 @@ class ChronicleContextEngine(ContextEngine):
                 kept.append((idx, m))
         return kept, used, dropped
 
+    def _keep_literals(self) -> bool:
+        """context_engine.keep_literals (Phase B), read once per pass."""
+        return bool(self.core and self.core.cfg.get("context_engine.keep_literals", False))
+
     def _cap_tool_result(self, m, cap: int):
         """A tool result over `cap` tokens, shortened (archived first, ending
         with the id that restores it); anything else unchanged."""
         if m.get("role") != "tool" or self._msg_cost(m) <= cap:
             return m
         text = _text(m)
-        clipped = dict(m, content=text[:budget_chars(cap, margin=COMPRESSION_BUDGET)])
+        clipped = dict(m, content=_cut_text(text, budget_chars(cap, margin=COMPRESSION_BUDGET),
+                                            self._keep_literals()))
         return self._mark_clipped(m, clipped)
 
     def _mark_clipped(self, orig, clipped):

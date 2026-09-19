@@ -1291,7 +1291,20 @@ DEFAULTS: dict[str, Any] = {
         # A12: `redundancy_vs_store` deleted -- _score_message has four
         # dimensions (relevance/recency/salience/criticality) and no redundancy
         # term; the fifth weight was scored by nothing.
-        "keep_weights": {"relevance": 0.35, "recency": 0.20, "salience": 0.20,
+        # Phase B: when a span must be shortened, spend the budget on its exact
+        # literals (ports, paths, ids, timestamps, the failing command) before
+        # the prose around them -- engine/tiers.py. Off = the head of the text,
+        # which is what every release up to 5.8.35 kept. The whole span is
+        # restorable either way (chronicle_expand), so this only decides what a
+        # reader sees without asking.
+        "keep_literals": False,
+        # `involatile` (Phase B) is the weight for a span that carries exact
+        # literals -- a port, a path, an id, a timestamp, the command that
+        # failed. 0.0 keeps the score every release up to 5.8.35 computed; the
+        # cost of the shape scan is only paid above 0.0. See
+        # deploy570/tier_measure.py for what a given weight does to the share
+        # of exact literals a compaction leaves in the window.
+        "keep_weights": {"involatile": 0.0, "relevance": 0.35, "recency": 0.20, "salience": 0.20,
                          "criticality": 0.20},
         "never_evict": "directives",
         "should_compress": {"on_memory_pressure": True, "on_focus_shift": True},
