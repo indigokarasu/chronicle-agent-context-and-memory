@@ -134,6 +134,7 @@ walk work write""".split())
 # A command can follow a clause: "Once everything is backed up, trigger ...".
 _CLAUSE_FIRST = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soon as)\b[^,]{0,120},\s*",
                            re.IGNORECASE)
+_CLAUSE_FIRST_WORD = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soon as)\b", re.IGNORECASE)
 # A question need not end in "?": "Can the scheduler be spread out so it never
 # uses 30% at once".
 # Only an auxiliary opens one that way: "when", "what" and the like open
@@ -141,6 +142,32 @@ _CLAUSE_FIRST = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soo
 _QUESTION_OPENER = re.compile(
     r"^(?:can|could|would|will|should|shall|is|are|was|were|do|does|did|have|has)\s+"
     r"(?:the|a|an|this|that|these|those|it|there|we|i|my|our|any|all|each|every|[A-Z])", re.IGNORECASE)
+
+
+def _opens_with_command(clause: str) -> bool:
+    first = _LEAD_FILLER.sub("", clause.strip()).split(maxsplit=1)
+    return bool(first) and first[0].lower().strip(",.:;!") in _IMPERATIVE_VERBS
+
+
+# After one of these a listed verb is narrative, not a command: a subject or
+# an auxiliary ("we would run", "I want to fix"), or a preposition or
+# determiner, after which it is a noun ("before work", "the check").
+_SUBJECTS = frozenset("""i we you he she they it this that there who which to will would can could should
+    must may might shall and or not never also then 'll 'd n't
+    a an the my your our his her their its some any no every each
+    at before after for from of in on with by into onto about over under during without""".split())
+
+
+def _command_after_open_clause(lead: str) -> bool:
+    """ "once everything is backed up run genie again": a leading clause with no
+    comma, then a command. The verb has to come a few words in and not follow
+    a subject or an auxiliary -- "when I was there I would run every day" is
+    narrative."""
+    if not _CLAUSE_FIRST_WORD.match(lead):
+        return False
+    toks = re.findall(r"[a-z']+", lead.lower())
+    return any(t in _IMPERATIVE_VERBS and toks[i - 1] not in _SUBJECTS
+               for i, t in enumerate(toks) if i >= 3)
 
 
 def _narrative(texts) -> str:
@@ -154,11 +181,20 @@ def _narrative(texts) -> str:
             lead = _LEAD_FILLER.sub("", s)
             m = _CLAUSE_FIRST.match(lead)          # "once it is backed up, trigger ..."
             main = lead[m.end():] if m else lead
-            first = main.split(maxsplit=1)
-            if first and first[0].lower().strip(",.:;!") in _IMPERATIVE_VERBS:
+            if _opens_with_command(main):
+                continue
+            if not m and _command_after_open_clause(lead):
                 continue
             if _QUESTION_OPENER.match(lead):
                 continue
+            # A command after a comma is still a command -- "…, so that isn't a
+            # viable path, figure out something else": the account stays, the
+            # request goes ("Same rules apply, don't out yourself, use the vibes
+            # skill" keeps only "Same rules apply", too short to be an episode).
+            parts = re.split(r"\s*[,;]\s*", s)
+            told = [c for c in parts[1:] if not _opens_with_command(c)]
+            if len(told) < len(parts) - 1:
+                s = ", ".join([parts[0]] + told).rstrip(",;. ") + "."
             keep.append(s)
     return " ".join(keep).strip()
 
@@ -225,6 +261,9 @@ they him her us what how where when why everything anything nothing all
 option options idea ideas suggestion suggestions approach answer response
 plan one ones way sound thought""".split())
 _META_REF = re.compile(r"\b(?:you|your|yours)\b")
+# Before "my X is Y", a desired state rather than a stated one.
+_WANTED_STATE = re.compile(r"\b(?:so\s+that|so|in\s+order|to\s+make|make\s+sure|ensure|until|once|when|if|unless"
+                           r"|should|want|wanted|need|needs|would\s+like|let)\b")
 _HYPOTHETICAL = re.compile(
     r"\bif\s+i\b|\bwould\s+(?:be|have|like|love|prefer)\b|\bwish\s+i\b|\bimagine\b|"
     r"\bsuppose\b|\bhypothetical|\bwhat\s+if\b|\bmaybe\s+i\b|\bi\s+might\b")
@@ -565,8 +604,13 @@ class HeuristicExtractor(Extractor):
         out.extend(self._preferences(line, low, owner, domain, source_event, hypothetical))
 
         # -- generic "my <attr> is <value>" -----------------------------------
-        if not grounded:
+        # Not a state the user WANTS or asks for: "Fix it so that my library is
+        # a folder slskd can see" is a request, and "folder slskd can see" is
+        # not their library.
+        if not grounded and not hypothetical and not _opens_with_command(line):
             m = re.search(r"\bmy\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:is|are|=)\s+(.+)", low)
+            if m and _WANTED_STATE.search(low[:m.start()]):
+                m = None
             if m and "name" not in m.group(1) and "office" not in m.group(1) \
                     and "favorite" not in m.group(1) and "favourite" not in m.group(1) \
                     and not any(c.isupper() for c in line[m.start(1):m.end(1)]):
