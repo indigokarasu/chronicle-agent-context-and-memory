@@ -123,6 +123,14 @@ H1_TABLES = ("host_model_requests", "host_model_results",
 # place if a test asserts the value directly, and test_host_model.py derives
 # that assertion FROM this tuple so an unasserted addition cannot pass silently.
 DELIBERATE_MODEL_COLUMNS = (("session_index", "model"),)
+
+# Columns added after the base tree that the default flow must leave NULL.
+# Dropped by NAME for the same reason as above -- the base tree has no such
+# cell to compare -- and licensed by
+# tests/test_host_model.py::test_added_columns_stay_null_on_the_default_flow,
+# which asserts every value directly. events.pointer is schema rung 19 (main's
+# dada805): only a caller that passes `pointer=` ever fills it.
+ADDED_NULL_COLUMNS = (("events", "pointer"),)
 # Ladder-10 A9 sweep bookkeeping in `meta`. Kept as a literal rather than
 # imported from engine.store, because this probe must run unchanged inside the
 # pre-A9 base tree, where that constant does not exist.
@@ -183,7 +191,8 @@ def dump_store(store) -> str:
         # Deliberate model-identity columns are dropped by NAME, so the
         # surviving cells keep the base tree's own order whether this tree put
         # the new column first, last or in the middle.
-        skip = {i for i, c in enumerate(columns) if (table, c) in DELIBERATE_MODEL_COLUMNS}
+        skip = {i for i, c in enumerate(columns)
+                if (table, c) in DELIBERATE_MODEL_COLUMNS or (table, c) in ADDED_NULL_COLUMNS}
         rendered = []
         for row in conn.execute("SELECT * FROM %s" % table).fetchall():
             cells = [_norm(row[i]) for i in range(len(columns)) if i not in skip]

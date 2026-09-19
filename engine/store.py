@@ -176,7 +176,11 @@ logger = logging.getLogger("chronicle.store")
 # is the LAST statement of _migrate, so a store at ANY prior version -- or one
 # stamped 12/13 by a DIFFERENT ladder-10 tree than the one that owns the number
 # here -- converges by running all of them.
-SCHEMA_VERSION = 18
+# 19 = events + pointer (main dada805, which claimed 12 in its own tree -- the
+#     same collision as 14-17). A skill reference such as `weave:<person_id>`
+#     stored beside an event instead of a copy of the payload it points at.
+#     Additive: NULL for every event written before it.
+SCHEMA_VERSION = 19
 
 # SQLite busy timeouts, milliseconds.
 #
@@ -609,6 +613,14 @@ class MemoryStore:
     # -- schema ------------------------------------------------------------
 
     def _init_db(self):
+        # NOT here: deleting `-wal`/`-shm` at startup (main dada805's "stale lock
+        # recovery"). A WAL can hold COMMITTED transactions not yet checkpointed
+        # into the main file, and SQLite replays it on the next open; unlinking it
+        # discards them. The store is also opened by several live processes at
+        # once (gateway, dashboard, cron jobs), so "at startup nothing else holds
+        # it" is false and removing a live -shm corrupts the others' view. The
+        # only sidecar removal is _unlink_sidecars(), after journal_mode=DELETE
+        # has proven exclusive access.
         # Bounded by the start-up timeout: a store opened while another process
         # holds the write lock (the live 2026-08-02 case was a concurrent
         # migration) must fail in seconds so its caller can degrade and retry,
@@ -691,6 +703,9 @@ class MemoryStore:
         if not _has_col(conn, "link_candidates", "provider"):
             logger.info("schema migration: link_candidates + provider")
             conn.execute("ALTER TABLE link_candidates ADD COLUMN provider TEXT")
+        if not _has_col(conn, "events", "pointer"):
+            logger.info("schema migration: events + pointer (skill pointer references)")
+            conn.execute("ALTER TABLE events ADD COLUMN pointer TEXT")
         # novelty (schema_version 6, E5): CREATE TABLE IF NOT EXISTS in _SCHEMA added
         # `novelty REAL` to all 6 BELIEF_TABLES, but that DDL is a no-op on a table
         # that already exists — an existing store never got the column and crashed
@@ -1162,14 +1177,15 @@ class MemoryStore:
             ).fetchone()[0]
             conn.execute(
                 """INSERT INTO events(event_id,seq,order_key,type,payload,parents,actor,owner,
-                   trust_level,session_id,branch_id,occurred_at,recorded_at,prev_head,sig)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   trust_level,session_id,branch_id,occurred_at,recorded_at,prev_head,sig,pointer)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (eid, seq, event.get("order_key"), event["type"],
                  _as_json(event["payload"]), _as_json(event.get("parents", [])),
                  event["actor"], event["owner"], event.get("trust_level", 2),
                  event.get("session_id"), event.get("branch_id") or event.get("session_id"),
                  event["occurred_at"], event.get("recorded_at") or now_iso(),
-                 event.get("prev_head"), event.get("sig")))
+                 event.get("prev_head"), event.get("sig"),
+                 event.get("pointer")))
             conn.execute("UPDATE meta SET value=? WHERE key='head_event_id'", (eid,))
             conn.execute("INSERT INTO git_queue(event_id,created_at) VALUES(?,?)",
                          (eid, event.get("recorded_at") or now_iso()))
@@ -3932,7 +3948,8 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL, payload TEXT NOT NULL, parents TEXT NOT NULL DEFAULT '[]',
     actor TEXT NOT NULL CHECK(actor IN ('user','agent','curator','system')),
     owner TEXT NOT NULL, trust_level INTEGER NOT NULL, session_id TEXT, branch_id TEXT,
-    occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL, prev_head TEXT, sig TEXT);
+    occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL, prev_head TEXT, sig TEXT,
+    pointer TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_recorded ON events(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, seq);
