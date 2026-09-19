@@ -3,6 +3,28 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.8.25
+
+**A request is not something that happened, and a wanted state is not a fact.**
+Three shapes from the user's real messages were still stored as memories:
+
+- "…once everything is correctly backed up … run genie again" became an
+  episode. The command followed a leading clause with no comma, and only a
+  clause ending in a comma was recognised.
+- "Same rules apply, don't out yourself, use the vibes skill on any prose"
+  became an episode, because the commands came after commas. Command clauses
+  are now taken out and the account stays: "There isn't enough space on the
+  VPS …, so that isn't a viable path, figure out something …" keeps everything
+  but "figure out …".
+- "Fix is so that my library is a folder slskd can see" became a fact,
+  library = "folder slskd can see". The generic "my X is Y" rule now ignores
+  a state asked for (after "so that", "should", "want", "until" …), a
+  hypothetical, and a sentence that opens with a command.
+
+A listed verb after a subject, an auxiliary, a preposition or a determiner is
+not a command ("I would run every morning before work"). Over 195 real
+messages, exactly those three items went and nothing else changed.
+
 ## 5.8.24
 
 **Masking is final.** 5.8.23 read its own `[redacted]` marker as a credential
