@@ -4,7 +4,7 @@ The real dashboard is OAuth-gated, so this serves the built bundles and the
 plugin's own API functions against a Chronicle database on disk, behind a
 minimal stand-in for the Hermes plugin SDK (harness/index.html).
 
-Read-only by construction: the Atlas reads with `mode=ro`, and the one write
+Read-only by construction: the Tapestry reads with `mode=ro`, and the one write
 endpoint (POST /enqueue-extractions) is answered with a refusal here instead of
 being called. Standard library only.
 
@@ -53,6 +53,7 @@ def _load(name, path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
+    ap.add_argument("--people", help="a people store (weave.sqlite) to classify contacts with")
     ap.add_argument("--port", type=int, default=8790)
     args = ap.parse_args()
     db = Path(args.db).resolve()
@@ -62,9 +63,12 @@ def main():
     atexit.register(shutil.rmtree, home, True)
     (home / "commons" / "db" / "chronicle").mkdir(parents=True)
     (home / "commons" / "db" / "chronicle" / "chronicle.db").symlink_to(db)
+    if args.people:
+        (home / "commons" / "db" / "ocas-weave").mkdir(parents=True)
+        (home / "commons" / "db" / "ocas-weave" / "weave.sqlite").symlink_to(Path(args.people).resolve())
     os.environ["HERMES_HOME"] = str(home)
 
-    atlas = _load("harness_atlas", DASH / "atlas_api.py")
+    tapestry = _load("harness_tapestry", DASH / "tapestry_api.py")
     api = _load("harness_plugin_api", DASH / "plugin_api.py")
 
     def q1(qs, key, default, cast=str):
@@ -77,15 +81,18 @@ def main():
     routes = {
         "/status": lambda qs: api.get_status(),
         "/recent": lambda qs: api.get_recent(q1(qs, "limit", 12, int)),
-        "/atlas/summary": lambda qs: atlas.summary(db),
-        "/atlas/events": lambda qs: atlas.events_chunk(db, q1(qs, "after_seq", 0, int), q1(qs, "limit", 50000, int)),
-        "/atlas/event": lambda qs: atlas.event_detail(db, q1(qs, "seq", 0, int)),
-        "/atlas/session": lambda qs: atlas.session_detail(db, q1(qs, "id", "")),
-        "/atlas/belief": lambda qs: atlas.belief_detail(db, q1(qs, "id", "")),
-        "/atlas/contradictions": lambda qs: atlas.contradictions(db, q1(qs, "limit", 100, int), q1(qs, "offset", 0, int)),
-        "/atlas/histories": lambda qs: atlas.fact_histories(db, q1(qs, "limit", 100, int)),
-        "/atlas/duplicates": lambda qs: atlas.duplicate_notes(db, q1(qs, "limit", 50, int)),
-        "/atlas/lanes": lambda qs: {"cron_names": atlas.cron_job_names(home)},
+        "/tapestry/index": lambda qs: tapestry.entity_index(db, people=tapestry.people_store(home)),
+        "/tapestry/entity": lambda qs: tapestry.entity_detail(db, q1(qs, "id", ""),
+                                                              people=tapestry.people_store(home)),
+        "/tapestry/log/summary": lambda qs: tapestry.summary(db),
+        "/tapestry/log/events": lambda qs: tapestry.events_chunk(db, q1(qs, "after_seq", 0, int), q1(qs, "limit", 50000, int)),
+        "/tapestry/log/event": lambda qs: tapestry.event_detail(db, q1(qs, "seq", 0, int)),
+        "/tapestry/log/session": lambda qs: tapestry.session_detail(db, q1(qs, "id", "")),
+        "/tapestry/log/belief": lambda qs: tapestry.belief_detail(db, q1(qs, "id", "")),
+        "/tapestry/log/contradictions": lambda qs: tapestry.contradictions(db, q1(qs, "limit", 100, int), q1(qs, "offset", 0, int)),
+        "/tapestry/log/histories": lambda qs: tapestry.fact_histories(db, q1(qs, "limit", 100, int)),
+        "/tapestry/log/duplicates": lambda qs: tapestry.duplicate_notes(db, q1(qs, "limit", 50, int)),
+        "/tapestry/log/lanes": lambda qs: {"cron_names": tapestry.cron_job_names(home)},
     }
     prefix = "/api/plugins/chronicle"
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 
+from . import entities as ents
 from . import speaker as spk
 from .embeddings import RemoteEndpointRefused, check_endpoint
 from .serialize import qualifiers_hash
@@ -112,6 +113,100 @@ _NORM_REFUSE = re.compile(
     r"struck|drawn|meant|supposed|able|going\s+to)\b")
 
 
+# An episode is something the user says happened -- not a request to the agent
+# or a question. Sampled on the user's real messages, every episode the old
+# rule (any message over 60 characters) made was one of those: "Just work
+# through all of them one by one", "Come up with a way to ...", "Would any of
+# this help SIFT? <url>". A sentence is dropped when it asks (ends with "?"),
+# speaks to the agent ("you", "please"), or opens -- after a filler word or
+# two -- with a verb in the imperative.
+_ADDRESSES_AGENT = re.compile(r"\b(?:you|your|yours|you're|you've|you'll|please|pls)\b", re.IGNORECASE)
+_LEAD_FILLER = re.compile(r"^(?:(?:just|now|also|ok|okay|so|then|and|but|first|next|pls|please|go ahead and"
+                          r"|yes|yeah|yep|no|nope|great|cool|perfect|thanks)[\s,.!]+)+", re.IGNORECASE)
+_IMPERATIVE_VERBS = frozenset("""add archive build cancel change check clean clear come compare configure connect continue convert
+copy create delete deploy disable do don't dont download draft email enable ensure explain export
+fetch figure find finish fix forward generate get give go grab help ignore import install integrate
+keep kill let's lets list look make merge move mute open pause post prioritize proceed pull push put
+read reboot reject remind remove rename replace reply rerun reset restart restore resume retry
+revert review run save schedule search see send set share show spread start stop summarise summarize
+sync take tell test text trigger try turn unblock uninstall update upgrade upload use verify wait
+walk work write""".split())
+# A command can follow a clause: "Once everything is backed up, trigger ...".
+_CLAUSE_FIRST = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soon as)\b[^,]{0,120},\s*",
+                           re.IGNORECASE)
+_CLAUSE_FIRST_WORD = re.compile(r"^(?:once|when|whenever|after|before|if|until|as soon as)\b", re.IGNORECASE)
+# A question need not end in "?": "Can the scheduler be spread out so it never
+# uses 30% at once".
+# Only an auxiliary opens one that way: "when", "what" and the like open
+# narrative too ("When we got to Riverton, ...") and are left to the "?".
+_QUESTION_OPENER = re.compile(
+    r"^(?:can|could|would|will|should|shall|is|are|was|were|do|does|did|have|has)\s+"
+    r"(?:the|a|an|this|that|these|those|it|there|we|i|my|our|any|all|each|every|[A-Z])", re.IGNORECASE)
+
+
+def _opens_with_command(clause: str) -> bool:
+    first = _LEAD_FILLER.sub("", clause.strip()).split(maxsplit=1)
+    return bool(first) and first[0].lower().strip(",.:;!") in _IMPERATIVE_VERBS
+
+
+# After one of these a listed verb is narrative, not a command: a subject or
+# an auxiliary ("we would run", "I want to fix"), or a preposition or
+# determiner, after which it is a noun ("before work", "the check").
+_SUBJECTS = frozenset("""i we you he she they it this that there who which to will would can could should
+    must may might shall and or not never also then 'll 'd n't
+    a an the my your our his her their its some any no every each
+    at before after for from of in on with by into onto about over under during without""".split())
+
+
+def _command_after_open_clause(lead: str) -> bool:
+    """ "once everything is backed up run genie again": a leading clause with no
+    comma, then a command. The verb has to come a few words in and not follow
+    a subject or an auxiliary -- "when I was there I would run every day" is
+    narrative."""
+    if not _CLAUSE_FIRST_WORD.match(lead):
+        return False
+    toks = re.findall(r"[a-z']+", lead.lower())
+    return any(t in _IMPERATIVE_VERBS and toks[i - 1] not in _SUBJECTS
+               for i, t in enumerate(toks) if i >= 3)
+
+
+def _narrative(texts) -> str:
+    """The sentences of `texts` that say something happened (see above)."""
+    keep = []
+    for text in texts:
+        for sentence in split_sentences(_URL.sub(" ", text or "")):
+            s = sentence.strip()
+            if not s or s.endswith("?") or _ADDRESSES_AGENT.search(s):
+                continue
+            lead = _LEAD_FILLER.sub("", s)
+            m = _CLAUSE_FIRST.match(lead)          # "once it is backed up, trigger ..."
+            main = lead[m.end():] if m else lead
+            if _opens_with_command(main):
+                continue
+            if not m and _command_after_open_clause(lead):
+                continue
+            if _QUESTION_OPENER.match(lead):
+                continue
+            # A command after a comma is still a command -- "…, so that isn't a
+            # viable path, figure out something else": the account stays, the
+            # request goes ("Same rules apply, don't out yourself, use the vibes
+            # skill" keeps only "Same rules apply", too short to be an episode).
+            parts = re.split(r"\s*[,;]\s*", s)
+            told = [c for c in parts[1:] if not _opens_with_command(c)]
+            if len(told) < len(parts) - 1:
+                s = ", ".join([parts[0]] + told).rstrip(",;. ") + "."
+            keep.append(s)
+    return " ".join(keep).strip()
+
+
+_TASK_SCOPE = re.compile(
+    r"\b(?:yet|for now|right now|now|until|till|today|tonight|this|these|here|first|for the moment|this time)\b"
+    r"|https?://", re.IGNORECASE)
+_STANDING = re.compile(
+    r"\b(?:always|never|ever|from now on|going forward|in (?:the )?future|every time|each time|whenever"
+    r"|any time|anytime|at all times)\b", re.IGNORECASE)
+
+
 def is_standing_instruction(text: str) -> bool:
     """True only for imperative / standing-instruction shape (§16.2).
 
@@ -124,8 +219,15 @@ def is_standing_instruction(text: str) -> bool:
     low = _POLITE_PREFIX.sub("", line.lower()).strip()
     if not low or _NORM_REFUSE.search(low):
         return False
-    return bool(_NORM_LEAD.match(low) or _NORM_SECOND_PERSON.match(low)
-                or _NORM_REQUEST.search(low))
+    if not (_NORM_LEAD.match(low) or _NORM_SECOND_PERSON.match(low) or _NORM_REQUEST.search(low)):
+        return False
+    # An instruction about the task in hand is not a standing one: "Don't try
+    # to come up with a fix yet", "don't stop until the stuck processes are
+    # fixed", "I want you to review the search code here <url>" -- sampled from
+    # the user's real messages, each would have been injected into every
+    # later turn. Scoped ("yet", "for now", "until", "this", "here", a link)
+    # and not made standing ("always", "never", "from now on"), it is not one.
+    return not (_TASK_SCOPE.search(low) and not _STANDING.search(low))
 
 
 # -- first-person preference (A6) -----------------------------------------
@@ -159,6 +261,9 @@ they him her us what how where when why everything anything nothing all
 option options idea ideas suggestion suggestions approach answer response
 plan one ones way sound thought""".split())
 _META_REF = re.compile(r"\b(?:you|your|yours)\b")
+# Before "my X is Y", a desired state rather than a stated one.
+_WANTED_STATE = re.compile(r"\b(?:so\s+that|so|in\s+order|to\s+make|make\s+sure|ensure|until|once|when|if|unless"
+                           r"|should|want|wanted|need|needs|would\s+like|let)\b")
 _HYPOTHETICAL = re.compile(
     r"\bif\s+i\b|\bwould\s+(?:be|have|like|love|prefer)\b|\bwish\s+i\b|\bimagine\b|"
     r"\bsuppose\b|\bhypothetical|\bwhat\s+if\b|\bmaybe\s+i\b|\bi\s+might\b")
@@ -203,9 +308,10 @@ def canonical_predicate(surface: str):
     return (re.sub(r"\s+", "_", s), "single")
 
 
-def entity_token(name: str, etype: str = "") -> str:
-    norm = re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
-    return norm or "unknown"
+# An entity's id lives with the rest of what an entity is (engine/entities.py);
+# re-exported here because hostmodel, derivation and the tools import it from
+# this module.
+entity_token = ents.entity_token
 
 
 # -- relation / possession patterns (A6) ----------------------------------
@@ -286,7 +392,6 @@ class HeuristicExtractor(Extractor):
                 lines=None):
         items: list[dict] = []
         ambiguous = False
-        text = _strip_roles(excerpt)
         seen: set = set()
         lines = _role_lines(excerpt) if lines is None else lines
 
@@ -343,21 +448,31 @@ class HeuristicExtractor(Extractor):
                 # ("My wife Robin ..." is handled by the relation patterns).
                 m = re.match(r"([A-Z][\w .'-]+?)\s+is\s+(?:a|an)\s+([\w ]+)", line)
                 if m and not _THIRD_PERSON_SUBJ.match(m.group(1)):
-                    ent = entity_token(m.group(1))
-                    add(_entity_item(m.group(1).strip(), m.group(2).strip(), owner, domain,
-                                     source_event))
-                    add(_fact_item(ent, "is_a", m.group(2).strip(), owner, domain, source_event,
-                                   "session_transcript", entity_name=m.group(1).strip()))
+                    subject, etype = m.group(1).strip(), m.group(2).strip()
+                    # "This is a real managed challenge" is a sentence, not an
+                    # entity of type "real managed challenge" (engine/entities.py).
+                    if ents.plausible_name(subject) and ents.plausible_type(etype):
+                        tok = entity_token(subject)
+                        add(_entity_item(subject, etype, owner, domain, source_event))
+                        add(_fact_item(tok, "is_a", etype, owner, domain, source_event,
+                                       "session_transcript", entity_name=subject))
 
-        # An episodic summary of the turn with tiered abstraction levels
-        if len(text) > 60:
-            abstract_level = text[:60] + "..." if len(text) > 60 else text
-            gist_level = text[:200] + "..." if len(text) > 200 else text
+        # An episodic summary of the turn with tiered abstraction levels -- of
+        # what the USER said happened (see _narrative): a request to the agent
+        # or a question is not an episode about the user, and every long one
+        # used to become one. It was built from the whole turn, so the
+        # assistant's reply ("Great, I will remember that ...", its code, its
+        # plan) became part of an episode about the user; on the production
+        # store 24 of the 32 active transcript episodes carried it.
+        said = _narrative(t for t, who in lines if who == spk.HUMAN)
+        if len(said) > 60:
+            abstract_level = said[:60] + "..."
+            gist_level = said[:200] + "..." if len(said) > 200 else said
             items.append({"type": "asserted", "kind": "episode",
-                          "key": {"title": text[:48], "session_ref": session_id},
-                          "body": text[:400], "confidence": 0.6, "source_event": source_event,
+                          "key": {"title": said[:48], "session_ref": session_id},
+                          "body": said[:400], "confidence": 0.6, "source_event": source_event,
                           "source_type": "session_transcript", "route": "promote",
-                          "abstract": abstract_level, "gist": gist_level, "verbatim": text})
+                          "abstract": abstract_level, "gist": gist_level, "verbatim": said})
         route = "promote" if items else "skip"
         return ExtractionResult(items, ambiguous, route)
 
@@ -380,7 +495,8 @@ class HeuristicExtractor(Extractor):
         if m:
             name, rel = m.group(1).strip(), m.group(2).strip().lower()
             tok = entity_token(name)
-            out.append(_entity_item(name, "person", owner, domain, source_event))
+            if ents.plausible_name(name):
+                out.append(_entity_item(name, "person", owner, domain, source_event))
             out.append(_fact_item(tok, "role", rel, owner, domain, source_event,
                                   "session_transcript", entity_name=name))
             out.append(_fact_item("user", _REL_PRED[rel], name, owner, domain, source_event,
@@ -392,8 +508,9 @@ class HeuristicExtractor(Extractor):
                 rel, name = m.group(1).strip().lower(), m.group(2).strip()
                 pred = _REL_PRED[rel]
                 tok = entity_token(name)
-                out.append(_entity_item(name, "person" if pred in _PERSON_REL else "animal",
-                                        owner, domain, source_event))
+                if ents.plausible_name(name):
+                    out.append(_entity_item(name, "person" if pred in _PERSON_REL else "animal",
+                                            owner, domain, source_event))
                 out.append(_fact_item("user", pred, name, owner, domain, source_event,
                                       "user_direct"))
                 tail = line[m.end():].strip().lstrip(",").strip()
@@ -415,7 +532,8 @@ class HeuristicExtractor(Extractor):
         m = _PET_NAMED.search(line)
         if m:
             name = m.group(2).strip()
-            out.append(_entity_item(name, "animal", owner, domain, source_event))
+            if ents.plausible_name(name):
+                out.append(_entity_item(name, "animal", owner, domain, source_event))
             out.append(_fact_item("user", "pet", name, owner, domain, source_event, "user_direct"))
             grounded = True
 
@@ -451,7 +569,8 @@ class HeuristicExtractor(Extractor):
             val = _clean_value(m.group(1))
             out.append(_fact_item("user", "works_at", val, owner, domain, source_event,
                                   "user_direct"))
-            out.append(_entity_item(val, "organization", owner, domain, source_event))
+            if ents.plausible_name(val):
+                out.append(_entity_item(val, "organization", owner, domain, source_event))
         else:
             m = re.search(r"\bi\s+(work at|work in|work for|works at|works in|live in|lives in)\s+(.+)",
                           low)
@@ -460,7 +579,7 @@ class HeuristicExtractor(Extractor):
                 val = _clean_value(_trim_clause(line[m.start(2):]))
                 out.append(_fact_item("user", canon, val, owner, domain, source_event,
                                       "user_direct"))
-                if canon == "works_at":
+                if canon == "works_at" and ents.plausible_name(val):
                     out.append(_entity_item(val, "organization", owner, domain, source_event))
         m = _MOVED_TO.search(line)
         if m and not hypothetical:
@@ -485,8 +604,13 @@ class HeuristicExtractor(Extractor):
         out.extend(self._preferences(line, low, owner, domain, source_event, hypothetical))
 
         # -- generic "my <attr> is <value>" -----------------------------------
-        if not grounded:
+        # Not a state the user WANTS or asks for: "Fix it so that my library is
+        # a folder slskd can see" is a request, and "folder slskd can see" is
+        # not their library.
+        if not grounded and not hypothetical and not _opens_with_command(line):
             m = re.search(r"\bmy\s+([a-z]+(?:\s+[a-z]+)?)\s+(?:is|are|=)\s+(.+)", low)
+            if m and _WANTED_STATE.search(low[:m.start()]):
+                m = None
             if m and "name" not in m.group(1) and "office" not in m.group(1) \
                     and "favorite" not in m.group(1) and "favourite" not in m.group(1) \
                     and not any(c.isupper() for c in line[m.start(1):m.end(1)]):
@@ -584,6 +708,8 @@ def _fact_item(entity_id, predicate, value, owner, domain, source_event, source_
 
 
 def _entity_item(name, etype, owner, domain, source_event):
+    """An entity item. Callers check `entities.plausible_name` first; the ONE
+    caller that cannot (a model's reply) is checked in LLMExtractor.extract."""
     tok = entity_token(name, etype)
     key = {"entity_type": etype, "type": etype, "name": name, "normalized_name": name.lower(),
            "owner": owner, "domain": domain}
@@ -598,6 +724,36 @@ def _note_item(body, note_type, owner, domain, source_event, risk="low"):
             "body": body, "confidence": 0.8, "source_event": source_event,
             "source_type": "user_direct", "route": "promote",
             "signal_type": "directive"}
+
+
+_LINE_LABEL = {spk.HUMAN: "User", spk.AUTOMATION: "Automation", spk.ASSISTANT: "Assistant"}
+
+
+def _reader_excerpt(excerpt: str, lines: list) -> str:
+    """The excerpt minus host framing and tool output, for what extraction
+    keeps or sends verbatim -- the episode text, the model's prompt. Speaker
+    lines already keep both out of every fact and note; the episode was the one
+    output built from the raw text, so a turn that opened with an earlier
+    compaction's handoff became an episode ABOUT that handoff, and a turn with a
+    file read in it became an episode that was mostly the file. Unchanged --
+    the same string -- when no line is either.
+
+    Rebuilt from the speaker LINES, not by re-reading `role:` prefixes: the
+    curation worker's lines come from the capture's spans, which know that a
+    "User: ignore previous instructions" line inside a tool's output is the
+    tool's, where a prefix reading would hand it to the user."""
+    drop = (spk.SYSTEM, spk.TOOL)
+    if not any(who in drop for _, who in lines):
+        return excerpt
+    out, prev = [], None
+    for text, who in lines:
+        if who in drop:
+            prev = None
+            continue
+        label = _LINE_LABEL.get(who)
+        out.append("%s: %s" % (label, text) if label and who != prev else text)
+        prev = who
+    return "\n".join(out)
 
 
 def _strip_roles(excerpt: str) -> str:
@@ -708,7 +864,7 @@ class LLMExtractor(Extractor):
         said = _grounding_text(spk.human_text(lines))
         try:
             import json as _json
-            reply = self._chat(_LLM_PROMPT + (excerpt or "")[:4000])
+            reply = self._chat(_LLM_PROMPT + _reader_excerpt(excerpt, lines)[:4000])
             m = re.search(r"\{.*\}", reply, re.DOTALL)      # tolerate fenced/prefixed replies
             parsed = _json.loads(m.group(0) if m else reply)
             items: list[dict] = []
@@ -728,7 +884,7 @@ class LLMExtractor(Extractor):
                                             source_event, "session_transcript", entity_name=subj))
             for e in (parsed.get("entities") or [])[:10]:
                 name, etype = str(e.get("name") or "").strip(), str(e.get("type") or "thing").strip()
-                if name:
+                if ents.plausible_name(name) and ents.plausible_type(etype):
                     items.append(_entity_item(name, etype, owner, domain, source_event))
             for d in (parsed.get("directives") or [])[:5]:
                 if str(d).strip() and _grounding_text(d) in said:

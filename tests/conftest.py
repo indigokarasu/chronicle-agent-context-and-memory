@@ -468,6 +468,27 @@ def _hermetic_test(request):
                     % (len(attempts), attempts[0]), pytrace=False)
 
 
+@pytest.fixture(autouse=True)
+def _hosts_drain_where_they_are_called(request, monkeypatch):
+    """In production a host (the provider, the context engine) moves a core's
+    per-turn curation drain onto one background thread
+    (`ChronicleCore.drain_in_background`, `curation.drain.background`): Hermes
+    calls on_turn_start inside the user's turn. Assertions here read the store
+    right after a turn, which a drain running beside the test would race, so in
+    the suite a host drains where it is called -- unless the test class sets
+    `background_drain = True`, which is how the worker itself is tested."""
+    if getattr(request.cls, "background_drain", False):
+        yield
+        return
+    try:
+        from engine.core import ChronicleCore
+    except Exception:                    # a test that never imports the engine
+        yield
+        return
+    monkeypatch.setattr(ChronicleCore, "drain_in_background", lambda self: None)
+    yield
+
+
 def _reset_process_state() -> None:
     """Undo the process-wide state a core construction installs.
 

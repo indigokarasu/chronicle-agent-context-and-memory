@@ -132,15 +132,18 @@ class ContextEngineWatermarkTests(unittest.TestCase):
                               "is included: %d tokens > %d budget" % (total, budget))
 
     def test_pressure_warning_latches_once_not_lost_by_small_body_shortcut(self):
-        # R9 regression: compress()'s small-body early return
-        # (len(body) <= protect_first_n + protect_last_n) used to run AFTER
-        # the warning flag was already latched True, so the flag was set but
-        # the warning never reached the caller -- permanently, since the flag
-        # only resets when update_from_response observes pressure drop below
-        # the watermark. The internal latch must never disagree with whether
-        # a warning was actually delivered.
+        # R9 regression: compress()'s small-body early return used to run AFTER
+        # the warning flag was latched, so the flag was set but the warning
+        # never reached the caller -- permanently, since the flag only resets
+        # when update_from_response observes pressure drop below the watermark.
+        # The internal latch must never disagree with whether a warning was
+        # actually delivered.
+        #
+        # 5.8.0: a compaction runs AT the watermark, so the warning rides in the
+        # handoff as advice for the next one. The shortcut folds nothing and
+        # writes no handoff: nothing delivered, nothing latched -- and the next
+        # pass that does fold delivers it.
         self.eng.update_model("test-model", context_length=1500)  # threshold = 1125
-        # A10b units restatement: 2000 x 3 = 6000 = 1500 x 4.
         small_body = [_msg("user" if i % 2 == 0 else "assistant", "pad %d" % i) for i in range(4)]
         self.assertLessEqual(len(small_body), self.eng.protect_first_n + self.eng.protect_last_n,
                               "test setup: body must be small enough to hit the early-return shortcut")
@@ -148,11 +151,21 @@ class ContextEngineWatermarkTests(unittest.TestCase):
         self.eng.update_from_response({"prompt_tokens": self.eng.threshold_tokens,
                                        "completion_tokens": 0, "total_tokens": 0})
         out = self.eng.compress(list(messages), focus_topic=None)
-        delivered = any(m.get("role") == "system" and "[Context pressure warning]" in (m.get("content") or "")
-                        for m in out)
-        self.assertTrue(delivered, "small-body shortcut must still deliver the pressure warning")
-        self.assertEqual(self.eng._pressure_warning_injected, delivered,
-                          "internal latch must match whether the warning was actually delivered")
+
+        def delivered(msgs):
+            return any("pin anything that must stay verbatim" in (m.get("content") or "")
+                       and m.get("role") != "system" for m in msgs)
+
+        self.assertFalse(delivered(out))
+        self.assertFalse(self.eng._pressure_warning_injected, "latched without delivery")
+
+        big = [_msg("user" if i % 2 == 0 else "assistant",
+                    "turn %d about the Zorblax rota " % i + "w" * 600) for i in range(16)]
+        out = self.eng.compress([_msg("system", "sys")] + big, focus_topic=None)
+        self.assertTrue(delivered(out), "the first pass that folds must deliver the warning")
+        self.assertTrue(self.eng._pressure_warning_injected)
+        again = self.eng.compress(out + big[:4], focus_topic=None)
+        self.assertEqual(sum(delivered([m]) for m in again), 1, "delivered once per crossing")
 
     def test_budget_scales_with_context_length(self):
         self.eng.update_model("small-model", context_length=400)

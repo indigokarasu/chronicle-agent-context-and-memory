@@ -123,6 +123,14 @@ H1_TABLES = ("host_model_requests", "host_model_results",
 # place if a test asserts the value directly, and test_host_model.py derives
 # that assertion FROM this tuple so an unasserted addition cannot pass silently.
 DELIBERATE_MODEL_COLUMNS = (("session_index", "model"),)
+
+# Columns added after the base tree that the default flow must leave NULL.
+# Dropped by NAME for the same reason as above -- the base tree has no such
+# cell to compare -- and licensed by
+# tests/test_host_model.py::test_added_columns_stay_null_on_the_default_flow,
+# which asserts every value directly. events.pointer is schema rung 19 (main's
+# dada805): only a caller that passes `pointer=` ever fills it.
+ADDED_NULL_COLUMNS = (("events", "pointer"),)
 # Ladder-10 A9 sweep bookkeeping in `meta`. Kept as a literal rather than
 # imported from engine.store, because this probe must run unchanged inside the
 # pre-A9 base tree, where that constant does not exist.
@@ -183,7 +191,8 @@ def dump_store(store) -> str:
         # Deliberate model-identity columns are dropped by NAME, so the
         # surviving cells keep the base tree's own order whether this tree put
         # the new column first, last or in the middle.
-        skip = {i for i, c in enumerate(columns) if (table, c) in DELIBERATE_MODEL_COLUMNS}
+        skip = {i for i, c in enumerate(columns)
+                if (table, c) in DELIBERATE_MODEL_COLUMNS or (table, c) in ADDED_NULL_COLUMNS}
         rendered = []
         for row in conn.execute("SELECT * FROM %s" % table).fetchall():
             cells = [_norm(row[i]) for i in range(len(columns)) if i not in skip]
@@ -208,11 +217,17 @@ def run_flow(home: str) -> str:
 
     _freeze_clock()
     prov = ChronicleMemoryProvider()
-    # embeddings.model is the ONLY override: a networked embedder would make the
-    # run non-deterministic (and this must work offline). Everything else — and
-    # host_model.piggyback in particular — is left at DEFAULTS.
+    # Two overrides, both for determinism. embeddings.model: a networked
+    # embedder would make the run non-deterministic (and this must work
+    # offline). curation.drain.background: a host drains on a background thread
+    # by default (5.7.13), which changes WHEN jobs run, not what they write --
+    # but the dump includes the job queue, and the base tree drains on the
+    # calling thread, so the two are compared that way. (The base tree ignores
+    # the key.) Everything else -- host_model.piggyback in particular -- is left
+    # at DEFAULTS.
     prov.initialize("s-h1-probe", hermes_home=home, principal_id="assistant",
-                    config={"embeddings": {"model": "hashing"}})
+                    config={"embeddings": {"model": "hashing"},
+                            "curation": {"drain": {"background": False}}})
     for user, assistant in TURNS:
         # The H1 attach hook, on the default path. The base tree has no such
         # method; the H1 tree has one that must return "" without touching the
