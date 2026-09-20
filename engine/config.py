@@ -326,20 +326,24 @@ CONFIDENCE_BASE = {
 
 DEFAULTS: dict[str, Any] = {
     "credentials": {
-        # Phase E. A masked value normally leaves `[redacted]`, which tells a
-        # reader nothing and invites the agent to ask for the secret again --
-        # which is how one ends up in a transcript twice. With this on the
-        # marker carries where the value lives, when the text already said so:
-        # `[redacted env:OPENROUTER_API_KEY]`, `[redacted vault_ab12cd34ef56]`,
-        # or `[redacted sk-…]` when only the vendor prefix is known. Nothing is
-        # read from the vault or the environment to produce it and no part of a
-        # secret is kept -- see engine/credentials.py.
+        # Phase E. A masked value used to leave `[redacted]`: a dead end that
+        # tells a reader nothing and invites the agent to ask for the secret
+        # again, which is how one ends up in a transcript twice. The sentinel
+        # now carries WHERE the value lives, when the text already said so --
+        # `«redacted:env:OPENROUTER_API_KEY»`, `«redacted:vault_ab12cd34ef56»`.
+        # Without a pointer it is `«redacted:ghp_…»` (vendor label) or
+        # `«redacted-secret»`. Nothing is read from the vault or the
+        # environment to produce it, and no part of a secret is kept -- see
+        # engine/credentials.py, including why the pointer goes INSIDE the
+        # sentinel rather than standing where the value stood.
         #
-        # Off by default because the marker is a STORED string: turning it on
-        # changes the text of every belief folded after that, while the ones
-        # already masked keep the bare marker. That is a deliberate migration,
-        # not a default.
-        "pointers": False,
+        # ON. Jared asked for the pointer to be there rather than a dead end,
+        # 2026-09-19. What that means in practice, because the marker is a
+        # STORED string and nothing migrates: beliefs folded from now on carry
+        # the pointer, and the ones already in the store keep whatever they
+        # were masked with. A store with two shapes in it is the expected
+        # state, not a bug.
+        "pointers": True,
     },
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",

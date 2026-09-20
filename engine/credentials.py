@@ -33,8 +33,27 @@ _LABELLED = re.compile(r"(?i)\b(%s)\b\s*(?:[:=]|\bis\b)\s*[\"'`]?([^\s\"'`]+)" %
 _KEY_SHAPED = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                          r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})")
 _NUMERIC_LABELS = ("pin", "otp", "code")
-REDACTED = "[redacted]"
-_MARKER = "[redacted"
+
+# THE SENTINEL IS HERMES', NOT OURS. The host already had one and Chronicle had
+# invented a second: `agent/redact.py` masks to «redacted-secret»,
+# «redacted:ghp_…» (prefix matched, vendor label kept) and
+# «redacted-vault-secret», and its own "already masked?" guards test
+# `value.startswith("«redacted")` and `"***" in value`. `[redacted]` matched
+# neither, so a host redaction pass did not recognise Chronicle's output as
+# masked and could mask it again.
+#
+# The SHAPE is load-bearing, and the reason is in Hermes' own docstring for
+# _mask_token_nonreusable: "an agent once wrote a truncated-looking mask back
+# into a config file", corrupting the stored credential (issue #35519). So the
+# replacement must not be mistakable for a usable value. That is why the
+# pointer goes INSIDE the sentinel rather than standing where the value stood:
+# `«redacted:vault_ab12cd34ef56»` says which item to resolve and cannot be
+# pasted back over the real one. The guillemets also keep masking idempotent
+# for free -- a bare `vault_ab12cd34ef56` passes _looks_secret (letters,
+# digits, six characters) and the next fold would re-mask our own pointer.
+REDACTED = "«redacted-secret»"
+SENTINEL = "«redacted:%s»"
+_MARKER = "«redacted"
 
 # WHAT A READER CAN DO ABOUT THE VALUE THAT IS GONE (Phase E).
 #
@@ -110,18 +129,26 @@ def pointer_for(text: str, a: int, b: int) -> str:
         return "env:" + env.group(1)
     prefix = _KEY_PREFIX.match((text or "")[a:b])
     if prefix:
+        # Hermes' own form for this case, ellipsis included: the vendor label
+        # says what KIND of credential it was and the ellipsis says the rest
+        # is gone. A pointer label is complete and carries no ellipsis.
         return prefix.group(1) + "\u2026"
     return ""
 
 
-def redact(text: str, pointer: bool = False) -> str:
-    """`text` with every credential value replaced by [redacted].
+def redact(text: str, pointer: bool = True) -> str:
+    """`text` with every credential value replaced by Hermes' sentinel.
 
-    With `pointer`, the marker also carries where the value can be fetched
-    from when the text said so -- `[redacted env:OPENROUTER_API_KEY]`. Off by
-    default: the marker is a stored string, so changing its shape changes
-    every belief that gets re-folded, and that is a decision a config flag
-    makes (`credentials.pointers`), not this function."""
+    With `pointer` (on by default, `credentials.pointers`), the sentinel's
+    label is where the value can be fetched from when the text said so --
+    `«redacted:env:OPENROUTER_API_KEY»`, `«redacted:vault_ab12cd34ef56»`.
+    Without it, or with nothing in the text to point at, the label is the
+    vendor prefix (`«redacted:ghp_…»`) or absent (`«redacted-secret»`).
+
+    The label is INSIDE the sentinel, never in place of the value: a bare
+    pointer reads as a usable string and an agent that round-trips a config
+    writes it back over the real credential -- Hermes issue #35519, and the
+    reason its own masks are non-reusable by construction."""
     found = spans(text)
     if not found:
         return text
@@ -131,7 +158,7 @@ def redact(text: str, pointer: bool = False) -> str:
             continue
         out.append(text[at:a])
         ref = pointer_for(text, a, b) if pointer else ""
-        out.append("[redacted %s]" % ref if ref else REDACTED)
+        out.append(SENTINEL % ref if ref else REDACTED)
         at = b
     out.append(text[at:])
     return "".join(out)
