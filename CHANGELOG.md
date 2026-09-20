@@ -3,6 +3,50 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — Phase E: a masked value says where to fetch it
+
+`[redacted]` is a dead end. An agent that meets one asks the user to type the
+secret again, which is how a secret reaches a transcript twice. Behind
+`credentials.pointers`, **default off**, the marker carries the pointer the
+text was already holding:
+
+    OPENROUTER_API_KEY=[redacted env:OPENROUTER_API_KEY]
+    the Zoom login is vault_ab12cd34ef56 password: [redacted vault_ab12cd34ef56]
+    token [redacted ghp_…]
+
+**It reads neither the vault nor the environment, and it cannot.** The vault
+(`agent/vault_store.py`) exists precisely so that values never reach a tool
+result, and guessing which vault item a masked string *was* would be inventing
+a reference — which the spec forbade in the same breath as saying the form
+`secrets/<NAME>` was illustrative only. Both mechanisms were read from source
+before any of this was written: the vault takes `login`/`payment`/`address`
+items referenced by an opaque `vault_<12 hex>` id and resolved server-side by
+`resolve_secret()`; provider API keys are **not** vault items, they are
+environment variables from the profile `.env`
+(`agent/credential_persistence.py`).
+
+So all this does is keep what the text said. Nothing it renders is secret: an
+env-var name is not, a vault id is designed to be shown, and `sk-` is a
+vendor's public prefix. A bare `password:` with no variable name behind it
+gets no invented pointer — the marker stays `[redacted]`. Tested end to end
+through a real fold, and tested that no part of a secret survives either way.
+
+Off by default because the marker is a **stored** string: turning it on
+changes the text of every belief folded after it, while the ones already
+masked keep the bare marker. That is a migration to choose, not a default.
+
+One thing it broke and fixed: `_looks_secret` skipped an already-masked value
+by testing `startswith(REDACTED)` — the whole `[redacted]`, closing bracket
+included. With a pointer the marker is `[redacted env:NAME]`, so a second pass
+re-masked its own output and appended a second pointer. It now tests
+`[redacted`. Masking has to be idempotent; the fold re-runs over beliefs it
+has already masked.
+
+Still not done in this phase, and named rather than glossed: nothing resolves
+a pointer back to a value, and the raw transcript still keeps credential
+values by design — the documented trade-off, worth re-deciding out loud rather
+than inheriting.
+
 ## Unreleased — the entity rules were wrong in both directions
 
 Two complaints, both correct, and one of them cannot be fixed by a rule.

@@ -159,5 +159,111 @@ class TestTheStore(unittest.TestCase):
         self.assertIn("Qx!Placeholder-00-Test_000", found)
 
 
+class TestAPointerBack(unittest.TestCase):
+    """Phase E. `[redacted]` is a dead end: an agent that meets one asks the
+    user to type the secret again, which is how a secret reaches a transcript
+    twice. With `credentials.pointers` on, the marker says where the value
+    lives -- read off the TEXT, never out of the vault or the environment,
+    because guessing which vault item a masked string was would be inventing a
+    reference. Fixtures use obviously fake values."""
+
+    def test_off_by_default_the_marker_is_unchanged(self):
+        said = "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789"
+        self.assertEqual(C.redact(said), "OPENROUTER_API_KEY=" + C.REDACTED)
+
+    def test_an_env_var_name_is_the_pointer(self):
+        said = "OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789"
+        self.assertEqual(C.redact(said, True), "OPENROUTER_API_KEY=[redacted env:OPENROUTER_API_KEY]")
+
+    def test_a_vault_id_beside_the_value_is_the_pointer(self):
+        said = "the login is vault_ab12cd34ef56, password: zz9-Plural-Zalpha7"
+        out = C.redact(said, True)
+        self.assertIn("[redacted vault_ab12cd34ef56]", out)
+        self.assertNotIn("zz9-Plural", out)
+
+    def test_otherwise_the_vendor_prefix_says_what_kind_it_was(self):
+        self.assertEqual(C.redact("token ghp_abcdefghij0123456789abcdefghij", True),
+                         "token [redacted ghp_\u2026]")
+
+    def test_a_plain_password_gets_no_invented_pointer(self):
+        """PASSWORD carries no underscore and names no variable: there is
+        nothing in the text to point at, so the marker stays bare."""
+        self.assertEqual(C.redact("password: zz9-Plural-Zalpha7", True),
+                         "password: " + C.REDACTED)
+
+    def test_no_part_of_the_secret_survives(self):
+        for said in ("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789",
+                     "token ghp_abcdefghij0123456789abcdefghij",
+                     "password: zz9-Plural-Zalpha7"):
+            with self.subTest(said=said):
+                out = C.redact(said, True)
+                for secret in ("abcdef0123456789", "abcdefghij0123456789", "Plural-Zalpha7"):
+                    self.assertNotIn(secret, out)
+
+    def test_it_is_still_idempotent(self):
+        for said in ("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789",
+                     "the login is vault_ab12cd34ef56, password: zz9-Plural-Zalpha7",
+                     "token ghp_abcdefghij0123456789abcdefghij"):
+            with self.subTest(said=said):
+                once = C.redact(said, True)
+                self.assertEqual(C.redact(once, True), once)
+                self.assertEqual(C.redact(once), once)
+
+    def test_a_pointer_is_not_read_out_of_the_vault(self):
+        """The only vault id it can render is one the text already held."""
+        self.assertEqual(C.pointer_for("password: zz9-Plural-Zalpha7", 10, 27), "")
+
+    def test_the_default_is_off(self):
+        from engine.config import DEFAULTS
+        self.assertIs(DEFAULTS["credentials"]["pointers"], False)
+
+
+class TestThePointerThroughTheFold(unittest.TestCase):
+    """The wiring, not the regex: a belief folded with the flag on carries the
+    pointer, and one folded with it off carries what every release before this
+    carried. Fixtures use obviously fake values."""
+
+    BODY = ("set OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789 in the profile "
+            "env; the Zoom login is vault_ab12cd34ef56 password: zz9-Plural-Zalpha7")
+
+    def folded(self, pointers):
+        home = temp_home(prefix="ptrfold_")
+        sid = "20260919_170000_p%d" % pointers
+        prov = ChronicleMemoryProvider()
+        try:
+            prov.initialize(sid, hermes_home=home, principal_id="default",
+                            config={"embeddings": {"model": "hashing"},
+                                    "credentials": {"pointers": pointers}})
+            prov.core.capture.append("asserted", {
+                "kind": "episode", "key": {"title": "the provider key and the Zoom login",
+                                           "session_ref": sid},
+                "body": self.BODY, "confidence": 0.9, "source_event": "probe",
+                "source_type": "probe"}, actor="agent", owner="default", trust_level=3)
+            prov.core.process_pending()
+            return [r[0] for r in prov.core.store._conn().execute("SELECT summary FROM episodes")]
+        finally:
+            ChronicleCore._instances.pop(prov.core.store.db_path, None)
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_off_is_what_every_release_before_this_stored(self):
+        rows = self.folded(False)
+        self.assertTrue(rows)
+        self.assertIn("OPENROUTER_API_KEY=" + C.REDACTED, rows[0])
+        self.assertIn("password: " + C.REDACTED, rows[0])
+
+    def test_on_the_belief_says_where_to_fetch_it(self):
+        rows = self.folded(True)
+        self.assertTrue(rows)
+        self.assertIn("[redacted env:OPENROUTER_API_KEY]", rows[0])
+        self.assertIn("[redacted vault_ab12cd34ef56]", rows[0])
+
+    def test_neither_stores_any_of_the_secret(self):
+        for pointers in (False, True):
+            with self.subTest(pointers=pointers):
+                body = " ".join(self.folded(pointers))
+                for secret in ("abcdef0123456789", "Plural-Zalpha7"):
+                    self.assertNotIn(secret, body)
+
+
 if __name__ == "__main__":
     unittest.main()

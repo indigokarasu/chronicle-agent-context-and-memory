@@ -325,6 +325,22 @@ CONFIDENCE_BASE = {
 }
 
 DEFAULTS: dict[str, Any] = {
+    "credentials": {
+        # Phase E. A masked value normally leaves `[redacted]`, which tells a
+        # reader nothing and invites the agent to ask for the secret again --
+        # which is how one ends up in a transcript twice. With this on the
+        # marker carries where the value lives, when the text already said so:
+        # `[redacted env:OPENROUTER_API_KEY]`, `[redacted vault_ab12cd34ef56]`,
+        # or `[redacted sk-…]` when only the vendor prefix is known. Nothing is
+        # read from the vault or the environment to produce it and no part of a
+        # secret is kept -- see engine/credentials.py.
+        #
+        # Off by default because the marker is a STORED string: turning it on
+        # changes the text of every belief folded after that, while the ones
+        # already masked keep the bare marker. That is a deliberate migration,
+        # not a default.
+        "pointers": False,
+    },
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",
     "git_remote": None,

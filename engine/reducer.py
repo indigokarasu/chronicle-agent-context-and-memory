@@ -427,6 +427,9 @@ def _normalize_value(s):
 
 
 class Reducer:
+    def _credential_pointers(self) -> bool:
+        return bool(self.cfg is not None and self.cfg.get("credentials.pointers", False))
+
     def __init__(self, store, embedder=None, cfg=None):
         self.store = store
         self.embedder = embedder
@@ -630,7 +633,7 @@ class Reducer:
         raw = p.get("confidence", base_confidence(source_type, self.cfg))
         confidence = clamp_to_ceiling(raw, trust, cfg=self.cfg)
 
-        key, body = _without_credentials(key, body)
+        key, body = _without_credentials(key, body, self._credential_pointers())
         b_id = compute_belief_id(kind, key, [source_event])
         if kind == "entity":
             # An entity IS its token: the id facts reference (`entity_id`) and the
@@ -806,7 +809,8 @@ class Reducer:
     def _on_derived(self, event):
         p = _payload(event)
         kind = p.get("kind", "fact")
-        key, body = _without_credentials(p.get("key", {}), p.get("body", ""))
+        key, body = _without_credentials(p.get("key", {}), p.get("body", ""),
+                                         self._credential_pointers())
         rule_id = p.get("rule_id", "")
         premises = p.get("premises", [])
         confidence = clamp_to_ceiling(p.get("confidence", 0.6), 2, cfg=self.cfg)  # C(inference)=0.75
@@ -1852,15 +1856,20 @@ class Reducer:
 
 # -- module helpers -------------------------------------------------------
 
-def _without_credentials(key, body):
+def _without_credentials(key, body, pointers=False):
     """A belief's key and body with any credential value masked
     (engine/credentials.py). A login the user handed the agent is not a memory
     about them; a belief would carry it into later prompts unasked. The belief
     itself stays -- an appointment whose meeting link carries `?pwd=` is still
     an appointment -- and the transcript keeps the message. In the fold, so a
-    rebuild masks the ones already asserted too (I3)."""
-    key = {k: (_cred.redact(v) if isinstance(v, str) else v) for k, v in (key or {}).items()}
-    return key, _cred.redact(body) if isinstance(body, str) else body
+    rebuild masks the ones already asserted too (I3).
+
+    `pointers` (Phase E, `credentials.pointers`, default off) keeps the
+    pointer the text was already carrying beside the marker, so the agent can
+    fetch the value instead of asking for it again."""
+    key = {k: (_cred.redact(v, pointers) if isinstance(v, str) else v)
+           for k, v in (key or {}).items()}
+    return key, _cred.redact(body, pointers) if isinstance(body, str) else body
 
 
 def _payload(event) -> dict:

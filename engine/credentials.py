@@ -34,10 +34,43 @@ _KEY_SHAPED = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|githu
                          r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})")
 _NUMERIC_LABELS = ("pin", "otp", "code")
 REDACTED = "[redacted]"
+_MARKER = "[redacted"
+
+# WHAT A READER CAN DO ABOUT THE VALUE THAT IS GONE (Phase E).
+#
+# `[redacted]` is a dead end: an agent that finds it asks the user to type the
+# secret again, which is how a secret gets into a transcript twice. A pointer
+# says WHERE the value lives instead.
+#
+# Hermes has exactly two places a secret legitimately lives, both read from
+# its source rather than invented (the spec was explicit that the form
+# `secrets/<NAME>` was illustrative and must not be copied):
+#
+#   * the VAULT (agent/vault_store.py) -- encrypted, profile-scoped, kinds
+#     login/payment/address, referenced by an opaque `vault_<12 hex>` id and
+#     resolved server-side by resolve_secret();
+#   * the profile `.env` -- provider API keys are environment variables, NOT
+#     vault items (agent/credential_persistence.py).
+#
+# This module reads NEITHER. It cannot: the vault exists so that values never
+# reach a tool result, and guessing which vault item a masked string was would
+# be inventing a reference. All it does is KEEP THE POINTER THE TEXT WAS
+# ALREADY CARRYING -- the env-var name the value was assigned to, the vault id
+# quoted beside it, or the provider prefix the key itself announces. Nothing
+# here reveals any part of a secret: an env-var name is not secret, a vault id
+# is designed to be shown, and `sk-` is a vendor's public prefix.
+_ENV_NAME = re.compile(r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\s*[:=]\s*[\"\'`]?$")
+_VAULT_REF = re.compile(r"\bvault_[0-9a-f]{12}\b")
+_KEY_PREFIX = re.compile(r"^(sk-|ghp_|github_pat_|xox[abprs]-|AKIA|AIza)")
+_POINTER_LOOKBEHIND = 80
 
 
 def _looks_secret(label: str, value: str) -> bool:
-    if value.startswith(REDACTED):
+    # `[redacted` and not REDACTED: with `credentials.pointers` on the marker
+    # is `[redacted env:NAME]`, so testing the whole bare marker let a second
+    # pass re-mask its own output and append a second pointer. Masking has to
+    # be idempotent -- the fold re-runs over beliefs it has already masked.
+    if value.startswith(_MARKER):
         return False                     # already masked
     v = value.strip(".,;:!?)]}")
     if label.lower().endswith(_NUMERIC_LABELS) and v.isdigit():
@@ -61,8 +94,34 @@ def contains_secret(text: str) -> bool:
     return bool(spans(text))
 
 
-def redact(text: str) -> str:
-    """`text` with every credential value replaced by [redacted]."""
+def pointer_for(text: str, a: int, b: int) -> str:
+    """Where the value at text[a:b] can be fetched from, or "".
+
+    Read off the text itself, never from the vault or the environment -- see
+    the note above _ENV_NAME. Order is by how specific the pointer is: a vault
+    id names one item, an env-var name names one variable, a provider prefix
+    only says what KIND of credential it was."""
+    before = (text or "")[max(0, a - _POINTER_LOOKBEHIND):a]
+    vault = _VAULT_REF.findall(before)
+    if vault:
+        return vault[-1]
+    env = _ENV_NAME.search(before)
+    if env:
+        return "env:" + env.group(1)
+    prefix = _KEY_PREFIX.match((text or "")[a:b])
+    if prefix:
+        return prefix.group(1) + "\u2026"
+    return ""
+
+
+def redact(text: str, pointer: bool = False) -> str:
+    """`text` with every credential value replaced by [redacted].
+
+    With `pointer`, the marker also carries where the value can be fetched
+    from when the text said so -- `[redacted env:OPENROUTER_API_KEY]`. Off by
+    default: the marker is a stored string, so changing its shape changes
+    every belief that gets re-folded, and that is a decision a config flag
+    makes (`credentials.pointers`), not this function."""
     found = spans(text)
     if not found:
         return text
@@ -71,7 +130,8 @@ def redact(text: str) -> str:
         if a < at:
             continue
         out.append(text[at:a])
-        out.append(REDACTED)
+        ref = pointer_for(text, a, b) if pointer else ""
+        out.append("[redacted %s]" % ref if ref else REDACTED)
         at = b
     out.append(text[at:])
     return "".join(out)
