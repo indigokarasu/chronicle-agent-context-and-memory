@@ -21,6 +21,17 @@ as the user's words (engine/speaker.py fixed that); these rules are the second
 half, so a pronoun or half a sentence cannot become an entity even when a person
 does write "This is a problem".
 
+WHAT SHAPE CANNOT FIX, said plainly. `plausible_type` is a shape test, and a
+shape test cannot tell a category from an adjective. Measured on the same
+table: of the 278 distinct types, 120 pass it, and 111 still pass with the
+particle rule below -- but `kind_for` recognises only 9 of those. The rest are
+"genuine", "hard", "first", "cross", "cutting", "fail": adjectives and verbs
+that are the right SHAPE for a category and are not one. Separating them needs
+a lexicon or a model, and a hand-written list of adjectives would be the prose
+rule this module exists to replace, wearing a different hat. What protects a
+reader instead is that an unrecognised type does not classify anything:
+`kind_for` answers "" and the entity is shown under the unknowns.
+
 WHAT THIS MODULE REFUSES TO GUESS. `kind_for` answers "" rather than inventing a
 kind for a type it does not recognise, and `resolve_name` only ever replaces an
 id with a name the log already asserts. A reader that needs to show everything
@@ -121,6 +132,15 @@ _MAX_TYPE_WORDS, _MAX_TYPE_CHARS = 3, 40
 # so several real contacts on the production store could not become entities at
 # all. Both are stripped before the rule looks at the words; neither can make an
 # implausible name plausible, because what is left still has to pass.
+# A bare lower-case handle IS a name. The capital rule below exists to refuse
+# clauses ("dead end for getting a usable key"), and a single token with no
+# spaces is not a clause. Measured on the same 1,488-row production table the
+# rules above were written from: this admits exactly two rows, `indigo` and
+# `user` -- the agent's own profile and the default principal, both of which
+# carry facts and neither of which could be an entity at all -- and no junk,
+# because every junk name in that table is a capitalised pronoun ("This",
+# "There", "It") or a sentence, and both are refused before this is reached.
+_HANDLE = re.compile(r"[a-z][a-z0-9._-]{1,23}")
 _PRONOUN_TAG = re.compile(r"\s*\((?:[a-z]+/)+[a-z]+\)\s*$")
 _CREDENTIAL = re.compile(r"""[,\s]+(?:ph\.?\s?d|m\.?\s?d|d\.?\s?d\.?\s?s|m\.?b\.?a|m\.?s
                           |m\.?a|b\.?a|b\.?s|j\.?d|r\.?n|n\.?p|p\.?e|esq|cpa|mph|mfa
@@ -172,6 +192,8 @@ def plausible_name(name) -> bool:
         return False
     if words[0].lower() in _NOT_A_NAME:
         return False           # "This server", "Each one"
+    if len(words) == 1 and _HANDLE.fullmatch(words[0]) and words[0] not in _TYPE_STOP:
+        return True            # a handle: `indigo`, `user`
     significant = [w for w in words if w.lower().strip(".,'-") not in _PARTICLES]
     if not significant:
         return False
@@ -195,6 +217,13 @@ def plausible_type(etype) -> bool:
     # A pronoun or a bare quantifier is no more a category than it is a name:
     # the production table holds rows typed "one", "second" and "no".
     if any(w in _TYPE_STOP or w in _NOT_A_NAME for w in words):
+        return False
+    # A category is a noun phrase, and a noun phrase does not start or end on a
+    # particle. The table holds types that ran out of room mid-phrase
+    # ("DIFFERENT shape from", "fork PR in"); those are a truncated capture, not
+    # a category. Only the ends: "schedule of inspections" is a category and
+    # keeps its particle.
+    if words[0] in _PARTICLES or words[-1] in _PARTICLES:
         return False
     return all(re.fullmatch(r"[a-z][a-z'&/-]*", w) for w in words)
 

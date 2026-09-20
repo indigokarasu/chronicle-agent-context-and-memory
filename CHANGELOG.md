@@ -3,6 +3,368 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — `keep_literals` is ON: the first flag to earn its default
+
+The rule for this whole build was that nothing defaults on until a replay
+shows a win. This one did, on two corpora that share nothing — a copy of the
+production store, and real tool-shaped transcripts written by a different
+agent doing different work — at the same budget:
+
+    chronicle copy (3 sessions)   38.0% -> 45.1% literals kept   out tokens -675
+    transcripts    (5 sessions)    1.8% ->  2.1%                 out tokens   -5
+
+**+18.8% and +17.8% relative: the same number twice.** The absolute share is a
+fact about how hard the session compresses, not about the flag — the
+transcript sessions go 4,023,745 → 29,998 tokens, a 99.25% cut, and almost
+nothing survives that either way. The relative figure is the one that
+transfers, and it transferred.
+
+It also keeps MORE messages while doing it (38→48, 45→52, 37→49): spending a
+cut on literals leaves room, it does not take it. What a reader gets instead
+of the sentence introducing the work is the port number, the path, the
+container id and the command that failed.
+
+**A correction to how the earlier numbers were reported.** Those runs had
+`keep_weights.involatile` at 0.25 alongside the flag, and the pair was written
+up as if it were one thing. Re-run with the weight at 0.0 the figures are
+byte-identical on both corpora: the weight contributes nothing and the whole
+effect is `keep_literals`. It stays at 0.0, so the shape scan it would pay for
+is not paid for.
+
+Everything the flag touches is still restorable either way
+(`chronicle_expand`), so this decides what a reader sees without asking, not
+what the store holds. Turned off, compaction cuts exactly as every release up
+to 5.8.35 did.
+
+## Unreleased — the redaction sentinel is Hermes', and the pointer is on
+
+Jared: "`[redacted]` might confuse the system, why don't you just put the
+correct pointer to the secrets system in its place?" Both halves of that are
+right, and the second one has a specific answer in Hermes' own source.
+
+**`[redacted]` was a dialect the host does not speak.** `agent/redact.py`
+already masks to `«redacted-secret»`, `«redacted:ghp_…»` (prefix matched,
+vendor label kept) and `«redacted-vault-secret»`, and its own "already
+masked?" guards test `value.startswith("«redacted")` and `"***" in value`.
+Chronicle's marker matched neither, so a host redaction pass did not recognise
+Chronicle's output as masked and could mask it again. Chronicle had invented a
+second convention where the host had one — the same mistake the spec warned
+about for `secrets/<NAME>`. It now emits the host's.
+
+**The pointer goes INSIDE the sentinel, not in place of the value.** Putting a
+bare `vault_ab12cd34ef56` where the value stood is the shape Hermes
+deliberately rejected, and its docstring for `_mask_token_nonreusable` says
+why: *"an agent once wrote a truncated-looking mask back into a config file"*,
+corrupting the stored credential (issue #35519). A bare pointer reads as a
+usable string; an agent that round-trips a config writes it back over the real
+secret. The sentinel cannot be pasted anywhere and still carries the pointer:
+
+    OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»
+    the Zoom login is vault_ab12cd34ef56 password: «redacted:vault_ab12cd34ef56»
+    token «redacted:ghp_…»          ← vendor label only, Hermes' exact form
+    password: «redacted-secret»     ← nothing in the text to point at
+
+It also makes masking idempotent for free. A bare `vault_ab12cd34ef56` passes
+`_looks_secret` (letters, digits, six characters), so the next fold would
+re-mask Chronicle's own pointer; the guillemets match the existing prefix
+guard and need no special case.
+
+**`credentials.pointers` now defaults to ON**, at Jared's request. Because the
+marker is a stored string and nothing migrates, a store will hold both shapes:
+beliefs folded from now on carry the pointer, and the ones already masked keep
+what they were masked with. That is the expected state, not a bug.
+
+## Unreleased — the handoff was the one surface still carrying a credential
+
+Found by asking what happens when Phase C and Phase E are both on, which is a
+question neither phase's own tests ask.
+
+A tool result that prints `OPENROUTER_API_KEY=…` used to reach the compacted
+window three ways. Two were already handled: a capped tool result is masked
+(`tiers.masked_and_shortened`) and a belief is masked in the fold. The third
+was not — **the compaction handoff, which Chronicle writes itself, carried the
+key in full.**
+
+That is the one that mattered most, and not because the model has not already
+read it. Chronicle writes that line from a span it is folding AWAY, and the
+line survives where the span does not: after a rotation the child session
+carries the handoff and not the turns behind it. An unmasked value there
+outlives the message it came from and travels into a conversation that never
+saw it.
+
+Every handoff line — folded requests and folded steps both — now goes through
+`engine/credentials`. Unconditional, like the other two surfaces: this is not
+an optimisation waiting on a replay, it is the rule they already follow.
+`credentials.pointers` only decides whether the marker also says where the
+value lives, so the handoff reads `OPENROUTER_API_KEY=«redacted-secret»`
+or `OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»`.
+
+What deliberately did NOT change: a tool result that was KEPT keeps what it
+said. That is the transcript, the agent it was given to can still search it,
+and rewriting it is a different decision from masking a line Chronicle
+authored. The test asserts that separation rather than leaving it to a
+comment — after the fix, every message in the window still holding the value
+is a `role: tool` original.
+
+## Unreleased — Phase E: a masked value says where to fetch it
+
+A bare marker is a dead end. An agent that meets one asks the user to type the
+secret again, which is how a secret reaches a transcript twice. Behind
+`credentials.pointers`, **default off**, the marker carries the pointer the
+text was already holding:
+
+    OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»
+    the Zoom login is vault_ab12cd34ef56 password: «redacted:vault_ab12cd34ef56»
+    token «redacted:ghp_…»
+
+**It reads neither the vault nor the environment, and it cannot.** The vault
+(`agent/vault_store.py`) exists precisely so that values never reach a tool
+result, and guessing which vault item a masked string *was* would be inventing
+a reference — which the spec forbade in the same breath as saying the form
+`secrets/<NAME>` was illustrative only. Both mechanisms were read from source
+before any of this was written: the vault takes `login`/`payment`/`address`
+items referenced by an opaque `vault_<12 hex>` id and resolved server-side by
+`resolve_secret()`; provider API keys are **not** vault items, they are
+environment variables from the profile `.env`
+(`agent/credential_persistence.py`).
+
+So all this does is keep what the text said. Nothing it renders is secret: an
+env-var name is not, a vault id is designed to be shown, and `sk-` is a
+vendor's public prefix. A bare `password:` with no variable name behind it
+gets no invented pointer — the sentinel stays bare. Tested end to end
+through a real fold, and tested that no part of a secret survives either way.
+
+Off by default because the marker is a **stored** string: turning it on
+changes the text of every belief folded after it, while the ones already
+masked keep the bare marker. That is a migration to choose, not a default.
+
+One thing it broke and fixed: `_looks_secret` skipped an already-masked value
+by testing `startswith(REDACTED)` — the whole bare sentinel, closing
+delimiter included. With a label the marker is longer, so a second pass
+re-masked its own output and appended a second pointer. It now tests
+the opening delimiter. Masking has to be idempotent; the fold re-runs over beliefs it
+has already masked.
+
+Still not done in this phase, and named rather than glossed: nothing resolves
+a pointer back to a value, and the raw transcript still keeps credential
+values by design — the documented trade-off, worth re-deciding out loud rather
+than inheriting.
+
+## Unreleased — the entity rules were wrong in both directions
+
+Two complaints, both correct, and one of them cannot be fixed by a rule.
+
+**A lower-case handle is a name.** `plausible_name` asks every significant
+word for a capital, which is a rule about sentences ("dead end for getting a
+usable key"), not about handles — so `indigo` and `user` could not be entities
+at all, although the agent's own profile and the default principal are things
+memory is about and both carry facts. A single token with no spaces is not a
+clause, so one is now enough. Measured on the same 1,488-row production table
+the rules were written from: this admits exactly those two rows and no junk,
+because every junk name there is a capitalised pronoun ("This", "There", "It")
+or a sentence, and both are refused before this is reached. 52 names passed;
+54 do. They were in the tests' `PRODUCTION_JUNK_NAMES` list and should not have
+been.
+
+**A category does not begin or end on a particle.** The table holds types that
+ran out of room mid-phrase ("DIFFERENT shape from", "fork PR in"); those are a
+truncated capture. Only the ends are checked — "schedule of inspections" is a
+category and keeps its particle.
+
+**And the part that a rule cannot do, said out loud rather than faked.** Of the
+278 distinct types in that table, 120 passed `plausible_type` and 111 still do;
+`kind_for` recognises **9** of them. The rest are "genuine", "hard", "first",
+"cross", "cutting", "fail" — adjectives and verbs that are exactly the right
+shape for a category and are not one. Separating them needs a lexicon or a
+model, and a hand-written list of adjectives would be the prose rule this
+module exists to replace wearing a different hat. What protects a reader
+instead is already true and is now tested: an unrecognised type classifies
+nothing — `kind_for` answers `""` and the entity is shown under the unknowns.
+
+## Unreleased — Phase C: a folded unit can leave a distilled episode
+
+Phase C wants recall to return one compact episode instead of several raw
+turns. **Production has no such episodes to return**: the live store holds 22
+active ones and every one is the agent's own memory write, because the
+transcript episodes were retracted as junk. So the phase needs a generation
+step before its recall step, and the compaction already writes the text —
+one line per folded unit saying what was called and what came back.
+
+Behind `context_engine.digest_episodes`, **default off**: each folded step's
+line is also kept as an episode (`source_type` `compaction_digest`, its fold
+id as the source event, the session as `session_ref`), at most
+`_DIGEST_EPISODE_CAP` (40) per pass so a thousand-turn compaction cannot
+become a thousand beliefs. Identical work folded twice confirms one episode
+rather than writing a second.
+
+Two rules it keeps, both learned here:
+
+* only a STEP becomes one. 5.8.1 removed digest episodes because the lines
+  being extracted were the user's own requests restated, and the handoff
+  quotes every folded request verbatim already.
+* these describe the AGENT's work, not the user's life, so per-turn recall
+  never injects them unasked (`_NOT_UNASKED` in engine/retrieval.py, beside
+  the agent's own memory writes). Explicit search and the engine's own
+  rehydration still see them — which is the question Phase C's second half
+  ranks.
+
+One thing the first pass got wrong, fixed here: `session_ref` was passed
+alongside the key rather than inside it. It is half an episode's natural key
+(`reducer._natural_key`: title + session_ref), so every digest landed with
+`session_ref` empty — the same line folded in two different conversations
+confirmed ONE episode belonging to neither, and the recall half below had
+nothing to prefer over a session's raw turns.
+
+### The recall half
+
+Behind `retrieval.prefer_digest_episodes`, **also default off**: when a
+distilled episode survives into the Tier-1 block, the raw fill below it caps
+how many of that SAME session's turns it then spends budget on
+(`retrieval.digest_session_excerpts`). Three things it is careful about:
+
+* the cap binds across BOTH raw phases. Capping the ranked fill alone caps
+  nothing — the session-window expansion returns every turn the ranked fill
+  did not carry, so one kept excerpt put the whole session back and the block
+  came within 0.7% of its unpreferred size. (That mistake produced a first set
+  of numbers showing coverage *improving*; they are withdrawn.)
+* a digest that was RANKED but cut by the Tier-1 budget prefers nothing, or
+  the reader loses the episode and its turns both.
+* per-turn recall is untouched. These episodes describe the agent's work, so
+  it never sees them (`_NOT_UNASKED`), so there is never one to prefer.
+
+**Measured, and the phase is not what it was written to be.**
+`deploy570/digest_measure.py`, 5 real transcripts, 40 question/answer pairs,
+budget 1200, offline embedder. "Answer words" is the share of the next
+assistant turn's content words still on the page — scoring the QUESTION's own
+words scores whether the block echoed the question, and the turn holding those
+words is the turn this skips, so that number falls by construction:
+
+      keep   chars     answer words
+         0   -43.1%    -9.1 points
+         1   -34.4%    -7.9
+         2   -25.2%    -3.6
+         4   -14.6%    -1.4
+         6    -5.8%    -0.2
+         8    -4.3%    +0.3   <- default
+        12    -1.8%    +0.3
+
+The large saving eats answers: a distilled line is ~220 characters of what was
+called and what came back, and below about six kept turns it is replacing
+turns that held the answer. The default is the most it saves for free, which
+is 4.3% — real, small, and not the win the phase was written for. Both flags
+therefore stay off, and this is the number a later run has to beat.
+
+Two things the harness had to fix before it could measure anything, both of
+which apply to the Phase B and D harnesses beside it:
+
+* **the role is in the excerpt, not in `actor`.** A session_transcript capture
+  writes every observed event with `actor='user'` (41,495 against 12,158
+  `agent` on the August copy) and puts the real role in the text
+  (`assistant: …`, `tool: …`). Rebuilding a session from `actor` hands the
+  compressor a conversation of pure requests, no folded unit is ever a step,
+  and the generation half cannot fire at all. `bench.py` and `tier_measure.py`
+  both rebuild from `actor`.
+* **the production copy cannot support this measurement.** Even with roles
+  restored, 13 non-cron sessions on it reach 25 observed events and exactly
+  ONE usable user question survives across all of them. The corpus used
+  instead is a directory of real Claude Code transcripts — real conversations,
+  real questions, real tool calls, i.e. the message shape a live compaction
+  sees — and it is NOT Hermes sessions: a different agent, and engineering
+  work rather than this user's life. Labelled as such wherever it is reported.
+  The two sessions being written while the measurement ran were excluded.
+
+## Unreleased — Phase D: a standing local benchmark
+
+`deploy570/bench.py` (outside the repo, with the other harnesses) runs the
+provider and the compaction against a COPY of the production store and writes
+one JSON record: recall (items, characters, seconds, how many one-word and
+few-word matches the floors judged), compaction (tokens in/out, messages,
+seconds, exact literals still on the page, restorability), and the shared
+score's distribution over a fixed sample. Pass a previous record and it prints
+the deltas, so a change has to say what it did to the numbers before it earns
+a default.
+
+Two baselines are kept. Offline, against the August store copy
+(`deploy570/bench_baseline.json`): 34 messages -> 246 items / 93,149
+characters; 93,473 -> 29,595 tokens with 278 of 1,497 literals. Against the
+live store, read-only, with the profile's own embedder and each message's own
+session excluded as a real turn would
+(`deploy570/bench_live_baseline.json`): 34 messages -> 27 items / 28,064
+characters in 6.6 s, with the similarity floors doing their work (28 one-word
+and 52 few-word checks, 984 gate drops); two real sessions 137,764 -> 56,839
+tokens, keeping 701 of 2,006 exact literals (34.9%) in 0.54 s.
+
+The two differ by four times on recall because the copy is a pre-cleanup
+snapshot: it still holds 67,685 active episodes and 30,018 notes that
+production has since retracted, most of them the phantom directives the
+speaker-attribution fix removed. Offline runs are for comparing a change
+against the previous offline run; the live figures are the ones that describe
+production, and `CHRONICLE_BENCH_PROFILE` is what turns the real embedder on.
+
+## Unreleased — Phase B: what may be summarised, and what only pointed at
+
+**A cut for budget no longer spends itself on the prose.** Compaction's one
+lossy step shortens a span that will not fit and leaves the id that restores
+it; cutting the head keeps whatever happens to be first, which on these
+transcripts is the sentence introducing the work, while the port number, the
+path, the container id and the failing command sit further in and go.
+`engine/tiers.py` classifies by shape — involatile (exact literals), critical,
+context, pointer — and spends the same budget on the literals first, in the
+cut path and in the handoff's step lines. A credential is the one literal that
+does not survive: engine/credentials.py masks it first.
+
+Behind `context_engine.keep_literals`, **default off**, and
+`keep_weights.involatile`, **default 0.0**: with both at their defaults the
+compaction is byte-for-byte what 5.8.35 produced (full gate, four modes).
+
+Measured, not assumed. Replaying the largest real session out of a copy of the
+production store (124 messages, 93,473 → ~29,600 tokens):
+
+* literal-first cutting keeps **289 of 1,497 exact literals against 278**
+  (19.3% vs 18.6%) at the same budget — +11, about 4% more;
+* the `involatile` keep-weight changed **nothing at any value** (0.15 to 0.9),
+  because 100 of 101 middle units on this corpus contain a literal: presence
+  is not scarce enough to rank by, so a flat bump lifts everything;
+* what the handoff can carry is the real ceiling: 25 step lines at 220
+  characters, holding 285 of the 289 surviving literals.
+
+Re-measured afterwards against the LIVE store (read-only), where only two
+genuine sessions still hold enough turns to compact: 484 of 1,750 literals
+against 473 (27.7% vs 27.0%), tokens slightly lower (55,311 vs 55,668). One of
+those sessions gains 11 literals and the other is unchanged.
+
+A third session did gain 9 points (83.1% → 92.1%) — but it is one of the
+scratch sessions a harness leaked into the store on 2026-09-18, a copy of a
+real transcript rather than a real one, so it is excluded from the figures
+above. It does show the mechanism bites when messages are moderate-sized
+rather than thousands of characters each.
+
+So the flag stays off: under a point of aggregate gain is not a win worth
+defaulting. The lever this measurement points at is not the cut but the
+handoff's room and how densely a folded unit's literals are packed into its
+line.
+
+## Unreleased — Phase A: one importance model
+
+**Recall and compaction score importance with one model.** The per-turn recall
+gate (a message's content words, how many an item must share, when an
+inflection counts) and the context engine's keep/evict score (recency, focus
+match, salience and criticality keywords) were separate implementations of the
+same question, with nothing to make them agree: a rule fixed on one side — a
+URL's pieces are not content words, a short number is not either — had to be
+remembered on the other. Both now call `engine/salience.py`, which also offers
+the score over any unit (`Unit`, `rank`) so a turn, an episode and a memory can
+be ordered the same way.
+
+A pure extraction, moved verbatim. Accepted by replaying 34 real messages out
+of a copy of the production store through both checkouts: recall blocks
+byte-identical (93,149 characters), all 204 keep scores identical, full gate
+green in four modes. `tests/test_salience_parity.py` pins the values and the
+wiring (the names retrieval exports must BE salience's, and the engine must
+call `keep_score` rather than re-implement it).
+
+Not deployed: this track is local-only by the build spec.
+
 ## 5.8.35
 
 **The Hermes plugin security scan passes, on Chronicle's own files.** The

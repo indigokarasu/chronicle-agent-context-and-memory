@@ -61,7 +61,7 @@ def _reference_inflects(a, b):
 
 def _reference_shares(words, text):
     """shares_content_word without the probe regex: every token, every word."""
-    from engine.retrieval import _gate_stem, _gate_words
+    from engine.salience import _gate_stem, _gate_words
     if not words:
         return False
     for t in map(_gate_stem, _gate_words(text)):
