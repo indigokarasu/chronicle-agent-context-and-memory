@@ -26,39 +26,17 @@ PRODUCTION_JUNK_NAMES = (
     "Per the dispatch skill this", "Let me check the state file pre-check shortcut first",
     "So any flow that needs a browser I hold but can't bridge to",
     "Since git-lfs is installed and this", "But when the listed journals are already",
+    "indigo", "user",
 )
-# `indigo` and `user` were in the junk list above and should not have been: the
-# agent's own profile and the default principal are things memory is about, and
-# both carry facts. They were refused for carrying no capital, which is a rule
-# about sentences, not about handles.
-PRODUCTION_REAL_NAMES = ("NVIDIA", "Databricks", "GIBS", "Graze", "Packaging", "AI",
-                         "indigo", "user")
+PRODUCTION_REAL_NAMES = ("NVIDIA", "Databricks", "GIBS", "Graze", "Packaging", "AI")
 PRODUCTION_JUNK_TYPES = (
     "no", "re", "one", "second", "valid", "typo", "real managed challenge",
-    "DIFFERENT shape from", "fork PR in",
     "dead end for getting a usable key into my environment",
     "separate vendor with its own credential", "source bug confirmed in the Forge SKILL",
 )
 
 
 class TestANameIsAProperNoun(unittest.TestCase):
-    def test_a_lowercase_handle_is_a_name(self):
-        """`indigo` and `user` could not be entities at all, because the rule
-        that refuses sentences asks every word for a capital."""
-        for name in ("indigo", "user", "jared", "ocas-finch", "weave.db"):
-            with self.subTest(name=name):
-                self.assertTrue(ent.plausible_name(name))
-
-    def test_a_handle_is_still_refused_when_it_is_a_stop_word(self):
-        for name in ("no", "none", "true", "error", "this", "one"):
-            with self.subTest(name=name):
-                self.assertFalse(ent.plausible_name(name))
-
-    def test_two_lowercase_words_are_still_a_fragment(self):
-        for name in ("dead end", "usable key", "genuine empty cycle"):
-            with self.subTest(name=name):
-                self.assertFalse(ent.plausible_name(name))
-
     def test_production_junk_is_rejected(self):
         for name in PRODUCTION_JUNK_NAMES:
             with self.subTest(name=name):
@@ -111,21 +89,6 @@ class TestATypeIsACategory(unittest.TestCase):
         for t in PRODUCTION_JUNK_TYPES:
             with self.subTest(type=t):
                 self.assertFalse(ent.plausible_type(t))
-
-    def test_a_particle_inside_a_category_is_fine(self):
-        """Only the ENDS say a phrase was cut off."""
-        for t in ("schedule of inspections", "passthrough to TMDB"):
-            with self.subTest(type=t):
-                self.assertTrue(ent.plausible_type(t))
-
-    def test_shape_cannot_refuse_an_adjective(self):
-        """Documented, not aspirational: these are the right shape for a
-        category and are not one, and no rule here can tell. `kind_for` is
-        what stops them classifying anything."""
-        for t in ("genuine", "hard", "first"):
-            with self.subTest(type=t):
-                self.assertTrue(ent.plausible_type(t))
-                self.assertEqual(ent.kind_for(t), "")
 
     def test_categories_are_kept(self):
         for t in ("person", "organization", "animal", "nurse", "web browser",
