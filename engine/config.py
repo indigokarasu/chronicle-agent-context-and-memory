@@ -1362,7 +1362,43 @@ DEFAULTS: dict[str, Any] = {
         # which is what every release up to 5.8.35 kept. The whole span is
         # restorable either way (chronicle_expand), so this only decides what a
         # reader sees without asking.
-        "keep_literals": False,
+        #
+        # ON as of 2026-09-19, and the second attempt at that, which is the
+        # part worth reading.
+        #
+        # The first attempt turned it on off the back of tier_measure numbers
+        # (+18% relative literals kept, same budget) and the full gate refused
+        # it: four tests failed, and they were right. `shorten_keeping_literals`
+        # kept the literals and DROPPED THE REST OF THE BUDGET rather than
+        # filling it -- on "turn 10 about the Zorblax rota " plus 600
+        # characters of prose, a 400-character cap came back as `turn 10 …`,
+        # nine characters. So that +18% was an artifact of my own measurement:
+        # squeezing every message to a skeleton leaves room for MORE messages,
+        # each contributing its literals, and the ratio rises while the page
+        # loses the prose. The harness counted literals and tokens and never
+        # asked whether anything readable survived.
+        #
+        # engine/tiers.py now fills the cap it was given. Re-measured over
+        # 3,000 real spans, which is the check that should have come first:
+        #
+        #   cap 220   98.1% of the budget spent   exact literals +117%
+        #   cap 400   92.2%                                       +81%
+        #   cap 900   75.4%                                       +48%
+        #
+        # and on whole sessions at the production policy, same budget:
+        #
+        #   chronicle copy (3 sessions)   38.0% -> 45.8%   out tokens -110
+        #   transcripts    (5 sessions)    1.8% ->  2.1%   out tokens    0
+        #
+        # Measured with `keep_weights.involatile` at 0.0, i.e. this flag ALONE:
+        # re-run at 0.25 the figures are byte-identical, so the weight
+        # contributes nothing and stays off rather than paying for its scan.
+        #
+        # KNOWN RESIDUAL: at a generous cap the fill still leaves ~25% unspent
+        # (the 900 row). Worth chasing; not a reason to keep the flag off,
+        # since the alternative spends that budget on prose the head cut was
+        # keeping anyway.
+        "keep_literals": True,
         # Phase C: keep the line each folded unit leaves in the handoff as an
         # EPISODE, so recall can later return one distilled unit instead of the
         # several raw turns it stands for. Off by default; these describe the

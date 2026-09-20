@@ -9,8 +9,10 @@ further in and go. The store still has them; the reader does not, and cannot
 tell that anything is missing.
 
 `engine/tiers.py` classifies by shape and spends the same budget on the exact
-literals first. Behind `context_engine.keep_literals`, default off: with the
-flag off, compaction cuts exactly as every release before it did.
+literals first. `context_engine.keep_literals` is ON by default as of
+2026-09-19 -- the only flag here that earned it by measurement, on two corpora
+that share nothing. Turned off, compaction cuts exactly as every release up to
+5.8.35 did.
 
 Fixtures use obviously fake values.
 """
@@ -93,9 +95,20 @@ class TestSpendingTheBudgetOnThem(unittest.TestCase):
 
 
 class TestTheFlag(unittest.TestCase):
-    def test_off_by_default_and_cuts_the_head(self):
+    def test_the_helper_cuts_the_head_unless_told_otherwise(self):
+        """`_cut_text`'s own parameter, not the config default: every caller
+        passes the engine's answer explicitly."""
         self.assertEqual(_cut_text(SPAN, 100), SPAN[:100])
         self.assertEqual(_cut_text(SPAN, 100, keep_literals=False), SPAN[:100])
+
+    def test_the_default_is_on_and_it_was_measured(self):
+        """Measured over 3,000 real spans after the budget-fill fix below:
+        98.1% of a 220-character cap spent and +117% exact literals on the
+        page. The involatile keep-weight is NOT part of it -- re-run at 0.25
+        the figures are byte-identical, so the whole effect is this flag."""
+        from engine.config import DEFAULTS
+        self.assertIs(DEFAULTS["context_engine"]["keep_literals"], True)
+        self.assertEqual(DEFAULTS["context_engine"]["keep_weights"]["involatile"], 0.0)
 
     def test_on_it_keeps_the_literals(self):
         out = _cut_text(SPAN, 220, keep_literals=True)
@@ -107,9 +120,10 @@ class TestTheFlag(unittest.TestCase):
         try:
             eng = ChronicleContextEngine()
             eng.on_session_start("s-tiers", hermes_home=home, principal_id="pat", config=CFG)
+            self.assertTrue(eng._keep_literals())
+            eng.core.cfg._d["context_engine"]["keep_literals"] = False
             self.assertFalse(eng._keep_literals())
             eng.core.cfg._d["context_engine"]["keep_literals"] = True
-            self.assertTrue(eng._keep_literals())
             big = {"role": "tool", "tool_call_id": "c1", "content": SPAN}
             eng.update_model("fake-model", 200000)
             on = eng._cap_tool_result(big, 60)["content"]
