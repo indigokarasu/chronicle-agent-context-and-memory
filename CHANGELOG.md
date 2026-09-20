@@ -3,6 +3,37 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — the entity rules were wrong in both directions
+
+Two complaints, both correct, and one of them cannot be fixed by a rule.
+
+**A lower-case handle is a name.** `plausible_name` asks every significant
+word for a capital, which is a rule about sentences ("dead end for getting a
+usable key"), not about handles — so `indigo` and `user` could not be entities
+at all, although the agent's own profile and the default principal are things
+memory is about and both carry facts. A single token with no spaces is not a
+clause, so one is now enough. Measured on the same 1,488-row production table
+the rules were written from: this admits exactly those two rows and no junk,
+because every junk name there is a capitalised pronoun ("This", "There", "It")
+or a sentence, and both are refused before this is reached. 52 names passed;
+54 do. They were in the tests' `PRODUCTION_JUNK_NAMES` list and should not have
+been.
+
+**A category does not begin or end on a particle.** The table holds types that
+ran out of room mid-phrase ("DIFFERENT shape from", "fork PR in"); those are a
+truncated capture. Only the ends are checked — "schedule of inspections" is a
+category and keeps its particle.
+
+**And the part that a rule cannot do, said out loud rather than faked.** Of the
+278 distinct types in that table, 120 passed `plausible_type` and 111 still do;
+`kind_for` recognises **9** of them. The rest are "genuine", "hard", "first",
+"cross", "cutting", "fail" — adjectives and verbs that are exactly the right
+shape for a category and are not one. Separating them needs a lexicon or a
+model, and a hand-written list of adjectives would be the prose rule this
+module exists to replace wearing a different hat. What protects a reader
+instead is already true and is now tested: an unrecognised type classifies
+nothing — `kind_for` answers `""` and the entity is shown under the unknowns.
+
 ## Unreleased — Phase C: a folded unit can leave a distilled episode
 
 Phase C wants recall to return one compact episode instead of several raw
