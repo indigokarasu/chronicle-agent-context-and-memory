@@ -265,5 +265,94 @@ class TestThePointerThroughTheFold(unittest.TestCase):
                     self.assertNotIn(secret, body)
 
 
+class TestTheHandoffChronicleWrites(unittest.TestCase):
+    """The compaction handoff is the one surface Chronicle AUTHORS.
+
+    A tool result that was kept keeps whatever it said: that is the
+    transcript, and the model has already read it. The handoff is different.
+    Chronicle writes it from a span it is folding AWAY, and it survives where
+    the span does not -- after a rotation the child session carries the
+    handoff and not the turns behind it, so a value left here outlives the
+    message it came from and travels into a conversation that never saw it.
+
+    Measured before this was fixed: the capped tool result was masked, the
+    belief was masked, and the handoff carried the key in full.
+
+    Fixtures use an obviously fake key.
+    """
+
+    SECRET = "sk-or-v1-abcdef0123456789abcdef0123456789"
+
+    def session(self, n=30):
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(n):
+            msgs.append({"role": "user",
+                         "content": "turn %d: check the Zorblax ledger %s" % (i, "detail " * 30)})
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c%d" % i, "type": "function",
+                 "function": {"name": "terminal", "arguments": '{"command": "env | grep OPENROUTER"}'}}]})
+            msgs.append({"role": "tool", "tool_call_id": "c%d" % i,
+                         "content": "OPENROUTER_API_KEY=%s %s" % (self.SECRET, "row " * 40)})
+            msgs.append({"role": "assistant",
+                         "content": "ledger %d reconciled %s" % (i, "note " * 30)})
+        return msgs
+
+    def compacted(self, pointers):
+        from context import ChronicleContextEngine
+        home = temp_home(prefix="handcred_")
+        try:
+            eng = ChronicleContextEngine()
+            eng.on_session_start("20260919_180000_hc%d" % pointers, hermes_home=home,
+                                 principal_id="default",
+                                 config={"embeddings": {"model": "hashing"},
+                                         "curation": {"drain": {"per_turn": 0, "background": False}},
+                                         "credentials": {"pointers": pointers},
+                                         "context_engine": {"digest_episodes": True}})
+            eng.update_model("fake-model", 4000)
+            out = eng.compress(self.session())
+            eng.core.process_pending()
+            eps = [r[0] for r in eng.core.store._conn().execute(
+                "SELECT summary FROM episodes WHERE status='active'")]
+            return out, eps
+        finally:
+            ChronicleCore._instances.pop(home, None)
+            shutil.rmtree(home, ignore_errors=True)
+
+    def handoff(self, out):
+        for m in out:
+            if "CONTEXT COMPACTION" in (m.get("content") or ""):
+                return m["content"]
+        self.fail("this fixture did not compact: there is no handoff to check")
+
+    def test_the_handoff_names_the_call_without_the_value(self):
+        for pointers in (False, True):
+            with self.subTest(pointers=pointers):
+                out, _eps = self.compacted(pointers)
+                hand = self.handoff(out)
+                self.assertIn("OPENROUTER_API_KEY=", hand)   # the reader still learns what ran
+                self.assertNotIn(self.SECRET, hand)
+
+    def test_with_pointers_the_handoff_says_where_it_lives(self):
+        out, _eps = self.compacted(True)
+        self.assertIn("[redacted env:OPENROUTER_API_KEY]", self.handoff(out))
+
+    def test_a_distilled_episode_never_carries_it(self):
+        for pointers in (False, True):
+            with self.subTest(pointers=pointers):
+                _out, eps = self.compacted(pointers)
+                self.assertTrue(any("OPENROUTER" in e for e in eps), "fixture wrote no digest")
+                for e in eps:
+                    self.assertNotIn(self.SECRET, e)
+
+    def test_a_kept_tool_result_still_says_what_it_said(self):
+        """The transcript is not rewritten. What this class protects is the
+        line Chronicle writes, not the turns it left alone."""
+        out, _eps = self.compacted(False)
+        carriers = [m for m in out if self.SECRET in (m.get("content") or "")]
+        self.assertTrue(carriers, "the fixture kept no tool result verbatim")
+        self.assertTrue(all(m.get("role") == "tool" for m in carriers),
+                        [m.get("role") for m in carriers])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,6 +65,11 @@ try:  # the one importance model recall and compaction share (Phase A) …
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
     from engine import salience as _salience
 
+try:  # credential values, for the one surface compaction AUTHORS …
+    from .engine import credentials as _cred  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import credentials as _cred
+
 try:  # one rule for the TEXT of a message, shared with capture …
     from .engine.speaker import message_text  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -1190,7 +1195,7 @@ class ChronicleContextEngine(ContextEngine):
         if len(msgs) == 1 and msgs[0].get("role") == "user":
             said = self._human_texts(msgs)
             if said:
-                self._handoff_asks.append("%s %s" % (ref, said[0]))
+                self._handoff_asks.append(self._handoff_safe("%s %s" % (ref, said[0])))
             return
         first = msgs[0]
         if first.get("role") == "assistant" and first.get("tool_calls"):
@@ -1206,15 +1211,37 @@ class ChronicleContextEngine(ContextEngine):
                 line = _one_line(said, 120, keep) + " — " + line
             if results:
                 line += " → " + " | ".join(r for r in results if r)
-            step = _one_line(line, 360, keep)
+            step = self._handoff_safe(_one_line(line, 360, keep))
             self._handoff_steps.append("%s %s" % (ref, step))
             self._keep_digest_episode(ref, step)
             return
         role = first.get("role") or "?"
-        body = _one_line(_text(first), 220, keep)
+        body = self._handoff_safe(_one_line(_text(first), 220, keep))
         if body:
             self._handoff_steps.append("%s %s: %s" % (ref, role, body))
             self._keep_digest_episode(ref, "%s: %s" % (role, body))
+
+    def _handoff_safe(self, text: str) -> str:
+        """A handoff line with any credential value masked.
+
+        THE HANDOFF IS THE ONE SURFACE CHRONICLE AUTHORS. A tool result that
+        was kept keeps whatever it said -- that is the transcript, and the
+        model has already read it. This line is different: Chronicle writes it
+        from a span it is FOLDING AWAY, and it survives where the span does
+        not. After a rotation the child session carries the handoff and not
+        the turns behind it, so an unmasked value here outlives the message it
+        came from and travels into a conversation that never saw it.
+
+        Measured on a fixture whose tool result printed an
+        `OPENROUTER_API_KEY=`: the capped tool result was masked (tiers), the
+        belief was masked (the fold), and the handoff carried the key in full.
+
+        Unconditional, like the other two: this is not an optimisation waiting
+        on a replay, it is the same rule those surfaces already follow.
+        `credentials.pointers` only decides whether the marker also says where
+        the value lives."""
+        return _cred.redact(text or "", bool(
+            self.core and self.core.cfg.get("credentials.pointers", False)))
 
     def _keep_digest_episode(self, ref: str, line: str) -> None:
         """Phase C: keep the line a folded unit leaves in the handoff as an
