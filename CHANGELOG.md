@@ -3,6 +3,38 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — the handoff was the one surface still carrying a credential
+
+Found by asking what happens when Phase C and Phase E are both on, which is a
+question neither phase's own tests ask.
+
+A tool result that prints `OPENROUTER_API_KEY=…` used to reach the compacted
+window three ways. Two were already handled: a capped tool result is masked
+(`tiers.masked_and_shortened`) and a belief is masked in the fold. The third
+was not — **the compaction handoff, which Chronicle writes itself, carried the
+key in full.**
+
+That is the one that mattered most, and not because the model has not already
+read it. Chronicle writes that line from a span it is folding AWAY, and the
+line survives where the span does not: after a rotation the child session
+carries the handoff and not the turns behind it. An unmasked value there
+outlives the message it came from and travels into a conversation that never
+saw it.
+
+Every handoff line — folded requests and folded steps both — now goes through
+`engine/credentials`. Unconditional, like the other two surfaces: this is not
+an optimisation waiting on a replay, it is the rule they already follow.
+`credentials.pointers` only decides whether the marker also says where the
+value lives, so the handoff reads `OPENROUTER_API_KEY=[redacted]` or
+`OPENROUTER_API_KEY=[redacted env:OPENROUTER_API_KEY]`.
+
+What deliberately did NOT change: a tool result that was KEPT keeps what it
+said. That is the transcript, the agent it was given to can still search it,
+and rewriting it is a different decision from masking a line Chronicle
+authored. The test asserts that separation rather than leaving it to a
+comment — after the fix, every message in the window still holding the value
+is a `role: tool` original.
+
 ## Unreleased — Phase E: a masked value says where to fetch it
 
 `[redacted]` is a dead end. An agent that meets one asks the user to type the
