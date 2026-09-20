@@ -335,6 +335,9 @@ def _cut_text(text: str, chars: int, keep_literals: bool = False) -> str:
     return _tiers.shorten_keeping_literals(text, chars) if keep_literals else text[:chars]
 
 
+# Phase C: how many distilled episodes one compaction may write.
+_DIGEST_EPISODE_CAP = 40
+
 _SALIENCE_RX = _salience._SALIENCE_RX
 _CRITICALITY_RX = _salience._CRITICALITY_RX
 
@@ -434,6 +437,7 @@ class ChronicleContextEngine(ContextEngine):
         # The compaction handoff (see _HANDOFF_PREFIX): folded user requests and
         # one line per folded step, oldest first, accumulated over the session.
         self._handoff_asks: list[str] = []
+        self._digests_written = 0            # Phase C: bounded per pass
         self._handoff_steps: list[str] = []
         self.last_pass = ""             # "extend" | "rebase", for the last compress()
         # -- pressure warning state (§R9) ----------------------------------
@@ -949,6 +953,7 @@ class ChronicleContextEngine(ContextEngine):
         # first, then the head -- whole tool units or none of one -- and a span
         # shortened to fit says so and stays recoverable.
         keep_literals = self._keep_literals()
+        self._digests_written = 0
         fitted, used_req, dropped_req = self._fit_required(
             fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units,
             keep_literals)
@@ -1172,9 +1177,9 @@ class ChronicleContextEngine(ContextEngine):
         return out
 
     def _note_folded_unit(self, msgs, span_ids) -> None:
-        keep = self._keep_literals()
         """Record one folded unit for the handoff: a user request verbatim
         (its framing removed), or one line saying what the step did."""
+        keep = self._keep_literals()
         # The unit is named by a span that has content to restore -- a call
         # with no text of its own hashes like every other one -- preferring
         # the first result, which is what a later chronicle_expand wants.
@@ -1201,12 +1206,61 @@ class ChronicleContextEngine(ContextEngine):
                 line = _one_line(said, 120, keep) + " — " + line
             if results:
                 line += " → " + " | ".join(r for r in results if r)
-            self._handoff_steps.append("%s %s" % (ref, _one_line(line, 360, keep)))
+            step = _one_line(line, 360, keep)
+            self._handoff_steps.append("%s %s" % (ref, step))
+            self._keep_digest_episode(ref, step)
             return
         role = first.get("role") or "?"
         body = _one_line(_text(first), 220, keep)
         if body:
             self._handoff_steps.append("%s %s: %s" % (ref, role, body))
+            self._keep_digest_episode(ref, "%s: %s" % (role, body))
+
+    def _keep_digest_episode(self, ref: str, line: str) -> None:
+        """Phase C: keep the line a folded unit leaves in the handoff as an
+        EPISODE, so later recall can return one distilled unit instead of the
+        several raw turns it stands for.
+
+        Off by default (`context_engine.digest_episodes`). Two things it is
+        careful about, both learned the hard way:
+
+        * only a STEP becomes one. 5.8.1 removed digest episodes because the
+          checkpoint digest's lines were the user's own requests restated, and
+          the handoff already quotes every folded request verbatim.
+        * it is not memory about the USER. These describe the agent's own
+          work, so retrieval leaves them out of what it injects unasked
+          (_NOT_UNASKED) and they are reached by explicit search and by the
+          engine's own rehydration -- which is what Phase C wants to rank.
+
+        Bounded: a pass writes at most `_DIGEST_EPISODE_CAP` of them, so a
+        compaction of a thousand-turn session cannot turn into a thousand
+        beliefs.
+        """
+        if not (self.core and self.core.cfg.get("context_engine.digest_episodes", False)):
+            return
+        text = (line or "").strip()
+        if len(text) < 40 or self._digests_written >= _DIGEST_EPISODE_CAP:
+            return
+        span = _FOLD_REF.match(ref or "")
+        self._digests_written += 1
+        try:
+            self.core.capture.append("asserted", {
+                "kind": "episode",
+                # session_ref belongs INSIDE the key: it is half an episode's
+                # natural key (reducer._natural_key: title + session_ref) and
+                # the only column that says which conversation this distilled.
+                # Passed alongside the key instead, both are lost -- the row
+                # lands with session_ref '', so the same line folded in two
+                # different sessions confirms ONE episode belonging to neither,
+                # and the recall half has nothing to prefer over that session's
+                # raw excerpts.
+                "key": {"title": _one_line(text, 60), "session_ref": self._session_id},
+                "body": text, "confidence": 0.9,
+                "source_event": span.group(1) if span else "compaction",
+                "source_type": "compaction_digest",
+            }, actor="agent", owner=self._principal_id, trust_level=3)
+        except Exception as e:  # noqa: BLE001 -- a digest may never break a compaction
+            logger.debug("chronicle: digest episode skipped: %s", e)
 
     def _render_handoff(self, room: int, asks_in: list, steps_in: list, known_in: list,
                         extra: list, warn) -> str:

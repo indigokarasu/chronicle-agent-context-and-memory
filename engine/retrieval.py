@@ -359,6 +359,13 @@ def _parse_time_window(text, now=None):
 # user's are kept distinct. Explicit search still finds them.
 _AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
 
+# Never injected unasked, for the same reason: not memory about the USER. The
+# agent's own memory writes, and (Phase C) the lines a compaction distilled
+# from its own work -- those are kept as episodes so explicit search and the
+# engine's own rehydration can return one distilled unit instead of several
+# raw turns, which is a different question from "what is this message about".
+_NOT_UNASKED = _AGENT_OWN_SOURCES | {"compaction_digest"}
+
 _GATE_EMBED_TIMEOUT = 1.0
 _GATE_EMBED_BUDGET = 1.5
 _GATE_EMBED_ITEM_CHARS = 240
@@ -2930,7 +2937,7 @@ class RetrievalEngine:
                 if eid not in metas:
                     metas[eid] = self._event_meta(eid)
                 meta = metas[eid]
-            if meta.get("source_type") in _AGENT_OWN_SOURCES:
+            if meta.get("source_type") in _NOT_UNASKED:
                 gate_drop["excerpts"] += 1
                 return None
             later_chunk = (meta.get("source_type") == "session_transcript"
@@ -3187,11 +3194,26 @@ class RetrievalEngine:
         # of a reader whose whole job is to notice what the user likes.
         tier1_chars = 0
         shown_beliefs: set = set()           # a belief goes into the block once
+        # Phase C: sessions already represented by a distilled episode ON THE
+        # PAGE. Filled only when the flag is on, and only by episodes that
+        # actually survived the budget below -- a session whose digest was
+        # ranked but cut must still get its raw turns, or preferring the
+        # episode would cost the reader both.
+        prefer_digests = bool(self.cfg is not None
+                              and self.cfg.get("retrieval.prefer_digest_episodes", False))
+        # How many of a digested session's own turns may still be kept beside
+        # its distilled line. 0 is the whole saving and the whole risk: the
+        # line is ~220 characters of what was called and what came back, and
+        # measured on real transcripts (deploy570/digest_measure.py) skipping
+        # every turn costs 9 points of answer-word coverage for 43% fewer
+        # characters. A small number buys most of the saving back cheaper.
+        digest_keep = _clamp_cfg(self.cfg, "retrieval.digest_session_excerpts", 0, 0, 20)
+        digested_sessions: set = set()
         for b in ([] if precision or pref_pack else
                   self.search(hint, limit=10, purpose=purpose, principal=principal, now=now,
                               fts_match=fts_match, lexical_only=lexical)):
             if gate is not None:
-                if b.get("source_type") in _AGENT_OWN_SOURCES:
+                if b.get("source_type") in _NOT_UNASKED:
                     gate_drop["beliefs"] += 1
                     continue
                 if not _relevant(self._gate_text(b), "beliefs", ("belief", b.get("belief_id"), b.get("kind"))):
@@ -3239,6 +3261,17 @@ class RetrievalEngine:
             parts.append(line)
             shown_beliefs.add(b.get("belief_id"))
             tier1_chars += len(line) + 1
+            if (prefer_digests and b.get("kind") == "episode"
+                    and b.get("source_type") == "compaction_digest"):
+                # Read on the spot rather than carried on every ranked belief:
+                # this dict is a dumped read surface (tests/a1b_surface_dump.py
+                # hashes it), and one more key on every belief of every table
+                # would change it for a field only episodes have and only this
+                # flag reads. One indexed lookup, and only when the flag is on
+                # and the belief is a digest, which is rare by construction.
+                row = self.store.get_belief("episodes", b.get("belief_id")) or {}
+                if row.get("session_ref"):
+                    digested_sessions.add(row["session_ref"])
         ctx = "\n".join(_dedupe(parts))
 
         # Fill remaining budget with raw evidence grouped BY SESSION and headed
@@ -3253,6 +3286,7 @@ class RetrievalEngine:
             remaining_chars = max_chars - used_chars
             groups: list[dict] = []          # insertion order = relevance order
             by_sid: dict[str, dict] = {}
+            digest_kept: dict = {}           # digested session -> turns kept anyway
             seen_excerpts = set()
             # F1: the identity half of "context already carries this turn". See
             # `_expand_session_window`'s `existing_event_ids`.
@@ -3294,6 +3328,18 @@ class RetrievalEngine:
                     ev = self.store.get_event(eid) or {}
                     sid = ev.get("session_id") or "(no session)"
                     date = (ev.get("occurred_at") or "")[:16]
+                if sid in digested_sessions:
+                    # Phase C: a distilled episode for this session is already
+                    # on the page above, so its turns are what that line was
+                    # distilled FROM -- one compact unit instead of the several
+                    # it stands for. Whatever is skipped here stays reachable
+                    # by chronicle_expand and by an explicit search for it.
+                    kept = digest_kept.get(sid, 0)
+                    if kept >= digest_keep:
+                        self.last_context_debug["digest_preferred"] = \
+                            self.last_context_debug.get("digest_preferred", 0) + 1
+                        continue
+                    digest_kept[sid] = kept + 1
                 if live_session and sid == live_session and not _folded_copy(ev):
                     # Per-turn recall of the conversation in progress: the model
                     # already has these turns -- except what a compaction folded
@@ -3521,9 +3567,20 @@ class RetrievalEngine:
                     sid = g["sid"]
                     if sid == "(no session)":
                         continue
+                    # Phase C: a session standing behind a distilled line is
+                    # capped ACROSS BOTH PHASES. Capping phase 1 alone caps
+                    # nothing -- this expansion returns every turn phase 1 did
+                    # not carry, so one kept excerpt is enough to put the whole
+                    # session back on the page (measured: the block came back
+                    # to within 0.7% of its unpreferred size).
+                    window = max_events
+                    if sid in digested_sessions:
+                        window = digest_keep - digest_kept.get(sid, 0)
+                        if window <= 0:
+                            continue
                     # One query, capped in SQL (see _expand_session_window).
                     expanded = self._expand_session_window(
-                        sid, principal, seen_excerpts, limit=max_events,
+                        sid, principal, seen_excerpts, limit=window,
                         only_folded=bool(live_session) and sid == live_session,
                         # E12: grounding means the turns AROUND the evidence,
                         # interleaved with this session's other ranked hits.

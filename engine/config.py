@@ -732,6 +732,51 @@ DEFAULTS: dict[str, Any] = {
         # consulted on the write path, so raising/lowering it changes nothing
         # about what gets stored.
         "support_threshold": 0.55,
+        # Phase C, recall half. A compaction can leave one distilled line per
+        # folded unit behind as an episode (`context_engine.digest_episodes`).
+        # When one of those ranks into the Tier-1 block, this makes the raw
+        # fill below it skip the SAME session's individual turns -- one compact
+        # unit instead of the several it stands for. Off by default, and inert
+        # unless the generation flag has been on: with no `compaction_digest`
+        # episode in the store nothing is ever preferred. Per-turn recall is
+        # untouched either way (those episodes are `_NOT_UNASKED`).
+        #
+        # The trade it makes is real and is why it stays off until measured:
+        # the distilled line is ~220 characters of what was called and what
+        # came back, and the turns it replaces may hold the answer it left out.
+        # Measure with deploy570/bench.py against bench_live_baseline.json --
+        # characters should fall; the query words covered must not.
+        "prefer_digest_episodes": False,
+        # How many of a digested session's own turns may still be kept beside
+        # its distilled line when the flag above is on. The cap binds across
+        # BOTH raw phases -- the ranked fill and the session-window expansion.
+        # Capping the first alone caps nothing: the expansion returns every
+        # turn the first did not carry, so one kept excerpt put the whole
+        # session back and the block came within 0.7% of its unpreferred size.
+        #
+        # MEASURED, and the trade is monotone. deploy570/digest_measure.py,
+        # 5 real transcripts, 40 question/answer pairs, budget 1200, offline
+        # embedder; "answer words" is the share of the NEXT assistant turn's
+        # content words still on the page, which is the nearest thing that
+        # corpus has to a gold answer (scoring the QUESTION's own words scores
+        # whether the block echoed the question, and the turn holding them is
+        # the turn this skips, so it falls by construction):
+        #
+        #   keep   chars     answer words
+        #      0   -43.1%    -9.1 points
+        #      1   -34.4%    -7.9
+        #      2   -25.2%    -3.6
+        #      4   -14.6%    -1.4
+        #      6    -5.8%    -0.2
+        #      8    -4.3%    +0.3   <- default: the most it saves for free
+        #     12    -1.8%    +0.3
+        #
+        # So the phase buys a SMALL budget saving without costing the reader,
+        # not the large one it was written for: a distilled line is ~220
+        # characters of what was called and what came back, and below ~6 kept
+        # turns it is replacing turns that held the answer. Lower it only if a
+        # budget has to come down and that cost is accepted deliberately.
+        "digest_session_excerpts": 8,
     },
     "context": {"default_token_budget": 1500,
                 "session_window": True,
@@ -1298,6 +1343,12 @@ DEFAULTS: dict[str, Any] = {
         # restorable either way (chronicle_expand), so this only decides what a
         # reader sees without asking.
         "keep_literals": False,
+        # Phase C: keep the line each folded unit leaves in the handoff as an
+        # EPISODE, so recall can later return one distilled unit instead of the
+        # several raw turns it stands for. Off by default; these describe the
+        # agent's own work, so retrieval never injects them unasked (they are
+        # reached by explicit search and by the engine's own rehydration).
+        "digest_episodes": False,
         # `involatile` (Phase B) is the weight for a span that carries exact
         # literals -- a port, a path, an id, a timestamp, the command that
         # failed. 0.0 keeps the score every release up to 5.8.35 computed; the
