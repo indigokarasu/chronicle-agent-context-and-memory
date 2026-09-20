@@ -3,6 +3,44 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — the redaction sentinel is Hermes', and the pointer is on
+
+Jared: "`[redacted]` might confuse the system, why don't you just put the
+correct pointer to the secrets system in its place?" Both halves of that are
+right, and the second one has a specific answer in Hermes' own source.
+
+**`[redacted]` was a dialect the host does not speak.** `agent/redact.py`
+already masks to `«redacted-secret»`, `«redacted:ghp_…»` (prefix matched,
+vendor label kept) and `«redacted-vault-secret»`, and its own "already
+masked?" guards test `value.startswith("«redacted")` and `"***" in value`.
+Chronicle's marker matched neither, so a host redaction pass did not recognise
+Chronicle's output as masked and could mask it again. Chronicle had invented a
+second convention where the host had one — the same mistake the spec warned
+about for `secrets/<NAME>`. It now emits the host's.
+
+**The pointer goes INSIDE the sentinel, not in place of the value.** Putting a
+bare `vault_ab12cd34ef56` where the value stood is the shape Hermes
+deliberately rejected, and its docstring for `_mask_token_nonreusable` says
+why: *"an agent once wrote a truncated-looking mask back into a config file"*,
+corrupting the stored credential (issue #35519). A bare pointer reads as a
+usable string; an agent that round-trips a config writes it back over the real
+secret. The sentinel cannot be pasted anywhere and still carries the pointer:
+
+    OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»
+    the Zoom login is vault_ab12cd34ef56 password: «redacted:vault_ab12cd34ef56»
+    token «redacted:ghp_…»          ← vendor label only, Hermes' exact form
+    password: «redacted-secret»     ← nothing in the text to point at
+
+It also makes masking idempotent for free. A bare `vault_ab12cd34ef56` passes
+`_looks_secret` (letters, digits, six characters), so the next fold would
+re-mask Chronicle's own pointer; the guillemets match the existing prefix
+guard and need no special case.
+
+**`credentials.pointers` now defaults to ON**, at Jared's request. Because the
+marker is a stored string and nothing migrates, a store will hold both shapes:
+beliefs folded from now on carry the pointer, and the ones already masked keep
+what they were masked with. That is the expected state, not a bug.
+
 ## Unreleased — the handoff was the one surface still carrying a credential
 
 Found by asking what happens when Phase C and Phase E are both on, which is a
@@ -25,8 +63,8 @@ Every handoff line — folded requests and folded steps both — now goes throug
 `engine/credentials`. Unconditional, like the other two surfaces: this is not
 an optimisation waiting on a replay, it is the rule they already follow.
 `credentials.pointers` only decides whether the marker also says where the
-value lives, so the handoff reads `OPENROUTER_API_KEY=[redacted]` or
-`OPENROUTER_API_KEY=[redacted env:OPENROUTER_API_KEY]`.
+value lives, so the handoff reads `OPENROUTER_API_KEY=«redacted-secret»`
+or `OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»`.
 
 What deliberately did NOT change: a tool result that was KEPT keeps what it
 said. That is the transcript, the agent it was given to can still search it,
@@ -37,14 +75,14 @@ is a `role: tool` original.
 
 ## Unreleased — Phase E: a masked value says where to fetch it
 
-`[redacted]` is a dead end. An agent that meets one asks the user to type the
+A bare marker is a dead end. An agent that meets one asks the user to type the
 secret again, which is how a secret reaches a transcript twice. Behind
 `credentials.pointers`, **default off**, the marker carries the pointer the
 text was already holding:
 
-    OPENROUTER_API_KEY=[redacted env:OPENROUTER_API_KEY]
-    the Zoom login is vault_ab12cd34ef56 password: [redacted vault_ab12cd34ef56]
-    token [redacted ghp_…]
+    OPENROUTER_API_KEY=«redacted:env:OPENROUTER_API_KEY»
+    the Zoom login is vault_ab12cd34ef56 password: «redacted:vault_ab12cd34ef56»
+    token «redacted:ghp_…»
 
 **It reads neither the vault nor the environment, and it cannot.** The vault
 (`agent/vault_store.py`) exists precisely so that values never reach a tool
@@ -60,7 +98,7 @@ environment variables from the profile `.env`
 So all this does is keep what the text said. Nothing it renders is secret: an
 env-var name is not, a vault id is designed to be shown, and `sk-` is a
 vendor's public prefix. A bare `password:` with no variable name behind it
-gets no invented pointer — the marker stays `[redacted]`. Tested end to end
+gets no invented pointer — the sentinel stays bare. Tested end to end
 through a real fold, and tested that no part of a secret survives either way.
 
 Off by default because the marker is a **stored** string: turning it on
@@ -68,10 +106,10 @@ changes the text of every belief folded after it, while the ones already
 masked keep the bare marker. That is a migration to choose, not a default.
 
 One thing it broke and fixed: `_looks_secret` skipped an already-masked value
-by testing `startswith(REDACTED)` — the whole `[redacted]`, closing bracket
-included. With a pointer the marker is `[redacted env:NAME]`, so a second pass
+by testing `startswith(REDACTED)` — the whole bare sentinel, closing
+delimiter included. With a label the marker is longer, so a second pass
 re-masked its own output and appended a second pointer. It now tests
-`[redacted`. Masking has to be idempotent; the fold re-runs over beliefs it
+the opening delimiter. Masking has to be idempotent; the fold re-runs over beliefs it
 has already masked.
 
 Still not done in this phase, and named rather than glossed: nothing resolves
