@@ -3,6 +3,98 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — Phase C: a folded unit can leave a distilled episode
+
+Phase C wants recall to return one compact episode instead of several raw
+turns. **Production has no such episodes to return**: the live store holds 22
+active ones and every one is the agent's own memory write, because the
+transcript episodes were retracted as junk. So the phase needs a generation
+step before its recall step, and the compaction already writes the text —
+one line per folded unit saying what was called and what came back.
+
+Behind `context_engine.digest_episodes`, **default off**: each folded step's
+line is also kept as an episode (`source_type` `compaction_digest`, its fold
+id as the source event, the session as `session_ref`), at most
+`_DIGEST_EPISODE_CAP` (40) per pass so a thousand-turn compaction cannot
+become a thousand beliefs. Identical work folded twice confirms one episode
+rather than writing a second.
+
+Two rules it keeps, both learned here:
+
+* only a STEP becomes one. 5.8.1 removed digest episodes because the lines
+  being extracted were the user's own requests restated, and the handoff
+  quotes every folded request verbatim already.
+* these describe the AGENT's work, not the user's life, so per-turn recall
+  never injects them unasked (`_NOT_UNASKED` in engine/retrieval.py, beside
+  the agent's own memory writes). Explicit search and the engine's own
+  rehydration still see them — which is the question Phase C's second half
+  ranks.
+
+One thing the first pass got wrong, fixed here: `session_ref` was passed
+alongside the key rather than inside it. It is half an episode's natural key
+(`reducer._natural_key`: title + session_ref), so every digest landed with
+`session_ref` empty — the same line folded in two different conversations
+confirmed ONE episode belonging to neither, and the recall half below had
+nothing to prefer over a session's raw turns.
+
+### The recall half
+
+Behind `retrieval.prefer_digest_episodes`, **also default off**: when a
+distilled episode survives into the Tier-1 block, the raw fill below it caps
+how many of that SAME session's turns it then spends budget on
+(`retrieval.digest_session_excerpts`). Three things it is careful about:
+
+* the cap binds across BOTH raw phases. Capping the ranked fill alone caps
+  nothing — the session-window expansion returns every turn the ranked fill
+  did not carry, so one kept excerpt put the whole session back and the block
+  came within 0.7% of its unpreferred size. (That mistake produced a first set
+  of numbers showing coverage *improving*; they are withdrawn.)
+* a digest that was RANKED but cut by the Tier-1 budget prefers nothing, or
+  the reader loses the episode and its turns both.
+* per-turn recall is untouched. These episodes describe the agent's work, so
+  it never sees them (`_NOT_UNASKED`), so there is never one to prefer.
+
+**Measured, and the phase is not what it was written to be.**
+`deploy570/digest_measure.py`, 5 real transcripts, 40 question/answer pairs,
+budget 1200, offline embedder. "Answer words" is the share of the next
+assistant turn's content words still on the page — scoring the QUESTION's own
+words scores whether the block echoed the question, and the turn holding those
+words is the turn this skips, so that number falls by construction:
+
+      keep   chars     answer words
+         0   -43.1%    -9.1 points
+         1   -34.4%    -7.9
+         2   -25.2%    -3.6
+         4   -14.6%    -1.4
+         6    -5.8%    -0.2
+         8    -4.3%    +0.3   <- default
+        12    -1.8%    +0.3
+
+The large saving eats answers: a distilled line is ~220 characters of what was
+called and what came back, and below about six kept turns it is replacing
+turns that held the answer. The default is the most it saves for free, which
+is 4.3% — real, small, and not the win the phase was written for. Both flags
+therefore stay off, and this is the number a later run has to beat.
+
+Two things the harness had to fix before it could measure anything, both of
+which apply to the Phase B and D harnesses beside it:
+
+* **the role is in the excerpt, not in `actor`.** A session_transcript capture
+  writes every observed event with `actor='user'` (41,495 against 12,158
+  `agent` on the August copy) and puts the real role in the text
+  (`assistant: …`, `tool: …`). Rebuilding a session from `actor` hands the
+  compressor a conversation of pure requests, no folded unit is ever a step,
+  and the generation half cannot fire at all. `bench.py` and `tier_measure.py`
+  both rebuild from `actor`.
+* **the production copy cannot support this measurement.** Even with roles
+  restored, 13 non-cron sessions on it reach 25 observed events and exactly
+  ONE usable user question survives across all of them. The corpus used
+  instead is a directory of real Claude Code transcripts — real conversations,
+  real questions, real tool calls, i.e. the message shape a live compaction
+  sees — and it is NOT Hermes sessions: a different agent, and engineering
+  work rather than this user's life. Labelled as such wherever it is reported.
+  The two sessions being written while the measurement ran were excluded.
+
 ## Unreleased — Phase D: a standing local benchmark
 
 `deploy570/bench.py` (outside the repo, with the other harnesses) runs the
