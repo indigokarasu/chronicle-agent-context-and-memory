@@ -63,20 +63,30 @@ class TestFindingPointers(unittest.TestCase):
         self.assertEqual(S.pointers_in("password: " + C.REDACTED), [])
 
     def test_the_forms(self):
-        self.assertEqual(S.form_of(VAULT_ID), S.VAULT)
+        """`env:` and the vendor ellipsis are decided here. A vault HANDLE is
+        not one shape -- `vault_…` local, `bw:…`, `op:…` route across backends
+        -- so anything else is a CANDIDATE handle and only the host's router
+        says whether a backend owns it. Guessing the grammar here is how the
+        first version of this module ended up local-only."""
         self.assertEqual(S.form_of("env:OPENROUTER_API_KEY"), S.ENV)
         self.assertEqual(S.form_of("ghp_…"), S.PREFIX)
-        self.assertEqual(S.form_of("something else"), S.UNKNOWN)
+        self.assertEqual(S.form_of(""), S.UNKNOWN)
+        for handle in (VAULT_ID, "bw:abc123", "op:Private/Zorblax"):
+            with self.subTest(handle=handle):
+                self.assertEqual(S.form_of(handle), S.VAULT)
+
+    def test_a_candidate_handle_no_backend_owns_does_not_resolve(self):
+        self.assertFalse(S.resolve("something else")["resolves"])
 
 
 class TestResolving(unittest.TestCase):
     def setUp(self):
         self.vault = _FakeVault()
-        self._real = S._vault
-        S._vault = lambda: self.vault
+        self._real = S._backend
+        S._backend = lambda _h=None: self.vault
 
     def tearDown(self):
-        S._vault = self._real
+        S._backend = self._real
 
     def test_a_known_item_resolves_to_metadata(self):
         r = S.resolve(VAULT_ID)
@@ -111,7 +121,7 @@ class TestResolving(unittest.TestCase):
 
 
 class TestEnvPointers(unittest.TestCase):
-    def test_set_means_resolves_and_the_value_is_not_read(self):
+    def test_defined_means_resolves_and_the_value_is_not_read(self):
         import os
         os.environ["CHRONICLE_FAKE_KEY_FOR_TEST"] = "sk-or-v1-abcdef0123456789abcdef"
         try:
@@ -132,16 +142,16 @@ class TestOfflineIsNotDangling(unittest.TestCase):
     report every pointer as broken."""
 
     def setUp(self):
-        self._real = S._vault
-        S._vault = lambda: None
+        self._real = S._backend
+        S._backend = lambda _h=None: None
 
     def tearDown(self):
-        S._vault = self._real
+        S._backend = self._real
 
     def test_it_says_it_cannot_tell(self):
         r = S.resolve(VAULT_ID)
         self.assertFalse(r["resolves"])
-        self.assertEqual(r["reason"], "vault unavailable")
+        self.assertEqual(r["reason"], "unavailable")
 
     def test_audit_files_it_as_undecidable_not_dangling(self):
         a = S.audit(["«redacted:%s»" % VAULT_ID])
@@ -152,11 +162,11 @@ class TestOfflineIsNotDangling(unittest.TestCase):
 class TestAudit(unittest.TestCase):
     def setUp(self):
         self.vault = _FakeVault()
-        self._real = S._vault
-        S._vault = lambda: self.vault
+        self._real = S._backend
+        S._backend = lambda _h=None: self.vault
 
     def tearDown(self):
-        S._vault = self._real
+        S._backend = self._real
 
     def test_it_separates_what_resolves_from_what_does_not(self):
         a = S.audit(["a «redacted:%s»" % VAULT_ID,
