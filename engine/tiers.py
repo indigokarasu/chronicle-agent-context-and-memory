@@ -178,6 +178,23 @@ def shorten_keeping_literals(text: str, cap: int) -> str:
         out.append(piece)
         used += len(piece)
         last_end = b
+    # PROSE SECOND -- the half this function promised and did not do. Placing
+    # the literals and returning left whatever they did not need UNSPENT: on
+    # "turn 10 about the Zorblax rota " + 600 characters of prose, a 400
+    # character budget came back as `turn 10 …`, nine characters, because the
+    # literal was short. The reader lost the sentence and the caller lost the
+    # budget it had asked for.
+    #
+    # It also made this flag look better than it is: squeezing every message
+    # to a skeleton leaves room for MORE messages, each contributing its
+    # literals, so a measurement that counts literals-kept and tokens sees a
+    # win while the page loses the prose around them. That is what the first
+    # +18% was.
+    room = cap - used - 2                     # 2 = the trailing " …"
+    if out and room > 0 and last_end < len(text):
+        tail = text[last_end:last_end + room]
+        out.append(tail)
+        last_end += len(tail)
     if last_end < len(text) and out:
         out.append(" …")
     return "".join(out) if out else text[:cap]

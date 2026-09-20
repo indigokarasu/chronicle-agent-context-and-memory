@@ -3,6 +3,39 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — `keep_literals` is ON: the first flag to earn its default
+
+The rule for this whole build was that nothing defaults on until a replay
+shows a win. This one did, on two corpora that share nothing — a copy of the
+production store, and real tool-shaped transcripts written by a different
+agent doing different work — at the same budget:
+
+    chronicle copy (3 sessions)   38.0% -> 45.1% literals kept   out tokens -675
+    transcripts    (5 sessions)    1.8% ->  2.1%                 out tokens   -5
+
+**+18.8% and +17.8% relative: the same number twice.** The absolute share is a
+fact about how hard the session compresses, not about the flag — the
+transcript sessions go 4,023,745 → 29,998 tokens, a 99.25% cut, and almost
+nothing survives that either way. The relative figure is the one that
+transfers, and it transferred.
+
+It also keeps MORE messages while doing it (38→48, 45→52, 37→49): spending a
+cut on literals leaves room, it does not take it. What a reader gets instead
+of the sentence introducing the work is the port number, the path, the
+container id and the command that failed.
+
+**A correction to how the earlier numbers were reported.** Those runs had
+`keep_weights.involatile` at 0.25 alongside the flag, and the pair was written
+up as if it were one thing. Re-run with the weight at 0.0 the figures are
+byte-identical on both corpora: the weight contributes nothing and the whole
+effect is `keep_literals`. It stays at 0.0, so the shape scan it would pay for
+is not paid for.
+
+Everything the flag touches is still restorable either way
+(`chronicle_expand`), so this decides what a reader sees without asking, not
+what the store holds. Turned off, compaction cuts exactly as every release up
+to 5.8.35 did.
+
 ## Unreleased — the redaction sentinel is Hermes', and the pointer is on
 
 Jared: "`[redacted]` might confuse the system, why don't you just put the
