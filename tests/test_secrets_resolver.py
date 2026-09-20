@@ -195,5 +195,58 @@ class TestAgainstTheRealVaultIfPresent(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestTheTool(unittest.TestCase):
+    """The integration: an agent that meets a masked value in memory can ask
+    what it points at, instead of asking the user to type the secret again."""
+
+    def setUp(self):
+        from engine.core import ChronicleCore
+        self.home = temp_home(prefix="ptrtool_")
+        self.core = ChronicleCore(self.home, {"embeddings": {"model": "hashing"}})
+
+    def tearDown(self):
+        from engine.core import ChronicleCore
+        ChronicleCore._instances.pop(self.core.store.db_path, None)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def call(self, **args):
+        import json
+        return json.loads(self.core.tools.dispatch("default", "chronicle_resolve_pointer", args))
+
+    def test_it_is_registered(self):
+        names = [t["function"]["name"] if "function" in t else t.get("name")
+                 for t in self.core.tools.schemas()]
+        self.assertIn("chronicle_resolve_pointer",
+                      [n for n in names if n] + ["chronicle_" + (n or "") for n in names])
+
+    def test_a_defined_env_key_resolves(self):
+        r = self.call(pointer="env:PATH")
+        self.assertTrue(r["pointers"][0]["resolves"])
+        self.assertEqual(r["unresolved"], [])
+
+    def test_an_undefined_one_is_reported_as_unresolved(self):
+        r = self.call(pointer="env:CHRONICLE_DEFINITELY_UNSET_KEY")
+        self.assertEqual(r["unresolved"], ["env:CHRONICLE_DEFINITELY_UNSET_KEY"])
+
+    def test_it_reads_pointers_out_of_masked_text(self):
+        said = C.redact("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789abcdef0123456789")
+        r = self.call(text=said)
+        self.assertEqual(r["pointers"][0]["pointer"], "env:OPENROUTER_API_KEY")
+
+    def test_the_tool_result_never_carries_a_value(self):
+        """A tool result is written to the session DB, which is exactly what
+        the host's value accessors forbid."""
+        import os
+        os.environ["CHRONICLE_TOOL_SECRET_TEST"] = "zz9-Plural-Zalpha7"
+        try:
+            blob = repr(self.call(pointer="env:CHRONICLE_TOOL_SECRET_TEST"))
+            self.assertNotIn("Plural-Zalpha7", blob)
+        finally:
+            del os.environ["CHRONICLE_TOOL_SECRET_TEST"]
+
+    def test_nothing_to_resolve_is_an_error_not_a_silent_empty(self):
+        self.assertIn("error", self.call(text="no pointers here"))
+
+
 if __name__ == "__main__":
     unittest.main()
