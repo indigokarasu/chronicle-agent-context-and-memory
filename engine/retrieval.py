@@ -2741,7 +2741,8 @@ class RetrievalEngine:
             if relevance_gate:
                 # Put into a turn unasked: never a credential's value (the
                 # agent's own search still finds the message that held it).
-                out = _cred.redact(out)
+                out = _cred.redact(out, bool(self.cfg is not None
+                                             and self.cfg.get("credentials.pointers", False)))
             if isinstance(self.last_context_debug, dict):
                 # exact count, not the bounded identity sample -- see answer()
                 self.last_context_debug["vectors_skipped_wrong_dim"] = \
