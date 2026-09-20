@@ -325,6 +325,26 @@ CONFIDENCE_BASE = {
 }
 
 DEFAULTS: dict[str, Any] = {
+    "credentials": {
+        # Phase E. A masked value used to leave `[redacted]`: a dead end that
+        # tells a reader nothing and invites the agent to ask for the secret
+        # again, which is how one ends up in a transcript twice. The sentinel
+        # now carries WHERE the value lives, when the text already said so --
+        # `«redacted:env:OPENROUTER_API_KEY»`, `«redacted:vault_ab12cd34ef56»`.
+        # Without a pointer it is `«redacted:ghp_…»` (vendor label) or
+        # `«redacted-secret»`. Nothing is read from the vault or the
+        # environment to produce it, and no part of a secret is kept -- see
+        # engine/credentials.py, including why the pointer goes INSIDE the
+        # sentinel rather than standing where the value stood.
+        #
+        # ON. Jared asked for the pointer to be there rather than a dead end,
+        # 2026-09-19. What that means in practice, because the marker is a
+        # STORED string and nothing migrates: beliefs folded from now on carry
+        # the pointer, and the ones already in the store keep whatever they
+        # were masked with. A store with two shapes in it is the expected
+        # state, not a bug.
+        "pointers": True,
+    },
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",
     "git_remote": None,
@@ -732,6 +752,51 @@ DEFAULTS: dict[str, Any] = {
         # consulted on the write path, so raising/lowering it changes nothing
         # about what gets stored.
         "support_threshold": 0.55,
+        # Phase C, recall half. A compaction can leave one distilled line per
+        # folded unit behind as an episode (`context_engine.digest_episodes`).
+        # When one of those ranks into the Tier-1 block, this makes the raw
+        # fill below it skip the SAME session's individual turns -- one compact
+        # unit instead of the several it stands for. Off by default, and inert
+        # unless the generation flag has been on: with no `compaction_digest`
+        # episode in the store nothing is ever preferred. Per-turn recall is
+        # untouched either way (those episodes are `_NOT_UNASKED`).
+        #
+        # The trade it makes is real and is why it stays off until measured:
+        # the distilled line is ~220 characters of what was called and what
+        # came back, and the turns it replaces may hold the answer it left out.
+        # Measure with deploy570/bench.py against bench_live_baseline.json --
+        # characters should fall; the query words covered must not.
+        "prefer_digest_episodes": False,
+        # How many of a digested session's own turns may still be kept beside
+        # its distilled line when the flag above is on. The cap binds across
+        # BOTH raw phases -- the ranked fill and the session-window expansion.
+        # Capping the first alone caps nothing: the expansion returns every
+        # turn the first did not carry, so one kept excerpt put the whole
+        # session back and the block came within 0.7% of its unpreferred size.
+        #
+        # MEASURED, and the trade is monotone. deploy570/digest_measure.py,
+        # 5 real transcripts, 40 question/answer pairs, budget 1200, offline
+        # embedder; "answer words" is the share of the NEXT assistant turn's
+        # content words still on the page, which is the nearest thing that
+        # corpus has to a gold answer (scoring the QUESTION's own words scores
+        # whether the block echoed the question, and the turn holding them is
+        # the turn this skips, so it falls by construction):
+        #
+        #   keep   chars     answer words
+        #      0   -43.1%    -9.1 points
+        #      1   -34.4%    -7.9
+        #      2   -25.2%    -3.6
+        #      4   -14.6%    -1.4
+        #      6    -5.8%    -0.2
+        #      8    -4.3%    +0.3   <- default: the most it saves for free
+        #     12    -1.8%    +0.3
+        #
+        # So the phase buys a SMALL budget saving without costing the reader,
+        # not the large one it was written for: a distilled line is ~220
+        # characters of what was called and what came back, and below ~6 kept
+        # turns it is replacing turns that held the answer. Lower it only if a
+        # budget has to come down and that cost is accepted deliberately.
+        "digest_session_excerpts": 8,
     },
     "context": {"default_token_budget": 1500,
                 "session_window": True,
@@ -1291,7 +1356,62 @@ DEFAULTS: dict[str, Any] = {
         # A12: `redundancy_vs_store` deleted -- _score_message has four
         # dimensions (relevance/recency/salience/criticality) and no redundancy
         # term; the fifth weight was scored by nothing.
-        "keep_weights": {"relevance": 0.35, "recency": 0.20, "salience": 0.20,
+        # Phase B: when a span must be shortened, spend the budget on its exact
+        # literals (ports, paths, ids, timestamps, the failing command) before
+        # the prose around them -- engine/tiers.py. Off = the head of the text,
+        # which is what every release up to 5.8.35 kept. The whole span is
+        # restorable either way (chronicle_expand), so this only decides what a
+        # reader sees without asking.
+        #
+        # ON as of 2026-09-19, and the second attempt at that, which is the
+        # part worth reading.
+        #
+        # The first attempt turned it on off the back of tier_measure numbers
+        # (+18% relative literals kept, same budget) and the full gate refused
+        # it: four tests failed, and they were right. `shorten_keeping_literals`
+        # kept the literals and DROPPED THE REST OF THE BUDGET rather than
+        # filling it -- on "turn 10 about the Zorblax rota " plus 600
+        # characters of prose, a 400-character cap came back as `turn 10 …`,
+        # nine characters. So that +18% was an artifact of my own measurement:
+        # squeezing every message to a skeleton leaves room for MORE messages,
+        # each contributing its literals, and the ratio rises while the page
+        # loses the prose. The harness counted literals and tokens and never
+        # asked whether anything readable survived.
+        #
+        # engine/tiers.py now fills the cap it was given. Re-measured over
+        # 3,000 real spans, which is the check that should have come first:
+        #
+        #   cap 220   98.1% of the budget spent   exact literals +117%
+        #   cap 400   92.2%                                       +81%
+        #   cap 900   75.4%                                       +48%
+        #
+        # and on whole sessions at the production policy, same budget:
+        #
+        #   chronicle copy (3 sessions)   38.0% -> 45.8%   out tokens -110
+        #   transcripts    (5 sessions)    1.8% ->  2.1%   out tokens    0
+        #
+        # Measured with `keep_weights.involatile` at 0.0, i.e. this flag ALONE:
+        # re-run at 0.25 the figures are byte-identical, so the weight
+        # contributes nothing and stays off rather than paying for its scan.
+        #
+        # KNOWN RESIDUAL: at a generous cap the fill still leaves ~25% unspent
+        # (the 900 row). Worth chasing; not a reason to keep the flag off,
+        # since the alternative spends that budget on prose the head cut was
+        # keeping anyway.
+        "keep_literals": True,
+        # Phase C: keep the line each folded unit leaves in the handoff as an
+        # EPISODE, so recall can later return one distilled unit instead of the
+        # several raw turns it stands for. Off by default; these describe the
+        # agent's own work, so retrieval never injects them unasked (they are
+        # reached by explicit search and by the engine's own rehydration).
+        "digest_episodes": False,
+        # `involatile` (Phase B) is the weight for a span that carries exact
+        # literals -- a port, a path, an id, a timestamp, the command that
+        # failed. 0.0 keeps the score every release up to 5.8.35 computed; the
+        # cost of the shape scan is only paid above 0.0. See
+        # deploy570/tier_measure.py for what a given weight does to the share
+        # of exact literals a compaction leaves in the window.
+        "keep_weights": {"involatile": 0.0, "relevance": 0.35, "recency": 0.20, "salience": 0.20,
                          "criticality": 0.20},
         "never_evict": "directives",
         "should_compress": {"on_memory_pressure": True, "on_focus_shift": True},

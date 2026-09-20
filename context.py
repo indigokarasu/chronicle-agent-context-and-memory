@@ -55,6 +55,21 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
 
         estimate_tokens = budget_chars = _no_estimator
 
+try:  # which spans may be summarised and which only pointed at (Phase B) …
+    from .engine import tiers as _tiers  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import tiers as _tiers
+
+try:  # the one importance model recall and compaction share (Phase A) …
+    from .engine import salience as _salience  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import salience as _salience
+
+try:  # credential values, for the one surface compaction AUTHORS …
+    from .engine import credentials as _cred  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine import credentials as _cred
+
 try:  # one rule for the TEXT of a message, shared with capture …
     from .engine.speaker import message_text  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -119,9 +134,17 @@ def _is_legacy_artifact(m) -> bool:
     return isinstance(c, str) and c.startswith(_LEGACY_ARTIFACT_PREFIXES)
 
 
-def _one_line(text: str, cap: int) -> str:
+def _one_line(text: str, cap: int, keep_literals: bool = False) -> str:
+    """One line of at most `cap` characters. `keep_literals` spends it on the
+    exact literals first (engine/tiers.py): these lines are the ONLY trace a
+    folded turn leaves on the page, so what they drop is what the reader has
+    to restore a span to see."""
     t = " ".join((text or "").split())
-    return t if len(t) <= cap else t[:max(0, cap - 1)].rstrip() + "…"
+    if len(t) <= cap:
+        return t
+    if keep_literals:
+        return _tiers.shorten_keeping_literals(t, cap)
+    return t[:max(0, cap - 1)].rstrip() + "…"
 
 
 _FOLD_REF = re.compile(r"\[(fold_[0-9a-f]{12})\]")
@@ -190,28 +213,29 @@ def _loads(text):
     return text if isinstance(text, (dict, list)) else None
 
 
-def _args_brief(arguments, width: int) -> str:
+def _args_brief(arguments, width: int, keep: bool = False) -> str:
     """A tool call's arguments as one short line: the telling one's value when
     it has one ("journalctl -xn 50"), not the JSON around it."""
     d = _loads(arguments)
     if isinstance(d, dict):
         key = next((k for k in _ARG_KEYS if isinstance(d.get(k), str) and d[k].strip()), None)
         if key is not None:
-            return _one_line(d[key], width)
-        return _one_line(json.dumps(d, ensure_ascii=False, separators=(",", ":")), width)
-    return _one_line(arguments if isinstance(arguments, str) else "", width)
+            return _one_line(d[key], width, keep)
+        return _one_line(json.dumps(d, ensure_ascii=False, separators=(",", ":")), width, keep)
+    return _one_line(arguments if isinstance(arguments, str) else "", width, keep)
 
 
-def _result_brief(text: str, width: int) -> str:
+def _result_brief(text: str, width: int, keep: bool = False) -> str:
     """A tool result as one short line: its error if it has one, else its
     output, and a non-zero exit code -- not the envelope ({"output": "...",
     "exit_code": 0, "error": null}) that took most of the line."""
     d = _loads(text)
     if not isinstance(d, dict):
-        return _one_line(text, width)
+        return _one_line(text, width, keep)
     err = d.get("error")
     if err:
-        return _one_line("error: %s" % (err if isinstance(err, str) else json.dumps(err, default=str)), width)
+        return _one_line("error: %s" % (err if isinstance(err, str) else json.dumps(err, default=str)),
+                         width, keep)
     out = next((d[k] for k in _RESULT_KEYS if d.get(k) not in (None, "", [], {})), None)
     body = out if isinstance(out, str) else (json.dumps(out, ensure_ascii=False, default=str)
                                               if out is not None else "")
@@ -220,7 +244,7 @@ def _result_brief(text: str, width: int) -> str:
     code = d.get("exit_code")
     if isinstance(code, int) and code != 0:
         body = ("exit %d: %s" % (code, body)) if body else "exit %d" % code
-    return _one_line(body or json.dumps(d, ensure_ascii=False, default=str), width)
+    return _one_line(body or json.dumps(d, ensure_ascii=False, default=str), width, keep)
 
 
 def _tool_units(pairs: list) -> list:
@@ -299,8 +323,28 @@ _DIGEST_EXTRACTOR = HeuristicExtractor() if HeuristicExtractor is not None else 
 
 _NEVER_EVICT_KW = ["always", "never", "must not", "do not", "don't", "[directive]"]
 
-_SALIENCE_RX = re.compile(r"\b(important|remember|critical|must)\b", re.IGNORECASE)
-_CRITICALITY_RX = re.compile(r"\b(critical|must|urgent|important)\b", re.IGNORECASE)
+# The keep/evict score and its keyword sets live in engine/salience.py, the one
+# importance model recall and compaction share (Phase A).
+def _cut_text(text: str, chars: int, keep_literals: bool = False) -> str:
+    """`text` shortened to `chars`. The head of it by default, which is what
+    every release up to 5.8.35 kept; with `context_engine.keep_literals` on,
+    the budget goes to the exact literals first (engine/tiers.py). A cut by
+    length alone is indifferent to what it cuts, so the port number, the path
+    and the failing command go as readily as the prose around them -- and a
+    reader can only get those back by restoring the span.
+    """
+    if chars <= 0:
+        return (text or "")[:max(0, chars)]
+    if len(text or "") <= chars:
+        return text
+    return _tiers.shorten_keeping_literals(text, chars) if keep_literals else text[:chars]
+
+
+# Phase C: how many distilled episodes one compaction may write.
+_DIGEST_EPISODE_CAP = 40
+
+_SALIENCE_RX = _salience._SALIENCE_RX
+_CRITICALITY_RX = _salience._CRITICALITY_RX
 
 # Structured focus (§R8). An entity NAME in focus.entities resolves to at most
 # this many candidate entity belief_ids (same substring-on-normalized_name rule
@@ -398,6 +442,7 @@ class ChronicleContextEngine(ContextEngine):
         # The compaction handoff (see _HANDOFF_PREFIX): folded user requests and
         # one line per folded step, oldest first, accumulated over the session.
         self._handoff_asks: list[str] = []
+        self._digests_written = 0            # Phase C: bounded per pass
         self._handoff_steps: list[str] = []
         self.last_pass = ""             # "extend" | "rebase", for the last compress()
         # -- pressure warning state (§R9) ----------------------------------
@@ -912,8 +957,11 @@ class ChronicleContextEngine(ContextEngine):
         # wins, then the user's newest request, the rest of the tail newest
         # first, then the head -- whole tool units or none of one -- and a span
         # shortened to fit says so and stays recoverable.
+        keep_literals = self._keep_literals()
+        self._digests_written = 0
         fitted, used_req, dropped_req = self._fit_required(
-            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units)
+            fresh_system, head_units, tail_units, max(0, fresh_budget - reserve), request_units,
+            keep_literals)
         fitted_content = dict(fitted)
         fresh_system = [(i, fitted_content[i]) for i, _m in fresh_system if i in fitted_content]
         head = [(i, fitted_content[i]) for i, _m in head if i in fitted_content]
@@ -922,7 +970,8 @@ class ChronicleContextEngine(ContextEngine):
         never_units = [u for u in middle_units if any(self._never_evict(m) for _i, m in u)]
         never_flat = [p for u in never_units for p in u]
         never_budget = max(0, fresh_budget - used_req - reserve)
-        fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget)
+        fitted_never, used_never, dropped_never = self._fit_within_budget(never_flat, never_budget,
+                                                                          keep_literals)
         kept_never = dict(fitted_never)
 
         used = used_locked + used_req + used_never
@@ -1135,6 +1184,7 @@ class ChronicleContextEngine(ContextEngine):
     def _note_folded_unit(self, msgs, span_ids) -> None:
         """Record one folded unit for the handoff: a user request verbatim
         (its framing removed), or one line saying what the step did."""
+        keep = self._keep_literals()
         # The unit is named by a span that has content to restore -- a call
         # with no text of its own hashes like every other one -- preferring
         # the first result, which is what a later chronicle_expand wants.
@@ -1145,27 +1195,99 @@ class ChronicleContextEngine(ContextEngine):
         if len(msgs) == 1 and msgs[0].get("role") == "user":
             said = self._human_texts(msgs)
             if said:
-                self._handoff_asks.append("%s %s" % (ref, said[0]))
+                self._handoff_asks.append(self._handoff_safe("%s %s" % (ref, said[0])))
             return
         first = msgs[0]
         if first.get("role") == "assistant" and first.get("tool_calls"):
             calls = []
             for tc in first.get("tool_calls") or []:
                 fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                calls.append("%s(%s)" % (fn.get("name") or "tool", _args_brief(fn.get("arguments"), 70)))
-            said = _one_line(_text(first), 120)
-            results = [_result_brief(_text(r), 110) for r in msgs[1:]]
+                calls.append("%s(%s)" % (fn.get("name") or "tool",
+                                         _args_brief(fn.get("arguments"), 70, keep)))
+            said = _one_line(_text(first), 120, keep)
+            results = [_result_brief(_text(r), 110, keep) for r in msgs[1:]]
             line = "called " + ", ".join(calls)
             if said:
-                line = _one_line(said, 120) + " — " + line
+                line = _one_line(said, 120, keep) + " — " + line
             if results:
                 line += " → " + " | ".join(r for r in results if r)
-            self._handoff_steps.append("%s %s" % (ref, _one_line(line, 360)))
+            step = self._handoff_safe(_one_line(line, 360, keep))
+            self._handoff_steps.append("%s %s" % (ref, step))
+            self._keep_digest_episode(ref, step)
             return
         role = first.get("role") or "?"
-        body = _one_line(_text(first), 220)
+        body = self._handoff_safe(_one_line(_text(first), 220, keep))
         if body:
             self._handoff_steps.append("%s %s: %s" % (ref, role, body))
+            self._keep_digest_episode(ref, "%s: %s" % (role, body))
+
+    def _handoff_safe(self, text: str) -> str:
+        """A handoff line with any credential value masked.
+
+        THE HANDOFF IS THE ONE SURFACE CHRONICLE AUTHORS. A tool result that
+        was kept keeps whatever it said -- that is the transcript, and the
+        model has already read it. This line is different: Chronicle writes it
+        from a span it is FOLDING AWAY, and it survives where the span does
+        not. After a rotation the child session carries the handoff and not
+        the turns behind it, so an unmasked value here outlives the message it
+        came from and travels into a conversation that never saw it.
+
+        Measured on a fixture whose tool result printed an
+        `OPENROUTER_API_KEY=`: the capped tool result was masked (tiers), the
+        belief was masked (the fold), and the handoff carried the key in full.
+
+        Unconditional, like the other two: this is not an optimisation waiting
+        on a replay, it is the same rule those surfaces already follow.
+        `credentials.pointers` only decides whether the marker also says where
+        the value lives."""
+        return _cred.redact(text or "", bool(
+            self.core and self.core.cfg.get("credentials.pointers", False)))
+
+    def _keep_digest_episode(self, ref: str, line: str) -> None:
+        """Phase C: keep the line a folded unit leaves in the handoff as an
+        EPISODE, so later recall can return one distilled unit instead of the
+        several raw turns it stands for.
+
+        Off by default (`context_engine.digest_episodes`). Two things it is
+        careful about, both learned the hard way:
+
+        * only a STEP becomes one. 5.8.1 removed digest episodes because the
+          checkpoint digest's lines were the user's own requests restated, and
+          the handoff already quotes every folded request verbatim.
+        * it is not memory about the USER. These describe the agent's own
+          work, so retrieval leaves them out of what it injects unasked
+          (_NOT_UNASKED) and they are reached by explicit search and by the
+          engine's own rehydration -- which is what Phase C wants to rank.
+
+        Bounded: a pass writes at most `_DIGEST_EPISODE_CAP` of them, so a
+        compaction of a thousand-turn session cannot turn into a thousand
+        beliefs.
+        """
+        if not (self.core and self.core.cfg.get("context_engine.digest_episodes", False)):
+            return
+        text = (line or "").strip()
+        if len(text) < 40 or self._digests_written >= _DIGEST_EPISODE_CAP:
+            return
+        span = _FOLD_REF.match(ref or "")
+        self._digests_written += 1
+        try:
+            self.core.capture.append("asserted", {
+                "kind": "episode",
+                # session_ref belongs INSIDE the key: it is half an episode's
+                # natural key (reducer._natural_key: title + session_ref) and
+                # the only column that says which conversation this distilled.
+                # Passed alongside the key instead, both are lost -- the row
+                # lands with session_ref '', so the same line folded in two
+                # different sessions confirms ONE episode belonging to neither,
+                # and the recall half has nothing to prefer over that session's
+                # raw excerpts.
+                "key": {"title": _one_line(text, 60), "session_ref": self._session_id},
+                "body": text, "confidence": 0.9,
+                "source_event": span.group(1) if span else "compaction",
+                "source_type": "compaction_digest",
+            }, actor="agent", owner=self._principal_id, trust_level=3)
+        except Exception as e:  # noqa: BLE001 -- a digest may never break a compaction
+            logger.debug("chronicle: digest episode skipped: %s", e)
 
     def _render_handoff(self, room: int, asks_in: list, steps_in: list, known_in: list,
                         extra: list, warn) -> str:
@@ -1357,29 +1479,8 @@ class ChronicleContextEngine(ContextEngine):
         Returns score in [0.0, 1.0].
         """
         w = self.core.cfg.get("context_engine.keep_weights", {}) if self.core else {}
-        content = _text(m).lower()
-
-        # Base score from recency (newer messages score higher)
-        score = recency_position * w.get("recency", 0.20)
-
-        # Relevance: any focus facet (topic, task, or entity name) matches
         focus = focus if isinstance(focus, dict) else self._normalize_focus(focus)
-        facets = list(focus.get("topics") or [])
-        if focus.get("task"):
-            facets.append(focus["task"])
-        facets += list(focus.get("entities") or [])
-        if any(f and f.lower() in content for f in facets):
-            score += w.get("relevance", 0.35)
-
-        # Salience: pre-compiled keyword match
-        if _SALIENCE_RX.search(content):
-            score += w.get("salience", 0.20)
-
-        # Criticality: pre-compiled keyword match
-        if _CRITICALITY_RX.search(content):
-            score += w.get("criticality", 0.20)
-
-        return min(1.0, score)  # Clamp to [0.0, 1.0]
+        return _salience.keep_score(_text(m), focus, recency_position, w)
 
     @staticmethod
     def _normalize_focus(focus) -> dict:
@@ -1598,7 +1699,7 @@ class ChronicleContextEngine(ContextEngine):
         return max(0, min(int(remaining_tokens), int(cfg_default)))
 
     @staticmethod
-    def _fit_within_budget(items, budget):
+    def _fit_within_budget(items, budget, keep_literals=False):
         """Fit `items` -- an ordered list of `(idx, msg)` pairs, highest
         priority first -- into `budget` tokens total (§R2: the
         compress()-output-<=-budget guarantee, for the required-but-fresh
@@ -1642,15 +1743,16 @@ class ChronicleContextEngine(ContextEngine):
             # §R5 requires a protected span to be shortened-but-present or
             # durably archived, never blanked-but-present, and
             # test_compression_fidelity asserts these bytes.
-            clipped = content[:budget_chars(max(0, remaining - _calls_cost(m)),
-                                            margin=COMPRESSION_BUDGET)]
+            clipped = _cut_text(content, budget_chars(max(0, remaining - _calls_cost(m)),
+                                                      margin=COMPRESSION_BUDGET), keep_literals)
             # A shortened message loses its sidecar too: replayed, the sidecar
             # would send the whole original again.
             kept.append((idx, _without_sidecar(dict(m, content=clipped)) if clipped != content else m))
             used += estimate_tokens(clipped, margin=COMPRESSION_BUDGET) + _calls_cost(m)
         return kept, used, dropped
 
-    def _fit_required(self, system, head_units, tail_units, budget, request_units=()):
+    def _fit_required(self, system, head_units, tail_units, budget, request_units=(),
+                      keep_literals=False):
         """Fit the spans compress() must not score away -- system messages,
         the protected head and tail, the user's newest request -- into
         `budget`, most important first: system, the newest unit, the request
@@ -1664,7 +1766,7 @@ class ChronicleContextEngine(ContextEngine):
         order = ([[p] for p in system] + newest_first[:1] + list(request_units)
                  + newest_first[1:] + list(head_units))
         for unit in order:
-            got, cost, lost = self._fit_within_budget(unit, budget - used)
+            got, cost, lost = self._fit_within_budget(unit, budget - used, keep_literals)
             if lost:
                 dropped.extend(unit)
                 continue
@@ -1675,13 +1777,18 @@ class ChronicleContextEngine(ContextEngine):
                 kept.append((idx, m))
         return kept, used, dropped
 
+    def _keep_literals(self) -> bool:
+        """context_engine.keep_literals (Phase B), read once per pass."""
+        return bool(self.core and self.core.cfg.get("context_engine.keep_literals", False))
+
     def _cap_tool_result(self, m, cap: int):
         """A tool result over `cap` tokens, shortened (archived first, ending
         with the id that restores it); anything else unchanged."""
         if m.get("role") != "tool" or self._msg_cost(m) <= cap:
             return m
         text = _text(m)
-        clipped = dict(m, content=text[:budget_chars(cap, margin=COMPRESSION_BUDGET)])
+        clipped = dict(m, content=_cut_text(text, budget_chars(cap, margin=COMPRESSION_BUDGET),
+                                            self._keep_literals()))
         return self._mark_clipped(m, clipped)
 
     def _mark_clipped(self, orig, clipped):
