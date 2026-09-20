@@ -42,6 +42,12 @@ class Tools:
             s("history", "Supersession history of a belief.", {"belief_id": text}, ["belief_id"]),
             s("get_context", "Assemble relevant context for a hint.", {"hint": text}, ["hint"]),
             s("explain", "Explain a derived belief (premises + rule).", {"belief_id": text}, ["belief_id"]),
+            s("resolve_pointer", "What a masked value in memory points at. Pass a pointer "
+                                 "(`env:OPENROUTER_API_KEY`, a vault handle) or any `text` that "
+                                 "contains one. Returns METADATA ONLY -- whether it resolves and "
+                                 "what it names, never the secret itself. Use it instead of asking "
+                                 "the user to repeat a credential.",
+              {"pointer": text, "text": text}),
             s("list_directives", "List active always/never directives.", {}),
             s("list_contradictions", "List open contradictions.", {}),
             s("correct", "Correct a belief (supersede or retract).", {"belief_id": text, "new_value": text, "reason": text}, ["belief_id"]),
@@ -91,6 +97,32 @@ class Tools:
             return json.dumps(fn(principal, args), default=str)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    def _t_resolve_pointer(self, principal, a):
+        """Phase E. A masked value leaves `«redacted:env:NAME»` behind; this
+        says whether that names anything real and what.
+
+        METADATA ONLY, and the reason is structural: a tool result is written
+        to the session DB, and the host's own accessors for the values are
+        documented "never place the returned values into tool results, logs,
+        exceptions, or any string that reaches the session DB". So this hands
+        back `resolves` and a description, and the agent that needs the VALUE
+        reads the env var or uses the host's vault-fill path -- which
+        registers it for redaction first. Asking the user to type the secret
+        again, which is what a bare marker invites, puts it in the transcript
+        twice."""
+        from . import secrets as _secrets
+
+        pointer = (a.get("pointer") or "").strip()
+        if pointer:
+            found = [pointer]
+        else:
+            found = _secrets.pointers_in(a.get("text") or "")
+            if not found:
+                return {"error": "pass a pointer, or text containing one"}
+        out = [dict(_secrets.resolve(p), described=_secrets.describe(p)) for p in found[:20]]
+        return {"pointers": out,
+                "unresolved": [r["pointer"] for r in out if not r["resolves"]]}
 
     def _emit(self, type_, payload, principal, **kw):
         return self.core.capture.append(type_, payload, owner=kw.pop("owner", principal),
