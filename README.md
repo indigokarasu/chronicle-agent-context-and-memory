@@ -550,10 +550,11 @@ it used to say, the events it appears in, and every captured turn that names it,
 each labelled with who was speaking in that turn (you, a scheduled job, the
 assistant, a tool, the host), so nothing reads as yours that was not.
 
-Above it, the **weave** puts the dated events on one time axis with a thread per
-entity they involve: a knot on your thread and on the person's, joined where an
-event names them both. Threads are ordered by how much of your memory runs
-through them, and the quieter ones are counted rather than drawn a pixel high.
+Above it, the **thread view** puts the dated events on one time axis with a
+thread per entity they involve: a knot on your thread and on the person's,
+joined where an event names them both. Threads are ordered by how much of your
+memory runs through them, and the quieter ones are counted rather than drawn a
+pixel high.
 
 Classification comes from the sources, never from a guess: an entity's kind from
 its own recorded type or its predicates, a contact's person-or-company from the
