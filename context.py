@@ -821,6 +821,36 @@ class ChronicleContextEngine(ContextEngine):
     # compression (§13.2)
     def compress(self, messages, current_tokens=None, focus_topic=None, focus=None,
                  force=False, **kwargs) -> list[dict[str, Any]]:
+        """Compact a window. Compaction may never be the reason a turn fails.
+
+        Everything below this method writes to a SQLite store the gateway and
+        the cron workers write to as well, so any of it can lose the race for
+        the lock. Unguarded, that OperationalError left compress(), passed
+        through the conversation loop's preflight gate and reached the
+        gateway's generic handler, which replaced the assistant's reply with
+        "Something went wrong and I couldn't finish this reply" -- a whole turn
+        lost to a memory write (observed 2026-09-22 18:55:26).
+
+        Individual writes degrade on their own terms wherever they can do
+        better than this: rescue keeps compacting, a fold that cannot archive
+        abandons the pass rather than evict what it failed to store. This is
+        the net under all of them, including paths neither of those covers. It
+        is the same fallback the engine already takes when the core cannot be
+        opened at all -- no store, so nothing is archived, and the handoff it
+        writes says plainly that the folded turns are gone.
+        """
+        try:
+            return self._compress_with_store(
+                messages, current_tokens=current_tokens, focus_topic=focus_topic,
+                focus=focus, force=force, **kwargs)
+        except Exception:
+            logger.warning(
+                "chronicle: compaction failed against the store; this pass falls back "
+                "to heuristic compaction and archives nothing.", exc_info=True)
+            return self._heuristic(messages)
+
+    def _compress_with_store(self, messages, current_tokens=None, focus_topic=None,
+                             focus=None, force=False, **kwargs) -> list[dict[str, Any]]:
         # Structured focus (§R8): `focus` (dict or string) wins if given, then
         # the pre-R8 `focus_topic` string kwarg, then whatever chronicle_focus
         # last set. _normalize_focus turns any of those into one shape so the
@@ -880,8 +910,26 @@ class ChronicleContextEngine(ContextEngine):
         fresh = [] if self._provider_captures() else [
             m for m in messages if self._rescue_key(m) not in self._rescued_hashes]
         if fresh:
-            self.core.capture.rescue(fresh, session_id=self._session_id,
-                                     speaker_context=self._host_context)
+            # Best effort, and never worth a failed turn. This store is shared
+            # with the gateway's own writers and the cron workers, so a write
+            # here can lose the race for the SQLite lock. Unguarded, that
+            # OperationalError left compress(), passed through the preflight
+            # gate and reached the gateway's generic handler -- the user lost
+            # the entire reply to a side-write that does not even run when a
+            # memory provider is live. Compression owes the caller messages; it
+            # can still return them.
+            try:
+                self.core.capture.rescue(fresh, session_id=self._session_id,
+                                         speaker_context=self._host_context)
+            except Exception:
+                # Marked rescued regardless: append() derives an event id from a
+                # payload carrying a fresh uuid4, so a later retry cannot dedupe
+                # against whatever landed before the failure -- it would only add
+                # a second copy of it on every subsequent pass.
+                logger.warning(
+                    "chronicle: rescue failed for %d span(s); they stay in context "
+                    "but are not separately durable. Compaction continues.",
+                    len(fresh), exc_info=True)
             self._rescued_hashes.update(self._rescue_key(m) for m in fresh)
 
         # 1.5) stable cut-point geometry (§R5): the settled prefix found in step
@@ -1014,21 +1062,39 @@ class ChronicleContextEngine(ContextEngine):
                 size = 0
             batches[-1].append(u)
             size += len(u)
-        for batch in batches:
-            with self.core.store.transaction():
-                for u in batch:
-                    ids = []
-                    for _i, m in u:
-                        if not _text(m):         # a bare call: nothing to restore
-                            ids.append(None)
+        # I17 makes a span evictable only once it is durable, so a fold that
+        # cannot finish must not return a compressed window: the messages it
+        # failed to store would leave the context with nothing to restore them
+        # from. Abandon the pass instead and hand back the original -- the host
+        # keeps a full window and the next turn tries again. Handoff state the
+        # loop already advanced is rewound to the watermarks taken above it, so
+        # the retry cannot emit those lines twice.
+        _asks_mark, _steps_mark = n_asks, n_steps
+        _digests_mark = self._digests_written
+        try:
+            for batch in batches:
+                with self.core.store.transaction():
+                    for u in batch:
+                        ids = []
+                        for _i, m in u:
+                            if not _text(m):         # a bare call: nothing to restore
+                                ids.append(None)
+                                durable_evicted.append(m)
+                                continue
+                            chunk_ids = self._ensure_durable(m)
+                            span_id, _digest, _stub = self._fold(m, chunk_ids)
+                            ids.append(span_id)
                             durable_evicted.append(m)
-                            continue
-                        chunk_ids = self._ensure_durable(m)
-                        span_id, _digest, _stub = self._fold(m, chunk_ids)
-                        ids.append(span_id)
-                        durable_evicted.append(m)
-                    evicted_span_ids.extend(i for i in ids if i)
-                    self._note_folded_unit([m for _i, m in u], ids)
+                        evicted_span_ids.extend(i for i in ids if i)
+                        self._note_folded_unit([m for _i, m in u], ids)
+        except Exception:
+            del self._handoff_asks[_asks_mark:]
+            del self._handoff_steps[_steps_mark:]
+            self._digests_written = _digests_mark
+            logger.warning(
+                "chronicle: fold failed; compaction abandoned and the window returned "
+                "uncompressed. Nothing was evicted.", exc_info=True)
+            return original
 
         kept_middle = [p for pos, u in enumerate(middle_units) if pos in kept_units for p in u]
         kept_middle += [(i, kept_never[i]) for i, _m in never_flat if i in kept_never]
@@ -1074,14 +1140,21 @@ class ChronicleContextEngine(ContextEngine):
 
         # 5) audit event (§R6/R4)
         kept_span_ids = [self._span_id(m) for m in result]
-        self.core.capture.append("compressed", {
-            "session_id": self._session_id,
-            "evicted_spans": evicted_span_ids, "kept_spans": kept_span_ids,
-            "folded_spans": evicted_span_ids, "folded_in_window": 0,
-            "evicted_count": len(evicted_span_ids), "retained": len(kept_span_ids),
-            "summary_ref": "", "budget_tokens": budget, "used_tokens": used,
-            "handoff_chars": len(handoff or ""), "mode": self.last_pass},
-            actor="system", session_id=self._session_id)
+        try:
+            self.core.capture.append("compressed", {
+                "session_id": self._session_id,
+                "evicted_spans": evicted_span_ids, "kept_spans": kept_span_ids,
+                "folded_spans": evicted_span_ids, "folded_in_window": 0,
+                "evicted_count": len(evicted_span_ids), "retained": len(kept_span_ids),
+                "summary_ref": "", "budget_tokens": budget, "used_tokens": used,
+                "handoff_chars": len(handoff or ""), "mode": self.last_pass},
+                actor="system", session_id=self._session_id)
+        except Exception:
+            # Observational only, and written after the window is already
+            # decided: losing the audit row costs a dashboard line, where
+            # raising would cost the user the whole reply.
+            logger.warning("chronicle: compaction audit event not written.",
+                           exc_info=True)
 
         self.compression_count += 1
         logger.info("chronicle compaction: session=%s mode=%s messages %d->%d folded=%d "
