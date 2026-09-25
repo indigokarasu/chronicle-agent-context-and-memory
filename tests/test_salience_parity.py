@@ -36,7 +36,7 @@ FOCUS = {"topics": ["zorblax"], "entities": ["Pat Testley"], "task": "fix the ga
 class TestOneModelNotTwoCopies(unittest.TestCase):
     def test_the_gate_retrieval_uses_is_the_one_in_salience(self):
         for name in ("relevance_words", "shared_content_words", "shares_content_word",
-                     "gate_needs", "gate_focus", "relevance_fts_match"):
+                     "gate_needs", "gate_focus", "relevance_fts_match", "proper_noun_words"):
             with self.subTest(name=name):
                 self.assertIs(getattr(R, name), getattr(S, name))
 
@@ -108,6 +108,37 @@ class TestTheGateWords(unittest.TestCase):
         self.assertTrue(S.is_relevant(words, "the zorblax standup moved to Thursdays"))
         self.assertFalse(S.is_relevant(words, "the Acme Fake Co invoice is paid"))
         self.assertFalse(S.is_relevant(S.relevance_words("thanks!"), "anything at all"))
+
+
+class TestProperNounWords(unittest.TestCase):
+    """F1b: which of a query's content words the federated one-word bypass
+    may trust without a vector -- capitalised, and not merely the query's
+    first word."""
+
+    def test_a_capitalised_word_after_the_first_counts(self):
+        self.assertEqual(S.proper_noun_words("what did I buy at Zorblax last week?"),
+                         frozenset({"zorblax"}))
+
+    def test_the_capitalised_first_word_does_not_count(self):
+        self.assertEqual(S.proper_noun_words("Zorblax was where I bought it"), frozenset())
+
+    def test_a_lowercase_word_never_counts_even_if_it_matches_a_name(self):
+        self.assertEqual(S.proper_noun_words("did I buy anything at zorblax recently"), frozenset())
+
+    def test_stemmed_the_same_way_relevance_words_stems(self):
+        # "Zorblax's" -> the possessive is dropped before stemming, same as
+        # relevance_words; the two must agree on the SAME word or a federated
+        # line matching one would never be recognised as matching the other.
+        self.assertEqual(S.proper_noun_words("check Zorblax's invoice"), frozenset({"zorblax"}))
+
+    def test_two_names_are_both_kept(self):
+        self.assertEqual(S.proper_noun_words("did I see Robin or Zorblax yesterday"),
+                         frozenset({"robin", "zorblax"}))
+
+    def test_a_short_word_never_counts_even_if_capitalised(self):
+        # "Ok" is two letters -- below _is_content's length floor.
+        # Capitalisation alone never overrides that, whatever position it's in.
+        self.assertEqual(S.proper_noun_words("Ok, is Zorblax open?"), frozenset({"zorblax"}))
 
 
 class TestRankingAnyUnit(unittest.TestCase):

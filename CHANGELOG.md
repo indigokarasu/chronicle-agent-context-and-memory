@@ -3,6 +3,19 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.10.1
+
+**A question that names something reaches the records about it.** The per-turn relevance gate
+keeps a line that shares only ONE of the question's words only when its vector is close to the
+question (cosine 0.65 with the default embedder), because most one-word matches are coincidences.
+A purchase record for a merchant the question names shares exactly one word with "what did I buy
+at <Merchant> last week" (records never say "buy"), scored 0.52-0.59, and was dropped: the
+question injected nothing although the records existed. A federated record now passes on one word
+when that word is a proper noun of the question (capitalised, and not the question's first word);
+common words keep the bar, and memory lines keep the old rule. `scripts/prefetch_eval.py
+--with-embedder` measures the gate as it runs live: without vectors every item reads "no vector",
+which is how the harness had shown this question as answered all along.
+
 ## 5.10.0
 
 **Whole documents, grouped results, and search that finds the specific word.**

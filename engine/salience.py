@@ -181,6 +181,30 @@ def gate_focus(text: str, limit: int = _GATE_MAX_WORDS) -> str:
     return " ".join(first[w][1] for w in ranked[:limit])
 
 
+def proper_noun_words(text: str) -> frozenset:
+    """Content-word stems that appear capitalised in `text` and are not its
+    first word -- the same "is this a name" heuristic `gate_focus` already
+    uses to prioritise a name when it trims a long prompt to its content
+    words, exposed here as its own question. A capitalised first word is a
+    sentence start, not a name ("Buy the tickets" says nothing about a
+    'Buy'); one capitalised anywhere later usually is ("...buy it at
+    Amazon"). Call this BEFORE `gate_focus`, which lower-cases every word it
+    returns and so erases the capitalisation this reads."""
+    named: set = set()
+    for i, raw in enumerate(word_tokens(_strip_urls(text))):
+        t = raw.lower()
+        if "'" in t:
+            if t.endswith("n't"):
+                continue
+            t = t.split("'", 1)[0]
+            raw = raw.split("'", 1)[0]
+        if not _is_content(t):
+            continue
+        if i > 0 and raw[:1].isupper():
+            named.add(_gate_stem(t))
+    return frozenset(named)
+
+
 def relevance_fts_match(text: str) -> str:
     """The FTS5 expression for the injection gate: the message's content words
     -- as written and as `_gate_stem` folds them -- each a PREFIX term, OR'd.
