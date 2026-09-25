@@ -290,6 +290,58 @@ class TestAppliesTheMigratedVectors(_WBCase):
 
 
 # ==========================================================================
+# F3 — the vector write generation counter
+# ==========================================================================
+class TestGenerationBumpsOncePerCommittedBatch(_WBCase):
+    """This tool UPDATEs a vector row on its existing natural key -- by design
+    (see the module docstring) it never INSERTs or DELETEs -- so row count and
+    max rowid never move, and ObservedVectorCache / ProjectionVectorCache
+    (engine/vector_cache.py) would keep serving the pre-image forever without
+    another signal. `meta.vecgen:<table>` is that signal, bumped ONCE per
+    committed batch (never once per row, and never on a batch every write to
+    which is refused, skipped or dry-run) the same way
+    MemoryStore.bump_vector_generation does it for every write inside the
+    engine."""
+
+    def _generation(self, table):
+        c = self._live()
+        row = c.execute("SELECT value FROM meta WHERE key=?", ("vecgen:" + table,)).fetchone()
+        c.close()
+        return int(row[0]) if row else 0
+
+    def test_a_successful_run_bumps_every_applied_table_once(self):
+        before = {t: self._generation(t) for t in WB._TABLES}
+        rc, counts, out = self._run_counts()
+        self.assertIn(rc, (0, 2), out)
+        self.assertGreater(counts.get("applied", 0), 0, out)
+        # The fixture gives every one of the five tables exactly one changed
+        # row (see _WBCase.setUp's comment), so each table's whole write
+        # lands in a single batch: the bump must be exactly one, not one per
+        # row written.
+        for t in WB._TABLES:
+            self.assertEqual(self._generation(t), before[t] + 1,
+                             "table %s: expected exactly one generation bump" % t)
+
+    def test_a_dry_run_bumps_nothing(self):
+        before = {t: self._generation(t) for t in WB._TABLES}
+        rc, counts, out = self._run_counts(dry_run=True)
+        self.assertGreater(counts.get("applied", 0), 0, out)   # the preview is non-trivial…
+        for t in WB._TABLES:
+            self.assertEqual(self._generation(t), before[t],
+                             "table %s: a dry run must never write, including the "
+                             "generation counter" % t)   # …but nothing was actually written
+
+    def test_a_second_run_with_nothing_left_to_apply_does_not_bump_again(self):
+        self._run_counts()   # first run: applies everything there is to apply
+        before = {t: self._generation(t) for t in WB._TABLES}
+        rc2, counts2, out2 = self._run_counts()
+        self.assertEqual(counts2.get("applied", 0), 0, out2)
+        for t in WB._TABLES:
+            self.assertEqual(self._generation(t), before[t],
+                             "table %s: a batch with nothing applied must not bump" % t)
+
+
+# ==========================================================================
 # W1 — the resurrection test
 # ==========================================================================
 class TestTheAnnMirrorKeepsCorrectedRowsVisible(_WBCase):

@@ -55,6 +55,16 @@ MAX_TEXT_COLUMNS = 12
 MAX_TOKENS = 5
 MAX_PROJECTION_CHARS = 350
 MAX_VALUE_CHARS = 100
+# Keys per IN-list in `lookup`: under SQLite's default variable limit (999 on
+# older builds) with room to spare.
+LOOKUP_CHUNK = 500
+# Bounds for a folder-shaped container (§F10d, engine/passages.py). A query's
+# focus tokens are matched against DECLARED path values, so the matcher must
+# see them all up front (one bounded DISTINCT scan, not a table scan per
+# candidate); the name list on a resulting card is capped separately so one
+# huge folder cannot fill a caller's whole budget with filenames.
+MAX_DISTINCT_VALUES = 2000
+MAX_FOLDER_NAMES = 8
 
 _LIKE_ESCAPE = "\\"
 
@@ -69,12 +79,24 @@ def quote_ident(name) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def like_pattern(token) -> str:
-    """`%token%` with LIKE metacharacters escaped (paired with ESCAPE '\\')."""
+def _like_escape(token) -> str:
     t = str(token)
     for ch in (_LIKE_ESCAPE, "%", "_"):
         t = t.replace(ch, _LIKE_ESCAPE + ch)
-    return "%" + t + "%"
+    return t
+
+
+def like_pattern(token) -> str:
+    """`%token%` with LIKE metacharacters escaped (paired with ESCAPE '\\')."""
+    return "%" + _like_escape(token) + "%"
+
+
+def like_prefix(token) -> str:
+    """`token%` with LIKE metacharacters escaped (paired with ESCAPE '\\') --
+    a PREFIX match, not a substring match. Used for a folder-shaped container
+    read (`LocalDBProvider.folder_card`): a query for "Taxes/2026" must not
+    also pull in an unrelated "Home/Old Taxes/2026" that merely contains it."""
+    return _like_escape(token) + "%"
 
 
 def is_text_column(decl_type) -> bool:
@@ -288,6 +310,138 @@ class LocalDBProvider(CapabilityProvider):
         finally:
             conn.close()
 
+    def lookup(self, table: str, key_column: str, keys, columns,
+               owner: str = "_user", principal: str = "_user") -> Dict[str, Dict]:
+        """{str(key): {column: value}} for the rows whose `key_column` is in
+        `keys` -- one bounded IN-list statement per LOOKUP_CHUNK keys.
+
+        The read that asks a source for a few columns of rows the caller already
+        knows by id (a container key, a passage's text) at query time, instead
+        of copying those columns into every cached projection. Keys come back
+        as strings because callers hold ids from JSON while the source returns
+        whatever its column affinity gives. The table and every column are
+        checked against the introspected schema before any SQL is built, so a
+        config naming a column that is not there reads nothing and says so.
+        ACL-checked. Never raises."""
+        out: Dict[str, Dict] = {}
+        keys = [k for k in (keys or []) if k is not None]
+        columns = [str(c) for c in (columns or []) if str(c)]
+        if not keys or not columns:
+            return out
+        if not can_read(self.read_acl, owner, principal):
+            return out
+        known = set(c["name"] for c in (self.schema().get(table) or []))
+        if not known:
+            logger.warning("localdb %s: lookup: table %r not found", self.name, table)
+            return out
+        absent = [c for c in [key_column] + columns if c not in known]
+        if absent:
+            logger.warning("localdb %s: lookup: %r has no column(s) %s",
+                           self.name, table, ", ".join(sorted(set(absent))))
+            return out
+        try:
+            conn = self._connect()
+        except Exception as e:
+            logger.warning("localdb %s: lookup(%s) failed to open: %s", self.name, table, e)
+            return out
+        cols_sql = ", ".join(quote_ident(c) for c in [key_column] + columns)
+        try:
+            for i in range(0, len(keys), LOOKUP_CHUNK):
+                part = keys[i:i + LOOKUP_CHUNK]
+                sql = "SELECT %s FROM %s WHERE %s IN (%s)" % (
+                    cols_sql, quote_ident(table), quote_ident(key_column),
+                    ",".join("?" * len(part)))
+                for r in conn.execute(sql, part).fetchall():
+                    row = dict(zip([key_column] + columns, tuple(r)))
+                    k = row.pop(key_column)
+                    if k is not None:
+                        out.setdefault(str(k), row)
+            return out
+        except Exception as e:
+            logger.warning("localdb %s: lookup(%s) failed: %s", self.name, table, e)
+            return out
+        finally:
+            conn.close()
+
+    def distinct_values(self, table: str, column: str, limit: int = MAX_DISTINCT_VALUES,
+                        owner: str = "_user", principal: str = "_user") -> List[str]:
+        """Up to `limit` distinct non-empty values of one column, sorted.
+
+        What a folder-path matcher needs before it can ask "does any declared
+        folder match the query": the set of folders that exist at all. One
+        bounded statement, schema-checked and ACL-checked like every other
+        read here. Never raises."""
+        out: List[str] = []
+        if not can_read(self.read_acl, owner, principal):
+            return out
+        known = set(c["name"] for c in (self.schema().get(table) or []))
+        if column not in known:
+            logger.warning("localdb %s: distinct_values: %r has no column %r",
+                           self.name, table, column)
+            return out
+        try:
+            conn = self._connect()
+        except Exception as e:
+            logger.warning("localdb %s: distinct_values(%s) failed to open: %s",
+                           self.name, table, e)
+            return out
+        try:
+            c = quote_ident(column)
+            rows = conn.execute(
+                "SELECT DISTINCT %s AS v FROM %s WHERE %s IS NOT NULL AND %s <> '' "
+                "ORDER BY v LIMIT ?" % (c, quote_ident(table), c, c),
+                (int(limit),)).fetchall()
+            return [r["v"] for r in rows if r["v"] is not None]
+        except Exception as e:
+            logger.warning("localdb %s: distinct_values(%s) failed: %s", self.name, table, e)
+            return out
+        finally:
+            conn.close()
+
+    def folder_card(self, table: str, column: str, folder_path: str, separator: str,
+                    name_column: str = "", owner: str = "_user", principal: str = "_user",
+                    max_names: int = MAX_FOLDER_NAMES) -> Optional[Dict]:
+        """{path, file_count, names} for the rows filed at `folder_path` or
+        nested under it -- `folder_path` itself, or any value that starts with
+        `folder_path + separator` -- so a card for a shallow folder already
+        counts everything in its subfolders instead of needing one card per
+        level. One COUNT and one capped, ordered SELECT (name_column="" skips
+        the second query and returns no names). Schema-checked, ACL-checked,
+        never raises."""
+        if not folder_path:
+            return None
+        if not can_read(self.read_acl, owner, principal):
+            return None
+        known = set(c["name"] for c in (self.schema().get(table) or []))
+        if column not in known or (name_column and name_column not in known):
+            logger.warning("localdb %s: folder_card: %r missing column(s)", self.name, table)
+            return None
+        try:
+            conn = self._connect()
+        except Exception as e:
+            logger.warning("localdb %s: folder_card(%s) failed to open: %s", self.name, table, e)
+            return None
+        try:
+            q, c = quote_ident(table), quote_ident(column)
+            where = "(%s = ? OR %s LIKE ? ESCAPE '%s')" % (c, c, _LIKE_ESCAPE)
+            params = [folder_path, like_prefix(folder_path + separator)]
+            row = conn.execute("SELECT COUNT(*) AS n FROM %s WHERE %s" % (q, where),
+                               params).fetchone()
+            file_count = row["n"] if row else 0
+            names: List[str] = []
+            if name_column and file_count:
+                nc = quote_ident(name_column)
+                rows = conn.execute(
+                    "SELECT %s AS v FROM %s WHERE %s ORDER BY %s LIMIT ?" %
+                    (nc, q, where, nc), params + [int(max_names)]).fetchall()
+                names = [str(r["v"]) for r in rows if r["v"] not in (None, "")]
+            return {"path": folder_path, "file_count": file_count, "names": names}
+        except Exception as e:
+            logger.warning("localdb %s: folder_card(%s) failed: %s", self.name, table, e)
+            return None
+        finally:
+            conn.close()
+
     def search(self, tokens, owner: str = "_user", principal: str = "_user",
                max_tables: int = MAX_TABLES, max_rows: int = MAX_ROWS_PER_TABLE) -> List[Dict]:
         """Rows where ANY text column LIKE ANY token — generic, bounded, read-only.
@@ -340,38 +494,76 @@ class LocalDBProvider(CapabilityProvider):
         if not text_cols:
             return []
 
-        clauses: List[str] = []
-        params: List[str] = []
-        for col in text_cols:
-            quoted = quote_ident(col)
-            for tok in tokens:
-                clauses.append("%s LIKE ? ESCAPE '%s'" % (quoted, _LIKE_ESCAPE))
-                params.append(like_pattern(tok))
+        # F1: ask for the MOST SPECIFIC token first, not `tokens` order.
+        #
+        # The old query OR'd every (column, token) pair into one WHERE and cut
+        # the result at `max_rows` with no ORDER BY, so a short generic word
+        # riding alongside a proper noun in the same query (a merchant name
+        # plus "last", from "last week") could fill the whole row cap with
+        # rows the generic word alone matched -- a 4-letter substring turns up
+        # inside ordinary words ("elastic", "blast") across a table of any
+        # size -- before the row the proper noun actually named was ever
+        # reached. Measured: a table where the specific match sorts after the
+        # generic one by rowid returned zero of the rows the query was about.
+        #
+        # Fix: one bounded subquery PER TOKEN (still all `text_cols`, still
+        # LIMIT `max_rows` each — the per-table cost bound is unchanged, and
+        # this stays ONE statement: a UNION ALL, one round trip), longest
+        # token first. Deduped and re-capped at `max_rows` in Python below, so
+        # a row every subquery would have found on its own only ever costs one
+        # slot, and the slots go to the longer (more specific) token's rows
+        # first when the cap is tight.
+        deduped_tokens = list(dict.fromkeys(str(t) for t in tokens if str(t).strip()))
+        if not deduped_tokens:
+            return []
+        ordered_tokens = sorted(deduped_tokens, key=len, reverse=True)[:MAX_TOKENS]
 
+        clause = " OR ".join("%s LIKE ? ESCAPE '%s'" % (quote_ident(c), _LIKE_ESCAPE)
+                             for c in text_cols)
         quoted_table = quote_ident(table)
-        tail = " FROM %s WHERE %s LIMIT %d" % (quoted_table, " OR ".join(clauses), int(max_rows))
+        pri_alias = self._priority_alias(columns)
+
+        def _union(select_cols: str):
+            parts: List[str] = []
+            params: List[str] = []
+            for priority, tok in enumerate(ordered_tokens):
+                # Each branch's LIMIT must bind to that branch alone, not the
+                # whole compound SELECT -- SQLite gives a bare
+                # `SELECT ... LIMIT n UNION ALL SELECT ...` to the compound,
+                # so the per-token cap is applied inside a FROM subquery instead.
+                parts.append("SELECT * FROM (SELECT %d AS %s, %s FROM %s WHERE %s LIMIT %d)"
+                             % (priority, quote_ident(pri_alias), select_cols,
+                                quoted_table, clause, int(max_rows)))
+                params.extend(like_pattern(tok) for _ in text_cols)
+            sql = " UNION ALL ".join(parts) + " ORDER BY %s" % quote_ident(pri_alias)
+            return sql, params
+
         pk_col = self.single_pk(table)
         rid_alias = None
         if pk_col is None:
             # No addressable declared key, so ask for the implicit rowid in the
-            # SAME statement (one query per table). Aliased, because for an
-            # `INTEGER PRIMARY KEY` table sqlite reports a bare `rowid` under the
-            # pk's own name; and the alias is made unique against the real
-            # columns so `*` can never shadow it.
+            # SAME statement (still one query per table). Aliased, because for
+            # an `INTEGER PRIMARY KEY` table sqlite reports a bare `rowid`
+            # under the pk's own name; and the alias is made unique against
+            # the real columns so `*` can never shadow it.
             rid_alias = self._rowid_alias(columns)
+            sql, params = _union("_rowid_ AS %s,*" % quote_ident(rid_alias))
             try:
-                rows = conn.execute(
-                    "SELECT _rowid_ AS %s,*%s" % (quote_ident(rid_alias), tail), params).fetchall()
+                rows = conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 # WITHOUT ROWID table: there is no implicit rowid to project.
                 rid_alias = None
-                rows = conn.execute("SELECT *%s" % tail, params).fetchall()
+                sql, params = _union("*")
+                rows = conn.execute(sql, params).fetchall()
         else:
-            rows = conn.execute("SELECT *%s" % tail, params).fetchall()
+            sql, params = _union("*")
+            rows = conn.execute(sql, params).fetchall()
 
         results = []
+        seen_keys: set = set()
         for r in rows:
             row = dict(r)
+            row.pop(pri_alias, None)
             row_id = None
             external_id = None
             if rid_alias is not None:
@@ -382,10 +574,32 @@ class LocalDBProvider(CapabilityProvider):
             elif pk_col is not None and row.get(pk_col) is not None:
                 row_id = row[pk_col]
                 external_id = "%s:%s" % (table, row_id)
+            # The same row can satisfy more than one token's subquery; kept
+            # once, under the HIGHER-priority (earlier, more specific) token
+            # it first appeared under, since ORDER BY above already sorted by
+            # priority. A row with no addressable identity (composite/no key)
+            # is deduped on its own content instead of `id(row)` -- a fresh
+            # dict per fetched row would otherwise never compare equal to
+            # itself across branches, and two such rows would silently cost
+            # two of `max_rows`' slots for what is provenance-wise one row.
+            key = external_id if external_id is not None else tuple(sorted(row.items()))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             results.append({"provider": self.name, "table": table, "row_id": row_id,
                             "external_id": external_id,
                             "projection": self.project_row(table, row)})
+            if len(results) >= max_rows:
+                break
         return results
+
+    @staticmethod
+    def _priority_alias(columns: List[Dict]) -> str:
+        names = set(c["name"] for c in columns)
+        alias = "_chronicle_priority"
+        while alias in names:
+            alias += "_"
+        return alias
 
     @staticmethod
     def _rowid_alias(columns: List[Dict]) -> str:

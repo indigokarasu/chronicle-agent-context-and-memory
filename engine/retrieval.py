@@ -22,6 +22,7 @@ import math
 import re
 from contextlib import contextmanager
 from itertools import zip_longest
+from pathlib import Path
 from time import monotonic as _time_monotonic
 
 from . import access
@@ -31,7 +32,9 @@ from .config import DEFAULTS, check_abstain_gate
 from . import embeddings as _embeddings
 from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
                          estimate_tokens, pack, unpack, wrong_dim_indices)
+from . import passages as _passages
 from .federated import FederatedChannel
+from .localdb import LocalDBProvider, providers_from_config
 # One importance model for recall and compaction (engine/salience.py): the
 # gate's words and thresholds live there now, and the context engine's
 # keep/evict score reads the same module.
@@ -93,6 +96,17 @@ VECTOR_SCAN_PAGE = 1000
 # (vector_cache.ProjectionVectorCache) shortlists against the same floor the
 # tier loop applies, and two literals could drift apart silently.
 _PROJ_FLOOR = 0.15
+
+# Folder-shaped containers (§F10d): how many aggregate cards one query may
+# return, across every declared source -- a query matching a broad path
+# ("2026") could otherwise match dozens of folders and crowd out everything
+# else. The score a folder-card synthetic hit is filed under in the raw tier
+# (`_retrieve_raw_inner`'s `scored`): a matched path SEGMENT is a stronger,
+# more specific signal than any cosine similarity computed there (whose
+# contributions top out well under 1.0), so a folder card always outranks a
+# fuzzy vector match for the same query.
+_FOLDER_CARD_MAX = 3
+_FOLDER_HIT_SCORE = 5.0
 
 
 def _tail_merged(pages, page_size):
@@ -1662,7 +1676,7 @@ class RetrievalEngine:
             return None
 
     def retrieve_raw(self, query, *, limit=20, principal=None, now=None, exclude_automation=False,
-                     fts_match=None, lexical_only=False):
+                     fts_match=None, lexical_only=False, include_folder_cards=False):
         """Raw observed/session/projection tier. Wrapper for the A0c scope; the
         body is `_retrieve_raw_inner`.
 
@@ -1673,11 +1687,23 @@ class RetrievalEngine:
         where the agent may be asking about its own work. On the production
         store 7,817 of 7,924 indexed sessions were cron runs, and the per-turn
         block was serving their tool JSON and operational narratives as memory
-        about the user."""
+        about the user.
+
+        `include_folder_cards` (§F10d): the mirror image, opt-IN. `get_context`
+        already has its own place for a folder card — the federated tail,
+        leftover budget only (`_folder_hits`, called directly from
+        `_get_context_inner`) — so its own internal `retrieve_raw()` call
+        (Tier 2 raw evidence) must NOT also carry one: a folder card is
+        external, federated content, and r1 says that content may never
+        compete with or displace Chronicle's own evidence. False by default
+        for exactly that reason; `chronicle_search` (Tools._t_search) is the
+        one caller that sets it True, because it has no separate federated
+        tail of its own to show one in."""
         with self._query_diagnostics():
             return self._retrieve_raw_inner(query, limit=limit, principal=principal, now=now,
                                             exclude_automation=exclude_automation,
-                                            fts_match=fts_match, lexical_only=lexical_only)
+                                            fts_match=fts_match, lexical_only=lexical_only,
+                                            include_folder_cards=include_folder_cards)
 
     @staticmethod
     def _from_automation(ev: dict | None) -> bool:
@@ -1727,26 +1753,101 @@ class RetrievalEngine:
     _PROJ_LONG_VALUE = 200
 
     def _federation_specs(self) -> dict:
-        """provider -> {capability, columns} from `federation.local_dbs`, read once."""
-        specs = getattr(self, "_fed_specs", None)
-        if specs is None:
-            specs = {}
-            dbs = self.cfg.get("federation.local_dbs", []) if self.cfg is not None else []
-            for d in dbs or []:
-                if isinstance(d, dict) and d.get("name"):
-                    specs[d["name"]] = {"capability": d.get("capability") or d["name"],
-                                        "columns": list(d.get("content_columns") or [])}
-            self._fed_specs = specs
+        """provider -> {capability, columns, table, id_column, passages,
+        container} from `federation.local_dbs`.
+
+        Re-read when the declared list changes (it is a handful of small
+        dicts), so a config edited in place is honoured without a restart. A
+        `passages`/`container` block that cannot be executed is logged once
+        and ignored for that source: a read path degrades, it does not fail
+        (the federation sweep is where a bad declaration fails loudly)."""
+        dbs = self.cfg.get("federation.local_dbs", []) if self.cfg is not None else []
+        sig = repr(dbs)
+        cached = getattr(self, "_fed_specs", None)
+        if cached is not None and getattr(self, "_fed_specs_sig", None) == sig:
+            return cached
+        specs = {}
+        for d in dbs or []:
+            if not (isinstance(d, dict) and d.get("name")):
+                continue
+            try:
+                pspec = _passages.passage_spec(d, self.cfg)
+            except ValueError as e:
+                logger.warning("federation %s: passages ignored: %s", d["name"], e)
+                pspec = None
+            try:
+                cspec = _passages.container_spec(d)
+            except ValueError as e:
+                logger.warning("federation %s: container ignored: %s", d["name"], e)
+                cspec = None
+            specs[d["name"]] = {"capability": d.get("capability") or d["name"],
+                                "columns": list(d.get("content_columns") or []),
+                                "table": str(d.get("table") or ""),
+                                "id_column": str(d.get("id_column") or "id"),
+                                "name_column": str(d.get("name_column") or ""),
+                                "passages": pspec, "container": cspec}
+        self._fed_specs, self._fed_specs_sig = specs, sig
+        # Providers are rebuilt with the specs they were read from.
+        self._fed_local_dbs = None
+        self._fed_other_dbs = {}
         return specs
 
-    def _render_projections(self, proj_ids, max_chars=1200) -> dict:
-        """`proj:<provider>:<external_id>` -> readable text from the pointer's
-        cached projection: `[provider] display -- field: value; ...`.
+    def _local_db(self, provider: str):
+        """The declared source's LocalDBProvider (engine/localdb.py), or None.
 
-        Fields follow the provider's declared column order, short values first
-        and long ones (bodies, transcripts) last, so a truncated excerpt still
-        says what the row is. A pointer that cannot be found or parsed is left
-        out, and the caller keeps its bare id."""
+        The query-time reads below -- a passage's text, a container key -- go
+        through the same read-only, schema-checked, ACL-checked helper the
+        federated channel uses; built once per declaration, so each keeps its
+        introspected schema."""
+        self._federation_specs()
+        dbs = getattr(self, "_fed_local_dbs", None)
+        if dbs is None:
+            dbs = {}
+            try:
+                for p in providers_from_config(self.cfg):
+                    dbs.setdefault(p.name, p)
+            except Exception as e:                       # noqa: BLE001
+                logger.warning("federation: local dbs unavailable: %s", e)
+            self._fed_local_dbs = dbs
+        return dbs.get(provider)
+
+    def _passage_source(self, spec):
+        """The LocalDBProvider over a passage spec's `from` database (cached)."""
+        key = (spec.from_path, spec.from_table)
+        others = getattr(self, "_fed_other_dbs", None)
+        if others is None:
+            others = self._fed_other_dbs = {}
+        db = others.get(key)
+        if db is None:
+            src = self._local_db(spec.provider)
+            db = LocalDBProvider("%s.passages" % spec.provider, str(Path(spec.from_path).expanduser()),
+                                 read_acl=src.read_acl if src is not None else access.DEFAULT_ACL,
+                                 table=spec.from_table)
+            others[key] = db
+        return db
+
+    def _passage_texts(self, spec, source_ids, principal) -> dict:
+        """{str(source row id): text} for a source's records, read at query
+        time through the local-db helpers -- the same text, by the same
+        definition (passages.fetch_passage_texts), the builder cut."""
+        src = self._local_db(spec.provider)
+        if src is None:
+            return {}
+        owner = self.active_principal
+
+        def lookup(where, table, key_column, keys, columns):
+            db = src if where == "source" else self._passage_source(spec)
+            return db.lookup(table, key_column, keys, columns, owner=owner, principal=principal)
+
+        try:
+            return _passages.fetch_passage_texts(spec, source_ids, lookup)
+        except Exception as e:                           # noqa: BLE001
+            logger.warning("federation %s: passage text unavailable: %s", spec.provider, e)
+            return {}
+
+    def _projection_cards(self, proj_ids) -> dict:
+        """`proj:<provider>:<external_id>` -> (provider, spec, projection dict)
+        for the pointers that exist and parse; the rest are left out."""
         out = {}
         if not proj_ids:
             return out
@@ -1781,27 +1882,216 @@ class RetrievalEngine:
                 proj = json.loads(row[0])
             except (TypeError, ValueError):
                 continue
-            fields = proj.get("fields") or {}
-            display = str(proj.get("display") or "").strip()
-            order = [c for c in spec.get("columns", []) if c in fields]
-            order += [k for k in fields if k not in order]
-            short, long_ = [], []
-            for k in order:
-                if k in self._PROJ_SKIP_KEYS or k.endswith("_id"):
+            if isinstance(proj, dict):
+                out[pid] = (provider, spec, proj)
+        return out
+
+    def _render_card(self, provider, spec, proj, max_chars=1200, passage=None) -> str:
+        """`[provider] display -- field: value; ...`, or, for a passage hit,
+        the short fields then the passage itself in place of the long ones.
+
+        `passage` is (n, count, text): the long fields (a body, a transcript,
+        a document's first page) are what the passage replaces -- they are
+        the part of the record the query did NOT match best."""
+        fields = proj.get("fields") or {}
+        display = str(proj.get("display") or "").strip()
+        order = [c for c in spec.get("columns", []) if c in fields]
+        order += [k for k in fields if k not in order]
+        short, long_ = [], []
+        for k in order:
+            if k in self._PROJ_SKIP_KEYS or k.endswith("_id"):
+                continue
+            v = fields.get(k)
+            v = "" if v is None else str(v).strip()
+            if v in ("", "null", "None") or v == display:
+                continue
+            (long_ if len(v) > self._PROJ_LONG_VALUE else short).append(f"{k}: {v}")
+        head = f"[{provider}] {proj.get('display') or ''}".rstrip()
+        if passage is not None:
+            n, count, body = passage
+            tail = " -- passage %d of %d: %s" % (n + 1, count, body)
+            lead = head + (" -- " + "; ".join(short) if short else "")
+            # The passage is the evidence; the card around it is context, so
+            # it is the card that gives way when the two exceed the budget.
+            room = max(len(head), max_chars - len(tail))
+            return (lead[:room] + tail)[:max(max_chars, len(head) + len(tail))]
+        parts = short + long_
+        text = head + (" -- " + "; ".join(parts) if parts else "")
+        return text[:max_chars]
+
+    def _render_projections(self, proj_ids, max_chars=1200, passages=None,
+                            principal=None) -> dict:
+        """`proj:<provider>:<external_id>` -> readable text from the pointer's
+        cached projection: `[provider] display -- field: value; ...`.
+
+        Fields follow the provider's declared column order, short values first
+        and long ones (bodies, transcripts) last, so a truncated excerpt still
+        says what the row is. A pointer that cannot be found or parsed is left
+        out, and the caller keeps its bare id.
+
+        `passages` maps a record's id to the passage number n that matched
+        best: that record renders with passage n's text, re-derived from the
+        source (engine/passages.py). A passage that can no longer be derived
+        (the source row is gone, the text got shorter) renders the plain card."""
+        cards = self._projection_cards(proj_ids)
+        return self._render_cards(cards, max_chars=max_chars, passages=passages,
+                                  principal=principal)
+
+    def _render_cards(self, cards, max_chars=1200, passages=None, principal=None) -> dict:
+        derived = self._derive_passages(cards, passages or {}, principal)
+        out = {}
+        for pid, (provider, spec, proj) in cards.items():
+            out[pid] = self._render_card(provider, spec, proj, max_chars=max_chars,
+                                         passage=derived.get(pid))
+        return out
+
+    def _derive_passages(self, cards, passages, principal) -> dict:
+        """{record id: (n, count, text)} for the records whose best hit was a
+        passage: one batched source read per provider, then the same split the
+        builder made."""
+        out = {}
+        want: dict = {}
+        for pid, n in passages.items():
+            card = cards.get(pid)
+            if card is None or n is None:
+                continue
+            provider, spec, proj = card
+            pspec = spec.get("passages")
+            sid = proj.get("source_row_id")
+            if pspec is None or sid is None:
+                continue
+            want.setdefault(provider, (pspec, []))[1].append((pid, sid, int(n)))
+        for provider, (pspec, items) in want.items():
+            texts = self._passage_texts(pspec, [sid for _p, sid, _n in items],
+                                        principal or self.active_principal)
+            for pid, sid, n in items:
+                text = texts.get(str(sid))
+                if not text:
                     continue
-                v = fields.get(k)
-                v = "" if v is None else str(v).strip()
-                if v in ("", "null", "None") or v == display:
+                pieces = _passages.split_passages(text, pspec.size, pspec.max_per_record)
+                if 0 <= n < len(pieces):
+                    out[pid] = (n, len(pieces), pieces[n])
+        return out
+
+    def _collapse_containers(self, entries, cards, principal) -> None:
+        """Collapse projection hits that share a declared container, in place.
+
+        `entries` is [score, seq, record id, hit external id, owner, text]
+        best-first. For every source with a `container` block, each surviving
+        record's container key is read FROM THE SOURCE by its row id (one
+        batched lookup per source, through the local-db helpers) -- never from
+        the cached fields, where adding a column would change every row's
+        content hash and re-embed the whole source. Records sharing a key keep
+        the best one, whose text notes how many more matched and names a few;
+        the rest are removed from `entries`."""
+        specs = self._federation_specs()
+        by_provider: dict = {}
+        for e in entries:
+            card = cards.get(e[2])
+            if card is None:
+                continue
+            provider, spec, proj = card
+            if spec.get("container") is None or proj.get("source_row_id") is None:
+                continue
+            by_provider.setdefault(provider, []).append(e)
+        if not by_provider:
+            return
+        drop = set()
+        for provider, group in by_provider.items():
+            spec = specs.get(provider) or {}
+            cspec = spec.get("container")
+            db = self._local_db(provider)
+            if cspec is None or db is None or not spec.get("table"):
+                continue
+            ids = [cards[e[2]][2].get("source_row_id") for e in group]
+            keys = db.lookup(spec["table"], spec["id_column"], ids, [cspec.column],
+                             owner=self.active_principal, principal=principal)
+            members: dict = {}
+            for e in group:
+                row = keys.get(str(cards[e[2]][2].get("source_row_id")))
+                key = None if row is None else row.get(cspec.column)
+                if key in (None, ""):
                     continue
-                (long_ if len(v) > self._PROJ_LONG_VALUE else short).append(f"{k}: {v}")
-            head = f"[{provider}] {proj.get('display') or ''}".rstrip()
-            parts = short + long_
-            text = head + (" -- " + "; ".join(parts) if parts else "")
-            out[pid] = text[:max_chars]
+                members.setdefault(str(key), []).append(e)
+            for same in members.values():
+                if len(same) < 2:
+                    continue
+                best, rest = same[0], same[1:]           # entries arrive best-first
+                names = []
+                for e in rest:
+                    nm = str(cards[e[2]][2].get("display") or "").strip()
+                    if nm and nm not in names:
+                        names.append(nm[:60])
+                note = " -- and %d more in this %s" % (len(rest), cspec.label)
+                if names:
+                    note += " (%s)" % "; ".join(names[:3])
+                best[5] = (best[5] or "") + note
+                drop.update(id(e) for e in rest)
+        if drop:
+            entries[:] = [e for e in entries if id(e) not in drop]
+
+    def _folder_hits(self, focus_tokens, principal, max_cards: int = _FOLDER_CARD_MAX) -> list:
+        """Folder-shaped container hits for this query's focus tokens.
+
+        A container normally only collapses hits that already exist (records
+        sharing an exact key, `_collapse_containers`). A folder is asked about
+        directly -- "what's in the Taxes 2026 Deductions folder" -- and no one
+        file's projection vector has to have scored for that to be answerable.
+        For every declared source whose `container` names a `path_separator`
+        (engine/passages.py ContainerSpec), read the folder values that exist
+        (`LocalDBProvider.distinct_values`, bounded), keep the ones whose path
+        SEGMENTS match every focus token (`best_folder_matches` -- a year token
+        must match a segment that IS a year, so a query naming "2026" is not
+        answered by a file merely modified that year), and read each survivor
+        back as an aggregate card (`LocalDBProvider.folder_card`, by path
+        PREFIX so a shallower match already counts a deeper one). Never writes,
+        links, or promotes anything (I20); ACL-checked through the same
+        local-db helpers every other query-time read here uses.
+
+        Returns [{provider, path, external_id, block}], best-effort: a source
+        with no path-separator container, an unavailable db, or a bad spec is
+        skipped rather than failing the whole call."""
+        out: list = []
+        toks = [t for t in (focus_tokens or []) if t]
+        if not toks:
+            return out
+        specs = self._federation_specs()
+        for provider, spec in specs.items():
+            if len(out) >= max_cards:
+                break
+            cspec = spec.get("container")
+            if cspec is None or not cspec.path_separator or not spec.get("table"):
+                continue
+            db = self._local_db(provider)
+            if db is None:
+                continue
+            try:
+                paths = db.distinct_values(spec["table"], cspec.column,
+                                           owner=self.active_principal, principal=principal)
+                matched = _passages.best_folder_matches(paths, toks, cspec.path_separator)
+                for path in matched:
+                    if len(out) >= max_cards:
+                        break
+                    card = db.folder_card(spec["table"], cspec.column, path, cspec.path_separator,
+                                          name_column=spec.get("name_column") or "",
+                                          owner=self.active_principal, principal=principal)
+                    if not card or not card.get("file_count"):
+                        continue
+                    names = ", ".join(card["names"])
+                    n = card["file_count"]
+                    text = "%s -- %d file%s%s" % (
+                        path, n, "" if n == 1 else "s", (": %s" % names) if names else "")
+                    out.append({"provider": provider, "path": path,
+                               "external_id": "%s:folder=%s" % (spec["table"], path),
+                               "block": text})
+            except Exception as e:                            # noqa: BLE001
+                logger.warning("federation %s: folder card unavailable: %s", provider, e)
+                continue
         return out
 
     def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
-                            exclude_automation=False, fts_match=None, lexical_only=False):
+                            exclude_automation=False, fts_match=None, lexical_only=False,
+                            include_folder_cards=False):
         principal = principal or self.active_principal
         q = self.query_understanding(query, embed=not lexical_only)
         scored: dict[str, dict] = {}
@@ -2009,14 +2299,26 @@ class RetrievalEngine:
             # Paged projection-vector streaming (§g5 projections). Similar bounded top-k
             # treatment to observed and session vectors. Projection ids are namespaced
             # "proj:<provider>:<external_id>" so they never collide with event or session ids.
-            proj_heap: list[tuple] = []  # (score, seq, proj_id, excerpt, owner)
+            #
+            # One heap slot per RECORD, not per row. A record may have passage
+            # vectors beside its own (engine/passages.py, "<external_id>#p<n>");
+            # it scores as its best one, and the passage that won is the one
+            # shown. Row-level slots would let one long document's passages
+            # fill the whole top-`limit`. A record already held is updated in
+            # place (a score only ever rises, so the heap min never falls); one
+            # pushed out can come back only with a row that beats the current
+            # minimum, which is exactly "its best row is in the top-`limit`".
+            # With no passages every row is its own record and this is the
+            # plain row heap it always was.
+            proj_heap: list = []  # [score, seq, record_id, hit_external_id, owner]
+            proj_held: dict = {}  # record_id -> its entry in proj_heap
             seq = 0
             self._note_wrong_dim_table(q["embedding"], "projection_vectors",
                                        "external_id", "projection")
             # The in-memory copy (vector_cache.ProjectionVectorCache) hands this
-            # loop only the rows that can reach the top-`limit`, with their
-            # float32 blobs re-read from the store, in rowid order; the loop
-            # below is unchanged either way. None = it cannot serve; page.
+            # loop only the rows that can reach the top-`limit` records, with
+            # their float32 blobs re-read from the store, in rowid order; the
+            # loop below is unchanged either way. None = it cannot serve; page.
             proj_batches = self._projection_rows_from_cache(q["embedding"], limit, principal)
             if proj_batches is None:
                 proj_batches = self.store.iter_projection_vectors_paged(
@@ -2028,20 +2330,42 @@ class RetrievalEngine:
                         continue
                     if not access.can_read(access.DEFAULT_ACL, v.get("owner"), principal):
                         continue
-                    proj_id = f"proj:{v['provider']}:{v['external_id']}"
-                    entry = (psims[i] * 0.5, seq, proj_id, f"{v['provider']}:{v['external_id']}", v.get("owner"))
+                    record_ext, _n = _passages.split_passage_id(v["external_id"])
+                    record_id = f"proj:{v['provider']}:{record_ext}"
+                    score = psims[i] * 0.5
+                    mine = proj_held.get(record_id)
+                    if mine is not None:
+                        if score > mine[0]:
+                            mine[0], mine[3], mine[4] = score, v["external_id"], v.get("owner")
+                            heapq.heapify(proj_heap)
+                        continue
+                    entry = [score, seq, record_id, v["external_id"], v.get("owner")]
                     seq += 1
                     if len(proj_heap) < limit:
                         heapq.heappush(proj_heap, entry)
+                        proj_held[record_id] = entry
                     elif entry[0] > proj_heap[0][0]:
-                        heapq.heapreplace(proj_heap, entry)
+                        gone = heapq.heapreplace(proj_heap, entry)
+                        proj_held.pop(gone[2], None)
+                        proj_held[record_id] = entry
             # A projection hit carries only its pointer id. Render the pointer's
             # cached projection instead, so a caller reads what the row says
-            # without needing to know which source database holds it.
-            rendered = self._render_projections([pid for _s, _q, pid, _e, _o in proj_heap])
-            for sim_score, _seq, proj_id, excerpt, owner in proj_heap:
-                scored[proj_id] = {"excerpt": rendered.get(proj_id) or excerpt,
-                                   "score": sim_score, "owner": owner}
+            # without needing to know which source database holds it -- and,
+            # when a passage won, that passage's text.
+            proj_entries = sorted(proj_heap, key=lambda e: (-e[0], e[1]))
+            cards = self._projection_cards([e[2] for e in proj_entries])
+            won = {e[2]: _passages.split_passage_id(e[3])[1] for e in proj_entries}
+            rendered = self._render_cards(
+                cards, passages={k: n for k, n in won.items() if n is not None},
+                principal=principal)
+            for e in proj_entries:
+                e.append(rendered.get(e[2]) or "%s:%s" % (e[2].split(":", 2)[1],
+                                                          _passages.split_passage_id(e[3])[0]))
+            # Records sharing a declared container (a thread, a folder) are one
+            # answer: the best is kept and notes the rest.
+            self._collapse_containers(proj_entries, cards, principal)
+            for sim_score, _seq, proj_id, _hit, owner, excerpt in proj_entries:
+                scored[proj_id] = {"excerpt": excerpt, "score": sim_score, "owner": owner}
 
             # §H2.4 doc2query EXCERPT tier. A question-shaped query can match a
             # question generated from a raw span even when it shares nothing
@@ -2071,6 +2395,23 @@ class RetrievalEngine:
                         continue        # nothing but host framing
                     scored[eid] = {"excerpt": excerpt, "score": contribution,
                                    "owner": ev["owner"]}
+
+        # §F10d: folder-shaped container cards, opt-in only (`include_folder_cards`
+        # — see retrieve_raw's docstring for why this must default off: an
+        # unconditional insert here would leak federated content into
+        # get_context's Tier-2 raw evidence, which calls this same method).
+        # Outside the paging loop above (one lookup per query, not per
+        # widening page); like `_collapse_containers`, it reads declared local
+        # dbs directly by their `container` spec, not through the generic
+        # FederatedChannel, so it works whether or not the per-turn federated
+        # LIKE channel is even on.
+        if include_folder_cards:
+            for hit in self._folder_hits(self._focus_tokens(query), principal):
+                fid = "folder:%s:%s" % (hit["provider"], hit["path"])
+                if fid not in scored:
+                    scored[fid] = {"excerpt": "[FOLDER %s] %s" % (hit["provider"], hit["block"]),
+                                   "score": _FOLDER_HIT_SCORE, "owner": self.active_principal}
+
         # Temporal channel (§18.6): a query naming a date/month/year reranks the
         # survivors by whether they OCCURRED then. Post-heap on ≤2·limit rows, so
         # the streaming top-k above is untouched; occurred_at is real because
@@ -3936,6 +4277,23 @@ class RetrievalEngine:
             if focus:
                 remaining_chars = max_chars - len(ctx)
                 added = 0
+                # §F10d: a folder card (path segments matched) is assembled
+                # BEFORE the generic per-column LIKE search below, so it claims
+                # remaining budget first -- the same first-come priority every
+                # tier in this method already runs under (r1). That is what
+                # makes a query naming a year prefer a folder whose PATH has
+                # that year segment over a file the LIKE search below finds
+                # only because its modified_at column happens to contain the
+                # same four digits.
+                for hit in self._folder_hits(focus, principal):
+                    line = "[FOLDER %s] %s" % (hit["provider"], hit["block"])
+                    if gate is not None and not _relevant(line, "tail"):
+                        continue
+                    if remaining_chars - len(line) - 1 <= 0:
+                        break
+                    parts.append(line)
+                    remaining_chars -= len(line) + 1
+                    added += 1
                 for hit in self.federated.query(focus, principal, self.active_principal):
                     line = "[FEDERATED %s] %s" % (hit["provider"], hit["block"])
                     if gate is not None and not _relevant(line, "tail"):

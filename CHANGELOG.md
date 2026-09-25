@@ -3,6 +3,56 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.10.0
+
+**Whole documents, grouped results, and search that finds the specific word.**
+
+Built as one ladder of thirteen changes, each gated on the full suite before merging.
+
+**Documents are searchable as documents.** A record may now carry *passage* vectors: its full
+text is cut on paragraph, line, sentence and word boundaries into ~900-character passages, each
+prefixed with the record's name and short identifying fields (a file's folder path, for example),
+and embedded alongside the record's own vector. Search keeps one slot per record, scored by its
+best passage, and shows that passage as the snippet, re-cut deterministically from the source so
+nothing extra is stored. A source declares where its text lives (`passages: {column}` for a
+column of the same row, or `passages: {from: {path, table, key_column, join_column, text_column}}`
+for another database), with `size` and `max_per_record` limits. When the sweep sees a record
+change, its vector, passages and bookkeeping row are dropped together. Before this, a long
+document's vector saw only its opening, and a record whose text lived outside its card was
+searchable by title alone.
+
+**Results collapse into their container.** A source can declare `container: {column, label}`: search
+hits that share a container, such as messages in one thread, show as the best one plus "and N more
+in this thread". The key is read from the source at query time and never enters the record's
+card, so declaring a container re-embeds nothing. With `path_separator`, the container is a
+path: a question whose words all match segments of a folder path (a four-digit year must match a
+year segment exactly) returns that folder with its file count and top files, and a year in the
+path counts as a date hint.
+
+**The keyword channel finds the specific word.** Each source's keyword search OR'd every token
+into one query and kept the first five rows it found, in rowid order. A short common word riding
+beside a proper noun could fill all five slots before the row the question named was reached.
+Measured on a table where the specific rows sort after the generic ones: 0 of 5 hits named the
+merchant before, 5 of 5 after. Tokens are now searched longest first, one bounded subquery each,
+in one statement.
+
+**Caches cannot serve a stale vector.** The event-vector cache now checks the identity of its
+newest row, like the projection cache: a deleted-and-reinserted newest row keeps count and max
+rowid, and used to go unseen. A per-table write generation catches the one change neither check
+can: a vector rewritten in place. Only same-rowid writes bump it, because inserts, replaces and
+deletes are already caught arithmetically, and writers that append with plain SQL must keep the
+cheap append path.
+
+**The wrong-dimension census reads no vectors.** It counted with a predicate that named the
+embedding column itself, so SQLite read every blob. It now uses covering indexes on
+(length(embedding), id) per vector table and never touches a blob page. The projection table had
+no width index at all.
+
+**Automation sessions leave the backfill queue.** The backfill sweep now writes the empty marker
+row for an automation session directly, instead of queuing a summary job that only wrote the
+marker. A skip without the marker would have kept those sessions in the sweep's candidate list
+forever.
+
 ## 5.9.0
 
 **The raw tier stops reading the disk, and the per-turn channel sees every source.**

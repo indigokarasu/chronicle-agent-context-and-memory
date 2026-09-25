@@ -291,12 +291,16 @@ class Tools:
         include_tools = bool(a.get("include_tool_output", False))
         r = self.core.retrieval
         said, seen = [], set()
-        pool = r.retrieve_raw(query, limit=min(50, limit * 3), principal=principal)
+        pool = r.retrieve_raw(query, limit=min(50, limit * 3), principal=principal,
+                              include_folder_cards=True)
         for row in pool:
             if len(said) >= limit:
                 break
             eid = row.get("event_id") or ""
-            ev = self.core.store.get_event(eid) if eid and not eid.startswith(("session:", "proj:")) else None
+            # "folder:" (§F10d, include_folder_cards=True above) names an
+            # aggregate card, not a captured event, same as "session:"/"proj:".
+            ev = self.core.store.get_event(eid) if eid and not eid.startswith(
+                ("session:", "proj:", "folder:")) else None
             text = row.get("excerpt") or ""
             if ev is not None and not include_tools:
                 raw = ev.get("payload")

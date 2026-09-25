@@ -38,7 +38,7 @@ import os
 import time
 import urllib.parse
 
-from . import access, sweeps
+from . import access, passages, sweeps
 from . import entities as ents
 from . import speaker as spk
 from .embeddings import (
@@ -1026,6 +1026,18 @@ class CurationWorker:
             "status": "active"},
             parents=sorted(parents), actor="curator", owner=owner)
 
+    def _mark_automation_session(self, sid):
+        """Write an empty marker row to session_index for an automation session.
+
+        This prevents the backfill sweep from re-queuing the session for
+        summarization. The marker row lands in session_index with empty summary
+        and embedding, so the session is marked as processed without the cost of
+        model calls or full event processing."""
+        events = self.store.get_events_by_session(sid)
+        owner = events[0]["owner"] if events else "default"
+        occurred_at = events[0].get("occurred_at", now_iso()) if events else now_iso()
+        self.store.add_session_vector(sid, "", b"", owner, occurred_at, model=None)
+
     def _task_session_summarize(self, payload):
         sid = payload.get("session_id")
         if not sid:
@@ -1040,10 +1052,7 @@ class CurationWorker:
         # lands in session_index so the backfill sweep (which enqueues for
         # any ended session lacking one) does not keep re-queuing it.
         if spk.is_automation_session(sid) and not self.cfg.get("sessions.summarize_automation", False):
-            events = self.store.get_events_by_session(sid)
-            owner = events[0]["owner"] if events else "default"
-            occurred_at = events[0].get("occurred_at", now_iso()) if events else now_iso()
-            self.store.add_session_vector(sid, "", b"", owner, occurred_at, model=None)
+            self._mark_automation_session(sid)
             return
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = self.cfg.get("embeddings.exclude_session_prefixes", [])
@@ -1167,8 +1176,10 @@ class CurationWorker:
         Generic by construction: which databases exist, and which of their
         columns matter, is entirely `federation.local_dbs` config —
         `[{name, path, read_only, table, id_column, content_columns,
-        name_column?, capability?}]`. No database name, schema, or column
-        belonging to any particular deployment appears in this file.
+        name_column?, capability?, passages?, container?}]`. No database
+        name, schema, or column belonging to any particular deployment
+        appears in this file. `passages`/`container` (engine/passages.py) are
+        read at query time, never swept: only their columns are validated here.
 
         Failure modes are deliberately different from one another:
           * provider offline (file gone, unreadable, locked) → SKIP it, this run
@@ -1221,6 +1232,10 @@ class CurationWorker:
         try:
             present = _local_columns(conn, table)
             wanted = [id_col] + ([name_col] if name_col else []) + content_cols
+            # Columns read at QUERY time (engine/passages.py), never swept into
+            # the projection: validated here so a typo fails this job loudly
+            # instead of making every later lookup quietly return nothing.
+            wanted += _query_time_columns(spec)
             missing = [c for c in wanted if c not in present]
             if missing:
                 raise ValueError("local db %r: %s has no column(s) %s"
@@ -1377,10 +1392,14 @@ class CurationWorker:
         if existing and cached.get("content_hash"):
             # The row's text changed, so its vector now describes text that no
             # longer exists. Drop it; the embedding backlog re-embeds the new text.
+            # Its passages (engine/passages.py) were cut from the same row, so
+            # they go in the same transaction, with the ledger row that would
+            # otherwise tell the passage builder they are still current.
             try:
                 with self.store.transaction() as conn:
                     conn.execute("DELETE FROM projection_vectors WHERE provider=? AND external_id=?",
                                  (provider, external_id))
+                    self.store.drop_record_passages(provider, external_id)
             except Exception as e:                   # noqa: BLE001
                 logger.warning("federate %s: stale vector for %s not dropped: %s",
                                provider, external_id, e)
@@ -1458,7 +1477,13 @@ class CurationWorker:
         budget = sweeps.sweep_budget(self.cfg, "backfill", default=200)
         sids = self.store.get_sessions_needing_index_backfill(limit=budget)
         for sid in sids:
-            self.store.enqueue_curation("session_summarize", {"session_id": sid})
+            # For automation sessions, write the empty marker directly instead of
+            # enqueueing a job that would no-op anyway. This avoids queue traffic
+            # and leaves the session in session_index so it is not re-queued.
+            if spk.is_automation_session(sid) and not self.cfg.get("sessions.summarize_automation", False):
+                self._mark_automation_session(sid)
+            else:
+                self.store.enqueue_curation("session_summarize", {"session_id": sid})
         report = self.store.get_sweep_state("backfill")
         logger.info("backfill_sweep: enqueued %d sessions for summarization, %d remaining",
                     len(sids), report.get("remaining", 0))
@@ -1480,6 +1505,20 @@ def _local_columns(conn, table: str):
     if row is None:
         raise ValueError("no table or view named %r" % table)
     return [r["name"] for r in conn.execute("PRAGMA table_info(%s)" % _quote_ident(table)).fetchall()]
+
+
+def _query_time_columns(spec: dict) -> list:
+    """Source columns a local_dbs entry names for query-time reads: its
+    container key and its same-row passage text or join column. Raises
+    ValueError for a passages/container block that cannot be executed."""
+    cols = []
+    container = passages.container_spec(spec)
+    if container is not None:
+        cols.append(container.column)
+    ps = passages.passage_spec(spec)
+    if ps is not None:
+        cols.append(ps.column or ps.join_column)
+    return cols
 
 
 def _as_text(value) -> str:

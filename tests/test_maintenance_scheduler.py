@@ -995,9 +995,11 @@ class TestSchemaLadder12(unittest.TestCase):
         # A3 added rung 12; A13 added rung 13 on top of it. This case still
         # proves A3's rung by the table probe above -- the constant just moved
         # on. The v5.7.0 integration renumbered A3's rung to 16 and the top of
-        # the merged ladder to 18, so the assertion is on the CONSTANT, not on a
-        # literal this test would have to chase every time a rung lands.
-        self.assertEqual(SCHEMA_VERSION, 19)
+        # the merged ladder to 18, then to 19 with main dada805, then to 20 with
+        # ladder-12 F4's projection_vectors width index, so the assertion is on
+        # the CONSTANT, not on a literal this test would have to chase every time
+        # a rung lands.
+        self.assertEqual(SCHEMA_VERSION, 20)
         self.assertIsNotNone(store.get_event("ev_old_a3"))
         # The new table is usable immediately.
         store.record_maintenance_run("health", task="health", payload={},

@@ -891,10 +891,12 @@ class TestSchemaMigration(unittest.TestCase):
         # into one ladder exactly as E5/E7/H1 were. 14 = A1's
         # rerank_hints.principal, 15 = A1b's owner/read_acl on goals and
         # reflections, 16 = A3's maintenance_runs, 17 = A13's narrowed
-        # curation_jobs task CHECK, 18 = A7's queue + vector-census indexes.
+        # curation_jobs task CHECK, 18 = A7's queue + vector-census indexes,
+        # 19 = main dada805's events + pointer, 20 = ladder-12 F4's
+        # projection_vectors width index.
         # Rungs land as their trees merge; the number below is the top of the
         # chain as it stands in this tree. See engine/store.py.
-        self.assertEqual(SCHEMA_VERSION, 19)
+        self.assertEqual(SCHEMA_VERSION, 20)
         # Pre-existing data survives, and the new queue is usable immediately.
         self.assertIsNotNone(store.get_event("ev_old"))
         registry = HostModelRegistry(store, _CfgStub({"host_model.piggyback": True}))

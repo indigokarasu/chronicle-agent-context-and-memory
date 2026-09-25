@@ -45,6 +45,18 @@ def _run(core, query, cache_on, limit=8):
             for r in rows]
 
 
+def _reembedded(core, text):
+    """(embedding, model) a correctly-shaped, correctly-prefixed vector for
+    `text` -- the same width, prefix and model tag `_on_observed` (reducer.py)
+    would write for it -- via the core's own embedder rather than a second,
+    possibly differently-configured one. No turn is captured, so nothing
+    leaks into observed_fts: only the vector bytes and model tag come back,
+    for the caller to UPDATE onto an existing row's natural key exactly as
+    scripts/writeback_vectors.py does."""
+    from engine.embeddings import embedder_model_tag, pack
+    return pack(core.embedder.embed_document(text)), embedder_model_tag(core.embedder)
+
+
 class _Case(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -94,6 +106,142 @@ class TestItStaysCurrent(_Case):
         after_off = _run(self.core, "sourdough starter", False)
         self.assertEqual(after_on, after_off)
         self.assertGreater(self.cache().rebuilds, rebuilds)
+
+    def test_the_newest_row_deleted_and_reinserted_is_not_mistaken_for_no_change(self):
+        """Curation deletes an event's observed vector when its source text
+        changes and the backlog re-embeds it under a new event_id. When the
+        deleted row held the table's max rowid, SQLite hands the reinsert
+        that same rowid back: count and max rowid alone come back exactly as
+        they were, so only the identity of the top row tells this apart from
+        no change at all (precedent: ProjectionVectorCache's equivalent test
+        in tests/test_projection_vector_cache.py)."""
+        victim = self.core.capture.observe(
+            "Turn alpha: a lighthouse keeper counts gulls over the harbor.",
+            "Noted: lighthouse keeper counts gulls.",
+            session_id="s_newest_a", occurred_at="2026-05-01T10:00:00Z")
+        self.core.process_pending()
+        first = _run(self.core, "lighthouse keeper counts gulls over the harbor", True)
+        self.assertTrue(first)
+        self.assertEqual(first[0][0], victim, "fixture: the query must rank its own event first")
+        cache = self.cache()
+        rebuilds = cache.rebuilds
+
+        def _state():
+            return tuple(self.core.store._conn().execute(
+                "SELECT COUNT(*), MAX(rowid) FROM observed_vectors").fetchone())
+
+        before = _state()
+        self.core.store.delete_observed_vector(victim)
+        # No word here overlaps `victim`'s text, so the lexical channel cannot
+        # explain a hit on this query -- only the vector cache can.
+        reinserted = self.core.capture.observe(
+            "Turn beta: a marmot naps beside a mossy trailhead sign.",
+            "Noted: marmot naps at the mossy trailhead.",
+            session_id="s_newest_b", occurred_at="2026-05-02T10:00:00Z")
+        self.core.process_pending()
+        self.assertEqual(_state(), before, "fixture: the rowid was not reused")
+        on = _run(self.core, "marmot naps beside a mossy trailhead sign", True)
+        off = _run(self.core, "marmot naps beside a mossy trailhead sign", False)
+        self.assertEqual(on, off)
+        self.assertTrue(on)
+        self.assertEqual(on[0][0], reinserted)
+        self.assertNotIn(victim, [e for e, _ in on])
+        self.assertGreater(cache.rebuilds, rebuilds)
+
+
+@_needs_numpy
+class TestGenerationTracksAnInPlaceUpdate(_Case):
+    """F3: `scripts/writeback_vectors.py` UPDATEs a row's embedding IN PLACE
+    on its existing event_id -- neither count, max rowid nor (unless the row
+    happens to be the newest) the anchor identity moves. Only the generation
+    counter (MemoryStore.bump_vector_generation) sees it.
+
+    `bump_vector_generation` is called ONLY for that same-rowid case. An
+    ordinary insert or `INSERT OR REPLACE` must NOT bump it -- most of this
+    table's rows are written that way, by server-side ops scripts issuing raw
+    SQL that never touch the generation at all -- so the append and
+    id-collision arithmetic below must keep working with no help from it,
+    exactly as it did before F3."""
+
+    def test_an_inplace_update_of_a_non_anchor_row_is_seen(self):
+        first = _run(self.core, "sourdough starter", True)
+        self.assertTrue(first)
+        victim = first[0][0]
+        state_before = tuple(self.core.store._conn().execute(
+            "SELECT COUNT(*), MAX(rowid) FROM observed_vectors").fetchone())
+        # Not the newest row: an ordinary query keeps scoring it, so its
+        # rowid is well below the table's current max.
+        self.assertNotEqual(
+            victim, self.core.store._conn().execute(
+                "SELECT event_id FROM observed_vectors ORDER BY rowid DESC LIMIT 1"
+            ).fetchone()[0])
+        # Rewrite it to a vector of "zebra-striped Fakeglider" -- the same
+        # shape scripts/writeback_vectors.py's `UPDATE ... WHERE event_id=?`
+        # takes, on the row's OWN natural key.
+        new_vec, new_model = _reembedded(self.core, "zebra-striped Fakeglider on the roof")
+        with self.core.store.transaction() as conn:
+            conn.execute("UPDATE observed_vectors SET embedding=?, model=? WHERE event_id=?",
+                        (new_vec, new_model, victim))
+            self.core.store.bump_vector_generation("observed_vectors")
+        state_after = tuple(self.core.store._conn().execute(
+            "SELECT COUNT(*), MAX(rowid) FROM observed_vectors").fetchone())
+        self.assertEqual(state_before, state_after,
+                         "fixture: an in-place UPDATE must not move count or max rowid")
+        on = _run(self.core, "zebra-striped Fakeglider on the roof", True)
+        off = _run(self.core, "zebra-striped Fakeglider on the roof", False)
+        self.assertEqual(on, off)
+        self.assertTrue(on)
+        self.assertEqual(on[0][0], victim, "the cache must score the NEW vector, not the stale one")
+
+    def test_a_raw_sql_insert_with_no_bump_still_takes_the_append_path(self):
+        """ops/embed_projections.py, ops/enrich_embeddings.py and their
+        siblings write new vectors via raw SQL directly against the store's
+        connection -- never through MemoryStore's Python API, so they never
+        call bump_vector_generation. The append path must keep working for
+        them with the generation flat throughout: count/max rowid growing,
+        with nothing at the old anchor changed, already proves a pure append
+        on its own (this is the pre-F3 arithmetic, unmodified)."""
+        _run(self.core, "kayaking", True)   # warm the cache
+        cache = self.cache()
+        rebuilds, appends = cache.rebuilds, cache.appends
+        new_vec, new_model = _reembedded(self.core, "a raw SQL inserted turn about gliders")
+        with self.core.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO observed_vectors(event_id,embedding,model,owner,created_at) "
+                "VALUES(?,?,?,?,?)",
+                ("ev_raw_sql_insert", new_vec, new_model, "assistant", "2026-07-01T00:00:00Z"))
+            # deliberately no bump_vector_generation call: this simulates an
+            # ops script's raw SQL write, which never makes one either.
+        on = _run(self.core, "a raw SQL inserted turn about gliders", True)
+        self.assertEqual(on, _run(self.core, "a raw SQL inserted turn about gliders", False))
+        self.assertTrue(on)
+        self.assertEqual(on[0][0], "ev_raw_sql_insert")
+        self.assertEqual(cache.rebuilds, rebuilds, "a plain append must stay on the cheap path")
+        self.assertEqual(cache.appends, appends + 1)
+
+    def test_a_raw_sql_insert_or_replace_of_an_existing_key_still_rebuilds(self):
+        """`INSERT OR REPLACE` on an event_id that already has a row deletes
+        the old row and inserts a fresh one under a NEW rowid: the net row
+        count does not grow (one out, one in), so the append branch's own
+        `count > self._count` precondition already rules this out and it
+        falls straight to a rebuild -- no generation involvement needed."""
+        first = _run(self.core, "sourdough starter", True)
+        self.assertTrue(first)
+        victim = first[0][0]
+        _run(self.core, "kayaking", True)   # warm the cache
+        cache = self.cache()
+        rebuilds = cache.rebuilds
+        new_vec, new_model = _reembedded(self.core, "sourdough starter but replaced entirely")
+        with self.core.store.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO observed_vectors(event_id,embedding,model,owner,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (victim, new_vec, new_model, "assistant", "2026-07-01T00:00:00Z"))
+        on = _run(self.core, "sourdough starter but replaced entirely", True)
+        self.assertEqual(on, _run(self.core, "sourdough starter but replaced entirely", False))
+        self.assertTrue(on)
+        self.assertEqual(on[0][0], victim)
+        self.assertGreater(cache.rebuilds, rebuilds)
 
 
 @_needs_numpy
