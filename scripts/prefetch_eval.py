@@ -12,7 +12,7 @@ script asks the same question the same way, against a store already on disk,
 and reports what came back — without a model call, a network socket, or a
 write to that store.
 
-Deterministic and read-only:
+Deterministic and read-only by default:
   * the embedder is forced through `embeddings.NullProbe()`, which resolves to
     a DegradedEmbedder on every machine regardless of what the config claims
     is running locally (engine/embeddings.py) — no HTTP call to the local
@@ -30,9 +30,17 @@ Deterministic and read-only:
     predicate/derivation-rule seeding, unconditional for every process that
     constructs an engine, args-independent) is unavoidable short of building
     the retrieval stack by hand; it changes nothing this run's inputs decide.
+  * F1b: NullProbe means every relevance-gate item with no stored vector is
+    marked "no vector" and KEPT rather than scored, which is why this script
+    kept showing thousands of injected characters for a question the live
+    embedder actually gated to zero -- the one-word cosine floor never ran.
+    `--with-embedder` drops NullProbe (passes `embedder_probe=None`, so
+    `ChronicleCore` probes the configured server the same way a live turn
+    does) to measure the gate as it actually runs; it opens a socket and is
+    no longer deterministic across machines, so it stays opt-in.
 
 Usage:
-    python3 scripts/prefetch_eval.py <config.yaml> <chronicle.db> [questions.json]
+    python3 scripts/prefetch_eval.py [--with-embedder] <config.yaml> <chronicle.db> [questions.json]
 
 `config.yaml` is a Hermes-style config file (a top-level `memory:` section) or
 a bare memory-config mapping — either is accepted, so a hand-written eval
@@ -67,6 +75,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.core import ChronicleCore
 from engine.embeddings import NullProbe
+
+# F1b: NullProbe (the default below) forces DegradedEmbedder, so every
+# relevance-gate item with no vector is kept as "no vector" rather than
+# scored -- measured on the live store, this hid the exact defect it exists
+# to catch (a one-word match dropped by the cosine floor, not by a missing
+# vector). --with-embedder skips NullProbe and lets embeddings.default_probe()
+# reach the configured server, so the gate runs the same way it does on a
+# real turn. Off by default: this script's whole point is a deterministic,
+# socket-free run, and most callers still want that.
+WITH_EMBEDDER_FLAG = "--with-embedder"
 
 # Two questions per category named in the brief -- people, places, purchases,
 # schedule, documents. Deliberately generic: no names, places or products, so
@@ -131,7 +149,7 @@ def _load_memory_config(config_path: str) -> dict:
     return dict(mem) if isinstance(mem, dict) else dict(raw)
 
 
-def _engine_for(config_path: str, store_path: str) -> ChronicleCore:
+def _engine_for(config_path: str, store_path: str, with_embedder: bool = False) -> ChronicleCore:
     """Build a `ChronicleCore` bound to exactly `store_path`, no matter what
     `db_path` (if any) `config_path` declares.
 
@@ -151,7 +169,8 @@ def _engine_for(config_path: str, store_path: str) -> ChronicleCore:
     """
     cfg = _load_memory_config(config_path)
     cfg["db_path"] = "~/.hermes"
-    return ChronicleCore.get(store_path, cfg, embedder_probe=NullProbe())
+    probe = None if with_embedder else NullProbe()
+    return ChronicleCore.get(store_path, cfg, embedder_probe=probe)
 
 
 def _classify(ctx: str) -> dict:
@@ -218,12 +237,16 @@ def evaluate(core: ChronicleCore, questions: list, principal: str = "default") -
         print("  belief_lines         : %d" % kinds["belief_lines"])
         print("  transcript_lines     : %d" % kinds["transcript_lines"])
         print("  gate_words           : %s" % gate.get("words", []))
-        print("  gate_dropped         : beliefs=%d excerpts=%d tail=%d" % (
-            gate.get("beliefs", 0), gate.get("excerpts", 0), gate.get("tail", 0)))
+        print("  gate_dropped         : beliefs=%d excerpts=%d tail=%d federated=%d" % (
+            gate.get("beliefs", 0), gate.get("excerpts", 0), gate.get("tail", 0),
+            gate.get("federated", 0)))
 
 
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    with_embedder = WITH_EMBEDDER_FLAG in argv
+    if with_embedder:
+        argv = [a for a in argv if a != WITH_EMBEDDER_FLAG]
     if len(argv) < 2:
         print(__doc__)
         return 2
@@ -239,7 +262,7 @@ def main(argv=None) -> int:
     else:
         questions = BUILTIN_QUESTIONS + PINNED_QUESTIONS
 
-    core = _engine_for(config_path, store_path)
+    core = _engine_for(config_path, store_path, with_embedder=with_embedder)
     evaluate(core, questions)
     return 0
 

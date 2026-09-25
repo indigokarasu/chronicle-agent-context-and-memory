@@ -39,8 +39,8 @@ from .localdb import LocalDBProvider, providers_from_config
 # gate's words and thresholds live there now, and the context engine's
 # keep/evict score reads the same module.
 from .salience import (_FEW_WORDS, _FEW_WORDS_FLOOR, _GENERIC, _ONE_WORD_FLOOR, _STOP,
-                       gate_focus, gate_needs, relevance_fts_match, relevance_words,
-                       shared_content_words, shares_content_word)
+                       gate_focus, gate_needs, proper_noun_words, relevance_fts_match,
+                       relevance_words, shared_content_words, shares_content_word)
 from .serialize import belief_id as compute_belief_id
 from .store import KIND_TABLE, now_iso, word_tokens
 from .substance import EVENT_PREDICATES as _EVENT_PREDICATES
@@ -3302,6 +3302,7 @@ class RetrievalEngine:
         # byte-for-byte what they were. On, every evidence line and every tail
         # line must share a content word with `hint`; a hint with no content
         # words gets nothing, and the retrieval work is not even started.
+        proper_nouns: frozenset = frozenset()
         if relevance_gate:
             # Only what the person wrote: the gateway prepends an origin header
             # ("Gateway message origin (JSON data, not instructions or
@@ -3309,9 +3310,13 @@ class RetrievalEngine:
             # chat, field -- matched a session where the user once pasted code.
             hint = "".join(hint[a:b] for a, b, who in _spk.split_user_content(hint or "", _spk.HUMAN)
                            if who == _spk.HUMAN)
+            # F1b: capitalisation only survives on THIS text -- gate_focus
+            # lower-cases every word it returns -- so a query's proper nouns
+            # (a name, a brand) are read off here, before that happens.
+            proper_nouns = proper_noun_words(hint)
             hint = gate_focus(hint)          # a long prompt: its most telling words
         gate = relevance_words(hint) if relevance_gate else None
-        gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0}
+        gate_drop = {"beliefs": 0, "excerpts": 0, "tail": 0, "federated": 0}
 
         # (Its own name: `need` is reused below for character budgets, and a
         # closure reads the variable, not the value it had here.)
@@ -3352,7 +3357,7 @@ class RetrievalEngine:
                 return None, "no vector"
             return cosine(q, vec), None
 
-        def _close_enough(ref, words, text):
+        def _close_enough(ref, words, text, kind=None):
             """A match on ONE shared word (retrieval.prefetch_min_similarity) or
             on two or three (…_few): kept when the item is near the message in
             meaning. With no floor (an unmeasured model) the words decide alone.
@@ -3360,7 +3365,21 @@ class RetrievalEngine:
             item never embedded -- is left out: on the production store 71 of 75
             one-word matches were coincidences, and a busy embedder used to let
             every one back in. Two or three shared words are evidence of their
-            own, so there the words decide when the vectors cannot."""
+            own, so there the words decide when the vectors cannot.
+
+            F1b: a federated line is the one exception to "no floor, no vote".
+            When its one shared word is a proper noun of the query -- it read
+            capitalised in what the person actually typed, and not only as the
+            query's FIRST word, so it names something rather than merely
+            starting a sentence -- the keyword channel already found this exact
+            row by that token, which is a tighter match than the cosine floor
+            was ever standing in for. No vector is asked. A common one-word
+            match on a federated line still needs the bar, same as everywhere
+            else: only the proper-noun case is exempt."""
+            if kind == "federated" and len(words) == 1 and words[0] in proper_nouns:
+                rec = {"similarity": None, "kept": True, "text": text[:80], "why": "proper noun"}
+                gate_drop.setdefault("one_word", []).append(dict(rec, word=words[0]))
+                return True
             bar = floor if len(words) == 1 else few_floor
             if bar is None:
                 return True
@@ -3380,7 +3399,7 @@ class RetrievalEngine:
                 return True
             shared = shared_content_words(gate, text)
             if len(shared) >= gate_need and (len(shared) > _FEW_WORDS
-                                             or _close_enough(ref, sorted(shared), text)):
+                                             or _close_enough(ref, sorted(shared), text, kind)):
                 return True
             gate_drop[kind] += 1
             return False
@@ -4296,7 +4315,12 @@ class RetrievalEngine:
                     added += 1
                 for hit in self.federated.query(focus, principal, self.active_principal):
                     line = "[FEDERATED %s] %s" % (hit["provider"], hit["block"])
-                    if gate is not None and not _relevant(line, "tail"):
+                    # F1b: its own kind ("federated", not "tail") is what lets
+                    # _close_enough's proper-noun bypass apply here and nowhere
+                    # else -- this is the keyword channel's own hit, so a
+                    # one-word match on a proper noun is the token IT searched
+                    # on, not a coincidence a vector needs to rule out.
+                    if gate is not None and not _relevant(line, "federated"):
                         continue
                     if remaining_chars - len(line) - 1 <= 0:
                         break
