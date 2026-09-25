@@ -41,3 +41,6 @@ s_ctx100.json
 # the repo rather than an absolute path in one developer's home directory.
 .a5bench/
 dashboard/web/node_modules/
+
+# Reference copies for builders (not deployed)
+ops/reference/

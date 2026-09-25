@@ -3,6 +3,59 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.9.0
+
+**The raw tier stops reading the disk, and the per-turn channel sees every source.**
+
+Seventeen changes built as one ladder, each gated on the full suite (2,406 tests) and measured
+on a production-sized store (2.3 GB, 742k events, 98k projection vectors) before and after.
+
+**Speed.** `chronicle_search` warm went from 1.3–1.7 s to 0.46–0.60 s, and the first query in a
+fresh process from 17.9 s to 3.6 s. Two causes, both in the raw vector tier:
+
+- The projection tier paged every `projection_vectors` blob out of SQLite on every query (280 MB).
+  It now shortlists candidates from an in-process float16 copy and re-scores only those rows from
+  their float32 blobs, so results are identical to the paged scan (asserted to 1e-6 in tests) while
+  the tier drops from 1.2–1.6 s to 0.33–0.36 s. The copy is invalidated by row count, max rowid AND
+  the identity of the row at that rowid: a deleted-and-reinserted newest row keeps its rowid, which
+  the count/max-rowid rule alone cannot see. (`retrieval.projection_cache.enabled`, default on;
+  `max_rows` 400000 falls back to paging.)
+- The wrong-dimension diagnostic ran `length(embedding) != ?` over the whole table on every query —
+  a scan the width index cannot serve without a model predicate: 0.2 s warm and 10 s cold on the
+  projection table alone. Its census is now remembered per table while the table stands still, and
+  still reported on every query, so the once-per-process warning and the counter behave as before.
+
+Also: connection pragmas (64 MB page cache, 512 MB mmap, a 64 MB journal size limit) declared under
+`store.*`; a truncating WAL checkpoint in the nightly quiet window; a changed source row now drops
+its stale vector so the backlog re-embeds the new text.
+
+**Recall.** The federated read channel searched only the first `MAX_DBS` = 3 declared sources — a
+cap that was never measured (the channel costs ~20–30 ms). It is now `federation.channel_max_dbs`.
+On ten fixed questions through the per-turn prefetch, the number reaching no connected source fell
+from 5 to 2 once every source was declared: schedule questions reach the calendar, purchases reach
+transactions, documents reach the file index. `scripts/prefetch_eval.py` is the harness (read-only,
+deterministic, no model calls). Automation sessions — most of a production store's turns — are no
+longer embedded or summarized (`embeddings.skip_automation`, `sessions.summarize_automation`), and
+already-queued jobs for them complete without a model call, which drains a backlog that had been
+starving the user's own events. `chronicle_ask_about` now follows entity merges and accepts a name.
+
+**Resiliency.** An unreachable embed server used to raise out of every explicit search; the query
+path now degrades to lexical with one warning. The aged-job pruner deleted one batch per daily
+health run against tens of thousands of new jobs a day, so the backlog only grew (186,827 dead rows
+on the production store); it now loops up to `max_rows` per call. Long-retracted projection rows
+(112k on that store) are pruned under `curation.retention.retracted_*`, never a row another row's
+`superseded_by` points at. `git_queue` rows are written only when the mirror is enabled, so scripts
+that construct the store directly no longer grow an undrained queue. Host-owned keys are read from
+the section the host handed the core, not through the engine's declared config, which two
+config-honesty tests had rightly flagged. A per-turn advisory skill suggestion can be attached from
+an external router (`suggest.*`, default off): a hard time budget on a daemon thread, fail-open,
+never on an automation turn.
+
+Corrections to the audit that produced this ladder, recorded so the numbers stay honest:
+`synchronous` was already NORMAL on engine connections (the audit's FULL reading came from a CLI
+probe measuring its own connection), and the retention pruner was present, not missing — it was
+under-provisioned for the job inflow.
+
 ## Unreleased — `keep_literals` is ON: the first flag to earn its default
 
 The rule for this whole build was that nothing defaults on until a replay

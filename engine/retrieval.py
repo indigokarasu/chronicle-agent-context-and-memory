@@ -47,6 +47,9 @@ from .vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.retrieval")
 
+# Module-level flag to log only once per process when embedding fails (X1)
+_embed_failure_logged = False
+
 
 class _WrongDimWidth:
     """A stand-in for a blob whose LENGTH is the only thing anyone reads.
@@ -84,6 +87,12 @@ class _WrongDimWidth:
 # ceiling would have to either refuse to answer above it or silently truncate
 # the corpus, and neither is a thing the read path may do.
 VECTOR_SCAN_PAGE = 1000
+
+# The projection tier's similarity floor: a `proj:` row scoring at or below it
+# is never a candidate. One name, because the in-memory projection cache
+# (vector_cache.ProjectionVectorCache) shortlists against the same floor the
+# tier loop applies, and two literals could drift apart silently.
+_PROJ_FLOOR = 0.15
 
 
 def _tail_merged(pages, page_size):
@@ -426,6 +435,12 @@ _DRAFT_TAG = "[DRAFT]"
 # shows identities at all -- `vectors_skipped_wrong_dim_detail`, which is
 # itself truncated to 20 -- so nothing downstream can tell the difference.
 _WRONG_DIM_SAMPLE = 20
+# The diagnostic's census is a table scan (`length(embedding) != ?` cannot use
+# the width index without a model predicate): ~0.2 s warm and seconds cold on
+# a 95k-row table, per query. Its answer only changes when vectors are written,
+# so it is remembered per table and reused while the table's row count and
+# max rowid stand still, and rescanned at most this often while they move.
+_WRONG_DIM_RESCAN_S = 60.0
 
 # A10: what the final trim says when it has to drop something. The old blind
 # `ctx[:max_chars] + "\n… (truncated)"` named neither what was lost nor how
@@ -680,6 +695,7 @@ class RetrievalEngine:
         # scan loop tripped over them" -- the same row is scanned by several
         # channels within one query.
         self._wrong_dim_seen: dict = {}
+        self._wrong_dim_memo: dict = {}     # (table, width, where, params) -> (state, at, total, pairs)
         # (channel, table) -> EXACT count, for the width-filtered channels whose
         # identities are only sampled. Assignment (never +=) keeps a channel read
         # twice in one query idempotent, exactly as the identity dict did.
@@ -799,6 +815,10 @@ class RetrievalEngine:
             try:
                 emb = embed_query(" ".join(expansions) or query)
             except Exception:
+                global _embed_failure_logged
+                if not _embed_failure_logged:
+                    logger.warning("embed server failure; search degrades to lexical-only for this session")
+                    _embed_failure_logged = True
                 emb = None  # vector channel drops out; FTS + structured still answer
         return {"raw": query, "tokens": tokens, "expanded": list(expansions), "embedding": emb}
 
@@ -1015,14 +1035,20 @@ class RetrievalEngine:
         # rows a channel, i.e. A5's bound undone by the diagnostic that A5's
         # own docstring asked for. The number stays exact because it now comes
         # from SQL rather than from len() of the identities.
-        total = self.store.wrong_dim_vector_count(table, id_col, want,
-                                                  extra_where, extra_params)
-        if not total:
-            return
-        pairs = self.store.wrong_dim_vector_ids(table, id_col, want,
-                                                extra_where, extra_params,
-                                                limit=_WRONG_DIM_SAMPLE)
-        if not pairs:
+        key = (table, want, extra_where, tuple(extra_params))
+        state = self._vector_table_state(table)
+        memo = self._wrong_dim_memo.get(key)
+        now = _time_monotonic()
+        if memo is not None and (memo[0] == state or now - memo[1] < _WRONG_DIM_RESCAN_S):
+            total, pairs = memo[2], memo[3]     # remembered census; the report below still runs
+        else:
+            total = self.store.wrong_dim_vector_count(table, id_col, want,
+                                                      extra_where, extra_params)
+            pairs = (self.store.wrong_dim_vector_ids(table, id_col, want,
+                                                     extra_where, extra_params,
+                                                     limit=_WRONG_DIM_SAMPLE) if total else [])
+            self._wrong_dim_memo[key] = (state, now, total, pairs)
+        if not total or not pairs:
             return
         # The process-wide counter and the once-per-process WARNING used to be
         # raised by batch_cosine seeing the blob. It no longer does, so they are
@@ -1041,6 +1067,17 @@ class RetrievalEngine:
             query_emb, [{id_col: ident, "embedding": _WrongDimWidth(nbytes)}
                         for ident, nbytes in pairs],
             id_col, channel, table=table, exact_count=total)
+
+    def _vector_table_state(self, table):
+        """(row count, max rowid) of a vector table: what the memo above keys on.
+        Both come from the b-tree, not the blobs. None when unreadable, which
+        matches nothing and forces a rescan."""
+        try:
+            row = self.store._conn().execute(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM %s" % table).fetchone()
+            return (int(row[0]), int(row[1])) if row else None
+        except Exception:
+            return None
 
     def _note_wrong_dim_rows(self, query_emb, rows, id_key, channel,
                              table=None, exact_count=None):
@@ -1686,6 +1723,83 @@ class RetrievalEngine:
             return stored
         return text if text.strip() else None
 
+    _PROJ_SKIP_KEYS = frozenset(("id", "item_id", "external_id", "content_hash"))
+    _PROJ_LONG_VALUE = 200
+
+    def _federation_specs(self) -> dict:
+        """provider -> {capability, columns} from `federation.local_dbs`, read once."""
+        specs = getattr(self, "_fed_specs", None)
+        if specs is None:
+            specs = {}
+            dbs = self.cfg.get("federation.local_dbs", []) if self.cfg is not None else []
+            for d in dbs or []:
+                if isinstance(d, dict) and d.get("name"):
+                    specs[d["name"]] = {"capability": d.get("capability") or d["name"],
+                                        "columns": list(d.get("content_columns") or [])}
+            self._fed_specs = specs
+        return specs
+
+    def _render_projections(self, proj_ids, max_chars=1200) -> dict:
+        """`proj:<provider>:<external_id>` -> readable text from the pointer's
+        cached projection: `[provider] display -- field: value; ...`.
+
+        Fields follow the provider's declared column order, short values first
+        and long ones (bodies, transcripts) last, so a truncated excerpt still
+        says what the row is. A pointer that cannot be found or parsed is left
+        out, and the caller keeps its bare id."""
+        out = {}
+        if not proj_ids:
+            return out
+        specs = self._federation_specs()
+        try:
+            conn = self.store._conn()
+        except Exception:
+            return out
+        for pid in proj_ids:
+            try:
+                _, provider, external_id = pid.split(":", 2)
+            except ValueError:
+                continue
+            spec = specs.get(provider) or {}
+            try:
+                row = None
+                if spec.get("capability"):
+                    row = conn.execute(
+                        "SELECT cached_projection FROM pointers "
+                        "WHERE capability=? AND provider=? AND external_id=?",
+                        (spec["capability"], provider, external_id)).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        "SELECT cached_projection FROM pointers "
+                        "WHERE provider=? AND external_id=? LIMIT 1",
+                        (provider, external_id)).fetchone()
+            except Exception:
+                continue
+            if not row or not row[0]:
+                continue
+            try:
+                proj = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            fields = proj.get("fields") or {}
+            display = str(proj.get("display") or "").strip()
+            order = [c for c in spec.get("columns", []) if c in fields]
+            order += [k for k in fields if k not in order]
+            short, long_ = [], []
+            for k in order:
+                if k in self._PROJ_SKIP_KEYS or k.endswith("_id"):
+                    continue
+                v = fields.get(k)
+                v = "" if v is None else str(v).strip()
+                if v in ("", "null", "None") or v == display:
+                    continue
+                (long_ if len(v) > self._PROJ_LONG_VALUE else short).append(f"{k}: {v}")
+            head = f"[{provider}] {proj.get('display') or ''}".rstrip()
+            parts = short + long_
+            text = head + (" -- " + "; ".join(parts) if parts else "")
+            out[pid] = text[:max_chars]
+        return out
+
     def _retrieve_raw_inner(self, query, *, limit=20, principal=None, now=None,
                             exclude_automation=False, fts_match=None, lexical_only=False):
         principal = principal or self.active_principal
@@ -1899,11 +2013,18 @@ class RetrievalEngine:
             seq = 0
             self._note_wrong_dim_table(q["embedding"], "projection_vectors",
                                        "external_id", "projection")
-            for batch in self.store.iter_projection_vectors_paged(
-                    batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4):
+            # The in-memory copy (vector_cache.ProjectionVectorCache) hands this
+            # loop only the rows that can reach the top-`limit`, with their
+            # float32 blobs re-read from the store, in rowid order; the loop
+            # below is unchanged either way. None = it cannot serve; page.
+            proj_batches = self._projection_rows_from_cache(q["embedding"], limit, principal)
+            if proj_batches is None:
+                proj_batches = self.store.iter_projection_vectors_paged(
+                    batch_size=VECTOR_SCAN_PAGE, width=len(q["embedding"]) * 4)
+            for batch in proj_batches:
                 psims = batch_cosine(q["embedding"], [v["embedding"] for v in batch])
                 for i, v in enumerate(batch):
-                    if psims[i] <= 0.15:
+                    if psims[i] <= _PROJ_FLOOR:
                         continue
                     if not access.can_read(access.DEFAULT_ACL, v.get("owner"), principal):
                         continue
@@ -1914,8 +2035,13 @@ class RetrievalEngine:
                         heapq.heappush(proj_heap, entry)
                     elif entry[0] > proj_heap[0][0]:
                         heapq.heapreplace(proj_heap, entry)
+            # A projection hit carries only its pointer id. Render the pointer's
+            # cached projection instead, so a caller reads what the row says
+            # without needing to know which source database holds it.
+            rendered = self._render_projections([pid for _s, _q, pid, _e, _o in proj_heap])
             for sim_score, _seq, proj_id, excerpt, owner in proj_heap:
-                scored[proj_id] = {"excerpt": excerpt, "score": sim_score, "owner": owner}
+                scored[proj_id] = {"excerpt": rendered.get(proj_id) or excerpt,
+                                   "score": sim_score, "owner": owner}
 
             # §H2.4 doc2query EXCERPT tier. A question-shaped query can match a
             # question generated from a raw span even when it shares nothing
@@ -4097,6 +4223,39 @@ class RetrievalEngine:
     def ask_about(self, entity_id, *, principal=None):
         principal = principal or self.active_principal
         out = []
+        # A name is accepted as well as an id. One match answers for that entity;
+        # several come back as choices, never blended: two people can share a name.
+        if entity_id and not self.store.get_belief("entities", entity_id):
+            named = [m for m in self.store.query_beliefs(
+                "entities", "normalized_name=?", (str(entity_id).strip().lower(),), 10)
+                if self._readable(m, principal, "*", None)]
+            roots = []
+            for m in named:                      # a merged name answers for its survivor
+                r = self._merge_root(m["belief_id"])
+                if r not in roots:
+                    roots.append(r)
+            if not roots:                        # a place or merchant, named by its own record
+                places, kept = self._records_named(entity_id), []
+                for ref, disp in places:        # one place held by two stores is ONE answer
+                    if not any(ref in self._merge_family(k) for k, _ in kept):
+                        kept.append((ref, disp))
+                places = kept
+                if len(places) > 1:
+                    return [{"kind": "ambiguous", "entity_id": ref, "name": disp,
+                             "records": self._mention_counts(ref, [ref])} for ref, disp in places]
+                if places:
+                    entity_id = places[0][0]
+            if len(roots) > 1:
+                return [{"kind": "ambiguous", "entity_id": r,
+                         "name": (self.store.get_belief("entities", r) or {}).get("name"),
+                         "records": self._mention_counts(r)} for r in roots]
+            if roots:
+                entity_id = roots[0]
+        elif entity_id:
+            entity_id = self._merge_root(entity_id)
+        # A merge leaves each fact on the entity it was written to; asking about
+        # the survivor must still find what was learned about the merged ones.
+        family = self._merge_family(entity_id)
         # §u2: the consolidation digest leads — it answers "what do we know about
         # this entity" in one line. The per-fact rows still follow verbatim; the
         # digest summarizes them, it never stands in for them.
@@ -4106,8 +4265,121 @@ class RetrievalEngine:
             if self._readable(d, principal, "*", None):
                 out.append({"belief_id": d["belief_id"], "kind": "digest",
                             "digest_line": d.get("body", ""), "confidence": d.get("confidence")})
-        rows = self.store.query_beliefs("facts", "entity_id=? AND status='active'", (entity_id,), 50)
+        rows = self.store.query_beliefs(
+            "facts", "entity_id IN (%s) AND status='active'" % ",".join("?" * len(family)),
+            tuple(family), 50)
         out.extend([self._render_fact(r) for r in rows if self._readable(r, principal, "*", None)])
+        out.extend(self._entity_records(entity_id, family))
+        return out
+
+    def _records_named(self, name):
+        """Records of the stores that hold non-person entities (the `id_prefix`
+        entity sources: places, merchants) whose own name is `name`, as
+        (external_id, display)."""
+        srcs = (self.cfg.get("mentions.entity_sources", []) if self.cfg is not None else []) or []
+        provs = sorted({str(s.get("id_prefix", "")).rstrip(":") for s in srcs if s.get("id_prefix")})
+        if not provs or not str(name or "").strip():
+            return []
+        try:
+            rows = self.store._conn().execute(
+                "SELECT external_id, json_extract(cached_projection,'$.display') FROM pointers "
+                "WHERE provider IN (%s) AND lower(json_extract(cached_projection,'$.display'))=? LIMIT 10"
+                % ",".join("?" * len(provs)), (*provs, str(name).strip().lower())).fetchall()
+        except Exception:
+            return []
+        return [(r[0], r[1]) for r in rows]
+
+    def _merge_root(self, entity_id):
+        """The entity a (possibly merged) id now lives on."""
+        seen = set()
+        try:
+            conn = self.store._conn()
+            while entity_id and entity_id not in seen:
+                seen.add(entity_id)
+                row = conn.execute("SELECT merged_into FROM entities WHERE belief_id=?",
+                                   (entity_id,)).fetchone()
+                if not row or not row[0]:
+                    return entity_id
+                entity_id = row[0]
+        except Exception:
+            pass
+        return entity_id
+
+    def _merge_family(self, entity_id, depth=3):
+        """The entity and every entity merged into it, survivor first."""
+        ids, frontier = [entity_id], [entity_id]
+        try:
+            conn = self.store._conn()
+            for _ in range(depth):
+                nxt = [r[0] for r in conn.execute(
+                    "SELECT belief_id FROM entities WHERE merged_into IN (%s)"
+                    % ",".join("?" * len(frontier)), tuple(frontier))]
+                nxt = [n for n in nxt if n not in ids]
+                if not nxt:
+                    break
+                ids += nxt
+                frontier = nxt
+            # one thing held by two stores (engine/mentions.py `same_as`) answers as one
+            for (other,) in conn.execute(
+                    "SELECT external_ref FROM entity_mentions WHERE entity_id=? AND role='same_as'",
+                    (entity_id,)).fetchall():
+                if other not in ids:
+                    ids.append(other)
+        except Exception:
+            pass
+        return ids
+
+    def _mention_counts(self, entity_id, family=None) -> dict:
+        ids = tuple(family or self._merge_family(entity_id))
+        try:
+            return dict(self.store._conn().execute(
+                "SELECT provider, count(DISTINCT external_ref) FROM entity_mentions WHERE entity_id IN (%s) GROUP BY provider"
+                % ",".join("?" * len(ids)), ids).fetchall())
+        except Exception:
+            return {}
+
+    def _entity_records(self, entity_id, family=None):
+        """Records that involve this entity by a hard identifier (engine/mentions.py):
+        its own source record first, then the most recent others, rendered like any
+        federated result. Empty when the index has not been built."""
+        limit = int(self.cfg.get("mentions.recent_limit", 15)) if self.cfg is not None else 15
+        date = ("coalesce(json_extract(p.cached_projection,'$.fields.sent_date'), "
+                "json_extract(p.cached_projection,'$.fields.day'), "
+                "json_extract(p.cached_projection,'$.fields.start_date'), "
+                "json_extract(p.cached_projection,'$.fields.date'), "
+                "json_extract(p.cached_projection,'$.fields.modified_at'), '')")
+        ids = tuple(family or self._merge_family(entity_id))
+        marks = ",".join("?" * len(ids))
+        try:
+            conn = self.store._conn()
+            own = conn.execute(
+                "SELECT m.provider, m.external_ref, m.role, '' FROM entity_mentions m "
+                "JOIN pointers p ON p.provider=m.provider AND p.external_id=m.external_ref "
+                "WHERE m.entity_id IN (%s) AND m.method='id' LIMIT 1" % marks, ids).fetchall()
+            if not own and ":" in str(entity_id):     # a place/merchant: its record is its profile
+                prov = str(entity_id).split(":", 1)[0]
+                if conn.execute("SELECT 1 FROM pointers WHERE provider=? AND external_id=?",
+                                (prov, entity_id)).fetchone():
+                    own = [(prov, entity_id, "id", "")]
+            recent = conn.execute(
+                "SELECT DISTINCT m.provider, m.external_ref, m.role, %s AS d FROM entity_mentions m "
+                "JOIN pointers p ON p.provider=m.provider AND p.external_id=m.external_ref "
+                "WHERE m.entity_id IN (%s) AND m.method!='id' AND m.external_ref != ? "
+                "ORDER BY d DESC LIMIT ?" % (date, marks),
+                ids + (str(entity_id), limit)).fetchall()
+        except Exception:
+            return []
+        rows = own + recent
+        if not rows:
+            return []
+        rendered = self._render_projections(["proj:%s:%s" % (p, ref) for p, ref, _r, _d in rows])
+        out = [{"kind": "records_summary", "entity_id": entity_id,
+                "counts": self._mention_counts(entity_id, ids)}]
+        for p, ref, role, d in rows:
+            text = rendered.get("proj:%s:%s" % (p, ref))
+            if text:
+                out.append({"kind": "profile" if not d and role == "id" else "record",
+                            "source": p, "role": role, "when": d or None, "text": text})
         return out
 
     def around(self, entity_id, depth=1, *, principal=None):
@@ -4502,6 +4774,61 @@ class RetrievalEngine:
             cache = ObservedVectorCache(self.store, max_rows=int(cap))
             self.store._observed_vector_cache = cache
         return cache
+
+    def _projection_cache(self):
+        """The store's ProjectionVectorCache, created on first use; None when
+        retrieval.projection_cache.enabled is off."""
+        on = self.cfg.get("retrieval.projection_cache.enabled", True) if self.cfg else True
+        if not on:
+            return None
+        cache = getattr(self.store, "_projection_vector_cache", None)
+        if cache is None:
+            from .vector_cache import ProjectionVectorCache
+            cap = (self.cfg.get("retrieval.projection_cache.max_rows", 400000)
+                   if self.cfg else 400000)
+            cache = ProjectionVectorCache(self.store, max_rows=int(cap))
+            self.store._projection_vector_cache = cache
+        return cache
+
+    def _projection_rows_from_cache(self, query, limit, principal):
+        """The projection tier's input from the in-memory copy: ONE batch of
+        rows shaped like `iter_projection_vectors_paged`'s, holding every row
+        that can reach the top-`limit` (see ProjectionVectorCache.shortlist)
+        with its float32 blob re-read by rowid, in rowid order. The tier loop
+        then scores, floors, ACL-checks and heaps them exactly as it does a
+        page, so its result is the paged scan's. None when the cache cannot
+        serve; the caller pages the table."""
+        cache = self._projection_cache()
+        if cache is None:
+            return None
+        verdicts: dict = {}
+
+        def readable(owner):
+            # The same check the loop applies per row, asked once per distinct
+            # owner: can_read depends on nothing but (acl, owner, principal).
+            ok = verdicts.get(owner)
+            if ok is None:
+                ok = verdicts[owner] = access.can_read(access.DEFAULT_ACL, owner, principal)
+            return ok
+
+        picked = cache.shortlist(query, limit, _PROJ_FLOOR, readable)
+        if picked is None:
+            return None
+        width = len(query) * 4
+        rows = self.store.get_projection_vectors_by_rowids([p[0] for p in picked])
+        batch = []
+        for rowid, provider, external_id, owner in picked:
+            r = rows.get(rowid)
+            if (r is None or r["provider"] != provider or r["external_id"] != external_id
+                    or r.get("owner") != owner or not r.get("embedding")
+                    or len(r["embedding"]) != width):
+                # The table moved between the cache's check and this read. The
+                # copy can no longer vouch for what it left out: drop it and
+                # page this query.
+                cache.invalidate(width)
+                return None
+            batch.append(r)
+        return [batch] if batch else []
 
     def _raw_from_cache(self, query, scored, vec_heap, limit, principal, exclude_automation) -> bool:
         """The raw tier's vector pass from the in-memory copy: the same result the

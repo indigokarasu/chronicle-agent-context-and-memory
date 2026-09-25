@@ -300,3 +300,29 @@ that changed at all is on a covered route (`scripts/a18_ab.py`, which exits
 non-zero if that is ever false).
 
 Measured with hashing embeddings (deterministic, no network), 2026-09.
+
+
+# Ladder 11: raw tier, per-turn channel, queue hygiene (2026-09-24)
+
+Production-sized store: chronicle.db 2,257 MB + 160 MB WAL, 742k events, 146k pointers, 95.5k→98.1k
+projection vectors, 21.7k observed vectors. Same machine, same queries, `bench.py`; warm = second run
+in one process.
+
+| Path | before warm | after warm | before cold | after cold |
+|---|---:|---:|---:|---:|
+| chronicle_search (4 queries) | 1,316–1,700 ms | 462–598 ms | 1,309–17,876 ms | 565–3,604 ms |
+| raw vector tier (retrieve_raw) | 1,180–1,617 ms | 326–359 ms | | |
+| chronicle_answer | 163 ms | 161 ms | 1,124 ms | 782 ms |
+| ask_about (person) | 26 ms | 15 ms | 266 ms | 125 ms |
+| federated read channel (3 → 8 sources) | 19 ms | 29 ms | 19 ms | 128 ms |
+| static block | 4 ms | 3 ms | | |
+
+The remaining ~330 ms of the raw tier is the observed-vector scan and the belief tier; the first
+query in a process pays a one-time load of the projection copy (~146 MB float16).
+
+Per-turn prefetch, ten fixed generic questions (`scripts/prefetch_eval.py`, lexical path):
+questions reaching no federated source 5 → 2; calendar hits 0 → 16 across the set; transactions
+0 → 9; the schedule question went from 780 chars with no source to 1,451 chars with the calendar.
+
+Queue hygiene on the same store: 186,827 aged terminal job rows pruned in one catch-up (0 left);
+automation-session embed and summary jobs now complete without the embedder.
