@@ -64,6 +64,15 @@ def _speaker():
     return speaker
 
 
+def _suggest_module():
+    """engine.suggest, dual-mode like every other engine import here."""
+    try:
+        from .engine import suggest  # plugin-package context
+    except Exception:
+        from engine import suggest  # top-level (dev/tests)
+    return suggest
+
+
 def _op_markers():
     """The reducer's own operational-exhaust markers (§issue-7.1): reused rather
     than re-invented, so a tool result that would never be promoted out of an
@@ -168,6 +177,7 @@ class ChronicleMemoryProvider(MemoryProvider):
         self._host_context = {k: str(kw[k]) for k in ("agent_context", "platform")
                               if kw.get(k)}
         self.scope = self.core.initialize(session_id, hermes_home=hermes_home, principal_id=principal_id)
+        logger.info("chronicle: initialized for hermes_home=%s", hermes_home)
         logger.info("Chronicle MemoryProvider ready (session %s, principal %s)", session_id, principal_id)
 
     def shutdown(self):
@@ -519,32 +529,78 @@ class ChronicleMemoryProvider(MemoryProvider):
     def prefetch(self, query, *, session_id="") -> str:
         if not self.core:
             return ""
-        if self._automation_turn(session_id) and \
-                not self.core.cfg.get("retrieval.prefetch_automation", False):
+        automation = self._automation_turn(session_id)
+        if automation and not self.core.cfg.get("retrieval.prefetch_automation", False):
             return ""
         # Injected into the user's turn unasked, so it is memory ABOUT THE USER:
         # nothing from a scheduled job's own runs (engine/speaker) -- and only
         # what is about THIS message: an item must share a content word with
         # it, and a message with none ("thanks") gets nothing.
-        return self.core.retrieval.get_context(
+        text = self.core.retrieval.get_context(
             query, token_budget=self.core.cfg.get("retrieval.prefetch_budget", 1200),
             principal=self._principal_id, epistemic=self.core.epistemic,
             exclude_automation=True,
             relevance_gate=bool(self.core.cfg.get("retrieval.prefetch_relevance_gate", True)),
             # The conversation in progress is already in the model's window.
             live_session=session_id or self._session_id or None)
+        # J1: an advisory "which skill might help" hint from an external
+        # router (engine/suggest.py), never for a scheduled job's own turn --
+        # a cron run has no skill roster to load one for. suggest() is
+        # fail-open on its own (disabled/unconfigured/error/timeout all yield
+        # []), so this never adds latency beyond `suggest.budget_ms` or risks
+        # the rest of prefetch's return.
+        if not automation:
+            names = _suggest_module().suggest(query, self.core.cfg)
+            if names:
+                sid = session_id or self._session_id
+                logger.info("chronicle: skill suggestion %s for session=%s", ", ".join(names), sid)
+                line = "[SKILL SUGGESTION] consider: " + ", ".join(names)
+                text = (line + "\n" + text) if text else line
+        return text
 
     def system_prompt_block(self) -> str:
         if not self.core:
             return ""
-        return self.core.retrieval.static_block(
+        block = self.core.retrieval.static_block(
             self._principal_id, include_agent_own=not self._host_injects_agent_memory())
+        cache = self._cache_map_text()
+        if not cache:
+            return block
+        return (block.rstrip() + "\n\n" + cache).strip() if block else cache
 
-    @staticmethod
-    def _host_injects_agent_memory() -> bool:
+    def _cache_map_text(self) -> str:
+        """The map of what Chronicle holds (engine/cache_map.py), if one has been
+        built. Read from its file so building the system prompt never waits on
+        the store; a missing or unreadable file adds nothing."""
+        try:
+            from .engine import cache_map
+        except ImportError:
+            try:
+                from engine import cache_map  # type: ignore
+            except ImportError:
+                return ""
+        try:
+            cfg = self.core.cfg
+            if not cfg.get("cache_map.enabled", True):
+                return ""
+            path = cache_map.resolve_path(getattr(self.core, "hermes_home", ""), cfg)
+            limit = int(cfg.get("cache_map.max_chars", cache_map.DEFAULT_MAX_CHARS))
+            with open(path, encoding="utf-8") as f:
+                return f.read(max(0, limit)).strip()
+        except Exception:
+            return ""
+
+    def _host_injects_agent_memory(self) -> bool:
         """Does the host put the agent's own memory file into the system prompt
         itself (Hermes' built-in memory, `memory.memory_enabled`)? Then
-        Chronicle's copies of the agent's memory writes are older duplicates."""
+        Chronicle's copies of the agent's memory writes are older duplicates.
+
+        When the provider is initialized (self.core exists) and memory_enabled is
+        present in the section the host handed the core, reads it from there.
+        Otherwise falls back to the process config."""
+        host = getattr(self.core, "host_config", None) if self.core else None
+        if host is not None and host.get("memory_enabled") is not None:
+            return bool(host.get("memory_enabled"))
         try:
             from hermes_cli.config import load_config
             mem = (load_config() or {}).get("memory") or {}
@@ -552,10 +608,16 @@ class ChronicleMemoryProvider(MemoryProvider):
             return False                  # outside Hermes: Chronicle is the only copy
         return bool(mem.get("memory_enabled", True))
 
-    @staticmethod
-    def _host_serves_this_provider() -> bool:
+    def _host_serves_this_provider(self) -> bool:
         """Is Chronicle the host's memory provider (`memory.provider`)? Then the
-        host puts `system_prompt_block()` into the system prompt itself."""
+        host puts `system_prompt_block()` into the system prompt itself.
+
+        When the provider is initialized (self.core exists) and provider is
+        present in the section the host handed the core, reads it from there.
+        Otherwise falls back to the process config."""
+        host = getattr(self.core, "host_config", None) if self.core else None
+        if host is not None and host.get("provider") is not None:
+            return str(host.get("provider") or "").strip().lower() == "chronicle"
         try:
             from hermes_cli.config import load_config
             mem = (load_config() or {}).get("memory") or {}

@@ -194,6 +194,13 @@ SCHEMA_VERSION = 19
 BUSY_TIMEOUT_MS = 30000
 INIT_BUSY_TIMEOUT_MS = 5000
 
+# SQLite connection pragmas for optimal performance on a large database.
+# These defaults can be overridden by ChronicleCore's config.
+STORE_CACHE_KB = 65536  # -cache_size in KB; defaults to 2 MB, upgrade to 64 MB
+STORE_MMAP_BYTES = 536870912  # mmap_size; 512 MB for sequential scans
+STORE_SYNCHRONOUS = "NORMAL"  # WAL mode + NORMAL is safe; durability only across power loss + hourly snapshots
+STORE_JOURNAL_SIZE_LIMIT = 67108864  # journal_size_limit in bytes; 64 MB cap on WAL growth
+
 # Belief tables that carry the common envelope (§8.1).
 BELIEF_TABLES = ["facts", "episodes", "notes", "refs", "relationships", "procedures"]
 # Every table truncate_projection() empties -- i.e. everything the reducer is
@@ -409,6 +416,7 @@ class MemoryStore:
         self._write_lock = threading.RLock()
         self.reducer = None  # set by ChronicleCore; enables inline reduce on append (I7)
         self.vector_index = None  # set by ChronicleCore; optional ANN index for fast KNN
+        self.cfg = None  # set by ChronicleCore; config object for reading PRAGMA values
         self._lock_waits = 0
         self._lock_acqs = 0
         # A11b: every connection this store hands out, keyed by the thread that
@@ -431,7 +439,15 @@ class MemoryStore:
         if getattr(self._local, "conn", None) is None:
             conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000.0)
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            # Read PRAGMA values from config if available, else use module defaults
+            cache_kb = self.cfg.get("store.cache_kb", STORE_CACHE_KB) if self.cfg else STORE_CACHE_KB
+            mmap_bytes = self.cfg.get("store.mmap_bytes", STORE_MMAP_BYTES) if self.cfg else STORE_MMAP_BYTES
+            synchronous = self.cfg.get("store.synchronous", STORE_SYNCHRONOUS) if self.cfg else STORE_SYNCHRONOUS
+            journal_size_limit = self.cfg.get("store.journal_size_limit", STORE_JOURNAL_SIZE_LIMIT) if self.cfg else STORE_JOURNAL_SIZE_LIMIT
+            conn.execute("PRAGMA cache_size=-%d" % cache_kb)
+            conn.execute("PRAGMA mmap_size=%d" % mmap_bytes)
+            conn.execute("PRAGMA synchronous=%s" % synchronous)
+            conn.execute("PRAGMA journal_size_limit=%d" % journal_size_limit)
             conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
@@ -1187,8 +1203,12 @@ class MemoryStore:
                  event.get("prev_head"), event.get("sig"),
                  event.get("pointer")))
             conn.execute("UPDATE meta SET value=? WHERE key='head_event_id'", (eid,))
-            conn.execute("INSERT INTO git_queue(event_id,created_at) VALUES(?,?)",
-                         (eid, event.get("recorded_at") or now_iso()))
+            # Queued only for an enabled git mirror (core sets `queue_git` from
+            # `git.enabled`). Default to False since scripts that construct MemoryStore
+            # directly never pass through core, so an enabled default grows an undrained queue.
+            if getattr(self, "queue_git", False):
+                conn.execute("INSERT INTO git_queue(event_id,created_at) VALUES(?,?)",
+                             (eid, event.get("recorded_at") or now_iso()))
             ev = dict(event)
             ev["seq"] = seq
             if self.reducer is not None:
@@ -2097,6 +2117,31 @@ class MemoryStore:
                 min_rowid = batch[-1]["rowid"]
             yield batch
 
+    def get_projection_vectors_by_rowids(self, rowids) -> dict:
+        """projection_vectors rows by rowid: {rowid: {rowid, provider,
+        external_id, owner, embedding}}. A rowid with no row is absent.
+
+        The projection-vector cache's rescoring read (retrieval's projection
+        tier): the
+        in-memory float16 copy picks the few rows that can reach the top-k, and
+        their float32 blobs are re-read here so the tier scores exactly what
+        the paged scan would. The keys are what the paged scan's rows carry,
+        so the tier loop reads either the same way. Chunked under
+        SQLITE_MAX_VARIABLE_NUMBER like the other by-id reads."""
+        out: dict = {}
+        ids = [int(r) for r in rowids]
+        if not ids:
+            return out
+        conn = self._conn()
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            sql = ("SELECT rowid, provider, external_id, owner, embedding FROM projection_vectors "
+                   "WHERE rowid IN (%s)" % ",".join("?" * len(part)))
+            for r in conn.execute(sql, part).fetchall():
+                out[int(r["rowid"])] = dict(r)
+        return out
+
     def delete_projection_vectors(self, provider: str):
         """Delete all projection vectors from a specific provider."""
         with self.transaction() as conn:
@@ -2895,11 +2940,21 @@ class MemoryStore:
         with self.transaction() as conn:
             if max_age_days is not None and float(max_age_days) >= 0:
                 cutoff = _iso_ago(float(max_age_days) * 86400.0)
-                cur = conn.execute(
-                    "DELETE FROM curation_jobs WHERE id IN (SELECT id FROM curation_jobs "
-                    "WHERE %s AND COALESCE(finished_at, created_at) <= ? AND %s "
-                    "ORDER BY id LIMIT ?)" % (terminal, referenced), (cutoff, int(batch)))
-                out["pruned_age"] = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                # One batch per call cannot keep up with a queue that gains tens of
+                # thousands of rows a day; the aged backlog only grew. Keep deleting
+                # full batches until the aged rows are gone or `max_rows` is spent.
+                bound = int(max_rows) if max_rows is not None and int(max_rows) >= 0 else None
+                deleted = 0
+                while True:
+                    cur = conn.execute(
+                        "DELETE FROM curation_jobs WHERE id IN (SELECT id FROM curation_jobs "
+                        "WHERE %s AND COALESCE(finished_at, created_at) <= ? AND %s "
+                        "ORDER BY id LIMIT ?)" % (terminal, referenced), (cutoff, int(batch)))
+                    n = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    deleted += n
+                    if n < int(batch) or (bound is not None and deleted >= bound):
+                        break
+                out["pruned_age"] = deleted
             if max_rows is not None and int(max_rows) >= 0:
                 n = conn.execute("SELECT COUNT(*) FROM curation_jobs WHERE %s" % terminal).fetchone()[0]
                 excess = int(n) - int(max_rows)
@@ -2912,6 +2967,107 @@ class MemoryStore:
         if out["pruned_age"] or out["pruned_cap"]:
             logger.info("curation queue: pruned %d aged + %d over-cap terminal job rows",
                         out["pruned_age"], out["pruned_cap"])
+        return out
+
+    # Same three tables `_belief_fts_text` knows how to index (§S6 is scoped
+    # to these; refs/relationships/procedures were not part of the measured
+    # problem and are left alone).
+    _RETRACTED_PRUNE_TABLES = ("facts", "episodes", "notes")
+
+    def prune_retracted_beliefs(self, days: float = 30, max_rows: int = 50000,
+                                batch: int = 5000) -> dict:
+        """Keep the retracted tail of notes/episodes/facts bounded (§S6).
+
+        On the production store almost every note and episode was retracted
+        (44,720 of 44,934 notes, 67,772 of 67,882 episodes) yet nothing ever
+        removed them: they still matched every `status='active'` scan's WHERE
+        clause (cheap to exclude, but scanned first) and still sat in
+        `belief_fts` (4,246 indexed rows against 2,749 active beliefs), so a
+        keyword search ranked thousands of rows it could never return before
+        it reached the ones it could. The event log is the durable record of
+        what was asserted and retracted; this table is a projection of it and
+        may drop rows nothing else still needs to read.
+
+        THE SUPERSEDE-CHAIN GUARD: `retrieval.history(belief_id)` walks a
+        chain forward through each row's `superseded_by` link (reducer.py is
+        the only writer of that column today, and it stays within `facts`,
+        but the guard is applied to every pruned table for the same reason
+        prune_curation_jobs' dependency guard is not special-cased to one
+        task: a future writer of the column should not have to rediscover
+        this rule). Deleting a row something still points at would not raise
+        — a missing link ends the walk exactly like an unreadable one, no
+        error, no marker (`retrieval.history`'s own docstring) — it would
+        just silently truncate a chain a caller can still ask to see. So a
+        row is only a candidate when NO surviving row in the same table
+        still has `superseded_by` pointing at it, checked within one table
+        because that is the only scope the column is ever written in.
+
+        THE GUARD IS EVALUATED ONCE PER TABLE, before any delete for that
+        table runs — the candidate list (age + status + unreferenced) is
+        read in a single SELECT and only then deleted in `batch`-sized
+        chunks. A chain of two retracted rows (old -> older still pointing
+        at it) must converge the same way prune_curation_jobs' does: the
+        unreferenced end goes first and its former target becomes a
+        candidate only on the NEXT call, once it is unreferenced too. Had
+        the guard instead re-queried per batch, deleting the referencing row
+        in batch 1 would make its target look unreferenced in time for
+        batch 2 of the SAME call, collapsing the whole chain in one run —
+        exactly the dependency-guard hazard `prune_curation_jobs` documents,
+        reintroduced by evaluating the guard against a moving target instead
+        of a fixed snapshot.
+
+        WHY replay is safe: pruning never touches the event log, only a
+        derived projection. A rebuild re-derives the same facts, re-applies
+        the same retraction, and the row is retracted again immediately —
+        it was already excluded from every `status='active'` read the
+        instant it was retracted, so removing it early changes nothing an
+        API caller can observe. The next scheduled prune would only delete
+        it again once it re-crosses the age bound; running it once more,
+        sooner, on a freshly rebuilt store is a no-op difference in output.
+
+        BATCHING: the candidate SELECT is capped at `max_rows` (a PER-TABLE
+        budget, not shared across the three — a shared budget would let
+        facts' larger backlog starve episodes and notes on every run, since
+        table order is fixed), then deleted `batch` rows at a time, each
+        chunk its OWN transaction — never one transaction for the whole
+        prune — so a run cannot hold a write lock for as long as it takes to
+        delete tens of thousands of rows, and a process killed mid-prune
+        leaves only whole, already-committed chunks behind."""
+        out = {"pruned": 0, "by_table": {}}
+        if days is None or float(days) < 0:
+            return out
+        cutoff = _iso_ago(float(days) * 86400.0)
+        cap = -1 if max_rows is None else max(0, int(max_rows))
+        batch = max(1, int(batch))
+        for table in self._RETRACTED_PRUNE_TABLES:
+            if cap == 0:
+                continue
+            rows = self._conn().execute(
+                "SELECT belief_id FROM %s WHERE status='retracted' AND "
+                "COALESCE(last_seen_at, created_at) <= ? AND belief_id NOT IN "
+                "(SELECT superseded_by FROM %s WHERE superseded_by IS NOT NULL) "
+                "ORDER BY belief_id LIMIT ?" % (table, table), (cutoff, cap)).fetchall()
+            ids = [r["belief_id"] for r in rows]
+            pruned_table = 0
+            for i in range(0, len(ids), batch):
+                chunk = ids[i:i + batch]
+                ph = ",".join("?" * len(chunk))
+                with self.transaction() as conn:
+                    conn.execute("DELETE FROM %s WHERE belief_id IN (%s)" % (table, ph), chunk)
+                    # Explicit, matching how these two are kept in sync everywhere
+                    # else (_fts_index_belief / update_belief / delete_memory_vector):
+                    # belief_fts is a contentless FTS5 table with no trigger of its
+                    # own, and memory_vectors has no ON DELETE CASCADE.
+                    conn.execute("DELETE FROM belief_fts WHERE belief_id IN (%s)" % ph, chunk)
+                    conn.execute("DELETE FROM memory_vectors WHERE belief_id IN (%s)" % ph, chunk)
+                pruned_table += len(chunk)
+            if pruned_table:
+                out["by_table"][table] = pruned_table
+                out["pruned"] += pruned_table
+        if out["pruned"]:
+            logger.info("retention: pruned %d long-retracted belief row(s) (%s)",
+                        out["pruned"],
+                        ", ".join("%s=%d" % (t, n) for t, n in sorted(out["by_table"].items())))
         return out
 
     def pending_counts_by_task(self) -> dict:
@@ -3007,7 +3163,8 @@ class MemoryStore:
             if exists:
                 return False
             conn.execute("INSERT INTO extractions(id,observed_event,extractor_version,produced,"
-                         "ambiguous,route,created_at) VALUES(?,?,?,?,?,?,?)",
+                         "ambiguous,route,created_at) VALUES(?,?,?,?,?,?,?) "
+                         "ON CONFLICT(observed_event, extractor_version) DO NOTHING",
                          (projection_row_id("xtr", {"observed_event": observed_event,
                                                     "extractor_version": extractor_version}),
                           observed_event, extractor_version,
@@ -4227,6 +4384,15 @@ CREATE TABLE IF NOT EXISTS link_candidates (
     created_at TEXT, reviewed_at TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_link_candidates_pair
     ON link_candidates(entity_id, external_ref);
+-- Which records involve which entity, by a hard identifier (engine/mentions.py).
+-- A rebuildable index derived from the sources, not beliefs.
+CREATE TABLE IF NOT EXISTS entity_mentions (
+    entity_id TEXT NOT NULL, external_ref TEXT NOT NULL, provider TEXT NOT NULL,
+    role TEXT NOT NULL, method TEXT NOT NULL, key TEXT, created_at TEXT,
+    PRIMARY KEY (entity_id, external_ref, role));
+CREATE INDEX IF NOT EXISTS idx_mentions_ref ON entity_mentions(external_ref);
+CREATE INDEX IF NOT EXISTS idx_mentions_provider ON entity_mentions(provider);
+CREATE INDEX IF NOT EXISTS idx_pointers_provider_ext ON pointers(provider, external_id);
 """ + _IDENTITY_DDL + "\n" + _HOST_MODEL_REQUESTS_DDL + "\n" + _HOST_MODEL_RESULTS_DDL + """
 CREATE INDEX IF NOT EXISTS idx_host_model_pending
     ON host_model_requests(created_at) WHERE status='pending';

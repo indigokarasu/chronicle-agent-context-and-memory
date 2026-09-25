@@ -348,6 +348,21 @@ DEFAULTS: dict[str, Any] = {
     "db_path": "~/.hermes/commons/db/chronicle/chronicle.db",
     "git_repo": "~/.hermes/commons/db/chronicle/git",
     "git_remote": None,
+    "store": {
+        # SQLite connection pragmas for optimal performance on 2+ GB databases.
+        # cache_size: in-process page cache size in KB; upgraded from default 2 MB
+        # to 64 MB to reduce paging on large scans (e.g., vector tier lookups).
+        "cache_kb": 65536,
+        # mmap_size: memory-mapped I/O window in bytes; 512 MB window enables
+        # the OS to page vector blobs directly without SQLite buffer copies.
+        "mmap_bytes": 536870912,
+        # synchronous: WAL + NORMAL is safe — durability only across power loss
+        # of the last transactions; Chronicle is snapshotted hourly by ops scripts.
+        "synchronous": "NORMAL",
+        # journal_size_limit: WAL size cap in bytes; 64 MB prevents unbounded
+        # growth (reached 160 MB before; WAL is checkpointed hourly).
+        "journal_size_limit": 67108864,
+    },
     # Default = auto: detect a running local OpenAI-compatible server (base_url
     # null → LM Studio :1234, Ollama :11434, llama.cpp :8080, or
     # $CHRONICLE_EMBED_BASE_URL) and use whatever embedding model IT serves — no
@@ -416,7 +431,21 @@ DEFAULTS: dict[str, Any] = {
                    # on a CPU-bound host a long excerpt needs more than that
                    # (measured: ~7 s for 200 words on the production VPS).
                    # Clamped to [10, 600] (engine/curation.py).
-                   "background_timeout": 120},
+                   "background_timeout": 120,
+                   # S5: observed events from an automation session (cron, batch,
+                   # subagent -- engine/speaker.is_automation_session, never the
+                   # user typing) are not embedded, at write time or from a queued
+                   # job. Measured on the production shape: ~97% of sessions are
+                   # cron, ~17.8k observed events land a day, and every read path
+                   # already excludes automation text from recall
+                   # (retrieval's exclude_automation) -- so embedding it only spent
+                   # the embedder and queue priority a cron transcript never gets
+                   # read back for. ON by default, unlike
+                   # exclude_session_prefixes (an opt-in, per-deployment prefix
+                   # list): this tracks the engine's own automation classifier, so
+                   # a fresh deployment is not left to discover and configure the
+                   # exclusion itself.
+                   "skip_automation": True},
     # A12: `bruteforce_ceiling` was declared here and read by nothing. There is
     # exactly one index backend (engine/vector_index.py brute force); a ceiling
     # past which a nonexistent ANN backend takes over is not a knob, it is a
@@ -452,6 +481,14 @@ DEFAULTS: dict[str, Any] = {
         "cache_ttl": "24h",
         "pins": {},
         "provider_trust": {"default": 2},
+        # How many declared `local_dbs` the federated read channel (§g3,
+        # engine/federated.py) actually searches, in declaration order. Was a
+        # hard-coded module constant (MAX_DBS=3, still the fallback when no
+        # cfg is supplied); the channel measured at ~19ms per query on the
+        # live box, so 3 was picked out of caution before that cost was known,
+        # not because a fourth or fifth declared database is unsafe to search.
+        # Default keeps the shipped behaviour unchanged.
+        "channel_max_dbs": 3,
         # Local SQLite databases this deployment declares, e.g.
         #   [{"name": "somedb", "path": "/abs/path.db", "read_only": True}]
         # Nothing about a particular database is hard-coded anywhere in engine/:
@@ -468,6 +505,12 @@ DEFAULTS: dict[str, Any] = {
         "local_dbs": [],
     },
     "outputs": {"ocas_signal_emit": {"enabled": "auto", "sink": "~/.hermes/commons/signals/"}},
+    # A small map of what the store holds and how to read it, built offline
+    # (engine/cache_map.py, scripts/build_cache_map.py) and put into the system
+    # prompt by the provider. `path` empty: <hermes_home>/commons/data/chronicle/
+    # chronicle.cache.md. `sources` optionally describes each federated db by
+    # name: {label, unit, about, date_column}; date_column "" means no dates.
+    "cache_map": {"enabled": True, "path": "", "max_chars": 2500, "sources": {}},
 
     "extraction": {
         "version": "extractor-v1",
@@ -646,6 +689,17 @@ DEFAULTS: dict[str, Any] = {
         # paged scan: at 768 dims a row costs ~1.5 KB, so 250,000 is ~400 MB.
         "observed_vector_cache": True,
         "observed_vector_cache_max_rows": 250000,
+        # The same for the projection tier (`proj:` hits from external sources'
+        # rows): it read every projection_vectors row from SQLite on every query,
+        # ~1.2-1.6 s of a search at ~95k rows. With this on, each process keeps a
+        # float16 copy (~146 MB at 95k x 768, ~215 MB at 140k), picks the rows
+        # that can reach the top-k from it, and re-reads only those rows' exact
+        # vectors -- same results as the scan. Above `max_rows` rows in the
+        # table it pages as before, with one warning, rather than grow further.
+        "projection_cache": {
+            "enabled": True,
+            "max_rows": 400000,
+        },
         "prefetch_min_similarity": "auto",
         # The same check for a match on two or three shared words ("send" and
         # "none" in a security alert's text), measured separately: "auto" =
@@ -1174,8 +1228,41 @@ DEFAULTS: dict[str, Any] = {
                  # store, the row cap catches a busy one that outruns the age
                  # bound. `enabled: False` turns the prune off and accepts
                  # unbounded growth.
+                 #
+                 # §S6: `retracted_days` / `retracted_max_rows` bound
+                 # `store.prune_retracted_beliefs`, the same shape of problem
+                 # one table over — notes and episodes were 99%+ retracted
+                 # (44,720/44,934 and 67,772/67,882 on the production store)
+                 # and none of it was ever deleted, so it sat in belief_fts
+                 # and every status='active' scan forever. `retracted_days`
+                 # is how long a retracted row's last change may age before
+                 # it becomes a prune candidate — long enough that a row a
+                 # human or another process might still want to look back at
+                 # ("what did this used to say") survives well past any
+                 # normal review window. `retracted_max_rows` is the same
+                 # per-table batch/run bound `batch` is for curation_jobs:
+                 # how many rows one health run may delete FROM EACH of
+                 # notes/episodes/facts, not a shared total (a shared budget
+                 # would let facts' backlog starve episodes and notes on
+                 # every run, since they are always pruned in the same
+                 # order). Governed by the same `enabled` switch above —
+                 # it is the same retention mechanism, just applied to a
+                 # different table shape.
                  "retention": {"enabled": True, "done_days": 7,
-                               "max_rows": 20000, "batch": 5000}},
+                               "max_rows": 20000, "batch": 5000,
+                               "retracted_days": 30, "retracted_max_rows": 50000}},
+
+    # §R3: 97% of captured sessions are cron/automation runs, and their
+    # summary is never surfaced -- retrieval's exclude_automation drops
+    # automation-session rows on every read path, so a real, embedded
+    # `session_summarize` job for one only spends the embedder's queue and
+    # delays the jobs from sessions someone can actually recall (only 147 of
+    # 952 interactive sessions had a summary while cron sessions were queued
+    # for the same model-backed work). Default False: automation sessions
+    # complete their summarize job with an empty marker row instead of a real
+    # summary. Set True to restore summarizing them (e.g. a deployment that
+    # wants automation transcripts recallable too).
+    "sessions": {"summarize_automation": False},
 
     # Identity evidence (§E7, issue #8). Similarity produces CANDIDATES only —
     # nothing here ever merges or splits an entity; identity is adjudicated,
@@ -1194,6 +1281,11 @@ DEFAULTS: dict[str, Any] = {
     # string disables it. `enabled: false` disables BOTH producers.
     "identity": {"enabled": True, "split_below": 0.30, "merge_above": 0.90,
                  "merge_scan_limit": 50, "schedule": "0 5 * * *"},
+    # Records linked to entities by hard identifiers (engine/mentions.py,
+    # scripts/build_mentions.py). `self`: the owner's own addresses and numbers,
+    # never a mention. See the module docstring for the source specs.
+    "mentions": {"enabled": True, "recent_limit": 15, "self": [],
+                 "entity_sources": [], "record_sources": []},
     "consolidation": {"enable_parametric": False},
 
     # -- sweeps (§A9) ---------------------------------------------------------
@@ -1443,6 +1535,30 @@ DEFAULTS: dict[str, Any] = {
         "prune_tool_results": {"enabled": True, "at_percent": 0.5, "min_chars": 2000,
                                "keep_head_chars": 500, "keep_tail_chars": 300,
                                "min_reclaim_tokens": 1500},
+    },
+    # J1: an advisory skill-selection hint on the per-turn prefetch path
+    # (engine/suggest.py, wired into `provider.prefetch`). An external
+    # router ranks the agent's installed skills against the user's message;
+    # Chronicle does not ship or run one itself.
+    "suggest": {
+        # Off by default: this calls into code Chronicle does not own or
+        # ship (an arbitrary file path), so a default-on install would be
+        # importing and running someone else's script on every turn with
+        # nobody having opted in.
+        "enabled": False,
+        # Filesystem path to the router module (e.g. a copy of
+        # jev_skill_suggest.py). "" = disabled regardless of `enabled` --
+        # nothing to import.
+        "module_path": "",
+        # Hard ceiling, in milliseconds, on how long a turn's prefetch may
+        # wait on the router -- enforced by a worker thread + join(timeout)
+        # in engine/suggest.py, never a plain call. The reference router
+        # this integrates with defaults its own remote ranking request to a
+        # 30-90s timeout, far longer than any turn should block for an
+        # advisory hint; past this budget the call is treated as no
+        # suggestion and its thread is abandoned (not killed) rather than
+        # awaited.
+        "budget_ms": 800,
     },
 }
 

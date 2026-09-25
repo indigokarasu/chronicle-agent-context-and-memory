@@ -156,6 +156,7 @@ class TestStore(unittest.TestCase):
         self.assertEqual(self.store.get_event("ev_x")["type"], "observed")
 
     def test_append_idempotent_and_git_queue(self):  # P1 / I2 / I7
+        self.store.queue_git = True  # git_queue disabled by default; enable for this test
         self.store.append_event(self._ev())
         self.store.append_event(self._ev())
         self.assertEqual(self.store.count_rows("events", "event_id='ev_x'"), 1)

@@ -371,6 +371,21 @@ class TestQueueRetention(_CoreCase):
         self.assertEqual(out["pruned_age"], 50)
         self.assertEqual(self._total(), 7)
 
+    def test_aged_rows_beyond_one_batch_go_in_one_call(self):
+        """One batch per call could not keep up with a queue gaining tens of
+        thousands of terminal rows a day; the aged backlog only grew."""
+        self._seed("done", 12, finished_days_ago=30)
+        out = self.store.prune_curation_jobs(max_age_days=7, max_rows=10**6, batch=5)
+        self.assertEqual(out["pruned_age"], 12)
+        self.assertEqual(self._total(), 0)
+
+    def test_the_age_prune_stops_at_max_rows(self):
+        self._seed("done", 12, finished_days_ago=30)
+        out = self.store.prune_curation_jobs(max_age_days=7, max_rows=10, batch=5)
+        self.assertEqual(out["pruned_age"], 10)
+        self.assertEqual(out["pruned_cap"], 0, "2 terminal rows left is under the cap")
+        self.assertEqual(self._total(), 2)
+
     def test_pending_and_running_work_is_never_pruned(self):
         self._seed("pending", 5, finished_days_ago=999)
         self._seed("running", 5, finished_days_ago=999)
@@ -434,6 +449,149 @@ class TestQueueRetention(_CoreCase):
         self.assertEqual(res, {"pruned_age": 0, "pruned_cap": 0, "enabled": False})
         self.assertEqual(off.store._conn().execute(
             "SELECT COUNT(*) FROM curation_jobs").fetchone()[0], 5)
+
+
+# ---------------------------------------------------------------------------
+# 4b. Retracted-belief retention (§S6) — same pattern as TestQueueRetention,
+# applied to notes/episodes/facts instead of curation_jobs.
+# ---------------------------------------------------------------------------
+class TestRetractedBeliefRetention(_CoreCase):
+    # Column order fixtures insert in, per table — belief_id/superseded_by/
+    # created_at/last_seen_at are what prune_retracted_beliefs reads; the rest
+    # is only there to satisfy each table's NOT NULL columns and to give the
+    # row real FTS text.
+    _COLS = {
+        "facts": ("belief_id", "entity_id", "attribute", "value", "provenance",
+                  "owner", "domain", "status", "superseded_by",
+                  "created_at", "last_seen_at"),
+        "episodes": ("belief_id", "title", "summary", "owner", "domain", "status",
+                     "superseded_by", "created_at", "last_seen_at"),
+        "notes": ("belief_id", "note_type", "subject", "body", "owner", "domain",
+                  "status", "superseded_by", "created_at", "last_seen_at"),
+    }
+    _KIND = {"facts": "fact", "episodes": "episode", "notes": "note"}
+
+    def _row(self, table, belief_id, status, superseded_by, ts, text):
+        if table == "facts":
+            return (belief_id, "e1", text[0], text[1], '{"source_type":"test"}',
+                    "user", "general", status, superseded_by, ts, ts)
+        if table == "episodes":
+            return (belief_id, text[0], text[1], "user", "general", status,
+                    superseded_by, ts, ts)
+        return (belief_id, "belief", text[0], text[1], "user", "general",
+                status, superseded_by, ts, ts)
+
+    def _seed(self, table, belief_id, status, age_days, *, superseded_by=None,
+              text=("subject", "body"), index_fts=False, vector=False):
+        ts = _iso_days_ago(age_days)
+        cols = self._COLS[table]
+        with self.store.transaction() as c:
+            c.execute("INSERT INTO %s(%s) VALUES(%s)" %
+                      (table, ",".join(cols), ",".join("?" * len(cols))),
+                      self._row(table, belief_id, status, superseded_by, ts, text))
+            if index_fts:
+                c.execute("INSERT INTO belief_fts(belief_id, kind, text) VALUES(?,?,?)",
+                          (belief_id, self._KIND[table], " ".join(text)))
+            if vector:
+                c.execute("INSERT INTO memory_vectors(belief_id,kind,embedding,model,created_at) "
+                          "VALUES(?,?,?,?,?)", (belief_id, table, b"\x00\x00\x00\x00", "hashing", ts))
+
+    def _fts_ids(self):
+        return {r[0] for r in self.store._conn().execute(
+            "SELECT belief_id FROM belief_fts").fetchall()}
+
+    def _vector_ids(self):
+        return {r[0] for r in self.store._conn().execute(
+            "SELECT belief_id FROM memory_vectors").fetchall()}
+
+    def _ids(self, table):
+        return {r[0] for r in self.store._conn().execute(
+            "SELECT belief_id FROM %s" % table).fetchall()}
+
+    def test_only_unreferenced_old_retracted_rows_are_pruned(self):
+        # active: never a candidate regardless of age.
+        self._seed("notes", "n_active", "active", 400,
+                   text=("s", "aardvark stays because it is active"),
+                   index_fts=True, vector=True)
+        # retracted, old, unreferenced: the one row this run should remove.
+        self._seed("notes", "n_old", "retracted", 400,
+                   text=("s", "wombat is old and unreferenced"),
+                   index_fts=True, vector=True)
+        # retracted, but not old enough yet.
+        self._seed("notes", "n_new", "retracted", 1,
+                   text=("s", "capybara is retracted but too recent"),
+                   index_fts=True, vector=True)
+        # retracted and old, but another row's superseded_by still points at
+        # it -- retrieval.history() would walk through this belief_id, so it
+        # must survive even though it independently qualifies by age.
+        self._seed("notes", "n_ref", "retracted", 400,
+                   text=("s", "quokka is old but still referenced"),
+                   index_fts=True, vector=True)
+        self._seed("notes", "n_ref_src", "retracted", 400,
+                   superseded_by="n_ref", text=("s", "points at quokka"))
+
+        out = self.store.prune_retracted_beliefs(days=30, max_rows=10**6)
+
+        # n_old and n_ref_src (nothing points at n_ref_src itself) are gone;
+        # n_active (wrong status), n_new (too recent) and n_ref (referenced)
+        # all survive.
+        self.assertEqual(out["by_table"], {"notes": 2})
+        self.assertEqual(out["pruned"], 2)
+        self.assertEqual(self._ids("notes"), {"n_active", "n_new", "n_ref"})
+        # belief_fts and memory_vectors were seeded for all four surviving
+        # candidates' rows except n_ref_src; only n_old's disappear.
+        self.assertEqual(self._fts_ids(), {"n_active", "n_new", "n_ref"})
+        self.assertEqual(self._vector_ids(), {"n_active", "n_new", "n_ref"})
+
+    def test_never_touches_active_draft_or_superseded_status(self):
+        for status in ("active", "draft", "superseded"):
+            self._seed("notes", "n_%s" % status, status, 400)
+        out = self.store.prune_retracted_beliefs(days=30, max_rows=10**6)
+        self.assertEqual(out["pruned"], 0)
+        self.assertEqual(self._ids("notes"), {"n_active", "n_draft", "n_superseded"})
+
+    def test_facts_and_episodes_are_pruned_the_same_way(self):
+        self._seed("facts", "f_old", "retracted", 400)
+        self._seed("facts", "f_new", "retracted", 1)
+        self._seed("episodes", "e_old", "retracted", 400)
+        self._seed("episodes", "e_new", "retracted", 1)
+        out = self.store.prune_retracted_beliefs(days=30, max_rows=10**6)
+        self.assertEqual(out["by_table"], {"facts": 1, "episodes": 1})
+        self.assertEqual(self._ids("facts"), {"f_new"})
+        self.assertEqual(self._ids("episodes"), {"e_new"})
+
+    def test_max_rows_bounds_rows_pruned_per_table_per_run(self):
+        """`max_rows` is a PER-TABLE budget, spent in `batch`-sized transactions
+        -- a fixed table order means a single shared budget would let one
+        table's backlog starve the others on every run."""
+        for i in range(20):
+            self._seed("notes", "n_%03d" % i, "retracted", 400)
+        out = self.store.prune_retracted_beliefs(days=30, max_rows=5, batch=2)
+        self.assertEqual(out["by_table"]["notes"], 5)
+        self.assertEqual(len(self._ids("notes")), 15)
+
+    def test_health_runs_belief_retention_and_the_switch_turns_it_off(self):
+        self._seed("notes", "n_old", "retracted", 400)
+        out = self.core.health.queue_maintenance()["belief_retention"]
+        self.assertEqual(out["by_table"], {"notes": 1})
+        self.assertEqual(self._ids("notes"), set())
+
+        # Same off-switch shape as test_health_runs_retention_and_the_switch_
+        # turns_it_off above: reopen the store with retention disabled and
+        # confirm an equally old retracted row survives.
+        off_home = tempfile.mkdtemp(prefix="s6ret_")
+        self.addCleanup(shutil.rmtree, off_home, ignore_errors=True)
+        off = ChronicleCore(off_home, dict(CFG, curation={"retention": {"enabled": False}}))
+        self.addCleanup(off.close)
+        with off.store.transaction() as c:
+            c.execute(
+                "INSERT INTO notes(belief_id,note_type,subject,body,owner,domain,status,"
+                "created_at,last_seen_at) VALUES('n_off','belief','s','b','user','general',"
+                "'retracted',?,?)", (_iso_days_ago(400), _iso_days_ago(400)))
+        res = off.health.queue_maintenance()["belief_retention"]
+        self.assertEqual(res, {"pruned": 0, "by_table": {}, "enabled": False})
+        self.assertIsNotNone(off.store._conn().execute(
+            "SELECT 1 FROM notes WHERE belief_id='n_off'").fetchone())
 
 
 # ---------------------------------------------------------------------------

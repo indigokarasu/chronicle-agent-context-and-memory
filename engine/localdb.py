@@ -97,8 +97,12 @@ def is_text_column(decl_type) -> bool:
 class LocalDBProvider(CapabilityProvider):
     """Read-only provider for a declared SQLite database file."""
 
-    def __init__(self, name: str, db_path: str, read_acl: str = DEFAULT_ACL):
+    def __init__(self, name: str, db_path: str, read_acl: str = DEFAULT_ACL, table=None):
         self.name = name
+        # The declared table (or view), when the entry names one: then it is
+        # the whole searchable surface, and other tables in the file -- which
+        # may belong to another application -- are never scanned.
+        self.table = table or None
         self.capability = name
         self.db_path = str(db_path)
         self.read_acl = read_acl or DEFAULT_ACL
@@ -162,6 +166,10 @@ class LocalDBProvider(CapabilityProvider):
             except Exception as e:
                 logger.warning("localdb %s: schema listing failed: %s", self.name, e)
                 return {}
+            if self.table:
+                rows = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name=?",
+                    (self.table,)).fetchall()
             for r in rows:
                 table = r["name"]
                 try:
@@ -503,7 +511,8 @@ def providers_from_config(cfg) -> List[LocalDBProvider]:
             logger.warning("federation.local_dbs %r declares read_only=false; refused", name)
             continue
         out.append(LocalDBProvider(str(name), str(Path(str(path)).expanduser()),
-                                   read_acl=entry.get("read_acl") or DEFAULT_ACL))
+                                   read_acl=entry.get("read_acl") or DEFAULT_ACL,
+                                   table=entry.get("table") or None))
     return out
 
 

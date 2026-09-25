@@ -55,13 +55,19 @@ class FederatedChannel:
         # schema, so a warm channel spends one statement per searched table.
         if providers is None:
             providers = providers_from_config(cfg)
-        self.providers = list(providers)[:MAX_DBS]
+        # Channel breadth (federation.channel_max_dbs, DEFAULTS): how many
+        # declared sources this channel actually searches. MAX_DBS is the
+        # fallback for a channel built with no cfg (e.g. a caller that passes
+        # `providers=` directly), so behaviour there is unchanged.
+        self.channel_max_dbs = int(cfg.get("federation.channel_max_dbs", MAX_DBS)) \
+            if cfg is not None else MAX_DBS
+        self.providers = list(providers)[:self.channel_max_dbs]
         # Adjudication inbox (rule: identity is decided, never inferred). Bounded
         # and in-memory: get_context is a READ path and does not write.
         self.pending_candidates: List[Dict] = []
 
     def query(self, focus_tokens, principal: str, owner: str,
-              max_dbs: int = MAX_DBS) -> List[Dict]:
+              max_dbs: Optional[int] = None) -> List[Dict]:
         """Search every available DB for rows matching any focus token.
 
         Returns pointer-shaped hits, in declaration order:
@@ -72,6 +78,8 @@ class FederatedChannel:
         tokens = [t for t in (focus_tokens or []) if t]
         if not tokens or not self.providers:
             return hits
+        if max_dbs is None:
+            max_dbs = self.channel_max_dbs
         for provider in self.providers[:max_dbs]:
             if not provider.is_available():
                 logger.info("federated: %s unavailable (%s)", provider.name, provider.db_path)

@@ -16,6 +16,7 @@ import json
 import logging
 import sqlite3
 
+from . import speaker as spk
 from . import sweeps
 from .embeddings import (
     VECTOR_TABLES,
@@ -147,7 +148,13 @@ class HealthEngine:
         for the life of the store and every enqueue's dedupe probe paid for the
         whole history. `curation.retention.*` bounds it by age AND by count.
 
-        Both are bounded per run and both report what they did."""
+        RETENTION (§S6): the same `curation.retention.enabled` switch also
+        gates `prune_retracted_beliefs`, which bounds the long-retracted tail
+        of notes/episodes/facts under its own `retracted_days` /
+        `retracted_max_rows` keys — same problem shape (a status nothing ever
+        deletes, growing every scan) on a different table.
+
+        All are bounded per run and all report what they did."""
         out = {}
         try:
             lease = int(self.cfg.get("curation.lease_seconds", 900))
@@ -181,6 +188,25 @@ class HealthEngine:
         else:
             out["job_retention"] = {"pruned_age": 0, "pruned_cap": 0, "enabled": False}
         out["job_queue"] = self.store.pending_counts_by_task()
+        # §S6: the same retention pattern as job_retention just above, applied
+        # to the retracted tail of notes/episodes/facts instead of terminal
+        # curation_jobs rows — almost all of both were retracted yet none was
+        # ever removed, so they sat in belief_fts and every status='active'
+        # scan forever. Gated by the same `curation.retention.enabled` switch
+        # since it is the same retention mechanism.
+        if self.cfg.get("curation.retention.enabled", True):
+            try:
+                retracted_days = float(self.cfg.get("curation.retention.retracted_days", 30))
+            except (TypeError, ValueError):
+                retracted_days = 30.0
+            try:
+                retracted_cap = int(self.cfg.get("curation.retention.retracted_max_rows", 50000))
+            except (TypeError, ValueError):
+                retracted_cap = 50000
+            out["belief_retention"] = self.store.prune_retracted_beliefs(
+                days=retracted_days, max_rows=retracted_cap, batch=max(1, pbatch))
+        else:
+            out["belief_retention"] = {"pruned": 0, "by_table": {}, "enabled": False}
         return out
 
     GHOST_WHERE = "status='active' AND confirm_count=0 AND confidence>=?"
@@ -713,11 +739,23 @@ class HealthEngine:
         _NONE = ("", [])
 
         pred, params = reembed.get("observed_vectors", _NONE)
+        skip_automation = self.cfg.get("embeddings.skip_automation", True)
         if pred and room > 0:
             for row in conn.execute(
                     "SELECT event_id FROM observed_vectors WHERE %s LIMIT ?" % pred,
                     (*params, room - requeued)).fetchall():
                 event_id = row[0]
+                # S5: an automation session's row (cron/batch/subagent) is left
+                # exactly as it is -- never requeued -- so the mismatch heal does
+                # not undo curation._task_embed's refusal to spend the embedder on
+                # text every read path already excludes. The row stays counted as
+                # "mismatched" (a wrong-geometry vector that can still be found),
+                # the same trade-off `recoverable is False` below already makes.
+                if skip_automation:
+                    erow = conn.execute(
+                        "SELECT session_id FROM events WHERE event_id=?", (event_id,)).fetchone()
+                    if erow is not None and spk.is_automation_session(erow[0]):
+                        continue
                 # reducer.observed_vector_text, not a local re-derivation: the
                 # job this queues must carry the SAME text the reducer embedded,
                 # or the "repair" writes a vector of something else.

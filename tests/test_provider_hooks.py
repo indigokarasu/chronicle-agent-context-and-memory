@@ -19,6 +19,7 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -30,6 +31,7 @@ from provider import (
     _summarize_tool_history,
     _tool_result_text,
 )
+from engine.config import Config
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +296,34 @@ class TestSubagentStopDelegationEpisode(unittest.TestCase):
     def test_noop_before_initialize(self):
         p = ChronicleMemoryProvider()
         p.subagent_stop("task", "result", child_status="completed")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# host-config helpers with stub core
+# ---------------------------------------------------------------------------
+class TestHostConfigHelpers(unittest.TestCase):
+    def test_instance_methods_with_core_using_core_config(self):
+        """When provider has a core, the helpers read the host section it was given."""
+        # Create a provider with a stub core
+        provider = object.__new__(ChronicleMemoryProvider)
+        host = {"provider": "chronicle", "memory_enabled": False}
+        cfg = Config(host)
+        provider.core = SimpleNamespace(cfg=cfg, host_config=dict(host))
+
+        # Now call the instance methods and verify they use core.host_config
+        self.assertTrue(provider._host_serves_this_provider())
+        self.assertFalse(provider._host_injects_agent_memory())
+
+    def test_instance_methods_without_core_fall_back_to_process_config(self):
+        """When provider has no core, the helpers fall back to hermes_cli config."""
+        # Create a provider without initializing it
+        provider = ChronicleMemoryProvider()
+        self.assertIsNone(provider.core)
+
+        # When there's no core and hermes_cli import fails (which it will in tests),
+        # both should return False
+        self.assertFalse(provider._host_serves_this_provider())
+        self.assertFalse(provider._host_injects_agent_memory())
 
 
 if __name__ == "__main__":

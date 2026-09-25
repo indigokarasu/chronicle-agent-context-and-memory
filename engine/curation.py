@@ -31,9 +31,11 @@ are no longer listed as merely-unscheduled above either.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import time
 import urllib.parse
 
 from . import access, sweeps
@@ -271,6 +273,26 @@ class CurationWorker:
                 self.cfg.get("curation.drain.share_maintenance", 0.2), 0.2),
         }
 
+    def _reclaim_abandoned(self):
+        """Re-arm jobs whose worker died (store.reclaim_stale_jobs), from the drain.
+
+        That repair used to run only inside the daily `health` job -- itself a
+        curation job. A health run killed mid-flight stayed 'running', no later
+        health run was ever claimed, and the one job that reclaims abandoned jobs
+        was itself abandoned: every other stuck row stayed stuck with it. The
+        drain runs in every worker, so the repair lives here. At most once per ten
+        minutes per process: one short transaction, not one per turn."""
+        now = time.monotonic()
+        if now - getattr(self, "_last_reclaim", -1e9) < 600:
+            return
+        self._last_reclaim = now
+        try:
+            out = self.store.reclaim_stale_jobs()
+            if out.get("reclaimed") or out.get("failed"):
+                logger.info("curation: reclaimed abandoned jobs %s", out)
+        except Exception as e:                       # noqa: BLE001
+            logger.warning("curation: reclaiming abandoned jobs failed: %s", e)
+
     def drain(self, max_jobs=None) -> int:
         """Run up to `max_jobs` jobs, apportioned across task classes so no one
         class's backlog can starve another (§A7).
@@ -295,6 +317,7 @@ class CurationWorker:
         Round-robin rather than "drain class A's quota, then B's" because the
         two differ when a handler ENQUEUES: an extract that queues a digest
         should not have that digest wait behind the whole embed quota."""
+        self._reclaim_abandoned()
         budget = self._drain_budget(max_jobs)
         if budget <= 0:
             return 0
@@ -788,6 +811,17 @@ class CurationWorker:
             if row is not None:
                 if excluded and (row[0] or "").startswith(excluded):
                     return
+                # S5: an automation session's transcript (cron/batch/subagent --
+                # engine/speaker.is_automation_session, never the user) is marked
+                # done here WITHOUT calling the embedder, rather than skipped
+                # silently like the exclude_session_prefixes check above -- this
+                # branch is also what drains a job that was already queued before
+                # this flag existed (or during an embedder outage) instead of
+                # leaving it pending forever or spending the embedder on text every
+                # read path already excludes from recall.
+                if (self.cfg.get("embeddings.skip_automation", True)
+                        and spk.is_automation_session(row[0])):
+                    return
                 try:
                     ev_payload = json.loads(row[1]) if isinstance(row[1], str) else row[1]
                 except ValueError:
@@ -996,6 +1030,21 @@ class CurationWorker:
         sid = payload.get("session_id")
         if not sid:
             return
+        # §R3: automation sessions (cron_ prefix, see speaker.is_automation_
+        # session) are dropped by every read path (retrieval's
+        # exclude_automation), so a real summary for one is never surfaced --
+        # only 147 of 952 INTERACTIVE sessions had one while cron sessions
+        # were queued for the same model-backed work. Complete the job with
+        # an empty marker row instead of doing the event-gathering, episode-
+        # boundary and embed work below: no model call, and the row still
+        # lands in session_index so the backfill sweep (which enqueues for
+        # any ended session lacking one) does not keep re-queuing it.
+        if spk.is_automation_session(sid) and not self.cfg.get("sessions.summarize_automation", False):
+            events = self.store.get_events_by_session(sid)
+            owner = events[0]["owner"] if events else "default"
+            occurred_at = events[0].get("occurred_at", now_iso()) if events else now_iso()
+            self.store.add_session_vector(sid, "", b"", owner, occurred_at, model=None)
+            return
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = self.cfg.get("embeddings.exclude_session_prefixes", [])
         if any(sid.startswith(prefix) for prefix in excluded):
@@ -1159,6 +1208,7 @@ class CurationWorker:
         content_cols = [str(c).strip() for c in (spec.get("content_columns") or []) if str(c).strip()]
         name_col = str(spec.get("name_column") or "").strip()      # optional
         capability = str(spec.get("capability") or "federation").strip()
+        id_hash = bool(spec.get("id_hash"))                        # text ids: see _sweep_local_db
         if not table or not content_cols:
             raise ValueError("local db %r needs table and non-empty content_columns" % name)
 
@@ -1166,6 +1216,8 @@ class CurationWorker:
         if not os.path.isfile(path):
             raise _ProviderOffline("no database file at %s" % path)
         conn = self._open_local_db(path, bool(spec.get("read_only", True)))
+        if id_hash:
+            conn.create_function("chronicle_sid", 1, _stable_sid, deterministic=True)
         try:
             present = _local_columns(conn, table)
             wanted = [id_col] + ([name_col] if name_col else []) + content_cols
@@ -1175,7 +1227,7 @@ class CurationWorker:
                                  % (name, table, ", ".join(sorted(set(missing)))))
             self._sweep_local_db(conn, provider=name, table=table, id_col=id_col,
                                  content_cols=content_cols, name_col=name_col,
-                                 capability=capability)
+                                 capability=capability, id_hash=id_hash)
         finally:
             conn.close()
 
@@ -1207,7 +1259,8 @@ class CurationWorker:
         except sqlite3.Error as e:
             raise _ProviderOffline("cannot open %s: %s" % (path, e))
 
-    def _sweep_local_db(self, conn, *, provider, table, id_col, content_cols, name_col, capability):
+    def _sweep_local_db(self, conn, *, provider, table, id_col, content_cols, name_col, capability,
+                        id_hash=False):
         """One bounded pass: ingest new rows, then re-read already-ingested ones.
 
         The watermark alone cannot see an EDIT. An external row that changes
@@ -1241,6 +1294,14 @@ class CurationWorker:
         # (_federate_db), so this is quoting a known-good name, not trusting input.
         cols_sql = ", ".join(_quote_ident(c) for c in select)
         qtable, qid = _quote_ident(table), _quote_ident(id_col)
+        # `id_hash: true` in the spec: the id column holds text (a UUID, say). The
+        # watermark and cursor need integers, so pages are ordered on a stable
+        # 60-bit hash of the id, while the pointer keeps the real id. Every page
+        # scans the table to evaluate the hash: meant for small tables.
+        key = "_sid" if id_hash else id_col
+        if id_hash:
+            qid = "chronicle_sid(%s)" % qid
+            cols_sql += ", %s AS _sid" % qid
         row_kw = dict(provider=provider, capability=capability, id_col=id_col,
                       name_col=name_col, content_cols=content_cols)
 
@@ -1251,7 +1312,7 @@ class CurationWorker:
         for row in rows:
             self._federate_row(row, **row_kw)
         if rows:
-            watermark = max([watermark] + [int(r[id_col]) for r in rows])
+            watermark = max([watermark] + [int(r[key]) for r in rows])
         budget -= len(rows)
         ingested = len(rows)
 
@@ -1269,7 +1330,7 @@ class CurationWorker:
                 self._federate_row(row, **row_kw)
             rescanned = len(rows)
             # A short page means the lap reached the ceiling: wrap.
-            cursor = int(rows[-1][id_col]) if rows and len(rows) >= budget else 0
+            cursor = int(rows[-1][key]) if rows and len(rows) >= budget else 0
 
         self.store.set_federation_state(provider, last_row_id=watermark, rescan_cursor=cursor)
         logger.info("federate_sweep %s: %d ingested, %d rescanned, watermark=%d, cursor=%d",
@@ -1313,6 +1374,16 @@ class CurationWorker:
             "id": existing["id"] if existing else None,
             "capability": capability, "provider": provider, "external_id": external_id,
             "cached_projection": json.dumps(projection, sort_keys=True), "cache_ttl": ttl})
+        if existing and cached.get("content_hash"):
+            # The row's text changed, so its vector now describes text that no
+            # longer exists. Drop it; the embedding backlog re-embeds the new text.
+            try:
+                with self.store.transaction() as conn:
+                    conn.execute("DELETE FROM projection_vectors WHERE provider=? AND external_id=?",
+                                 (provider, external_id))
+            except Exception as e:                   # noqa: BLE001
+                logger.warning("federate %s: stale vector for %s not dropped: %s",
+                               provider, external_id, e)
         for entity_id in linked:                  # refresh, not re-link
             self.store.update_belief("entities", entity_id, cache_ttl=ttl, last_seen_at=now_iso())
 
@@ -1426,3 +1497,8 @@ def _content_hash(external_id: str, display: str, fields: dict) -> str:
 
 def _bucket(score: float) -> str:
     return f"{int(max(0.0, min(0.999, score)) * 10) / 10:.1f}"
+
+
+def _stable_sid(value) -> int:
+    """A stable positive 60-bit integer for a text id (a source spec's `id_hash`)."""
+    return int(hashlib.sha256(str(value).encode()).hexdigest()[:15], 16)

@@ -239,6 +239,48 @@ class TestTheDiagnosticIsTheExactComplementOfTheScan(_WrongDimStore):
             "counted; a count of 1 means the NULL-kind row fell out of the complement")
 
 
+class TestTheCensusIsRememberedBetweenQueries(_WrongDimStore):
+    """The diagnostic's census is a table scan. It is remembered per table and
+    reused while the table stands still; a new row invalidates it; and the
+    remembered census is still REPORTED on every query, so the counter and the
+    once-per-process warning behave exactly as before."""
+
+    def _census_calls(self):
+        from unittest import mock
+        return mock.patch.object(type(self.core.store), "wrong_dim_vector_count",
+                                 wraps=self.core.store.wrong_dim_vector_count)
+
+    def test_a_second_query_on_a_still_table_does_not_rescan(self):
+        r = self.core.retrieval
+        with self._census_calls() as census:
+            r.search(QUERY, limit=10)
+            first = census.call_count
+            self.assertGreater(first, 0)
+            r.search(QUERY, limit=10)
+            self.assertEqual(census.call_count, first, "unchanged table: no rescan")
+
+    def test_the_remembered_census_is_still_reported(self):
+        E.reset_wrong_dim_skipped()
+        r = self.core.retrieval
+        r.search(QUERY, limit=10)
+        once = E.wrong_dim_skipped()
+        r.search(QUERY, limit=10)
+        self.assertGreater(E.wrong_dim_skipped(), once, "the memo must not silence the report")
+
+    def test_a_new_row_forces_a_rescan(self):
+        import engine.retrieval as RM
+        r = self.core.retrieval
+        with mock.patch.object(RM, "_WRONG_DIM_RESCAN_S", 0.0), self._census_calls() as census:
+            r.search(QUERY, limit=10)
+            first = census.call_count
+            with self.core.store.transaction() as c:
+                c.execute("INSERT INTO memory_vectors(belief_id, kind, embedding, model, created_at) "
+                          "VALUES('b_new_wrong_width', 'fact', ?, 'nemotron', '2026-01-01T00:00:00Z')",
+                          (E.pack([0.02] * 2048),))
+            r.search(QUERY, limit=10)
+            self.assertGreater(census.call_count, first, "a changed table is rescanned")
+
+
 class TestOldSilentBehaviorFailsTheTest(_WrongDimStore):
     """MUTATION GUARD. Restore the pre-A0c read path — score a wrong-length
     blob as 0.0 and count nothing — and the assertions above must FAIL. If they

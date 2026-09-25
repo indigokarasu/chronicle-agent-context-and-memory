@@ -60,6 +60,10 @@ class ChronicleCore:
         self.hermes_home = hermes_home
         self.embedder_probe = embedder_probe
         self.cfg = Config(config or {})
+        # The host's own keys (its memory provider choice, whether it injects
+        # its memory file) live in the section it hands us but are not part of
+        # this engine's declared config; keep the raw dict for those reads.
+        self.host_config = dict(config or {})
         # §15.8 (issue #5): install the declarative users/agents ACL topology
         # from `principals:` config into the access.can_read choke point. One
         # process-wide default (mirrors ChronicleCore._active) — every existing
@@ -82,6 +86,9 @@ class ChronicleCore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.store = MemoryStore(db_path)
+
+        self.store.cfg = self.cfg
+        self.store.queue_git = bool(self.cfg.get("git.enabled", True))
         self.embedder = get_embedder(self.cfg.get("embeddings.model"),
                                      self.cfg.get("embeddings.dimensions"),
                                      self.cfg.get("embeddings.base_url"),

@@ -194,13 +194,13 @@ def load_config() -> Config:
     return Config(overrides)
 
 
-def build_embedder(cfg: Config, endpoint=None, model=None):
+def build_embedder(cfg: Config, endpoint=None, model=None, timeout=None):
     """The configured embedder, with CLI overrides applied.
 
     max_input_tokens / overflow come from config so a migration clamps input
     exactly the way the live write path does -- a migration that sent over-cap
     text would reproduce the nemotron->nomic 500 incident at 193k-row scale."""
-    return get_embedder(
+    emb = get_embedder(
         model or cfg.get("embeddings.model"),
         cfg.get("embeddings.dimensions"),
         endpoint or cfg.get("embeddings.base_url"),
@@ -214,6 +214,24 @@ def build_embedder(cfg: Config, endpoint=None, model=None):
         # ChronicleCore -- a migration must not be the way memory leaves the host.
         cfg.get("embeddings.allow_remote"),
     )
+    # THE REQUEST TIMEOUT IS THE LIVE ONE UNLESS SOMEONE SAYS OTHERWISE, and a
+    # migration is the most off-the-critical-path work there is. HTTPEmbedder
+    # defaults to 10s so a TURN never waits on a busy server; here nobody is
+    # waiting, and on a CPU-bound host one long excerpt exceeds it -- measured
+    # ~7s for 200 words, and llama.cpp serves serially so a bulk run queues
+    # behind itself and climbs past 10s within seconds. The breaker then trips
+    # on a single attempt and every remaining row fails fast: on the production
+    # store that was 7,612 rows "failed" in 8.3 seconds against an embedder
+    # that answered a hand-rolled request in 0.5s.
+    #
+    # `embeddings.background_timeout` already exists for precisely this -- its
+    # own comment says "Seconds one embed request may take OFF the critical
+    # path" -- so use it rather than inventing a number, with the same
+    # [10, 600] clamp engine/curation.py applies.
+    want = timeout if timeout else cfg.get("embeddings.background_timeout")
+    if hasattr(emb, "timeout") and want:
+        emb.timeout = max(10.0, min(600.0, float(want)))
+    return emb
 
 
 # --------------------------------------------------------------------------
@@ -767,6 +785,7 @@ class Migrator:
 # entry point
 # --------------------------------------------------------------------------
 def migrate(db_path, dry_run=False, batch=_DEFAULT_BATCH, endpoint=None, model=None,
+            timeout=None,
             cfg=None, embedder=None, verbose=True, expect_dims=None, tables=None) -> int:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -774,7 +793,7 @@ def migrate(db_path, dry_run=False, batch=_DEFAULT_BATCH, endpoint=None, model=N
         return 1
 
     cfg = cfg if cfg is not None else load_config()
-    emb = embedder if embedder is not None else build_embedder(cfg, endpoint, model)
+    emb = embedder if embedder is not None else build_embedder(cfg, endpoint, model, timeout)
     active_tag = embedder_model_tag(emb)
     expect_len = expected_blob_len(emb)
     if not is_usable_model_tag(active_tag):
@@ -890,6 +909,10 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=_DEFAULT_BATCH,
                     help="rows per embed + commit batch (default %d)" % _DEFAULT_BATCH)
     ap.add_argument("--endpoint", default=None, help="OpenAI-compatible base URL override")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="seconds one embed request may take (default: "
+                         "embeddings.background_timeout, clamped to [10,600]). The live "
+                         "10s default is why a bulk run on a CPU-bound host fails fast.")
     ap.add_argument("--model", default=None, help="model id override")
     ap.add_argument("--expect-dims", type=int, default=None, dest="expect_dims",
                     help="the vector width this endpoint is EXPECTED to answer with, "
@@ -903,7 +926,7 @@ def main() -> int:
     args = ap.parse_args()
     try:
         return migrate(args.db, dry_run=args.dry_run, batch=args.batch,
-                       endpoint=args.endpoint, model=args.model,
+                       endpoint=args.endpoint, model=args.model, timeout=args.timeout,
                        expect_dims=args.expect_dims, tables=args.tables)
     except ValueError as e:
         print("ERROR: %s" % e)

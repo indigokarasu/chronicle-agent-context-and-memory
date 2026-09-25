@@ -588,12 +588,22 @@ class Reducer:
         # Check if session_id is excluded from embedding (§27 embeddings.exclude_session_prefixes).
         excluded = (self.cfg.get("embeddings.exclude_session_prefixes", []) if self.cfg else [])
         sid = event.get("session_id") or ""  # observed events may carry no session_id at all
-        skip_vec = any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
+        is_automation = spk.is_automation_session(sid)
+        # S5: an automation session's transcript (cron/batch/subagent, never the
+        # user typing) is never embedded, ON by default -- unlike
+        # exclude_session_prefixes above, which is an opt-in per-deployment list.
+        # ~97% of sessions are cron and every read path already excludes them from
+        # recall (retrieval's exclude_automation), so embedding them only spent the
+        # embedder, and queue priority, on text nothing ever reads back.
+        skip_automation = is_automation and (self.cfg.get("embeddings.skip_automation", True)
+                                             if self.cfg else True)
+        skip_vec = (any(sid.startswith(prefix) for prefix in excluded) or is_duplicate_copy(p)
+                    or skip_automation)
         if excerpt:
             # The user's own index leaves out an archive copy of a turn the
             # provider already captured: recall would show that turn twice.
             self.store.fts_index_observed(
-                eid, excerpt, user=not spk.is_automation_session(sid) and not is_duplicate_copy(p))
+                eid, excerpt, user=not is_automation and not is_duplicate_copy(p))
             if self.embedder is not None and not skip_vec:
                 blob = self._safe_vec(excerpt, target_id=eid, kind="observed")
                 if blob is not None:

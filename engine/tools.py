@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from . import access
+from . import speaker as _spk
 from .reducer import _normalize_value as _norm_fact_value
 
 
@@ -35,9 +36,9 @@ class Tools:
                "content": text, "entity": text, "attribute": text,
                "salience": {"type": "string", "enum": ["pinned", "high", "normal", "incidental"]}},
               ["content"]),
-            s("search", "Search the belief store + raw events (dual-tier).", {"query": text, "limit": {"type": "integer"}}, ["query"]),
+            s("search", "Search everything Chronicle holds in one call: beliefs, what was said in past conversations, and every connected source (each result carries a [source] label). Pure tool output is left out unless include_tool_output is true.", {"query": text, "limit": {"type": "integer"}, "include_tool_output": {"type": "boolean"}}, ["query"]),
             s("answer", "Answer a question from memory (read-and-answer, abstains if unknown).", {"query": text}, ["query"]),
-            s("ask_about", "All known facts about an entity.", {"entity": text}, ["entity"]),
+            s("ask_about", "Everything known about a person or thing, by name or id: its facts, plus the records that involve it by an exact email address, phone number or id (recent messages, emails, calendar events), newest first. A name shared by several entities returns each as a choice.", {"entity": text}, ["entity"]),
             s("timeline", "Recent episodes in time order.", {}),
             s("history", "Supersession history of a belief.", {"belief_id": text}, ["belief_id"]),
             s("get_context", "Assemble relevant context for a hint.", {"hint": text}, ["hint"]),
@@ -272,20 +273,47 @@ class Tools:
     # reads
     def _t_search(self, principal, a):
         """Both tiers, as the schema says: `results` (beliefs) and `said` (what
-        was said, from the transcript, with its session and date). Beliefs
-        alone missed most of what a user tells the agent -- on the production
-        store the transcript is most of the memory about them."""
+        was said, from the transcript, with its session and date, plus rows
+        from connected sources). Beliefs alone missed most of what a user tells
+        the agent -- on the production store the transcript is most of the
+        memory about them.
+
+        `said` holds what the user and the agent said. A file read or a command's
+        output is neither, so pure tool output is dropped (and tool rows are cut
+        out of a mixed transcript) unless `include_tool_output` is set. Repeats
+        of the same text collapse to one entry. The pool is drawn larger than
+        `limit` so the list still fills after those removals."""
         query = a.get("query", "")
         try:
             limit = max(1, min(50, int(a.get("limit", 10) or 10)))
         except (TypeError, ValueError):
             limit = 10
+        include_tools = bool(a.get("include_tool_output", False))
         r = self.core.retrieval
-        said = []
-        for row in r.retrieve_raw(query, limit=limit, principal=principal):
+        said, seen = [], set()
+        pool = r.retrieve_raw(query, limit=min(50, limit * 3), principal=principal)
+        for row in pool:
+            if len(said) >= limit:
+                break
             eid = row.get("event_id") or ""
             ev = self.core.store.get_event(eid) if eid and not eid.startswith(("session:", "proj:")) else None
             text = row.get("excerpt") or ""
+            if ev is not None and not include_tools:
+                raw = ev.get("payload")
+                try:
+                    payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except ValueError:
+                    payload = {}
+                if not payload.get("excerpt"):
+                    payload = dict(payload, excerpt=text)
+                kept = _spk.reader_text(payload, actor=ev.get("actor") or "", drop_tools=True)
+                if not kept.strip():
+                    continue
+                text = kept
+            key = " ".join(text.split())[:300]
+            if key in seen:
+                continue
+            seen.add(key)
             if len(text) > 1500:             # ten of them stay a readable tool result
                 text = text[:1500].rsplit(" ", 1)[0] + " …"
             said.append({"excerpt": text, "event_id": eid,

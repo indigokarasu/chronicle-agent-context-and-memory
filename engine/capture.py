@@ -294,7 +294,14 @@ class CaptureEngine:
             if ev["type"] == "observed":
                 self.store.enqueue_curation("extract", {"event_id": ev["event_id"], "session_id": session_id})
             max_seq = max(max_seq, ev["seq"])
-        self.store.enqueue_curation("session_summarize", {"session_id": session_id})
+        # §R3: 97% of sessions are cron/automation, whose summary nothing ever
+        # reads (retrieval's exclude_automation drops it) -- queuing a model-
+        # backed session_summarize job for every one of them just delays the
+        # jobs from sessions someone will actually recall. Skip the enqueue
+        # unless the deployment opts back in.
+        summarize_automation = bool(self.cfg.get("sessions.summarize_automation", False)) if self.cfg else False
+        if summarize_automation or not spk.is_automation_session(session_id):
+            self.store.enqueue_curation("session_summarize", {"session_id": session_id})
         self.store.upsert_session({
             "session_id": session_id, "status": "reaped" if via == "reaped" else "ended",
             "ended_via": via, "ended_at": self._now(), "last_extracted_seq": max_seq})
