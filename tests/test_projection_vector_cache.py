@@ -281,6 +281,79 @@ class TestItStaysCurrent(_Case):
         self.assertEqual(on[0][0], "proj:prov9:newest")
         self.assertGreater(cache.rebuilds, rebuilds)
 
+    def test_an_inplace_update_of_a_non_newest_row_is_seen(self):
+        """F3: `scripts/writeback_vectors.py` UPDATEs a row's embedding IN
+        PLACE on its existing (provider, external_id) -- when that row is
+        neither the newest nor deleted, count, max rowid AND the anchor's
+        identity all come back exactly as they were. Only the generation
+        counter (MemoryStore.bump_vector_generation) shows it. That counter is
+        bumped ONLY for this same-rowid case -- the two tests below prove an
+        ordinary raw-SQL insert (the shape ops/embed_projections.py and its
+        siblings actually write in) still takes the cheap pre-F3 path with no
+        help from it at all."""
+        first = _run(self.core, self.q, True)
+        _p, provider, external_id = first[0][0].split(":", 2)
+        before = self._state()
+        new_vec = pack(_qvec(self.core, QUERIES[3]))   # now a perfect match for a DIFFERENT query
+        with self.core.store.transaction() as conn:
+            conn.execute("UPDATE projection_vectors SET embedding=? WHERE provider=? AND external_id=?",
+                        (new_vec, provider, external_id))
+            self.core.store.bump_vector_generation("projection_vectors")
+        self.assertEqual(self._state(), before,
+                         "fixture: an in-place UPDATE must not move count or max rowid")
+        on = _run(self.core, QUERIES[3], True)
+        self.assertSameAnswer(on, _run(self.core, QUERIES[3], False))
+        self.assertEqual(on[0][0], first[0][0], "the cache must score the NEW vector, not the stale one")
+
+    def test_a_raw_sql_insert_with_no_bump_still_takes_the_append_path(self):
+        """ops/embed_projections.py and its siblings write new projection
+        vectors via raw SQL directly against the connection -- never through
+        MemoryStore's Python API, so they never call bump_vector_generation.
+        The append path must keep working for them with the generation flat
+        throughout: this is the pre-F3 arithmetic, unmodified -- count/max
+        rowid growing, with nothing at the old anchor changed, already proves
+        a pure append on its own."""
+        _run(self.core, self.q, True)   # warm the cache
+        cache = self.cache(self.core)
+        rebuilds, appends = cache.rebuilds, cache.appends
+        new_vec = pack(_qvec(self.core, self.q))   # a perfect match
+        with self.core.store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO projection_vectors(provider,external_id,embedding,model,owner,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                ("prov9", "raw-sql-insert", new_vec, "hashing-v1", "assistant", "2026-07-01T00:00:00Z"))
+            # deliberately no bump_vector_generation call: this simulates an
+            # ops script's raw SQL write, which never makes one either.
+        on = _run(self.core, self.q, True)
+        self.assertSameAnswer(on, _run(self.core, self.q, False))
+        self.assertEqual(on[0][0], "proj:prov9:raw-sql-insert")
+        self.assertEqual(cache.rebuilds, rebuilds, "a plain append must stay on the cheap path")
+        self.assertEqual(cache.appends, appends + 1)
+
+    def test_a_raw_sql_insert_or_replace_of_an_existing_key_still_rebuilds(self):
+        """`INSERT OR REPLACE` on a (provider, external_id) that already has
+        a row deletes the old row and inserts a fresh one under a NEW rowid:
+        net row count does not grow (one out, one in), so the append
+        branch's own `count > copy.count` precondition already rules this
+        out and it falls straight to a rebuild -- no generation involvement
+        needed."""
+        first = _run(self.core, self.q, True)
+        _p, provider, external_id = first[0][0].split(":", 2)
+        _run(self.core, self.q, True)   # warm the cache
+        cache = self.cache(self.core)
+        rebuilds = cache.rebuilds
+        new_vec = pack(_qvec(self.core, QUERIES[3]))
+        with self.core.store.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO projection_vectors"
+                "(provider,external_id,embedding,model,owner,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (provider, external_id, new_vec, "hashing-v1", "assistant", "2026-07-01T00:00:00Z"))
+        on = _run(self.core, QUERIES[3], True)
+        self.assertSameAnswer(on, _run(self.core, QUERIES[3], False))
+        self.assertEqual(on[0][0], first[0][0])
+        self.assertGreater(cache.rebuilds, rebuilds)
+
     def test_a_query_at_another_width_gets_its_own_copy(self):
         _run(self.core, self.q, True)
         cache = self.cache(self.core)

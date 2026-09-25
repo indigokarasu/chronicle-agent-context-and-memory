@@ -23,7 +23,8 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from typing import List, Optional  # names this module already annotates with
 
-from .embeddings import batch_cosine_f64
+from .embeddings import VECTOR_TABLES, batch_cosine_f64
+from .passages import DELETE_PASSAGES_SQL, delete_passages_params
 from .serialize import projection_row_id
 
 logger = logging.getLogger("chronicle.store")
@@ -180,7 +181,16 @@ logger = logging.getLogger("chronicle.store")
 #     same collision as 14-17). A skill reference such as `weave:<person_id>`
 #     stored beside an event instead of a copy of the payload it points at.
 #     Additive: NULL for every event written before it.
-SCHEMA_VERSION = 19
+# 20 = vector-census COVERING indexes (ladder-12 F4): per-vector-table
+#     covering indexes on (length(embedding), <id_col>) for wrong_dim_vector_count
+#     and wrong_dim_vector_ids, enabling index-only scans without blob reads.
+#     The redundant `embedding IS NOT NULL` was removed from the WHERE clauses
+#     (length(NULL) is NULL, defeating the covering index). New indexes:
+#     idx_ov_width_event_id, idx_si_width_session_id, idx_pv_width_external_id,
+#     idx_mv_width_belief_id, idx_qpv_width_belief_kind (the last includes kind
+#     for the extra_where clause on query_proxy_vectors). Keep the existing
+#     (model, length(embedding)) indexes for other uses.
+SCHEMA_VERSION = 20
 
 # SQLite busy timeouts, milliseconds.
 #
@@ -212,6 +222,11 @@ PROJECTION_TABLES = BELIEF_TABLES + [
     "contradictions", "supersede_candidates", "entity_centroids",
     "identity_candidates", "observed_vectors", "session_index", "memory_vectors",
     "projection_vectors", "query_proxy_vectors", "rerank_hints",
+    # passage_state describes rows of projection_vectors (which passages of a
+    # record exist, cut from which text). A rebuild that empties the vectors
+    # and kept this would tell the passage builder they are still there, and
+    # those records would never get passages again.
+    "passage_state",
 ]
 # Statuses that take a belief out of search; its embedding becomes dead weight.
 _INACTIVE_STATUSES = {"retracted", "superseded", "inactive", "expired"}
@@ -655,6 +670,16 @@ class MemoryStore:
             # so the first append_event crashed with "NoneType is not subscriptable".
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('event_seq', "
                          "(SELECT COALESCE(MAX(seq),0) FROM events))")
+            # F3: every vector table's write-generation counter, seeded to
+            # '0' up front on a fresh store AND on an existing one reopened
+            # under this code (INSERT OR IGNORE, so an already-bumped row is
+            # left alone). This is what lets scripts/writeback_vectors.py --
+            # which W1 restricts to UPDATE on its five vector tables and
+            # nothing else, so it cannot INSERT a missing counter itself --
+            # always advance the counter with a plain UPDATE.
+            for t in VECTOR_TABLES:
+                conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, '0')",
+                             (self.VECTOR_GENERATION_PREFIX + t,))
             conn.commit()
 
     def _migrate(self, conn):
@@ -1131,6 +1156,70 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    # -- vector write generation (F3) ---------------------------------------
+    #
+    # `scripts/writeback_vectors.py` UPDATEs a vector row's embedding IN PLACE
+    # on its existing natural key -- the row keeps its rowid, so count and max
+    # rowid never move. ObservedVectorCache and ProjectionVectorCache
+    # (engine/vector_cache.py) key their freshness on exactly those two
+    # numbers (plus the identity of the row at the anchor rowid, which only
+    # ever covers ONE row), so an in-place UPDATE of any other row is
+    # invisible to both: they keep serving the pre-update vector until the
+    # process restarts.
+    #
+    # CALL THIS ONLY FOR A SAME-ROWID CHANGE TO AN EXISTING ROW'S EMBEDDING.
+    # Every insert, `INSERT OR REPLACE`, and delete on a vector table must NOT
+    # bump this: those already move count and/or max rowid (an `INSERT OR
+    # REPLACE` on an existing key deletes the old row and inserts a fresh one
+    # under a NEW rowid, which both caches' append-vs-delete arithmetic and
+    # anchor-identity check already detect), so the generation would tell a
+    # cache nothing it could not already see. It would also actively regress
+    # the caches' own reason to exist: most of the store's vectors are written
+    # by server-side ops scripts issuing raw SQL directly against the
+    # connection (ops/embed_projections.py, ops/enrich_embeddings.py,
+    # ops/chronicle_daily_embed.py, ops/reembed.py, ops/embed_passages.py --
+    # none of them go through MemoryStore's Python API and none of them call
+    # this), so requiring the generation to track ordinary inserts would make
+    # a live gateway process's cache see its generation fall permanently
+    # behind count/max rowid the moment any of those scripts' batches landed,
+    # forcing a full rebuild (tens of thousands of rows) after every one of
+    # them instead of the cheap append the caches exist to provide. The one
+    # place in `engine/` itself that keeps a vector row's rowid while
+    # rewriting its embedding is `update_session_vector` below (a plain
+    # `UPDATE ... WHERE session_id=?`, not an upsert) -- there is no cache
+    # over `session_index` today, but it is bumped here on the same principle,
+    # so a future cache over that table inherits a correct signal for free.
+    VECTOR_GENERATION_PREFIX = "vecgen:"
+
+    def bump_vector_generation(self, table: str):
+        """Advance `table`'s write generation by one, inside the caller's
+        transaction when there is one (`transaction()` is re-entrant, so
+        calling this from inside an existing `with self.transaction():`
+        block folds the bump into that same commit rather than opening a
+        second one). See the section comment above for WHEN to call this --
+        a same-rowid change to an existing row only, never an insert,
+        `INSERT OR REPLACE`, or delete."""
+        key = self.VECTOR_GENERATION_PREFIX + table
+        with self.transaction() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            try:
+                current = int(row["value"]) if row else 0
+            except (TypeError, ValueError):
+                current = 0
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, str(current + 1)))
+
+    def get_vector_generation(self, table: str) -> int:
+        """`table`'s current write generation (0 if never bumped): one read of
+        `meta` by its primary key -- the whole cost a cache pays per query to
+        detect an in-place UPDATE that row count and max rowid do not show."""
+        raw = self.get_meta(self.VECTOR_GENERATION_PREFIX + table, "0")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
 
     # -- sweep state (§A9) --------------------------------------------------
     #
@@ -1725,6 +1814,7 @@ class MemoryStore:
         with self.transaction() as conn:
             cur = conn.execute("UPDATE session_index SET embedding=?, model=? WHERE session_id=?",
                                (embedding, model, session_id))
+            self.bump_vector_generation("session_index")
             return cur.rowcount > 0
 
     def get_session_vector(self, session_id: str) -> Optional[dict]:
@@ -1859,15 +1949,14 @@ class MemoryStore:
         the rows the scan can no longer see. Asking for them directly is the
         only way to keep both -- the cheap scan and the honest count.
 
-        ID-ONLY, deliberately. `length(embedding)` is answerable from the
-        `(model, length(embedding))` expression indexes A7 added, so nothing
-        here loads a blob; the pre-A5 code that this restores the signal of
-        loaded every one of them.
+        ID-ONLY via covering indexes. `length(NULL) IS NULL` and `NULL != ?` is
+        never true, so `embedding IS NOT NULL` is redundant and must stay out:
+        it defeats the covering index by referencing a blob column.
 
-        An absent embedding is "no vector", never a wrong-dimension one, and is
-        excluded here exactly as `embeddings.wrong_dim_indices` excludes it."""
+        An absent embedding is "no vector", never a wrong-dimension one, and the
+        NULL length naturally excludes it from the != comparison."""
         qtable, qid = self._checked_ident(table, id_col)
-        where = "embedding IS NOT NULL AND length(embedding) != ?"
+        where = "length(embedding) != ?"
         params: list = [int(width)]
         if extra_where:
             where += " AND (%s)" % extra_where
@@ -1894,23 +1983,22 @@ class MemoryStore:
         """How many rows `wrong_dim_vector_ids` would return, unbounded.
 
         Split from the identity query so the identities can be SAMPLED while the
-        number stays exact. `length(embedding)` is answerable from
-        `idx_{ov,mv,qpv}_model_width`, so this is an index scan that loads no
-        blob and builds no Python object per row -- which is the whole point:
-        on an 88%-mismatched store the identity list was ~93k tuples per
-        channel, five to six times per top-level query, retained until the next
-        one. The count is what every consumer actually reports; the identities
-        are a 20-item sample in one debug field."""
+        number stays exact. Answered via covering indexes like
+        `idx_ov_width_event_id(length(embedding), event_id, ...)` for
+        index-only scans that load no blob and build no Python objects.
+        This is the whole point: on an 88%-mismatched store the identity list
+        was ~93k tuples per channel, five to six times per top-level query,
+        retained until the next one. The count is what every consumer reports."""
         qtable, qid = self._checked_ident(table, id_col)
-        where = "embedding IS NOT NULL AND length(embedding) != ?"
+        where = "length(embedding) != ?"
         params: list = [int(width)]
         if extra_where:
             where += " AND (%s)" % extra_where
             params.extend(extra_params)
         try:
             row = self._conn().execute(
-                "SELECT COUNT(*) FROM %s WHERE %s AND %s IS NOT NULL"
-                % (qtable, where, qid), tuple(params)).fetchone()
+                "SELECT COUNT(*) FROM %s WHERE %s"
+                % (qtable, where), tuple(params)).fetchone()
         except sqlite3.Error as e:                 # table absent on an old store
             logger.debug("wrong-dim count skipped for %s (%s)", table, e)
             return 0
@@ -2146,6 +2234,23 @@ class MemoryStore:
         """Delete all projection vectors from a specific provider."""
         with self.transaction() as conn:
             conn.execute("DELETE FROM projection_vectors WHERE provider=?", (provider,))
+
+    def drop_record_passages(self, provider: str, external_id: str) -> int:
+        """Delete one record's passage vectors and its passage_state row.
+
+        Called when the record's source row changed: its passages were cut
+        from text that no longer exists, exactly like its own vector, and a
+        stale passage is worse than a missing one because nothing reports it.
+        Re-entrant (store.transaction), so a caller already holding a write
+        transaction drops the record's vector and its passages atomically.
+        Passage ids are matched by a binary key range plus a digits-only tail
+        (engine/passages.py), never LIKE. Returns the vectors deleted."""
+        with self.transaction() as conn:
+            cur = conn.execute(DELETE_PASSAGES_SQL, delete_passages_params(provider, external_id))
+            dropped = cur.rowcount or 0
+            conn.execute("DELETE FROM passage_state WHERE provider=? AND external_id=?",
+                         (provider, external_id))
+        return dropped
 
     def iter_session_vectors(self) -> list[dict]:
         return [dict(r) for r in self._conn().execute("SELECT * FROM session_index").fetchall()]
@@ -3945,6 +4050,11 @@ _VECTOR_CENSUS_INDEX_DDLS = (
     "CREATE INDEX IF NOT EXISTS idx_ov_model_width ON observed_vectors(model, length(embedding));",
     "CREATE INDEX IF NOT EXISTS idx_mv_model_width ON memory_vectors(model, length(embedding));",
     "CREATE INDEX IF NOT EXISTS idx_qpv_model_width ON query_proxy_vectors(model, length(embedding));",
+    "CREATE INDEX IF NOT EXISTS idx_ov_width_event_id ON observed_vectors(length(embedding), event_id);",
+    "CREATE INDEX IF NOT EXISTS idx_si_width_session_id ON session_index(length(embedding), session_id);",
+    "CREATE INDEX IF NOT EXISTS idx_pv_width_external_id ON projection_vectors(length(embedding), external_id);",
+    "CREATE INDEX IF NOT EXISTS idx_mv_width_belief_id ON memory_vectors(length(embedding), belief_id);",
+    "CREATE INDEX IF NOT EXISTS idx_qpv_width_belief_kind ON query_proxy_vectors(length(embedding), belief_id, kind);",
 )
 _VECTOR_CENSUS_INDEX_DDL = "\n".join(_VECTOR_CENSUS_INDEX_DDLS)
 
@@ -4298,6 +4408,18 @@ CREATE TABLE IF NOT EXISTS projection_vectors (
     provider TEXT NOT NULL, external_id TEXT NOT NULL, embedding BLOB, model TEXT,
     owner TEXT, created_at TEXT, PRIMARY KEY(provider, external_id));
 CREATE INDEX IF NOT EXISTS idx_proj_vectors_provider ON projection_vectors(provider);
+
+-- Passage vectors (engine/passages.py) sit in projection_vectors as
+-- "<record external_id>#p<n>". This is the builder's per-record ledger: the
+-- pointer content_hash and the hash of the text the passages were cut from
+-- (either changing makes them stale), how many there are (0 = the record was
+-- examined and needs none), and the recipe (split version, size, cap, model
+-- tag) that decides what passage n means. The federation sweep deletes a
+-- record's row here together with its passages when the record changes.
+CREATE TABLE IF NOT EXISTS passage_state (
+    provider TEXT NOT NULL, external_id TEXT NOT NULL, content_hash TEXT, text_hash TEXT,
+    n INTEGER NOT NULL DEFAULT 0, recipe TEXT, built_at TEXT,
+    PRIMARY KEY(provider, external_id));
 
 CREATE TABLE IF NOT EXISTS sources (
     source_id TEXT PRIMARY KEY, source_type TEXT, trust_level INTEGER, info_label TEXT);

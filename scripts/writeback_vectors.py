@@ -267,6 +267,27 @@ def sha_text(text):
     return hashlib.sha256((text or "").encode("utf-8")).digest()
 
 
+def _bump_vector_generation(conn, table):
+    """Advance `table`'s write-generation counter in `meta` (F3), the same
+    `vecgen:<table>` key `MemoryStore.bump_vector_generation` (engine/store.py)
+    uses -- by an UPDATE alone, never an INSERT: W1 (see TestW1NeverResurrects
+    in tests/test_writeback_vectors.py) bans every INSERT/REPLACE/DELETE/DDL
+    statement from this whole module, on the theory that a tool restricted to
+    "UPDATE on the natural key of five named tables" cannot resurrect a row
+    ANYWHERE if it is mechanically unable to write any other shape of
+    statement. `MemoryStore._init_db` seeds this counter to '0' for every
+    vector table the moment any process opens the live db under this code --
+    which in production is always true first, since the gateway holds a live
+    MemoryStore continuously -- so the row this UPDATE targets should always
+    already exist. If it somehow does not, the UPDATE matches zero rows and
+    is silently a no-op: the caches simply keep the pre-F3 staleness check for
+    that table (never wrong, just not as fast to notice this write) rather
+    than this tool aborting an otherwise-valid batch over a missing counter.
+    Caller holds the write transaction; this makes no commit of its own."""
+    conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = ?",
+                ("vecgen:" + table,))
+
+
 def _hex(digest):
     return None if digest is None else digest.hex()
 
@@ -936,6 +957,16 @@ class WriteBack:
                         "table": table, "applied": applied_rows,
                         "cursor_after": items[-1][0] if items else None}
                     self.state.save()
+                if pending_applied:
+                    # F3: this UPDATE is on the table's natural key, so its row
+                    # count and max rowid never move -- ObservedVectorCache and
+                    # ProjectionVectorCache (engine/vector_cache.py) would keep
+                    # serving the pre-image forever otherwise. Bumped ONCE per
+                    # batch (not per row) inside the same transaction as the
+                    # UPDATEs above, mirroring MemoryStore.bump_vector_generation
+                    # -- this tool writes raw SQL against `self.live`, so it has
+                    # no MemoryStore to call that through.
+                    _bump_vector_generation(self.live, table)
                 self.live.execute("COMMIT")
                 # Banked ONLY now. Until this line these rows could still be
                 # un-written by a later Refused in this same batch, and a counter

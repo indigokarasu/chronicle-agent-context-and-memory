@@ -40,9 +40,20 @@ config needs no wrapper. `chronicle.db` is the store to evaluate against,
 whatever its `db_path` declares (see `_engine_for` for why pointing an
 arbitrary path in takes a small detour through `hermes_home`). `questions.json`
 is a JSON array of strings; omitted, this runs a built-in set of 10 generic
-questions spanning people, places, purchases, schedule and documents —
-generic wording only, so the script carries no real names and is safe to keep
-in the tree this repository publishes nightly.
+questions spanning people, places, purchases, schedule and documents, plus 3
+PINNED regressions (F1: a proper noun sharing a query with a short common word
+that used to crowd it out of a federated source's row cap — see
+`PINNED_QUESTIONS`). The generic ten carry no real names; the three pinned
+ones name ordinary, widely-known retailers (never a person, a place tied to
+one, or anything specific to a deployment) because that is the shape of data
+the bug needs to reproduce against — safe to keep in the tree this repository
+publishes nightly.
+
+Per question, this now prints every stage the injection passes through:
+focus tokens, each federated source's hit count BEFORE the relevance gate,
+what actually reached the rendered block, and the gate's own words and drop
+counts — so a regression like F1 (0 chars injected, 199 matching rows in the
+store) shows exactly which stage lost the evidence, not just the final total.
 """
 from __future__ import annotations
 
@@ -71,6 +82,23 @@ BUILTIN_QUESTIONS = [
     "When is my next appointment?",
     "What documents have I referenced?",
     "What files or attachments have I mentioned?",
+]
+
+# F1 regressions, pinned. Each names a proper noun (a real, ordinary retailer
+# — never a person or anything specific to a deployment) sharing the question
+# with a short common word ("last", "next", "recently"): a federated source's
+# LIKE search used to OR every (column, token) pair into one query with no
+# ORDER BY and cut it at a flat row cap, so when the common word's matches
+# happened to sort ahead of the proper noun's by rowid, they filled the whole
+# cap and the row the question was actually about never came back at all.
+# Measured: "what did I buy at Amazon last week" against a store with 199
+# matching transactions injected 0 chars. One case per differently-shaped
+# federated source (transactions x2, styx) so a fix scoped to one source's
+# schema would still show up here as a regression on the others.
+PINNED_QUESTIONS = [
+    "What did I buy at Amazon last week?",
+    "Have I bought anything from Trader Joe's next time I'm low on groceries?",
+    "Did I go to Starbucks recently?",
 ]
 
 # provider.prefetch()'s own settings (provider.py), reproduced here rather
@@ -154,19 +182,44 @@ def _classify(ctx: str) -> dict:
     return {"federated": dict(federated), "belief_lines": belief, "transcript_lines": transcript}
 
 
+def _federated_pre_gate(core: ChronicleCore, focus_tokens: list, principal: str) -> dict:
+    """Each federated source's raw hit count for `focus_tokens`, run the same
+    way `get_context` runs it (engine/retrieval.py §g3) but read BEFORE the
+    relevance gate has a chance to drop anything -- the stage a source that
+    matched, then lost every hit to the gate or to the row cap, is otherwise
+    invisible past. {} when the channel is off or the query has no focus
+    tokens (get_context does not even ask in that case)."""
+    channel = core.retrieval.federated
+    if channel is None or not focus_tokens:
+        return {}
+    hits = channel.query(focus_tokens, principal, core.active_principal)
+    counts: Counter = Counter(h["provider"] for h in hits)
+    return dict(counts)
+
+
 def evaluate(core: ChronicleCore, questions: list, principal: str = "default") -> None:
     for q in questions:
+        # Same tokens get_context itself will compute for this hint -- read
+        # ahead of the call so a run that injects nothing still says what the
+        # query's own distinctive words were.
+        focus_tokens = core.retrieval._focus_tokens(q)
+        pre_gate = _federated_pre_gate(core, focus_tokens, principal)
         ctx = core.retrieval.get_context(
             q, token_budget=PREFETCH_TOKEN_BUDGET, principal=principal,
             epistemic=core.epistemic, exclude_automation=True, relevance_gate=True)
         kinds = _classify(ctx)
-        debug_keys = sorted((core.retrieval.last_context_debug or {}).keys())
+        dbg = core.retrieval.last_context_debug or {}
+        gate = dbg.get("relevance_gate") or {}
         print("=== %s" % q)
-        print("  chars_injected   : %d" % len(ctx))
-        print("  federated        : %s" % (kinds["federated"] or "{}"))
-        print("  belief_lines     : %d" % kinds["belief_lines"])
-        print("  transcript_lines : %d" % kinds["transcript_lines"])
-        print("  context_debug    : %s" % debug_keys)
+        print("  focus_tokens         : %s" % focus_tokens)
+        print("  federated_pre_gate   : %s" % (pre_gate or "{}"))
+        print("  chars_injected       : %d" % len(ctx))
+        print("  federated_post_gate  : %s" % (kinds["federated"] or "{}"))
+        print("  belief_lines         : %d" % kinds["belief_lines"])
+        print("  transcript_lines     : %d" % kinds["transcript_lines"])
+        print("  gate_words           : %s" % gate.get("words", []))
+        print("  gate_dropped         : beliefs=%d excerpts=%d tail=%d" % (
+            gate.get("beliefs", 0), gate.get("excerpts", 0), gate.get("tail", 0)))
 
 
 def main(argv=None) -> int:
@@ -184,7 +237,7 @@ def main(argv=None) -> int:
             return 2
         questions = loaded
     else:
-        questions = BUILTIN_QUESTIONS
+        questions = BUILTIN_QUESTIONS + PINNED_QUESTIONS
 
     core = _engine_for(config_path, store_path)
     evaluate(core, questions)

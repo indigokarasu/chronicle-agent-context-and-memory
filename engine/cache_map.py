@@ -90,8 +90,13 @@ def build(chronicle_db, cfg, now=None) -> str:
     c = _ro(chronicle_db)
     try:
         pointers = dict(c.execute("SELECT provider, count(*) FROM pointers GROUP BY provider"))
+        # Records WITH a vector, not rows: a record's passage vectors
+        # ("<id>#p<n>", engine/passages.py) share its table, and counting them
+        # would report a source 100% searchable while most records have none.
         vectors = dict(c.execute(
-            "SELECT provider, count(*) FROM projection_vectors GROUP BY provider"))
+            "SELECT v.provider, count(*) FROM projection_vectors v WHERE EXISTS "
+            "(SELECT 1 FROM pointers p WHERE p.provider=v.provider "
+            "AND p.external_id=v.external_id) GROUP BY v.provider"))
         synced = dict(c.execute("SELECT db_name, last_sync_at FROM federation_watermarks"))
         facts = c.execute("SELECT count(*) FROM facts WHERE status='active'").fetchone()[0]
         kinds = [r[0] for r in c.execute(

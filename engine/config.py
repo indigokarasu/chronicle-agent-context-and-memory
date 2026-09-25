@@ -502,7 +502,43 @@ DEFAULTS: dict[str, Any] = {
         # `name` is the provider id in pointers/watermarks, `content_columns` are
         # what the cached projection holds, and the optional `name_column` is the
         # only thing that can propose an identity link — for review, never applied.
+        #
+        # Two optional blocks make long records whole and group related ones
+        # (engine/passages.py). Neither adds anything to `content_columns`: a
+        # column there is part of every row's content hash, so adding one
+        # re-embeds the whole source. Both are read from the source at query
+        # time instead.
+        #   passages: {column: <text column of the same row>}
+        #          or {from: {path, table, key_column, join_column, text_column}}
+        #             [+ size, max_per_record: override federation.passages.*]
+        #     The record's full text, cut into passages that are embedded as
+        #     extra projection vectors ("<external_id>#p<n>") by the passage
+        #     builder. `from` reads another database: `join_column` is the
+        #     column of THIS row whose value equals `key_column` over there.
+        #     Search counts a record once, at its best passage, and shows it.
+        #   container: {column: <column naming the group>, label: <noun>,
+        #               path_separator: <optional, e.g. "/">}
+        #     Records sharing the column's value (a thread id, a folder) are
+        #     collapsed in search results to the best one, noting "and N more
+        #     in this <label>". `path_separator` additionally marks the column
+        #     as a hierarchical PATH (a folder): a query whose focus tokens
+        #     match every path SEGMENT (a 4-digit token must match a segment
+        #     that is itself a year) gets an aggregate card -- path, file
+        #     count, top file names -- read by path prefix at query time
+        #     (engine/passages.py folder_matches/best_folder_matches,
+        #     engine/localdb.py LocalDBProvider.folder_card). Omit it for a
+        #     container whose key is an opaque id (a thread) rather than a path.
+        # e.g. {name: mail, ..., container: {column: thread_id, label: thread},
+        #       passages: {from: {path: /abs/mail.db, table: bodies,
+        #                         key_column: msg_id, join_column: msg_id,
+        #                         text_column: text}}}
         "local_dbs": [],
+        # Defaults for a local_dbs entry's `passages` block. `size` is the
+        # longest passage in characters (a paragraph-, line-, sentence-, then
+        # word-aligned cut); `max_per_record` caps the vectors one record can
+        # add (48 x 900 covers a 40,000-character document). Changing either
+        # changes what passage n means, so the builder rebuilds every record.
+        "passages": {"size": 900, "max_per_record": 48},
     },
     "outputs": {"ocas_signal_emit": {"enabled": "auto", "sink": "~/.hermes/commons/signals/"}},
     # A small map of what the store holds and how to read it, built offline

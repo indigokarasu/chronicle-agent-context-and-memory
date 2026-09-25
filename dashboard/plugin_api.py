@@ -139,7 +139,10 @@ def _get_embedding_stats(db_path: Path) -> Dict[str, Any]:
              "SELECT COUNT(*) FROM session_index WHERE embedding IS NOT NULL"),
         ("projection",
              "SELECT COUNT(*) FROM pointers",
-             "SELECT COUNT(*) FROM projection_vectors"),
+             # Records with a vector: passage rows ("<id>#p<n>") are extra
+             # vectors of records already counted, not coverage.
+             "SELECT COUNT(*) FROM projection_vectors v WHERE EXISTS (SELECT 1 FROM pointers p "
+             "WHERE p.provider=v.provider AND p.external_id=v.external_id)"),
         ("reference",
              "SELECT COUNT(*) FROM refs WHERE status='active'",
              "SELECT COUNT(*) FROM memory_vectors WHERE kind='reference'"),
