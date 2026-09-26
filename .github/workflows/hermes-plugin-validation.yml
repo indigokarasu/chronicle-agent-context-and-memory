@@ -24,8 +24,14 @@ jobs:
       # Hermes's tests, docs and .mailmap). Move it out before validating.
       - name: Move the validator out of the plugin tree
         run: mv .hermes-validator "$RUNNER_TEMP/hermes-validator"
-      - name: Install validator dependency
-        run: python -m pip install pyyaml packaging
+      # hermes_yaml does `from ruamel.yaml import YAML` at module scope, and
+      # the validator import chain (plugin_validate -> plugins_manifest ->
+      # utils/hermes_yaml) pulls it in before a single admission check runs.
+      # Without it the job dies with ModuleNotFoundError: No module named
+      # 'ruamel'. `packaging` is needed by pm.plugin_declarations, `pyyaml` by
+      # the manifest loader's fast path.
+      - name: Install validator dependencies
+        run: python -m pip install --upgrade pyyaml packaging "ruamel.yaml>=0.18"
       - name: Validate against the Hermes plugin admission checks
         env:
           HERMES_VALIDATOR: ${{ runner.temp }}/hermes-validator
