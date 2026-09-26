@@ -8,6 +8,15 @@ on:
 permissions:
   contents: write
 
+# Several pushes can land on one release tag in quick succession (and a re-run
+# of a tag overlaps the original). Without this, two runs for the same tag reach
+# the publish step together, both see no release, and the second "create" loses
+# the race and fails. Serialise per tag, and let a queued run run rather than be
+# cancelled so a re-run still republishes the assets.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
