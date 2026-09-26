@@ -51,7 +51,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           version=${GITHUB_REF_NAME#v}
+          # Idempotent: a re-run of a tag whose release already exists (the
+          # burst pushes that trigger this workflow several times for one tag)
+          # must not die with "a release with the same tag name already exists".
+          # Re-running uploads the freshly built artifacts to the existing
+          # release instead.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists — updating it."
+            gh release upload "${GITHUB_REF_NAME}" \
+              "dist/chronicle-${version}.zip" \
+              "dist/chronicle-${version}.zip.sha256" \
+              --clobber
+            gh release edit "${GITHUB_REF_NAME}" --title "Chronicle ${version}"
+            exit 0
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             "dist/chronicle-${version}.zip" \
             "dist/chronicle-${version}.zip.sha256" \
