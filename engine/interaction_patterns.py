@@ -19,7 +19,7 @@ from .speaker import attribute_lines, human_text
 
 
 def _normalize(text: str) -> str:
-    """Case-fold text into space-delimited word/phrase matching form."""
+    """Case-fold text into a space-delimited form for literal phrase matching."""
     cleaned = "".join(
         ch if ch.isalnum() or ch == "'" else " "
         for ch in str(text or "").casefold()
@@ -140,12 +140,7 @@ def _matches(normalized_text: str, phrases: tuple[str, ...]) -> bool:
 
 
 class InteractionPatternMiner:
-    """Mine recurrent, descriptive interaction signals from Chronicle events.
-
-    Output is deliberately policy-free. A downstream relationship learner may
-    interpret these observations, but Chronicle only reports what recurred and
-    where the supporting evidence lives.
-    """
+    """Mine recurrent, descriptive interaction signals from Chronicle events."""
 
     def __init__(self, store):
         self.store = store
