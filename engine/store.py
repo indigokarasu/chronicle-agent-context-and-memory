@@ -1373,6 +1373,32 @@ class MemoryStore:
             "SELECT * FROM events WHERE type=? AND seq > ? ORDER BY seq", (type_, since_seq)).fetchall()
         return [dict(r) for r in rows]
 
+    def get_observed_user_events_since(
+        self,
+        since_seq: int = 0,
+        *,
+        limit: int | None = None,
+        before_seq: int | None = None,
+    ) -> list[dict]:
+        """Newest observed user-actor events after since_seq.
+
+        The interaction-pattern miner still applies speaker-span validation
+        because legacy rows may have a user actor without human-authored text.
+        This query keeps database work focused on the only event class that can
+        possibly qualify, and supports bounded descending pagination.
+        """
+        q = "SELECT * FROM events WHERE type='observed' AND actor='user' AND seq > ?"
+        params: list = [since_seq]
+        if before_seq is not None:
+            q += " AND seq < ?"
+            params.append(before_seq)
+        q += " ORDER BY seq DESC"
+        if limit is not None:
+            q += " LIMIT ?"
+            params.append(int(limit))
+        rows = self._conn().execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
     def get_head_event_id(self) -> str:
         return self.get_meta("head_event_id", "") or ""
 
