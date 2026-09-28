@@ -27,6 +27,7 @@ from .gitmirror import GitMirror
 from .health import HealthEngine
 from .hostmodel import HostModelRegistry
 from .learning import LearningLoop
+from .interaction_patterns import InteractionPatternMiner
 from .localdb import register_local_dbs
 from .reasoning import EpistemicModel, ReasoningLayer
 from .reducer import Reducer
@@ -118,6 +119,9 @@ class ChronicleCore:
         self.forgetting = ForgettingEngine(self.store, self.cfg, self.capture.append)
         self.health = HealthEngine(self)
         self.learning = LearningLoop(self)
+        # Descriptive only: downstream relationship-learning may interpret
+        # these observations, but Chronicle never turns them into policy.
+        self.interaction_patterns = InteractionPatternMiner(self.store)
         self.epistemic = EpistemicModel(self.store, self.cfg)
         self.reasoning = ReasoningLayer(self)
         self.gitmirror = GitMirror(self.store, self.cfg)
