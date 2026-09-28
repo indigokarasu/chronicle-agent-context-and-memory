@@ -12,10 +12,12 @@ pattern summaries with event ids as provenance.
 from __future__ import annotations
 
 import json
-from collections import deque
 from typing import Any
 
-from .speaker import attribute_lines, human_text
+try:
+    from .speaker import attribute_lines, human_text
+except ImportError:  # direct module execution / standalone tooling
+    from speaker import attribute_lines, human_text
 
 
 def _normalize(text: str) -> str:
@@ -85,14 +87,16 @@ _RAW_RULES: dict[str, tuple[tuple[str, ...], str]] = {
     ),
     "fidelity": (
         (
-            "exact",
-            "exactly",
             "do not alter",
             "don't alter",
             "don't change",
             "do not change",
-            "missing",
-            "omitted",
+            "you changed",
+            "you altered",
+            "you omitted",
+            "you left out",
+            "still missing",
+            "missing from",
             "left out",
         ),
         "User messages repeatedly correct omissions or unwanted changes to requested details.",
@@ -145,17 +149,6 @@ class InteractionPatternMiner:
     def __init__(self, store):
         self.store = store
 
-    def _observed_rows(self, since_seq: int, limit: int) -> list[dict[str, Any]]:
-        if hasattr(self.store, "iter_events_since"):
-            rows = deque(maxlen=limit if limit > 0 else None)
-            for row in self.store.iter_events_since(since_seq):
-                if row.get("type") == "observed":
-                    rows.append(row)
-            return list(rows)
-
-        rows = self.store.get_events_by_type("observed", since_seq)
-        return rows[-limit:] if limit > 0 and len(rows) > limit else rows
-
     @staticmethod
     def _human_text(row: dict[str, Any]) -> str:
         if row.get("actor") != "user":
@@ -168,13 +161,77 @@ class InteractionPatternMiner:
         )
         return human_text(lines).strip()
 
+    def _eligible_rows(
+        self, since_seq: int, limit: int
+    ) -> list[tuple[dict[str, Any], str]]:
+        """Return the newest eligible human events, then order them ascending."""
+        if hasattr(self.store, "get_observed_user_events_since"):
+            if limit <= 0:
+                rows = self.store.get_observed_user_events_since(
+                    since_seq, limit=None
+                )
+                eligible = [
+                    (row, text)
+                    for row in rows
+                    if (text := self._human_text(row))
+                ]
+                eligible.sort(key=lambda item: int(item[0].get("seq") or 0))
+                return eligible
+
+            batch_size = max(64, min(1000, limit * 2))
+            eligible: list[tuple[dict[str, Any], str]] = []
+            before_seq: int | None = None
+            while len(eligible) < limit:
+                rows = self.store.get_observed_user_events_since(
+                    since_seq,
+                    limit=batch_size,
+                    before_seq=before_seq,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    text = self._human_text(row)
+                    if text:
+                        eligible.append((row, text))
+                        if len(eligible) >= limit:
+                            break
+                if len(rows) < batch_size:
+                    break
+                next_before = int(rows[-1].get("seq") or 0)
+                if next_before <= since_seq or next_before == before_seq:
+                    break
+                before_seq = next_before
+
+            eligible.sort(key=lambda item: int(item[0].get("seq") or 0))
+            return eligible
+
+        rows = self.store.get_events_by_type("observed", since_seq)
+        eligible = [
+            (row, text)
+            for row in rows
+            if (text := self._human_text(row))
+        ]
+        return eligible[-limit:] if limit > 0 else eligible
+
     @staticmethod
     def _turn_key(row: dict[str, Any]) -> tuple[str, str]:
+        payload = _payload(row)
         event_id = str(row.get("event_id") or "")
-        return (
-            str(row.get("session_id") or ""),
-            str(row.get("occurred_at") or event_id),
-        )
+        session_id = str(row.get("session_id") or "")
+        try:
+            chunk_count = int(payload.get("chunk_count") or 1)
+            chunk_index = int(payload.get("chunk_index") or 0)
+            seq = int(row.get("seq") or 0)
+        except (TypeError, ValueError):
+            chunk_count, chunk_index, seq = 1, 0, 0
+
+        if chunk_count > 1 and 0 <= chunk_index < chunk_count and seq > 0:
+            source_ref = str(payload.get("source_ref") or session_id)
+            return (
+                session_id,
+                f"{source_ref}:chunks:{seq - chunk_index}:{chunk_count}",
+            )
+        return (session_id, event_id)
 
     @staticmethod
     def _new_bucket(category: str, summary: str) -> dict[str, Any]:
@@ -233,10 +290,8 @@ class InteractionPatternMiner:
             raise ValueError("min_support must be >= 1")
 
         buckets: dict[str, dict[str, Any]] = {}
-        for row in self._observed_rows(since_seq, limit):
-            text = _normalize(self._human_text(row))
-            if not text:
-                continue
+        for row, human_message in self._eligible_rows(since_seq, limit):
+            text = _normalize(human_message)
             for category, (phrases, summary) in _RULES.items():
                 if not _matches(text, phrases):
                     continue
