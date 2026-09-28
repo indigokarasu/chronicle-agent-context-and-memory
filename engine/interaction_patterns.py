@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import deque
 from typing import Any
 
 from .speaker import attribute_lines, human_text
@@ -22,8 +23,8 @@ from .speaker import attribute_lines, human_text
 _RULES: dict[str, tuple[tuple[re.Pattern[str], ...], str]] = {
     "correction": (
         (
-            re.compile(r"\b(?:that's wrong|that is wrong|incorrect|you missed|you omitted|not what i asked|i said)\b", re.I),
-            re.compile(r"\b(?:stop|don't|do not)\b", re.I),
+            re.compile(r"\b(?:that's wrong|that is wrong|incorrect|you missed|you omitted|not what i asked)\b", re.I),
+            re.compile(r"\b(?:i already said|i told you|i said (?:no|not|don't|do not))\b", re.I),
         ),
         "User messages contain repeated direct corrections of the assistant.",
     ),
@@ -53,7 +54,7 @@ _RULES: dict[str, tuple[tuple[re.Pattern[str], ...], str]] = {
     ),
     "verification": (
         (
-            re.compile(r"\b(?:check again|verify|look at|inspect|review the actual|source|repo|code)\b", re.I),
+            re.compile(r"\b(?:check again|verify|look at the|inspect the|review the actual|actual (?:code|repo)|source material|check the (?:source|repo|code))\b", re.I),
         ),
         "User messages repeatedly request checking source material or verifying claims before concluding.",
     ),
@@ -94,9 +95,19 @@ class InteractionPatternMiner:
         if min_support < 1:
             raise ValueError("min_support must be >= 1")
 
-        rows = self.store.get_events_by_type("observed", since_seq)
-        if limit > 0 and len(rows) > limit:
-            rows = rows[-limit:]
+        if hasattr(self.store, "iter_events_since"):
+            # Chronicle stores can contain hundreds of thousands of events.
+            # Keep memory bounded while retaining the latest observed events.
+            rows_q = deque(maxlen=limit if limit > 0 else None)
+            for row in self.store.iter_events_since(since_seq):
+                if row.get("type") == "observed":
+                    rows_q.append(row)
+            rows = list(rows_q)
+        else:
+            # Small test/fallback stores may only implement this older helper.
+            rows = self.store.get_events_by_type("observed", since_seq)
+            if limit > 0 and len(rows) > limit:
+                rows = rows[-limit:]
 
         buckets: dict[str, dict[str, Any]] = {}
         for row in rows:
@@ -125,13 +136,23 @@ class InteractionPatternMiner:
                         "summary": summary,
                         "event_ids": [],
                         "session_ids": set(),
+                        "turn_keys": set(),
                         "last_seq": 0,
                     },
                 )
                 event_id = str(row.get("event_id") or "")
-                if event_id and event_id not in bucket["event_ids"]:
-                    bucket["event_ids"].append(event_id)
                 session_id = str(row.get("session_id") or "")
+                # A long turn may be stored as several chunk events with one
+                # occurred_at timestamp. Count that turn once per category.
+                turn_key = (
+                    session_id,
+                    str(row.get("occurred_at") or event_id),
+                )
+                if turn_key in bucket["turn_keys"]:
+                    continue
+                bucket["turn_keys"].add(turn_key)
+                if event_id:
+                    bucket["event_ids"].append(event_id)
                 if session_id:
                     bucket["session_ids"].add(session_id)
                 bucket["last_seq"] = max(int(row.get("seq") or 0), bucket["last_seq"])
