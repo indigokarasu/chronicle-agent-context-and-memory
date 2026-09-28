@@ -96,7 +96,6 @@ _RAW_RULES: dict[str, tuple[tuple[str, ...], str]] = {
             "you omitted",
             "you left out",
             "still missing",
-            "missing from",
             "left out",
         ),
         "User messages repeatedly correct omissions or unwanted changes to requested details.",
