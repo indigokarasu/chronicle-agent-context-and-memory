@@ -1,0 +1,61 @@
+{
+  "schema_version": "0.1",
+  "meta": {
+    "id": "chatgpt-chronicle-agent-context-and-memory-27-dreaming-boundaries",
+    "repo": "indigokarasu/chronicle-agent-context-and-memory",
+    "commit_range": {
+      "base_sha": "98e1155aa3d170a40fdc34639830698809fe8d86",
+      "head_sha": "26c7d92a945aeedeaae94ff5e3698aff21a84034"
+    },
+    "session": {
+      "agent": "ChatGPT",
+      "model": "GPT-5.6 Sol"
+    },
+    "generated_by": {
+      "pipeline": "chatgpt-assisted-refactor",
+      "version": "1"
+    },
+    "generated_at": "2026-09-28T05:20:00Z",
+    "interview": {
+      "rounds": 0,
+      "questions_asked": 0,
+      "unresolved": 0
+    }
+  },
+  "problem": {
+    "statement": "Add descriptive, provenance-preserving interaction-pattern evidence for downstream relationship Dreaming without turning Chronicle into a behavioral-policy engine.",
+    "origin": "stated_upfront",
+    "user_asks": [
+      "Add descriptive, provenance-preserving interaction-pattern evidence for downstream relationship Dreaming without turning Chronicle into a behavioral-policy engine."
+    ]
+  },
+  "assumptions": [],
+  "approach": {
+    "requirements": [
+      {
+        "text": "Keep user facts, relationship posture, system improvement, and Indigo identity as separate epistemic objects."
+      },
+      {
+        "text": "Preserve Chronicle as canonical evidence and Autobio/SOUL as identity authority."
+      }
+    ],
+    "adopted": {
+      "summary": "Expose conservative descriptive interaction patterns from ChronicleCore, grounded in human-attributed observed events, with automation exclusion and source event ids.",
+      "rationale": "Implements the architecture agreed in the design review while minimizing changes to existing subsystem ownership."
+    }
+  },
+  "tour": [
+    {
+      "id": "T1",
+      "title": "Dreaming boundaries",
+      "role": "core",
+      "what": "Expose conservative descriptive interaction patterns from ChronicleCore, grounded in human-attributed observed events, with automation exclusion and source event ids.",
+      "why": "Add descriptive, provenance-preserving interaction-pattern evidence for downstream relationship Dreaming without turning Chronicle into a behavioral-policy engine.",
+      "anchors": [],
+      "provenance": "stated_upfront"
+    }
+  ],
+  "verification": {
+    "performed": []
+  }
+}
