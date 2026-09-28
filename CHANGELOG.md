@@ -3,6 +3,10 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.11.0
+
+**Descriptive interaction-pattern evidence for relationship learning.** Chronicle can now mine recurrent human-authored interaction signals while preserving source event ids, speaker attribution, session scope, and a descriptive-only boundary. Automation/system turns are excluded, chunked turns count once, and no mined pattern becomes behavioral policy inside Chronicle. The additive `ChronicleCore.interaction_patterns` surface is intended for downstream relationship Dreaming.
+
 ## 5.10.1
 
 **A question that names something reaches the records about it.** The per-turn relevance gate
