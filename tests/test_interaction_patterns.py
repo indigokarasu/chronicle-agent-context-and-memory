@@ -84,6 +84,17 @@ class InteractionPatternTests(unittest.TestCase):
         )
         self.assertFalse(any(p["category"] == "verification" for p in miner.mine(min_support=2)))
 
+    def test_word_substrings_do_not_trigger_patterns(self):
+        miner = InteractionPatternMiner(
+            FakeStore(
+                [
+                    row(1, "e1", "Run the debrief process.", session="a"),
+                    row(2, "e2", "The debrief artifact exists.", session="b"),
+                ]
+            )
+        )
+        self.assertFalse(any(p["category"] == "brevity" for p in miner.mine(min_support=2)))
+
     def test_since_seq_is_respected(self):
         miner = InteractionPatternMiner(
             FakeStore(
