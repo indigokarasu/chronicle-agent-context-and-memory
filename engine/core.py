@@ -14,28 +14,52 @@ import logging
 import threading
 from pathlib import Path
 
-from . import access
-from .capture import CaptureEngine, Reaper
-from .config import Config
-from .curation import CurationWorker
-from .derivation import DerivationEngine
-from .embeddings import get_embedder
-from .extraction import PREDICATE_MAP, make_extractor
-from .federation import CapabilityRegistry
-from .forgetting import ForgettingEngine
-from .gitmirror import GitMirror
-from .health import HealthEngine
-from .hostmodel import HostModelRegistry
-from .learning import LearningLoop
-from .interaction_patterns import InteractionPatternMiner
-from .localdb import register_local_dbs
-from .reasoning import EpistemicModel, ReasoningLayer
-from .reducer import Reducer
-from .retrieval import RetrievalEngine
-from .scheduler import Scheduler
-from .store import MemoryStore, StoreClosed, now_iso
-from .tools import Tools
-from .vector_index import VectorIndex
+try:
+    from . import access
+    from .capture import CaptureEngine, Reaper
+    from .config import Config
+    from .curation import CurationWorker
+    from .derivation import DerivationEngine
+    from .embeddings import get_embedder
+    from .extraction import PREDICATE_MAP, make_extractor
+    from .federation import CapabilityRegistry
+    from .forgetting import ForgettingEngine
+    from .gitmirror import GitMirror
+    from .health import HealthEngine
+    from .hostmodel import HostModelRegistry
+    from .interaction_patterns import InteractionPatternMiner
+    from .learning import LearningLoop
+    from .localdb import register_local_dbs
+    from .reasoning import EpistemicModel, ReasoningLayer
+    from .reducer import Reducer
+    from .retrieval import RetrievalEngine
+    from .scheduler import Scheduler
+    from .store import MemoryStore, StoreClosed, now_iso
+    from .tools import Tools
+    from .vector_index import VectorIndex
+except ImportError:  # direct module execution / standalone tooling
+    import access
+    from capture import CaptureEngine, Reaper
+    from config import Config
+    from curation import CurationWorker
+    from derivation import DerivationEngine
+    from embeddings import get_embedder
+    from extraction import PREDICATE_MAP, make_extractor
+    from federation import CapabilityRegistry
+    from forgetting import ForgettingEngine
+    from gitmirror import GitMirror
+    from health import HealthEngine
+    from hostmodel import HostModelRegistry
+    from interaction_patterns import InteractionPatternMiner
+    from learning import LearningLoop
+    from localdb import register_local_dbs
+    from reasoning import EpistemicModel, ReasoningLayer
+    from reducer import Reducer
+    from retrieval import RetrievalEngine
+    from scheduler import Scheduler
+    from store import MemoryStore, StoreClosed, now_iso
+    from tools import Tools
+    from vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.core")
 
