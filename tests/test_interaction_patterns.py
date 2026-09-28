@@ -142,6 +142,19 @@ class InteractionPatternTests(unittest.TestCase):
             any(p["category"] == "fidelity" for p in miner.mine(min_support=2))
         )
 
+    def test_missing_from_question_is_not_fidelity_correction(self):
+        miner = InteractionPatternMiner(
+            FakeStore(
+                [
+                    row(1, "e1", "What is missing from the package?", session="a"),
+                    row(2, "e2", "What is missing from the package?", session="b"),
+                ]
+            )
+        )
+        self.assertFalse(
+            any(p["category"] == "fidelity" for p in miner.mine(min_support=2))
+        )
+
     def test_explicit_change_correction_is_fidelity_signal(self):
         miner = InteractionPatternMiner(
             FakeStore(
