@@ -6,10 +6,6 @@
   "scripts": {
     "build": "node build.mjs"
   },
-  "dependencies": {
-    "@deck.gl/core": "9.4.0",
-    "@deck.gl/layers": "9.4.0"
-  },
   "devDependencies": {
     "esbuild": "0.28.2"
   }

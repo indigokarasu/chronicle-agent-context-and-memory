@@ -3,6 +3,14 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.11.1
+
+**The Tapestry is removed.** The dashboard's memory navigator did not work and is gone:
+`dashboard/tapestry_api.py`, the `/tapestry/*` routes, the `dist/tapestry.js` bundle and
+its deck.gl dependency, and its UI source. The dashboard tab now shows the overview only
+(store counts, embedding coverage, recent activity, the extraction queue action). Memory
+itself, the entity layer, and every tool are unchanged.
+
 ## 5.11.0
 
 **Descriptive interaction-pattern evidence for relationship learning.** Chronicle can now mine recurrent human-authored interaction signals while preserving source event ids, speaker attribution, session scope, and a descriptive-only boundary. Automation/system turns are excluded, chunked turns count once, and no mined pattern becomes behavioral policy inside Chronicle. The additive `ChronicleCore.interaction_patterns` surface is intended for downstream relationship Dreaming.

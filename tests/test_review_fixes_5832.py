@@ -21,7 +21,6 @@ from engine.core import ChronicleCore  # noqa: E402
 from scripts import clean_entities  # noqa: E402
 from scripts.migrate_vectors import Migrator  # noqa: E402
 from scripts.writeback_vectors import Refused, _open_ro  # noqa: E402
-from test_dashboard_tapestry import A  # noqa: E402  (tapestry_api, loaded as the host does)
 
 
 def _db_with_hot_journal():
@@ -60,71 +59,6 @@ class TestAHotJournalIsNeverReadImmutable(unittest.TestCase):
             wb._connect_probed = real
         self.assertIn("journal", str(cm.exception))
         self.assertFalse([u for u in opened if "immutable" in u], opened)
-
-    def test_the_tapestry_reader_does_not_open_it_immutable(self):
-        path = _db_with_hot_journal()
-        opened = []
-        real = sqlite3.connect
-
-        def spy(target, *a, **k):
-            opened.append(target)
-            if "immutable" not in target:
-                raise sqlite3.OperationalError("simulated: read-only open failed")
-            return real(target, *a, **k)
-        A.sqlite3.connect = spy
-        try:
-            with self.assertRaises(sqlite3.Error):
-                A._connect(path)
-        finally:
-            A.sqlite3.connect = real
-        self.assertFalse([u for u in opened if "immutable" in u], opened)
-
-
-class TestUnreviewedContactsAreNotGuessedToBePeople(unittest.TestCase):
-    def test_kinds(self):
-        self.assertEqual(A._people_kind({"is_company": 1})[0], "thing")
-        self.assertEqual(A._people_kind({"is_company": 0})[0], "person")
-        kind, subtype = A._people_kind({"is_company": None})
-        self.assertIsNone(kind)
-        self.assertEqual(subtype, "contact (unreviewed)")
-
-
-class TestAMergeCycleIsListedOnce(unittest.TestCase):
-    def _map(self, pairs):
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.execute("CREATE TABLE entities(belief_id TEXT, merged_into TEXT)")
-        conn.executemany("INSERT INTO entities VALUES(?,?)", pairs)
-        return A._merge_map(conn)
-
-    def test_a_two_cycle_keeps_one_representative(self):
-        m = self._map([("ent_b", "ent_a"), ("ent_a", "ent_b")])
-        self.assertEqual(m, {"ent_b": "ent_a"})    # ent_a is listed; ent_b folds into it
-
-    def test_a_chain_into_a_cycle(self):
-        m = self._map([("ent_c", "ent_b"), ("ent_b", "ent_a"), ("ent_a", "ent_b")])
-        self.assertEqual(m, {"ent_c": "ent_a", "ent_b": "ent_a"})
-
-    def test_a_plain_chain_is_unchanged(self):
-        self.assertEqual(self._map([("ent_c", "ent_b"), ("ent_b", "ent_a")]),
-                         {"ent_c": "ent_a", "ent_b": "ent_a"})
-
-
-class TestAReplacementIsAfterWhatItReplaced(unittest.TestCase):
-    def test_even_with_an_earlier_timestamp(self):
-        rows = [("b_new", "Globex Fake Inc", "active", "2026-09-01T00:00:00Z", None, None, None),
-                ("b_old", "Acme Fake Co", "superseded", "2026-09-02T00:00:00Z", None, None, "b_new")]
-        self.assertEqual([r[1] for r in A._in_supersession_order(rows)],
-                         ["Acme Fake Co", "Globex Fake Inc"])
-
-    def test_unrelated_chains_keep_time_order(self):
-        rows = [("a1", "a1", "superseded", "2020", None, None, "a2"),
-                ("a2", "a2", "active", "2021", None, None, None),
-                ("b1", "b1", "superseded", "2024", None, None, "b2"),
-                ("b2", "b2", "superseded", "2025", None, None, "b3"),
-                ("b3", "b3", "active", "2026", None, None, None)]
-        self.assertEqual([r[1] for r in A._in_supersession_order(rows)],
-                         ["a1", "a2", "b1", "b2", "b3"])
 
 
 def _entities_db():

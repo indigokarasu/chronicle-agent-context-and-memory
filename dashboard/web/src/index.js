@@ -1,10 +1,6 @@
 // Chronicle dashboard plugin entry (dist/index.js).
 //
-// Two tabs. Overview: store counts, embedding coverage, recent activity and the
-// extraction queue action (ported from the hand-written bundle this replaces,
-// now versioned with the plugin). Tapestry: the memory navigator, whose bundle
-// (dist/tapestry.js, with deck.gl) is loaded only when the tab is first opened so
-// every other dashboard page pays nothing for it.
+// Store counts, embedding coverage, recent activity and the extraction queue action.
 
 import { SDK, PLUGINS, h, hooks, C, fetchJSON, API, fmt, relTime, injectCSS } from "./common.js";
 
@@ -142,46 +138,9 @@ function main() {
       ActivityCard(recent && recent.events));
   }
 
-  // -- Tapestry: load dist/tapestry.js next to this file, once --------------------------
-  let tapestryPromise = null;
-  function loadTapestry() {
-    if (window.__CHRONICLE_TAPESTRY__) return Promise.resolve(window.__CHRONICLE_TAPESTRY__);
-    if (tapestryPromise) return tapestryPromise;
-    tapestryPromise = new Promise((resolve, reject) => {
-      const self = document.querySelector('script[data-hermes-plugin="chronicle"]');
-      // dist/tapestry.js sits next to the dist/index.js the host loaded
-      const src = self && self.src ? self.src.split("?")[0] : "";
-      const base = src ? src.slice(0, src.lastIndexOf("/") + 1) : "";
-      if (!base) { reject(new Error("could not locate the Chronicle plugin bundle")); return; }
-      const s = document.createElement("script");
-      s.src = base + "tapestry.js";
-      s.async = true;
-      s.onload = () => window.__CHRONICLE_TAPESTRY__ ? resolve(window.__CHRONICLE_TAPESTRY__) : reject(new Error("tapestry.js loaded but registered nothing"));
-      s.onerror = () => { tapestryPromise = null; reject(new Error("could not load " + s.src)); };
-      document.head.appendChild(s);
-    });
-    return tapestryPromise;
-  }
-
-  function TapestryTab() {
-    const [mod, setMod] = useState(window.__CHRONICLE_TAPESTRY__ || null);
-    const [err, setErr] = useState(null);
-    useEffect(() => { if (!mod) loadTapestry().then(setMod).catch((e) => setErr(e.message)); }, []);
-    if (err) return h("div", { className: "chr-err" }, "Tapestry could not load: " + err);
-    if (!mod) return h("div", { className: "chr-quiet", style: { padding: "2rem" } }, "Loading Tapestry…");
-    return h(mod.Tapestry, null);
-  }
-
   function ChronicleDashboard() {
-    const initial = (() => { try { return sessionStorage.getItem("chr-tab") || "overview"; } catch (e) { return "overview"; } })();
-    const [tab, setTab] = useState(initial);
     useEffect(() => { injectCSS(); }, []);
-    const choose = (t) => { setTab(t); try { sessionStorage.setItem("chr-tab", t); } catch (e) { /* private mode */ } };
-    return h("div", { className: "chr", style: { padding: "1rem", gap: ".75rem" } },
-      h("div", { className: "chr-tabs", role: "tablist" },
-        h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "overview", onClick: () => choose("overview") }, "Overview"),
-        h("button", { className: "chr-tab", role: "tab", "aria-selected": tab === "tapestry", onClick: () => choose("tapestry") }, "Tapestry")),
-      tab === "tapestry" ? h(TapestryTab) : h(Overview));
+    return h("div", { className: "chr", style: { padding: "1rem", gap: ".75rem" } }, h(Overview));
   }
 
   PLUGINS.register("chronicle", ChronicleDashboard);

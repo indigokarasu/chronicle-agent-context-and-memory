@@ -47,9 +47,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-# Predicates that assert something HAPPENED. The read model groups exactly these
-# as events (dashboard/tapestry_api.py imports this set rather than keeping a
-# second copy of it).
+# Predicates that assert something HAPPENED.
 EVENT_PREDICATES = {
     "attended_event": "attended",
     "had_appointment": "appointment",

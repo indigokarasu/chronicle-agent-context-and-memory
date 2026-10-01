@@ -12,8 +12,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-MODULES = ("engine/speaker.py", "engine/substance.py", "engine/retrieval.py",
-           "dashboard/tapestry_api.py")
+MODULES = ("engine/speaker.py", "engine/substance.py", "engine/retrieval.py")
 
 
 class TestPublicFunctionsAreAnnotated(unittest.TestCase):
