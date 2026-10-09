@@ -47,7 +47,7 @@ _FIRST_PERSON = re.compile(r"\b(i|my|i'm|im|me)\b", re.IGNORECASE)
 # boundary is terminal punctuation followed by WHITESPACE and an opening
 # capital/quote/digit; `pat.testley@example.com`, `v1.5` and `3.5%` have no
 # whitespace after the dot and so are never cut.
-_SENT_BOUNDARY = re.compile(r"(?<=[.!?])[ \t]+(?=[\"'“‘(\[]?[A-Z0-9])")
+_SENT_BOUNDARY = re.compile(r"(?<=[.!?])[ \t]+(?=[\"'“‘(\[]?[A-Z0-9])|(?<=[。！？])")
 # Abbreviations that end in a period mid-sentence. Deliberately short: an
 # over-long list under-splits, which costs precision but never breaks a token.
 _ABBREV = frozenset("""mr mrs ms dr prof sr jr st vs etc inc ltd corp dept fig
@@ -375,6 +375,48 @@ _THIRD_PERSON_SUBJ = re.compile(
     r"^(?:my|your|our|his|her|their|the|a|an|this|that|these|those)\s", re.IGNORECASE)
 _MAX_FACTS_PER_SENTENCE = 8
 
+# -- Japanese first-person facts (i18n) ------------------------------------
+# Japanese has no capital letter and no `\b` word boundary, so the English
+# signals (a capitalised proper noun; `_NOT_A_NAME`) do not exist. Precision
+# therefore comes entirely from the FRAME: a fixed first-person predicate with
+# a bounded value ("私の名前は…です", "…が好きです"), cut at the copula or the
+# clause boundary. Only high-precision forms are emitted; the raw tier still
+# floors recall for everything else (I23), exactly as the English floor does.
+_JP_SUBJ = re.compile(r"^(?:私は|わたしは|僕は|俺は|自分は)\s*")
+_JP_VALUE = r"[^。、！？\n]{1,24}"
+_JP_COP = r"(?:です|でした|ます|ました|だ|である|といいます|と申します|という)"
+_JP_COP_RE = re.compile(_JP_COP)
+# A sentence whose topic is somebody else is not a fact about the user. Framed
+# patterns ("私の妻は…") are exempt because their frame already names the user.
+_JP_THIRD = re.compile(
+    r"(?:友人|友だち|ともだち|彼|彼女|父|母|兄|弟|姉|妹|息子|娘|上司|同僚|先生|あなた|みんな)は")
+
+_JP_NAME = re.compile(r"(?:私の名前は|わたしの名前は)(%s?)(?:%s)" % (_JP_VALUE, _JP_COP))
+_JP_NAME_TO = re.compile(r"(?:私は|わたしは)(%s?)と(?:いいます|申します|いう)" % _JP_VALUE)
+_JP_SPOUSE = re.compile(r"(?:私|わたし)の(妻|夫|パートナー)は(%s?)(?:%s)" % (_JP_VALUE, _JP_COP))
+_JP_PET = re.compile(
+    r"(?:猫|犬|うさぎ|ハムスター|ペット)の名前は(%s?)(?:%s)" % (_JP_VALUE, _JP_COP))
+_JP_ALLERGY = re.compile(r"(%s?)(?:に)?アレルギーがあります" % _JP_VALUE)
+_JP_ALLERGY_IS = re.compile(r"アレルギーは(%s?)(?:%s)" % (_JP_VALUE, _JP_COP))
+_JP_LIVES = re.compile(r"(%s?)に住んで(?:います|いる|ます|る)" % _JP_VALUE)
+_JP_LIKES = re.compile(r"(%s?)が(?:好き|大好き)(?:%s)?" % (_JP_VALUE, _JP_COP))
+_JP_DISLIKES = re.compile(r"(%s?)が(?:嫌い|きらい)(?:%s)?" % (_JP_VALUE, _JP_COP))
+
+
+def _jp_clean(s: str) -> str:
+    """A Japanese fact value: drop a leading first-person subject and a trailing
+    copula, then the usual boundary punctuation. No `\\b` is involved."""
+    s = _JP_SUBJ.sub("", (s or "").strip()).strip()
+    s = s.strip("。、！？ ")
+    s = _JP_COP_RE.sub("", s).strip()
+    return s[:200]
+
+
+# Any line whose script is Japanese: the gate for the Japanese pass only. It
+# only has to recognise the script, not a word, since the frames below decide
+# what is emitted.
+_re_jp = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff]")
+
 
 class HeuristicExtractor(Extractor):
     """Deterministic pattern extractor. Emits entity-grounded facts, directives,
@@ -600,6 +642,14 @@ class HeuristicExtractor(Extractor):
                 out.append(_fact_item("user", "goal", val, owner, domain, source_event,
                                       "user_direct"))
 
+        # -- Japanese first-person facts (i18n) ------------------------------
+        # A framed Japanese sentence: the frame names the user, so the raw
+        # third-person refusal is skipped for it; an unframed Japanese line is
+        # refused when its topic is somebody else. Only high-precision frames run.
+        if _re_jp.search(line):
+            out.extend(self._japanese_facts(line, owner, domain, source_event))
+            return out
+
         # -- preferences (F3 §5.4, fenced by F3's own precision finding) -------
         out.extend(self._preferences(line, low, owner, domain, source_event, hypothetical))
 
@@ -656,6 +706,54 @@ class HeuristicExtractor(Extractor):
                     and not _is_conversational_object(tail)):
                 out.append(_fact_item("user", "habit", val, owner, domain, source_event,
                                       "user_direct"))
+        return out
+
+    def _japanese_facts(self, line, owner, domain, source_event):
+        """High-precision Japanese first-person facts (i18n).
+
+        No capital and no `\\b`, so precision is the FRAME, not the value: each
+        pattern fixes both the predicate and the surrounding particles, and the
+        value is cut at the copula. A framed line ("私の妻は…") names the user
+        already; an unframed line whose topic is somebody else is refused.
+        """
+        out: list = []
+        if _JP_THIRD.search(line):
+            return out
+
+        def add(predicate, value):
+            v = _jp_clean(value)
+            if v:
+                out.append(_fact_item("user", predicate, v, owner, domain,
+                                      source_event, "user_direct"))
+
+        m = _JP_NAME.search(line)
+        if m:
+            add("name", m.group(1))
+        else:
+            m = _JP_NAME_TO.search(line)
+            if m:
+                add("name", m.group(1))
+        m = _JP_SPOUSE.search(line)
+        if m:
+            add({"妻": "spouse", "夫": "spouse", "パートナー": "spouse"}[m.group(1)], m.group(2))
+        m = _JP_PET.search(line)
+        if m:
+            add("pet", m.group(1))
+        m = _JP_ALLERGY.search(line)
+        if not m:
+            m = _JP_ALLERGY_IS.search(line)
+        if m:
+            add("allergy", m.group(1))
+        m = _JP_LIVES.search(line)
+        if m:
+            add("lives_in", m.group(1))
+        m = _JP_LIKES.search(line)
+        if m:
+            add("likes", m.group(1))
+        else:
+            m = _JP_DISLIKES.search(line)
+            if m:
+                add("dislikes", m.group(1))
         return out
 
     def _name_from(self, line, low):
