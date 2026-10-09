@@ -2537,9 +2537,15 @@ class RetrievalEngine:
 
         t2 = self.retrieve_raw(query, principal=principal, now=now)
         # Lexical grounding: a raw span only counts as support if it shares a query
-        # token (guards against spurious vector hits → false answers).
+        # token (guards against spurious vector hits → false answers). A CJK
+        # query shares no WHOLE token with the sentence that answers it (the run
+        # is glued: "アレルギーは何" is not a substring of "アレルギーはそばです"),
+        # so it is matched on character bigrams too; Latin is unchanged.
         focus = set(q["tokens"])
-        t2 = [c for c in t2 if any(w in (c["excerpt"] or "").lower() for w in focus)]
+        jp_focus = bigram_units(focus)
+        t2 = [c for c in t2
+              if any(w in (c["excerpt"] or "").lower() for w in focus) or (jp_focus and any(
+                  b in (c["excerpt"] or "").lower() for b in jp_focus))]
 
         if not t1 and not t2:
             self.store.log_retrieval(query, "*", 0.0)
@@ -4881,15 +4887,20 @@ class RetrievalEngine:
         if self._abstain_gate == "score":
             return view[0][1] >= self._score_threshold
         if self._abstain_gate == "overlap":
-            qt = {t for t in q["tokens"] if len(t) > 3}
-            return any(len(qt & _content_tokens(txt)) >= self._overlap_min_tokens
+            qt = _content_units(" ".join(q["tokens"]), _EMPTY_DROP)
+            return any(len(qt & _content_units(txt, _STOP)) >= self._overlap_min_tokens
                        for txt, _ in view[:3])
-        qt = {t for t in q["tokens"] if len(t) > 3 and t not in _GENERIC}
+        # focus: coverage of the query's distinctive units. Both sides go through
+        # `_content_units` so a CJK run is compared as character bigrams (a
+        # Japanese question shares no whole token with the sentence answering
+        # it); Latin is unchanged because the query side still drops `_GENERIC`
+        # and the support side still drops `_STOP`.
+        qt = _content_units(" ".join(q["tokens"]), _GENERIC)
         if not qt:
             return True  # nothing distinctive to cover → nothing to fail on
         seen = set()
         for txt, _ in view[:5]:
-            seen |= _content_tokens(txt)
+            seen |= _content_units(txt, _STOP)
         return len(qt & seen) / float(len(qt)) >= self._focus_coverage
 
     def _confident(self, t1):
@@ -5422,6 +5433,61 @@ def _clamp(v, lo=0.0, hi=1.0):
 def _content_tokens(text):
     return {w for w in word_tokens((text or "").lower())
                if len(w) > 3 and w not in _STOP}
+
+
+# A CJK / kana character. Japanese (and Chinese) run text together with no
+# spaces, so `word_tokens` and FTS5's unicode61 both keep a whole run as ONE
+# token ("私の名前は牧野亮です" is a single word). A question and the sentence
+# that answers it then share no token unless the wording is identical, which is
+# exactly why the focus support gate abstains on every Japanese store: measured,
+# "私の名前は？" vs a raw span "私の名前は牧野亮です" scores 0.00 on whole tokens
+# and 1.00 once each run is expanded to character bigrams. Latin is left
+# untouched, so the English path stays byte-for-byte the same.
+_CJK_RX = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+#: Empty drop set: the overlap gate historically applied no query-side filter.
+_EMPTY_DROP = frozenset()
+
+
+def bigram_units(tokens: set) -> set:
+    """The CJK character bigrams of `tokens`, for SUBSTRING matching against a
+    raw excerpt. Empty when no token is CJK, so a Latin query is unchanged."""
+    out = set()
+    for t in tokens:
+        tl = (t or "").lower()
+        if len(tl) > 1 and _CJK_RX.search(tl):
+            out |= {tl[i:i + 2] for i in range(len(tl) - 1)}
+    return out
+
+
+def _cjk_subtokens(tokens):
+    """Expand each multi-character CJK run to character bigrams; pass every
+    other token through unchanged. Latin tokens are therefore identical to
+    their input, which is what keeps the English gate result unchanged."""
+    out = set()
+    for t in tokens:
+        if len(t) > 1 and _CJK_RX.search(t):
+            out |= {t[i:i + 2] for i in range(len(t) - 1)}
+        else:
+            out.add(t)
+    return out
+
+
+def _content_units(text, drop):
+    """The support-comparison units of `text`: a word longer than 3 chars and
+    not in `drop`, EXCEPT any CJK run, which is kept regardless of length and
+    expanded to character bigrams. Japanese words are one to three characters
+    and glued together with no spaces, so the Latin length floor would discard
+    the very token carrying the answer; for text with no CJK this is exactly
+    `{w for w in word_tokens(text) if len(w) > 3 and w not in drop}` — the
+    caller passes `drop` so the query side can keep its own stop set."""
+    out = set()
+    for w in word_tokens((text or "").lower()):
+        if _CJK_RX.search(w):
+            out |= _cjk_subtokens({w})
+        elif len(w) > 3 and w not in drop:
+            out.add(w)
+    return out
 
 
 def _support_text(item):
