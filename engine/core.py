@@ -17,7 +17,7 @@ from pathlib import Path
 try:
     from . import access
     from .capture import CaptureEngine, Reaper
-    from .config import Config
+    from .config import Config, expand_env_refs
     from .curation import CurationWorker
     from .derivation import DerivationEngine
     from .embeddings import get_embedder
@@ -40,7 +40,7 @@ try:
 except ImportError:  # direct module execution / standalone tooling
     import access
     from capture import CaptureEngine, Reaper
-    from config import Config
+    from config import Config, expand_env_refs
     from curation import CurationWorker
     from derivation import DerivationEngine
     from embeddings import get_embedder
@@ -198,12 +198,22 @@ class ChronicleCore:
         This is what makes embeddings/retrieval settings (e.g. a hosted embeddings
         endpoint) actually take effect at runtime, matching embedding_check.py."""
         try:
+            import os
             import yaml
             p = Path(hermes_home) / "config.yaml"
             if p.exists():
                 raw = yaml.safe_load(p.read_text()) or {}
                 mem = raw.get("memory")
                 if isinstance(mem, dict):
+                    mem = expand_env_refs(mem)
+                    # Official env var takes precedence over any YAML value.
+                    env_key = (os.environ.get("CHRONICLE_EMBED_API_KEY") or "").strip()
+                    if env_key:
+                        import copy
+                        mem = copy.deepcopy(mem)
+                        mem.setdefault("embeddings", {})
+                        if isinstance(mem.get("embeddings"), dict):
+                            mem["embeddings"]["api_key"] = env_key
                     return mem
         except Exception as e:
             logger.warning("Chronicle: could not load memory config from %s/config.yaml: %s",

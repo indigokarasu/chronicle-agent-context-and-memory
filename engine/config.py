@@ -12,12 +12,18 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import re
 from typing import Any, Callable
 
 # Env override for the embedding model (§27 embeddings.model). Deliberately wins
 # over file config: eval/CI must be able to pin the deterministic offline embedder
 # on a host whose config says `auto`, without editing anyone's config.yaml.
 EMBED_MODEL_ENV = "CHRONICLE_EMBED_MODEL"
+
+# Env override for the embedding API key (embeddings.api_key). Deliberately wins
+# over file config so a secret can live in the environment / .env instead of in
+# config.yaml. Precedence matches $CHRONICLE_EMBED_MODEL / $CHRONICLE_EMBED_BASE_URL.
+EMBED_API_KEY_ENV = "CHRONICLE_EMBED_API_KEY"
 
 # Support gates selectable via retrieval.abstain_gate — §18.4
 ABSTAIN_GATES = ("score", "overlap", "focus")
@@ -1610,6 +1616,28 @@ def check_abstain_gate(name: str) -> str:
     return name
 
 
+_ENV_REF_RE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env_refs(value: Any) -> Any:
+    """Resolve `${VAR}` / `${env:VAR}` references in config values.
+
+    Hermes normally expands these in config.yaml before handing Chronicle a
+    config dict, but Chronicle re-reads the raw YAML on paths where the host
+    did not pass one. Expand here so secrets can be stored as references
+    (e.g. `${CHRONICLE_EMBED_API_KEY}`) and resolved from the environment at
+    runtime. Missing variables leave the original token in place.
+    """
+    if isinstance(value, str):
+        def _repl(match: re.Match) -> str:
+            return os.environ.get(match.group(1), match.group(0))
+        return _ENV_REF_RE.sub(_repl, value)
+    if isinstance(value, dict):
+        return {k: expand_env_refs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env_refs(v) for v in value]
+    return value
+
 def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (over or {}).items():
@@ -1624,8 +1652,21 @@ class Config:
     """Thin dotted-path accessor over a merged config dict."""
 
     def __init__(self, overrides: dict[str, Any] | None = None):
-        check_refused_keys(overrides or {})
-        self._d = _deep_merge(DEFAULTS, overrides or {})
+        overrides = overrides or {}
+        check_refused_keys(overrides)
+        # $CHRONICLE_EMBED_API_KEY takes precedence over any YAML value, so a
+        # secret can live in the environment without being written into config.
+        env_key = (os.environ.get(EMBED_API_KEY_ENV) or "").strip()
+        if env_key:
+            overrides = copy.deepcopy(overrides)
+            overrides.setdefault("embeddings", {})
+            if not isinstance(overrides.get("embeddings"), dict):
+                overrides["embeddings"] = {}
+            overrides["embeddings"]["api_key"] = env_key
+        # Expand `${VAR}` / `${env:VAR}` references the host would normally
+        # have expanded before handing us a config dict.
+        overrides = expand_env_refs(overrides) or {}
+        self._d = _deep_merge(DEFAULTS, overrides)
         # What the CALLER actually said, kept apart from what DEFAULTS supplies.
         # See `explicit()` for why the difference is load-bearing (A0g).
         self._explicit = copy.deepcopy(overrides) if overrides else {}
