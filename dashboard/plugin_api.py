@@ -57,9 +57,55 @@ def _resolve_version() -> str:
 _VERSION = _resolve_version()
 
 
-def _get_db_path() -> Optional[Path]:
-    """Locate the Chronicle SQLite database."""
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+def _profile_home(profile: Optional[str] = None) -> Path:
+    """Resolve the Hermes profile home for a selected dashboard profile."""
+    base = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    if base.parent.name == "profiles":
+        root = base.parent.parent
+    elif (base / "profiles").is_dir():
+        root = base
+    else:
+        root = base
+    if not profile or profile == "default":
+        return root
+    candidate = root / "profiles" / profile
+    if candidate.is_dir():
+        return candidate
+    return root
+
+
+def _get_db_path(profile: Optional[str] = None) -> Optional[Path]:
+    """Locate the Chronicle SQLite database.
+
+    Honours the active profile's configured ``memory.db_path`` (including the
+    ``~/.hermes`` / profile expansion the runtime applies) and falls back to
+    the legacy locations for compatibility. ``profile`` selects which Hermes
+    profile's configuration is inspected for multi-profile dashboards.
+    """
+    if not isinstance(profile, str):
+        profile = None
+    home = _profile_home(profile)
+    # Configured path first.
+    cfg_path = home / "config.yaml"
+    try:
+        import yaml
+        if cfg_path.exists():
+            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            mem = raw.get("memory") if isinstance(raw, dict) else None
+            if isinstance(mem, dict):
+                db_path_str = mem.get("db_path")
+                if isinstance(db_path_str, str) and db_path_str.strip():
+                    db_path = db_path_str.strip()
+                    # Mirror ChronicleCore's ~/.hermes -> profile home expansion.
+                    if db_path.startswith("~/.hermes"):
+                        db_path = str(Path(home) / db_path[len("~/.hermes"):].lstrip("/"))
+                    p = Path(db_path).expanduser()
+                    if not p.is_absolute():
+                        p = home / p
+                    if p.exists():
+                        return p
+    except Exception:
+        pass
     for rel in ["commons/db/chronicle/chronicle.db", "commons/db/chronicle.db", "chronicle.db"]:
         p = home / rel
         if p.exists():
@@ -309,8 +355,8 @@ def _outstanding_extractions(db_path):
 
 
 @router.get("/status")
-def get_status():
-    db_path = _get_db_path()
+def get_status(profile: Optional[str] = None):
+    db_path = _get_db_path(profile)
     if not db_path:
         return {"plugin": "chronicle", "status": "no_db"}
 
