@@ -336,6 +336,14 @@ host or its private network**:
 | link-local `169.254.0.0/16`, `fe80::/10` | a hostname that will not resolve (**fail closed**) |
 | a `unix:` / `http+unix:` socket URL | a hostname with **any** public answer in its DNS result |
 
+`0.0.0.0` and `::` in the table above are **destinations, not bind
+addresses**: they classify where memory content may be *sent*, and connecting
+to either targets this host. Chronicle opens **no listening socket** — nothing
+in the engine accepts inbound connections — and the dashboard dev harness
+(`dashboard/web/harness/server.py`) binds `127.0.0.1` explicitly. This table
+governs egress of memory-bearing requests, not network exposure: exposure is a
+separate question, answered by your own firewall.
+
 A hostname is resolved **once**, when the client is constructed, and the verdict is
 cached — the embed path itself never does DNS.
 
