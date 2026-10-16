@@ -228,9 +228,51 @@ Requires Hermes Agent with plugin support. Python 3.9+.
 
 ## Configuration
 
-Set in `~/.hermes/config.yaml`:
+Set in `~/.hermes/config.yaml` (single bot) or `~/.hermes/profiles/<name>/config.yaml` (one file per bot in a multi-bot chat).
+
+### What is Chronicle-only vs. standard config
+
+Every key **inside the `memory:` block below is Chronicle-only**. Chronicle reads only that block.
+The host (Hermes Agent) owns the rest of `config.yaml`; Chronicle does not read or change host keys.
+
+- `memory.provider: chronicle` is the **host's** slot selector. Hermes reads it to load this plugin; Chronicle never reads it.
+- Every other key under `memory:` (`db_path`, `embeddings`, `retrieval`, `curation`, …) is Chronicle's own config.
+
+### Where this config belongs
+
+- Single bot / default profile: `~/.hermes/config.yaml`.
+- Per-bot profile: `~/.hermes/profiles/<profile-name>/config.yaml`. Each profile keeps its own database path and schedule, so two bots do not share state.
+
+### Example: two-bot (multi-bot) chat
+
+Bot A (default profile, `~/.hermes/config.yaml`):
 
 ```yaml
+memory:
+  provider: chronicle
+  db_path: ~/.hermes/commons/db/chronicle/bot-a.db
+  embeddings:
+    model: auto
+  retrieval:
+    abstain_gate: focus
+```
+
+Bot B (profile `support`, `~/.hermes/profiles/support/config.yaml`):
+
+```yaml
+memory:
+  provider: chronicle
+  db_path: ~/.hermes/commons/db/chronicle/bot-b.db
+  embeddings:
+    model: auto
+  retrieval:
+    abstain_gate: focus
+```
+
+Both run the same plugin; only `db_path` (and any per-bot overrides) differs, so each bot keeps separate memory.
+
+```yaml
+
 memory:
   provider: chronicle    # the HOST's slot selector — Hermes reads this, not Chronicle
   db_path: ~/.hermes/commons/db/chronicle/chronicle.db
