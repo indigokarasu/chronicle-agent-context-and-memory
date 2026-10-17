@@ -126,7 +126,7 @@ class _ProviderOffline(Exception):
 
 # source_type → memory domain (governs decay/contradiction, §8.4)
 _DOMAIN = {"user_direct": "user", "session_transcript": "user", "rescue_extraction": "user",
-           "agent_memory_write": "agent", "delegation": "agent", "ocas_journal": "user",
+           "agent_memory_write": "agent", "agent_tool_remember": "agent", "delegation": "agent", "ocas_journal": "user",
            "inference": "user"}
 
 
@@ -375,11 +375,11 @@ class CurationWorker:
         # them is left raw-indexed for recall and extracts nothing.
         lines = spk.attribute_lines(p, session_id=ev.get("session_id") or "",
                                     actor=ev.get("actor") or "")
-        if source_type != "agent_memory_write" and not spk.has_human(lines):
+        if source_type not in ("agent_memory_write", "agent_tool_remember") and not spk.has_human(lines):
             self.store.record_extraction(eid, version, {"skipped": "no_human_speaker"}, 0, "skip")
             self._advance_watermark(ev)
             return
-        if source_type == "agent_memory_write":
+        if source_type in ("agent_memory_write", "agent_tool_remember"):
             # An explicit save by the agent (on_memory_write) is the agent's own
             # deliberate record, kept under the agent domain; its text is read as
             # written.

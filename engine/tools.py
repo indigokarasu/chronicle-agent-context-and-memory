@@ -13,6 +13,7 @@ import uuid
 from typing import Any
 
 from . import access
+from .config import INFERENCE_TRUST
 from . import speaker as _spk
 from .reducer import _normalize_value as _norm_fact_value
 
@@ -186,12 +187,12 @@ class Tools:
         # is the DESIRED behavior (no contradiction policy applies to them), and it is what
         # keeps N identical non-fact remembers deduping onto one belief_id / one search hit.
         source_event = f"tool_remember_{uuid.uuid4().hex}" if kind == "fact" else "tool"
-        payload = {"kind": kind, "key": key, "body": content, "confidence": 0.9,
-                  "source_event": source_event, "source_type": "agent_memory_write",
+        payload = {"kind": kind, "key": key, "body": content,
+                  "source_event": source_event, "source_type": "agent_tool_remember",
                   "salience": a.get("salience", "normal")}
         if kind == "fact":
             payload["domain"] = "user"
-        eid = self._emit("asserted", payload, principal, actor="agent", trust_level=3)
+        eid = self._emit("asserted", payload, principal, actor="agent", trust_level=INFERENCE_TRUST)
 
         if conflicting_belief_id:
             return {"status": "conflict_recorded", "event": eid,

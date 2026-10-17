@@ -76,6 +76,23 @@ run automatically. The agent receives memory tools including `chronicle_remember
 `chronicle_search`, `chronicle_answer`, `chronicle_explain`, `chronicle_correct`,
 and `chronicle_forget`.
 
+### Migrating memories between profiles
+
+Chronicle stores durable memory in a local SQLite database at
+`~/.hermes/commons/db/chronicle/chronicle.db`. There is no migration step:
+a fresh install creates a new store, and equipped profiles read the same
+store. To move memories to a new machine or fresh install:
+
+1. Stop the running hermes session.
+2. Copy `~/.hermes/commons/db/chronicle/chronicle.db` to the same path on
+   the new machine (keep the default location so the default profile reads it).
+3. Restart hermes and verify with `/chronicle`.
+
+`SOUL.md`, `USER.md`, and `MEMORY.md` are separate files of the session and
+memory layer — they are not part of, or migrated by, Chronicle. There is no
+reverse migration from Chronicle to the old default hermes memory handler;
+conversation history can only be re-read from its original source.
+
 ### Embeddings and graceful degradation
 
 Embeddings default to `auto`: Chronicle checks local OpenAI-compatible servers

@@ -322,6 +322,7 @@ CONFIDENCE_BASE = {
     "user_direct": 0.85,
     "session_transcript": 0.70,
     "agent_memory_write": 0.85,
+    "agent_tool_remember": 0.60,
     "ocas_journal": 0.70,
     "tool_output": 0.50,
     "web_retrieval": 0.40,
