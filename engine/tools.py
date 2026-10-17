@@ -202,12 +202,12 @@ class Tools:
 
     def _t_correct(self, principal, a):
         self._emit("corrected", {"belief_id": a["belief_id"], "new_body": a.get("new_value"),
-                                 "reason": a.get("reason", "user_correction")}, principal, actor="user")
+                                 "reason": a.get("reason", "agent_correct")}, principal, actor="agent")
         return {"status": "corrected"}
 
     def _t_forget(self, principal, a):
-        self._emit("retracted", {"belief_id": a["belief_id"], "reason": a.get("reason", "user_request")},
-                   principal, actor="user")
+        self._emit("retracted", {"belief_id": a["belief_id"], "reason": a.get("reason", "agent_forget")},
+                   principal, actor="agent")
         return {"status": "retracted"}
 
     def _t_withdraw_consent(self, principal, a):
