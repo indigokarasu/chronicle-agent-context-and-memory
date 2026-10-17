@@ -380,7 +380,7 @@ def _parse_time_window(text, now=None):
 # and include notes the agent has since removed. So the injection into a user's
 # turn -- memory about the USER -- leaves them out: the agent's memory and the
 # user's are kept distinct. Explicit search still finds them.
-_AGENT_OWN_SOURCES = frozenset({"agent_memory_write"})
+_AGENT_OWN_SOURCES = frozenset({"agent_memory_write", "agent_tool_remember"})
 
 # Never injected unasked, for the same reason: not memory about the USER. The
 # agent's own memory writes, and (Phase C) the lines a compaction distilled
