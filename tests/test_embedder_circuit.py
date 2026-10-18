@@ -236,7 +236,7 @@ class TestATurnDoesNotWaitOnADownServer(unittest.TestCase):
         for eid in ids:
             ex = _json.loads(self.core.store.get_event(eid)["payload"])["excerpt"]
             self.core.store.enqueue_embed_job(eid, "observed", ex)
-        self.emb = _embedder(cooldown=0.05)
+        self.emb = _embedder(cooldown=3.0)
         self.core.embedder = self.emb
 
     def test_a_turn_costs_at_most_one_budget(self):
@@ -257,7 +257,7 @@ class TestATurnDoesNotWaitOnADownServer(unittest.TestCase):
         c = self.core.store._conn()
         c.execute("UPDATE curation_jobs SET run_after=NULL WHERE task='embed'")   # job backoff over
         c.commit()
-        time.sleep(0.08)                                                           # circuit cooldown over
+        time.sleep(3.1)                                                           # circuit cooldown over
         self.core.tick()
         self.assertEqual(self.emb._embed_raw.calls - first, 1, "half-open: exactly one real try")
 
