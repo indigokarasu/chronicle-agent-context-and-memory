@@ -315,7 +315,11 @@ memory:
                          # grows with the corpus. 'sqlite-vec' opts into the ANN fast path,
                          # which needs `pip install sqlite-vec` AND a sqlite3 built with
                          # loadable-extension support (Apple's macOS system Python has
-                         # neither). Missing either — or a vec0 left over at a different
+                         # neither). The PyPI `sqlite-vec` package tracks the original
+                         # asg017/sqlite-vec, which is unmaintained; the community-maintained
+                         # fork vlasky/sqlite-vec is an alternative
+                         # (`pip install git+https://github.com/vlasky/sqlite-vec.git`).
+                         # Missing either — or a vec0 left over at a different
                          # embedding width — falls back to the paged scan on its own. The
                          # top-k is the same either way; only the time to get it changes.
   maintenance:            # the in-process cadence; see "Maintenance runs on
