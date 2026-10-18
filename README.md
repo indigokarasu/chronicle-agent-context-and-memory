@@ -715,6 +715,8 @@ is which Hermes extension points a system owns and what must run behind it.
 | Mem0 | ✓ | — | Every turn | ✓ |
 | Hindsight | ✓ | — | Default on | Default on |
 | Graphiti | — | — | MCP/custom | MCP/custom |
+| Mnemosyne | ✓ | — | Every turn | ✓ |
+| Limbic | ✓ | — | Agent-directed | ✓ |
 
 **Auto-capture** means Hermes stores completed turns without the model choosing a
 tool. **Auto-recall** means memory is added to turn context automatically, not
@@ -729,6 +731,8 @@ merely exposed through a search tool.
 | Mem0 | Mem0 Platform | — | Search, add, update, delete |
 | Hindsight | Hindsight Cloud | — | Retain, recall, reflect |
 | Graphiti | No provider | — | MCP episode/graph tools |
+| Mnemosyne | Local SQLite | — | remember, recall, search |
+| Limbic | Local SQLite | — | remember, recall |
 
 Among these systems, Chronicle alone fills both the Hermes memory-provider and
 context-engine slots. Its context engine rescues valuable spans into durable
