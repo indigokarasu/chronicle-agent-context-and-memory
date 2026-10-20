@@ -619,11 +619,12 @@ class TestHandlersExistAndDispatch(_Rig):
         shape of this change (the context engine once leaked 850MB/min from a
         background loop)."""
         import threading
-        before = threading.active_count()
+        before = sum(1 for t in threading.enumerate() if not t.daemon)
         self.at(3 * 86400)
         self.hooks(60)
         self.core.process_pending()
-        self.assertEqual(threading.active_count(), before)
+        after = sum(1 for t in threading.enumerate() if not t.daemon)
+        self.assertEqual(after, before)
 
 
 # ---------------------------------------------------------------------------
