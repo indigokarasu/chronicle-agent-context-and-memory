@@ -291,7 +291,7 @@ memory:
   embeddings:
     model: auto
   retrieval:
-    abstain_gate: focus
+    abstain_gate: focus         # retrieval abstain threshold mode
 ```
 
 Bot B (profile `support`, `~/.hermes/profiles/support/config.yaml`):
@@ -328,7 +328,7 @@ memory:
     model: auto          # auto-detect the local server's embedding model; or pin an id, or 'hashing'
                          # for offline vectors. Unreachable = degraded (queued embeds), never hashed.
                          # $CHRONICLE_EMBED_MODEL overrides this.
-    dimensions: 768
+    dimensions: 768            # vector size; match your embedder model
     allow_remote: false  # permission to send memory excerpts OFF this host. See "Where memory
                          # is allowed to go" below. Leave false unless you mean it.
   extraction:
@@ -352,21 +352,21 @@ memory:
   reaper:
     enabled: true        # false stops the idle-session reaper and its startup recovery
     schedule: "*/5 * * * *"   # 5-field cron, UTC; "" disables
-    idle_threshold: "20m"
-    reap_threshold: "45m"
+    idle_threshold: "20m"       # mark session idle after this
+    reap_threshold: "45m"       # finalize idle sessions after this
   retrieval:
-    fts_weight: 0.4
-    vector_weight: 0.6
-    rrf_k: 60
-    rerank_blend: 0.5
+    fts_weight: 0.4            # FTS5 score weight in hybrid retrieval
+    vector_weight: 0.6          # vector score weight in hybrid retrieval
+    rrf_k: 60                  # reciprocal rank fusion constant
+    rerank_blend: 0.5           # blend weight for the reranker
     abstain_gate: focus
     include_drafts: true  # drafts are rendered [DRAFT], not hidden; false shows
                           # only confirmed truth. Read at the one _readable gate.
   context:
     breadth_floor: true          # reserve room for N sessions in the ranked fill
-    breadth_floor_sessions: 5
+    breadth_floor_sessions: 5  # distinct sessions reserved in ranked fill
   forgetting:
-    decay_schedule: "0 3 * * *"
+    decay_schedule: "0 3 * * *" # daily 03:00 UTC fidelity decay sweep
   identity:
     schedule: "0 5 * * *"   # exact-name sweep: proposes merge CANDIDATES only
   health:
@@ -374,7 +374,7 @@ memory:
     consistency_sweep:
       enabled: true
       schedule: "0 * * * *"
-    census_total_max_age_hours: 24
+    census_total_max_age_hours: 24  # cache age for vector count census
     self_heal:
       embedder_mismatch_max: 500  # vectors ONE health run may requeue to re-embed
   confidence:
@@ -388,11 +388,11 @@ memory:
   curation:
     drain:
       per_turn: 16       # split across task classes by the three share_* weights
-      share_write_path: 0.5
-      share_embed: 0.3
-      share_maintenance: 0.2
+      share_write_path: 0.5       # weight for write-path jobs
+      share_embed: 0.3            # weight for deferred vector writes
+      share_maintenance: 0.2      # weight for sweeps and repair
     sweep_schedule: "0 * * * *"   # hourly session-index backfill for ended sessions
-    lease_seconds: 900   # a 'running' job older than this is treated as abandoned
+    lease_seconds: 900         # a running job older than this is abandoned
     max_attempts: 20
     retention:
       enabled: true      # prune terminal job rows; false accepts unbounded growth
