@@ -249,6 +249,20 @@ hermes plugins install indigokarasu/chronicle-agent-context-and-memory
 
 Requires Hermes Agent with plugin support. Python 3.9+.
 
+### Optional: sqlite-vec (faster vector search)
+
+Chronicle works without it (bruteforce scan). To enable the ANN fast path:
+
+```bash
+# Install into the Hermes agent runtime venv — once per machine, not per profile:
+~/.hermes/hermes-agent/.venv/bin/pip install sqlite-vec
+# or the community fork:
+~/.hermes/hermes-agent/.venv/bin/pip install git+https://github.com/vlasky/sqlite-vec.git
+```
+
+Verify: `~/.hermes/hermes-agent/.venv/bin/python -c "import sqlite_vec; print(sqlite_vec.__version__)"`.
+Requires a sqlite3 build with loadable-extension support (Apple's macOS system Python lacks it). If unavailable, Chronicle falls back to bruteforce automatically.
+
 ## Configuration
 
 Set in `~/.hermes/config.yaml` (single bot) or `~/.hermes/profiles/<name>/config.yaml` (one file per bot in a multi-bot chat).
@@ -293,6 +307,16 @@ memory:
 ```
 
 Both run the same plugin; only `db_path` (and any per-bot overrides) differs, so each bot keeps separate memory.
+
+> **Where the paths land.** `~/.hermes` in any `db_path` / `git_repo` value is expanded to the **active profile's home** (`$HERMES_HOME`), so the same literal `~/.hermes/commons/db/chronicle/...` resolves to `~/.hermes/commons/...` for the default profile and to `~/.hermes/profiles/<name>/commons/...` for a named profile. Do **not** write `~/.hermes/profiles/<name>/...` by hand — it would be expanded twice and point at the wrong place. Keep the canonical `~/.hermes/...` form in every profile's config.
+
+> **Installing per profile.** The plugin is installed into the agent runtime, but each profile must register it:
+>
+> ```bash
+> hermes -p <profile> plugins install indigokarasu/chronicle-agent-context-and-memory
+> hermes -p <profile> memory setup chronicle
+> ```
+> Then restart the gateways (`hermes gateway start`, and `hermes -p <profile> gateway start` for each profile).
 
 ```yaml
 
