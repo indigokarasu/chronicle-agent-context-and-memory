@@ -217,9 +217,11 @@ def _claimed_by_other_profile(legacy: str, home: str) -> str:
     for h in homes:
         if _same_real(h, home):
             continue
-        cfg = _read_yaml(os.path.join(h, "config.yaml"))
-        mem = cfg.get("memory") if isinstance(cfg.get("memory"), dict) else {}
-        ctx = cfg.get("context") if isinstance(cfg.get("context"), dict) else {}
+        # The host's whole config file, not Chronicle's Config: its `memory`
+        # and `context` sections say whether that profile runs Chronicle.
+        host_yaml = _read_yaml(os.path.join(h, "config.yaml"))
+        mem = host_yaml.get("memory") if isinstance(host_yaml.get("memory"), dict) else {}
+        ctx = host_yaml.get("context") if isinstance(host_yaml.get("context"), dict) else {}
         if mem.get("provider") != "chronicle" and ctx.get("engine") != "chronicle":
             continue
         try:
