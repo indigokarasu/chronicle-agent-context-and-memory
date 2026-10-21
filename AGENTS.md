@@ -26,9 +26,11 @@ The codebase is split into plugin adapters at the root level and the core subsys
 - **`derivation.py` (`DerivationEngine`)**: Guarded compositional inference and Truth Maintenance System (TMS).
 - **`forgetting.py` (`ForgettingEngine`)**: Asymmetric decay, fidelity ladder degradation, and unlearning.
 - **`tools.py` (`Tools`)**: Exposes agent-facing tools (`chronicle_remember`, `chronicle_search`, `chronicle_answer`, `chronicle_forget`, `chronicle_get_context`, etc.).
-- **`vector_index.py` (`VectorIndex`)**: Dual-mode vector store (SQLite brute-force or `sqlite-vec` ANN extension).
 - **`embeddings.py`**: Pluggable embedding providers (`auto`, `hashing`, OpenAI-compatible local server, `DegradedEmbedder`).
 - **`config.py` (`Config`)**: Default settings reference and hierarchical parameter lookup.
+- **`paths.py`**: The one place the Hermes home and the store and git-mirror paths are resolved (`resolve_home`, `expand_data_path`, `readable_db_path`). It also keeps the path rules of earlier releases verbatim (`legacy_db_path`, `legacy_git_path`) so migration can find the old files. Stdlib only; the dashboard loads it by path.
+- **`migrate_paths.py`**: Moves a store or git mirror that an earlier release left at another path (`settle_db_path`, `settle_git_repo`). It never raises, leaves the store where it was when a move is not safe, and records each move in `chronicle-migration.json` next to the new store.
+- **`yaml_load.py`**: Reads YAML with PyYAML, or with ruamel.yaml when PyYAML is absent, and says plainly when neither is available. Every YAML read in `engine/`, `dashboard/` and `scripts/` goes through it.
 
 ---
 

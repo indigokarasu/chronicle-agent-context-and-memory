@@ -17,13 +17,12 @@ import os
 import sqlite3
 import sys
 
-import yaml
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import mentions          # noqa: E402
 from engine.config import Config     # noqa: E402
 from engine.paths import DB_REL, readable_db_path, resolve_home   # noqa: E402
+from engine.yaml_load import safe_load_file   # noqa: E402
 
 SHARED_LIMIT = 5   # an identifier shared by more people than this is reported, not paired
 
@@ -49,8 +48,7 @@ def parse_args():
     # A config that was named must exist. The home's own may be absent (a fresh
     # install has none yet), and the defaults then apply.
     if a.config or os.path.exists(config_path):
-        with open(config_path) as f:
-            a.memory = (yaml.safe_load(f) or {}).get("memory") or {}
+        a.memory = (safe_load_file(config_path) or {}).get("memory") or {}
     a.config = config_path
     if not a.db:
         a.db = readable_db_path(Config(a.memory).get("db_path"), a.home)

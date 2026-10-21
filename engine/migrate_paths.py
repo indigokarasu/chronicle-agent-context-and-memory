@@ -31,16 +31,22 @@ from typing import Callable, List, Optional
 
 try:
     from .paths import DB_REL, expand_data_path, has_data, profile_root
+    from .yaml_load import safe_load_file
 except Exception:  # standalone tooling / pytest from the repo root
     from paths import DB_REL, expand_data_path, has_data, profile_root
+    from yaml_load import safe_load_file
 
 logger = logging.getLogger("chronicle.migrate")
 
 #: The journal the store moves are recorded in, next to the new store.
 MARKER_NAME = "chronicle-migration.json"
 
-#: Meta key holding the realpath of the mirror this store's events were queued for.
+#: Meta key naming the mirror this store's events were queued for (see
+#: `_mirror_marker` for its two forms).
 GIT_META_KEY = "git_mirror_repo"
+
+#: Prefix of a mirror marker written relative to the profile home.
+HOME_PREFIX = "home:"
 
 #: How long to wait for another process to let go of the old store before
 #: deferring. Start-up has a 5 s budget; this is the one wait the move adds.
@@ -158,14 +164,31 @@ def _remove(path: str) -> None:
 
 def _read_yaml(path: str) -> dict:
     try:
-        import yaml  # type: ignore
-        with open(path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+        data = safe_load_file(path) or {}
         return data if isinstance(data, dict) else {}
     except Exception:
         # A config that cannot be read cannot run Chronicle either, so it
         # cannot be a profile using the store.
         return {}
+
+
+def _mirror_marker(repo: str, home: Optional[str]) -> str:
+    """How the store records which mirror its events were queued for.
+
+    A mirror inside the profile home is recorded relative to the home's
+    realpath, as `home:<relative path>`; anywhere else, as its realpath. An
+    absolute path to the home put the home's own location into the store, so
+    the same profile at another path (a copied or restored home, or a fresh
+    temporary home per run) wrote a different store, and every start there
+    took the mirror for a new one and queued every event for it again.
+    """
+    target = os.path.realpath(repo)
+    if home:
+        base = os.path.realpath(home)
+        if target.startswith(base.rstrip(os.sep) + os.sep):
+            rel = target[len(base.rstrip(os.sep)) + 1:]
+            return HOME_PREFIX + rel.replace(os.sep, "/")
+    return target
 
 
 def _claimed_by_other_profile(legacy: str, home: str) -> str:
@@ -513,18 +536,20 @@ def _move(new: str, legacy: str, resume: bool) -> MigrationResult:
 # -- the git mirror -----------------------------------------------------------
 
 def settle_git_repo(new_repo: str, legacy_repo: str, store, *, enabled: bool,
-                    remote: Optional[str]) -> MigrationResult:
+                    remote: Optional[str], home: Optional[str] = None) -> MigrationResult:
     """Point this store at its own mirror, queuing all of its events for it once.
 
     Never raises. The mirror is always used at `new_repo`; the old shared
     mirror is never touched, because it may hold other profiles' events.
+    `home` is the profile home; a mirror inside it is recorded relative to it
+    (see `_mirror_marker`).
     """
     try:
         new = os.path.abspath(os.fspath(new_repo))
         legacy = os.path.abspath(os.fspath(legacy_repo)) if legacy_repo else ""
         if not enabled or (legacy and _same_real(new, legacy)):
             return MigrationResult("none", new)
-        target = os.path.realpath(new)
+        target = _mirror_marker(new, home)
         if store.get_meta(GIT_META_KEY) == target:
             return MigrationResult("none", new)
         try:

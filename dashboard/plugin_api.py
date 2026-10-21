@@ -56,28 +56,37 @@ def _resolve_version() -> str:
 _VERSION = _resolve_version()
 
 
-def _load_paths():
-    """`engine/paths.py`, loaded by file path.
+def _load_engine_module(name: str):
+    """`engine/<name>.py`, loaded by file path.
 
-    The Hermes home and the data paths are worked out in that one module, so the
-    dashboard and the runtime cannot disagree about which store a profile uses.
     It is read by path for the same reason `_resolve_version` reads plugin.yaml
     by path: this file is mounted without a parent package, and importing the
     engine package would run its whole import chain (and, by putting the plugin
     root on ``sys.path``, shadow generically named modules for the dashboard
-    process). `paths.py` imports nothing from the plugin, so loading it alone is
-    safe.
+    process). Only modules that import nothing from the plugin are loaded this
+    way, so loading one alone is safe.
     """
     import importlib.util
 
-    path = Path(__file__).resolve().parent.parent / "engine" / "paths.py"
-    spec = importlib.util.spec_from_file_location("chronicle_dashboard_paths", str(path))
+    path = Path(__file__).resolve().parent.parent / "engine" / ("%s.py" % name)
+    spec = importlib.util.spec_from_file_location("chronicle_dashboard_%s" % name, str(path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+def _load_paths():
+    """`engine/paths.py`: the Hermes home and the data paths are worked out in
+    that one module, so the dashboard and the runtime cannot disagree about
+    which store a profile uses."""
+    return _load_engine_module("paths")
+
+
 _paths = _load_paths()
+# The profile's config.yaml is read the way the runtime reads it: a host
+# install with ruamel.yaml and no PyYAML would otherwise show the default
+# store instead of the configured one.
+_yaml = _load_engine_module("yaml_load")
 
 
 def _profile_home(profile: Optional[str] = None) -> Path:
@@ -115,9 +124,8 @@ def _get_db_path(profile: Optional[str] = None) -> Optional[Path]:
     configured = None
     cfg_path = home / "config.yaml"
     try:
-        import yaml
         if cfg_path.exists():
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            raw = _yaml.safe_load_file(cfg_path) or {}
             mem = raw.get("memory") if isinstance(raw, dict) else None
             if isinstance(mem, dict):
                 value = mem.get("db_path")

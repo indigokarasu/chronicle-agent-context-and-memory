@@ -3,6 +3,29 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## 5.12.0
+
+**Profile paths follow the active profile, and the sqlite-vec backend is removed.**
+
+**Fixed**
+
+- **Profile paths (#53, #56).** `db_path` and `git_repo` resolve against the active profile's home. An absolute `db_path` is honoured; it used to be ignored and the store went to the default location. A `~/.hermes/profiles/<name>/...` value no longer names the profile twice. The git mirror belongs to the profile; it used to be shared by every profile. The dashboard, the scripts, and the context engine (when Hermes starts it without a home) use the same rules.
+- **`config.yaml` without PyYAML (#57).** On a package-managed Hermes install with no PyYAML in its environment, Chronicle could not read the `memory:` section and silently ran on defaults. It now reads the file with PyYAML, or with the ruamel.yaml parser that Hermes ships when PyYAML is absent. If neither parser can be imported, it logs one warning that names the file and runs on defaults.
+
+**Removed**
+
+- **sqlite-vec.** The `vector_index.py` backend and the ANN fast path are gone, with their tests. Chronicle needs no extra Python packages; vector search uses an in-memory cache over the stored vectors. `vector_index.backend: sqlite-vec` is ignored and logs one warning at start. A `vec0` table that an earlier release left in a store is neither read nor written. If sqlite-vec was installed for an earlier version, it can be uninstalled.
+
+**Added**
+
+- **`scripts/recall_check.py` (#58).** A read-only report of where a profile's store is and what it holds (`--profile NAME`), and `--canary`, which checks that Chronicle alone recalls a fact in a new session with Hermes' own memory files switched off. The README section "Check that it works" describes both.
+
+**Migration**
+
+- On the first start with 5.12.0, a store that an earlier release left at a path the config does not name is moved to the configured path, when that is safe. On the same disk the file is moved and the old name becomes a symlink to it. Across disks the store is copied and checked, and the original is kept at `<old name>.migrated-<time>`. Each move is appended to `chronicle-migration.json` next to the new store.
+- The git mirror is per profile. On its first start, the profile's events are queued once for its own mirror. The old shared mirror is left in place, with a warning. If `git_remote` is set, a warning says the new mirror's history no longer matches that remote.
+- Nothing moves, and the log says why, when another process has the store open (the move is retried at the next start) or when both the configured location and the old one hold data. In the second case Chronicle keeps opening the old location, as before, and logs one warning that says how to choose.
+
 ## 5.11.1
 
 **The Tapestry is removed.** The dashboard's memory navigator did not work and is gone:

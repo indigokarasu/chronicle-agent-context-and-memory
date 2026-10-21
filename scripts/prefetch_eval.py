@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from engine.core import ChronicleCore
 from engine.embeddings import NullProbe
 from engine.paths import readable_db_path, resolve_home
+from engine.yaml_load import safe_load_file
 
 # F1b: NullProbe (the default below) forces DegradedEmbedder, so every
 # relevance-gate item with no vector is kept as "no vector" rather than
@@ -149,8 +150,7 @@ def _load_memory_config(config_path: str) -> dict:
     """Same shape `ChronicleCore._load_memory_config` reads from a live
     `config.yaml`: a top-level `memory:` section. A bare memory-shaped mapping
     (no `memory:` wrapper) is accepted too, for a hand-written eval config."""
-    import yaml
-    raw = yaml.safe_load(Path(config_path).read_text()) or {}
+    raw = safe_load_file(config_path) or {}
     if not isinstance(raw, dict):
         return {}
     mem = raw.get("memory")
