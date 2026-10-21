@@ -133,13 +133,15 @@ def _patched_home(tag: str):
     """Context manager patching context.Path.home() to a disposable tempdir.
 
     compress()'s never-started lazy-init path (R1) resolves its default
-    hermes_home via context._default_hermes_home() -> Path.home() / ".hermes"
-    -- correctly expanded, unlike the pre-fix literal "~/.hermes" that
-    resolved relative to cwd. Tests exercising that exact bare-engine
-    codepath must not let it write a real, persistent SQLite store into the
-    developer's actual $HOME while the suite runs; patching Path.home() for
-    the duration keeps the test hitting the real default-resolution logic
-    without touching anything outside a tempdir this test owns.
+    hermes_home via context._default_hermes_home() -> engine/paths.resolve_home:
+    the host's answer, else $HERMES_HOME (the suite pins it to a sandbox), else
+    Path.home() / ".hermes" -- correctly expanded, unlike the pre-fix literal
+    "~/.hermes" that resolved relative to cwd. Tests exercising that exact
+    bare-engine codepath must not let it write a real, persistent SQLite store
+    into the developer's actual $HOME while the suite runs; patching
+    Path.home() (the shared pathlib class, so engine/paths sees it too) covers
+    that last fallback without touching anything outside a tempdir this test
+    owns.
     """
     tmp_home = Path(temp_home(prefix=f"chronicle_fidelity_{tag}_home_"))
     return mock.patch("context.Path.home", return_value=tmp_home)
