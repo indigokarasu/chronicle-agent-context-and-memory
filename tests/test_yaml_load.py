@@ -29,7 +29,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import yaml as _pyyaml  # the suite's own dependency; hidden per test below
 
 from _dashboard_loader import _load
 from _tmp_support import temp_home
@@ -38,6 +37,12 @@ from engine import yaml_load
 from engine.core import ChronicleCore
 from engine.embeddings import NullProbe
 from engine.paths import DB_REL
+
+try:
+    import yaml as _pyyaml  # hidden per test below; the stand-in ruamel parses with it
+except ImportError:  # CI installs only pytest and the package: no PyYAML there
+    _pyyaml = None
+_NEEDS_PYYAML = unittest.skipIf(_pyyaml is None, "PyYAML is not installed for this Python")
 
 _ROOT = Path(__file__).parent.parent
 
@@ -178,6 +183,7 @@ class _Home(unittest.TestCase):
             fh.write(CONFIG)
 
 
+@_NEEDS_PYYAML
 class TestPyYamlPresent(_Home):
     def test_pyyaml_is_used_and_reads_like_safe_load(self):
         self.assertEqual(yaml_load.parser_name(), "pyyaml")
@@ -200,6 +206,7 @@ class TestPyYamlPresent(_Home):
         self.assertIsNone(yaml_load.safe_load_text(""))
 
 
+@_NEEDS_PYYAML
 class TestRuamelOnly(_Home):
     def test_ruamel_is_used_with_the_safe_pure_loader_reading_yaml_1_1(self):
         patch, made = _only_ruamel()
@@ -296,6 +303,7 @@ class TestNoParser(_Home):
                                                      "custom.db")))
 
 
+@_NEEDS_PYYAML
 @unittest.skipUnless(_real_ruamel(), "ruamel.yaml is not installed for this Python")
 class TestRealRuamel(_Home):
     def test_real_ruamel_reads_the_profile_config_as_pyyaml_does(self):

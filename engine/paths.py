@@ -183,33 +183,44 @@ def _in_wal_mode(path: str) -> bool:
     return head[:16] == _SQLITE_MAGIC and head[18:20] == b"\x02\x02"
 
 
+def connect_readonly(db_path: PathLike, timeout: float = 5.0) -> sqlite3.Connection:
+    """A read-only connection to an existing, non-empty SQLite file that creates nothing.
+
+    Raises OSError for a missing or empty file (a plain `sqlite3.connect` would
+    make an empty database there) and sqlite3.Error when SQLite refuses the open.
+    """
+    p = os.path.abspath(os.fspath(db_path))
+    if not os.path.isfile(p):
+        raise FileNotFoundError(p)
+    if os.path.getsize(p) <= 0:
+        raise OSError("empty file: %s" % p)
+    query = "?mode=ro"
+    # A WAL store closed cleanly keeps no -wal or -shm on standard builds,
+    # and a copy of the main file alone has none either. A read-only open
+    # then fails where it may not create the -shm (macOS's system SQLite, a
+    # read-only directory), so a probe said "no data" and the migration opened
+    # an empty store at the new path; elsewhere (Linux, Homebrew) it worked but
+    # left a -wal and a -shm behind. With no -wal the main file holds every
+    # committed transaction, so `immutable` reads it exactly and creates nothing.
+    # Only then: a -wal can hold rows the main file lacks, and a file in
+    # rollback mode may be mid-write, which only the locked read waits out.
+    if _in_wal_mode(p) and not os.path.lexists(p + "-wal"):
+        query += "&immutable=1"
+    # Quoted: `?`, `#` and `%` in a file name would otherwise be read as
+    # URI syntax and the open would land on a different (new) file.
+    uri = "file:" + quote(p, safe="/") + query
+    return sqlite3.connect(uri, uri=True, timeout=timeout)
+
+
 def has_data(db_path: PathLike) -> bool:
     """True only for a SQLite file whose `events` table holds at least one row.
 
-    Never creates a file: a plain `sqlite3.connect` makes an empty database at
-    a missing path, and an empty file at the new location would then look like
-    a store that is already there. Any error is False.
+    Never creates a file (see `connect_readonly`): an empty file at the new
+    location would otherwise look like a store that is already there. Any
+    error is False.
     """
     try:
-        p = os.path.abspath(os.fspath(db_path))
-        if not os.path.isfile(p) or os.path.getsize(p) <= 0:
-            return False
-        query = "?mode=ro"
-        # A WAL store closed cleanly keeps no -wal or -shm on standard builds,
-        # and a copy of the main file alone has none either. A read-only open
-        # then fails where it may not create the -shm (macOS's system SQLite, a
-        # read-only directory), so this said "no data" and the migration opened
-        # an empty store at the new path; elsewhere it worked but left a -wal
-        # and a -shm behind. With no -wal the main file holds every committed
-        # transaction, so `immutable` reads it exactly and creates nothing.
-        # Only then: a -wal can hold rows the main file lacks, and a file in
-        # rollback mode may be mid-write, which only the locked read waits out.
-        if _in_wal_mode(p) and not os.path.lexists(p + "-wal"):
-            query += "&immutable=1"
-        # Quoted: `?`, `#` and `%` in a file name would otherwise be read as
-        # URI syntax and the open would land on a different (new) file.
-        uri = "file:" + quote(p, safe="/") + query
-        conn = sqlite3.connect(uri, uri=True)
+        conn = connect_readonly(db_path)
     except Exception:
         return False
     try:

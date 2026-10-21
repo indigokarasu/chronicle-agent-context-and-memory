@@ -38,12 +38,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from _dashboard_loader import _load
-from _tmp_support import temp_home
+from _tmp_support import has_yaml_parser, temp_home
+
 
 from engine import cache_map, curation, localdb
 from engine.config import Config
 from engine.paths import DB_REL
 from engine.store import MemoryStore, now_iso
+
+_NEEDS_YAML = unittest.skipUnless(has_yaml_parser(), "no YAML parser (PyYAML or ruamel.yaml) in this Python")
 
 _ROOT = Path(__file__).parent.parent
 _PLUGIN_API = _ROOT / "dashboard" / "plugin_api.py"
@@ -171,6 +174,7 @@ class TestDashboardHome(_ProfileCase):
             self.assertEqual(mod._profile_home("p"), Path(self.profile))
 
 
+@_NEEDS_YAML
 class TestDashboardStore(_ProfileCase):
     def test_picks_the_profiles_store_not_the_roots(self):
         _make_db(os.path.join(self.root, DB_REL), rows=3)
@@ -418,6 +422,7 @@ class _ScriptCase(_ProfileCase):
         return rc, out.getvalue()
 
 
+@_NEEDS_YAML
 class TestScriptConfigHome(_ScriptCase):
     """`load_config` reads the host's home, with HERMES_HOME unset."""
 
@@ -476,6 +481,7 @@ class TestMigrateVectorsStore(_ScriptCase):
         self.assertFalse(os.path.exists(self.profile_db))
 
 
+@_NEEDS_YAML
 class TestBuildCacheMap(_ScriptCase):
     def test_no_arguments_builds_the_active_homes_map(self):
         _make_store(self.profile_db)
@@ -535,6 +541,7 @@ class TestBuildCacheMap(_ScriptCase):
         self.assertFalse(os.path.exists(os.path.join(self.profile, _CACHE_REL)))
 
 
+@_NEEDS_YAML
 class TestBuildMentions(_ScriptCase):
     def test_no_arguments_reads_the_active_homes_store(self):
         _make_store(self.profile_db)
@@ -598,6 +605,7 @@ class TestBuildMentions(_ScriptCase):
         self.assertFalse(os.path.exists(self.profile_db))
 
 
+@_NEEDS_YAML
 class TestPrefetchEval(_ScriptCase):
     def test_a_bare_run_evaluates_the_active_home(self):
         mod = _load_script("prefetch_eval")

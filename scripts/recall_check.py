@@ -48,7 +48,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-from urllib.parse import quote
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -58,6 +57,7 @@ from engine.core import ChronicleCore
 from engine.embeddings import VECTOR_TABLES
 from engine.migrate_paths import MARKER_NAME
 from engine.paths import (
+    connect_readonly,
     DB_REL,
     GIT_REL,
     expand_data_path,
@@ -202,10 +202,8 @@ def _open_ro(path: str) -> Tuple[Optional[sqlite3.Connection], str]:
     Never creates anything: a missing or empty file is refused before SQLite
     sees it, and the URI says `mode=ro`.
 
-    A store whose last connection closed cleanly has no `-wal` or `-shm`, and a
-    read-only open cannot make the `-shm` it needs, so SQLite refuses it. With
-    no `-wal` on disk the main file holds every committed transaction, and an
-    `immutable` read of it is exact, so that is tried second.
+    A store whose last connection closed cleanly has no `-wal` or `-shm`; it is
+    read `immutable`, which is exact then and creates no sidecar files.
     """
     p = os.path.abspath(path)
     try:
@@ -215,23 +213,19 @@ def _open_ro(path: str) -> Tuple[Optional[sqlite3.Connection], str]:
             return None, "the file is empty"
     except OSError as e:
         return None, str(e)
-    base = "file:" + quote(p, safe="/") + "?mode=ro"
-    attempts = [base]
-    if not os.path.lexists(p + "-wal"):
-        attempts.append(base + "&immutable=1")
-    first = ""
-    for uri in attempts:
-        conn = None
-        try:
-            conn = sqlite3.connect(uri, uri=True, timeout=2)
-            conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
-            return conn, ""
-        except sqlite3.Error as e:
-            first = first or str(e)
-            if conn is not None:
-                with contextlib.suppress(sqlite3.Error):
-                    conn.close()
-    return None, first
+    # One rule for every read-only open (engine/paths.connect_readonly): on
+    # standard SQLite builds a plain `mode=ro` open of a cleanly closed WAL
+    # store creates a -wal and a -shm next to it.
+    conn = None
+    try:
+        conn = connect_readonly(p, timeout=2)
+        conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        return conn, ""
+    except (OSError, sqlite3.Error) as e:
+        if conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+        return None, str(e)
 
 
 def _holds_events(path: str) -> bool:

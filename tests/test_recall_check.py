@@ -36,12 +36,15 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from _tmp_support import temp_home
+from _tmp_support import has_yaml_parser, temp_home
+
 
 from engine.core import ChronicleCore
 from engine.embeddings import pack
 from engine.store import MemoryStore, now_iso
 from provider import ChronicleMemoryProvider
+
+_NEEDS_YAML = unittest.skipUnless(has_yaml_parser(), "no YAML parser (PyYAML or ruamel.yaml) in this Python")
 
 _ROOT = Path(__file__).parent.parent
 _SCRIPT = _ROOT / "scripts" / "recall_check.py"
@@ -190,6 +193,7 @@ class _Case(unittest.TestCase):
 # report mode
 # --------------------------------------------------------------------------
 
+@_NEEDS_YAML
 class TestReportMode(_Case):
     def test_a_named_profile_is_reported_with_its_own_store(self):
         _write_config(self.profile, "memory:\n  provider: chronicle\n  memory_enabled: false\n"

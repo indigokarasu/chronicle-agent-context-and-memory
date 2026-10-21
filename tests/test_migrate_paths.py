@@ -22,7 +22,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from _tmp_support import temp_home
+from _tmp_support import has_yaml_parser, temp_home
+
 
 from engine import migrate_paths as mp_mod
 from engine import paths as paths_mod
@@ -31,6 +32,8 @@ from engine.gitmirror import GitMirror
 from engine.migrate_paths import MARKER_NAME, settle_db_path, settle_git_repo
 from engine.paths import DB_REL, GIT_REL
 from engine.store import MemoryStore
+
+_NEEDS_YAML = unittest.skipUnless(has_yaml_parser(), "no YAML parser (PyYAML or ruamel.yaml) in this Python")
 
 HASHING = {"embeddings": {"model": "hashing"}}
 
@@ -156,6 +159,7 @@ class TestRules(Base):
         with open(os.path.join(h, "config.yaml"), "w") as fh:
             fh.write(text)
 
+    @_NEEDS_YAML
     def test_rule4_claimed_by_another_chronicle_profile_is_kept(self):
         seed_store(self.legacy, 3)
         self._profile("other", "memory:\n  provider: chronicle\n  db_path: %s\n" % self.legacy)
@@ -165,6 +169,7 @@ class TestRules(Base):
         self.assertFalse(os.path.islink(self.legacy))
         self.assertFalse(os.path.exists(self.new))
 
+    @_NEEDS_YAML
     def test_rule4_context_engine_profile_and_default_profile_count(self):
         seed_store(self.legacy, 3)
         self._profile(None, "context:\n  engine: chronicle\nmemory:\n  db_path: %s\n" % self.legacy)

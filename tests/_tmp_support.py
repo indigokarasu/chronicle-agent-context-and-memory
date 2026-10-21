@@ -55,3 +55,18 @@ def remove_db(path: str) -> None:
 def rm_tree(path: str) -> None:
     """Remove a temp directory tree; never raises."""
     shutil.rmtree(path, ignore_errors=True)
+
+
+def has_yaml_parser() -> bool:
+    """True when engine/yaml_load can parse YAML in this Python (PyYAML or
+    ruamel.yaml). A test that writes a config.yaml and expects Chronicle to
+    read it needs one: with neither parser Chronicle runs on its defaults by
+    design, so such a test would fail for a reason it does not test."""
+    try:
+        try:
+            from engine import yaml_load
+        except Exception:
+            import yaml_load  # type: ignore
+        return yaml_load.safe_load_text("a: 1") == {"a": 1}
+    except Exception:
+        return False
