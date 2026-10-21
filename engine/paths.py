@@ -172,6 +172,17 @@ def legacy_git_path(value: Optional[str]) -> str:
     return os.path.expanduser(value or "~/.hermes/" + GIT_REL)
 
 
+#: The first 16 bytes of every SQLite database file.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _in_wal_mode(path: str) -> bool:
+    """True when the file header says WAL mode (format versions 2 at bytes 18 and 19)."""
+    with open(path, "rb") as fh:
+        head = fh.read(20)
+    return head[:16] == _SQLITE_MAGIC and head[18:20] == b"\x02\x02"
+
+
 def has_data(db_path: PathLike) -> bool:
     """True only for a SQLite file whose `events` table holds at least one row.
 
@@ -183,9 +194,21 @@ def has_data(db_path: PathLike) -> bool:
         p = os.path.abspath(os.fspath(db_path))
         if not os.path.isfile(p) or os.path.getsize(p) <= 0:
             return False
+        query = "?mode=ro"
+        # A WAL store closed cleanly keeps no -wal or -shm on standard builds,
+        # and a copy of the main file alone has none either. A read-only open
+        # then fails where it may not create the -shm (macOS's system SQLite, a
+        # read-only directory), so this said "no data" and the migration opened
+        # an empty store at the new path; elsewhere it worked but left a -wal
+        # and a -shm behind. With no -wal the main file holds every committed
+        # transaction, so `immutable` reads it exactly and creates nothing.
+        # Only then: a -wal can hold rows the main file lacks, and a file in
+        # rollback mode may be mid-write, which only the locked read waits out.
+        if _in_wal_mode(p) and not os.path.lexists(p + "-wal"):
+            query += "&immutable=1"
         # Quoted: `?`, `#` and `%` in a file name would otherwise be read as
         # URI syntax and the open would land on a different (new) file.
-        uri = "file:" + quote(p, safe="/") + "?mode=ro"
+        uri = "file:" + quote(p, safe="/") + query
         conn = sqlite3.connect(uri, uri=True)
     except Exception:
         return False

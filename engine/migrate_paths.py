@@ -28,7 +28,6 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional
-from urllib.parse import quote
 
 try:
     from .paths import DB_REL, expand_data_path, has_data, profile_root
@@ -139,37 +138,6 @@ def _same_inode(a: str, b: str) -> bool:
         return os.path.samefile(a, b)
     except OSError:
         return False
-
-
-def _holds_data(path: str) -> bool:
-    """`has_data`, plus the WAL store whose sidecars are gone.
-
-    A store in WAL mode closed cleanly by the last connection has no `-wal`
-    or `-shm` left on most builds, and a read-only open then fails, because it
-    may not create the `-shm` it needs. `has_data` reads that as "no data",
-    which would skip the move and open an empty store at the new path. With no
-    `-wal` on disk the main file holds every committed transaction, so an
-    `immutable` read of it is exact.
-    """
-    try:
-        if has_data(path):
-            return True
-        p = os.path.abspath(os.fspath(path))
-        if not os.path.isfile(p) or os.path.getsize(p) <= 0 or os.path.lexists(p + "-wal"):
-            return False
-        uri = "file:" + quote(p, safe="/") + "?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True)
-    except Exception:
-        return False
-    try:
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                        "AND name='events'").fetchone() is None:
-            return False
-        return conn.execute("SELECT 1 FROM events LIMIT 1").fetchone() is not None
-    except Exception:
-        return False
-    finally:
-        _close(conn)
 
 
 def _close(conn: Optional[sqlite3.Connection]) -> None:
@@ -289,7 +257,7 @@ def settle_db_path(new_path: str, legacy_path: str, *, home: str) -> MigrationRe
     try:
         return _settle_db(new, legacy, os.path.abspath(home))
     except Exception as e:
-        path = legacy if _holds_data(legacy) else new
+        path = legacy if has_data(legacy) else new
         logger.warning("chronicle: could not check or move the store at %s (%s); "
                        "opening %s", legacy, e, path)
         return MigrationResult("kept_legacy", path, "error: %s" % e)
@@ -300,14 +268,14 @@ def _settle_db(new: str, legacy: str, home: str) -> MigrationResult:
     if _same_real(new, legacy):
         return MigrationResult("none", new)
     # 2. Nothing to move.
-    if not _holds_data(legacy):
+    if not has_data(legacy):
         return MigrationResult("none", new)
     # A move interrupted between the link and the symlink leaves two hard-link
     # names for one store. That is the unsafe state, not a conflict: finish it.
     resume = (not os.path.islink(legacy)) and _same_inode(new, legacy)
     if not resume:
         # 3. Both hold data: which one is right is the user's call.
-        if _holds_data(new):
+        if has_data(new):
             _warn_once(("conflict", new, legacy),
                        "chronicle: two stores hold data: %s (where the config points) and %s "
                        "(where releases before 5.12 put it). Opening %s, as before. To use "
