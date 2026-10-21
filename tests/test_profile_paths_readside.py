@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from _dashboard_loader import _load
 from _tmp_support import temp_home
 
-from engine import cache_map, curation
+from engine import cache_map, curation, localdb
 from engine.config import Config
 from engine.paths import DB_REL
 from engine.store import MemoryStore, now_iso
@@ -368,26 +368,30 @@ class TestCurationSourcePaths(_ProfileCase):
                 worker._federate_db(spec)
         return str(caught.exception)
 
-    def test_a_federated_database_path_lands_under_the_profile(self):
+    def test_a_federated_database_is_swept_where_the_query_side_reads_it(self):
+        # `federation.local_dbs[].path` has two readers: this sweep, which projects
+        # the rows into pointers, and `localdb.providers_from_config`, which serves
+        # them at query time. If they resolve `~/.hermes/...` differently, a
+        # profile that has its own copy of the file projects ids from one database
+        # and answers from the other, so a record carries another database's content.
         self._write(os.path.join(self.profile, "data"), name="src.db", text="")
         self._write(os.path.join(self.user_hermes, "data"), name="src.db", text="")
+        entry = {"name": "src", "path": "~/.hermes/data/src.db", "table": "t",
+                 "content_columns": ["c"]}
+        served = localdb.providers_from_config(
+            Config({"federation": {"local_dbs": [entry]}}))[0].db_path
         worker = _worker(self.profile, Config({}))
-        self.assertEqual(self._federate(worker, "~/.hermes/data/src.db"),
-                         os.path.join(self.profile, "data", "src.db"))
+        swept = self._federate(worker, entry["path"])
+        self.assertEqual(swept, served)
+        self.assertEqual(swept, os.path.join(self.user_hermes, "data", "src.db"))
 
-    def test_a_federated_database_at_the_old_meaning_of_the_path_is_still_found(self):
-        self._write(os.path.join(self.user_hermes, "data"), name="src.db", text="")
-        worker = _worker(self.profile, Config({}))
-        self.assertEqual(self._federate(worker, "~/.hermes/data/src.db"),
-                         os.path.join(self.user_hermes, "data", "src.db"))
-
-    def test_a_missing_federated_database_is_reported_at_the_new_path(self):
+    def test_a_missing_federated_database_is_reported_where_the_query_side_would_look(self):
         worker = _worker(self.profile, Config({}))
         spec = {"name": "src", "path": "~/.hermes/data/src.db", "table": "t",
                 "content_columns": ["c"]}
         with self.assertRaises(curation._ProviderOffline) as caught:
             worker._federate_db(spec)
-        self.assertIn(os.path.join(self.profile, "data", "src.db"), str(caught.exception))
+        self.assertIn(os.path.join(self.user_hermes, "data", "src.db"), str(caught.exception))
 
 
 # --------------------------------------------------------------------------

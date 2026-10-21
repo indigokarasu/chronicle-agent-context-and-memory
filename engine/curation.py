@@ -202,8 +202,8 @@ class CurationWorker:
         self.cfg = core.cfg
 
     def _source_path(self, value) -> str:
-        """Where a configured source path (a journal directory, a federated
-        database) points for THIS core's Hermes home.
+        """Where a configured source path (a journal directory) points for THIS
+        core's Hermes home.
 
         `~/.hermes/...` means the home the core runs in, as it does for the
         store. Expanded on its own, `~` named the user's directory, which under a
@@ -1246,7 +1246,13 @@ class CurationWorker:
         if not table or not content_cols:
             raise ValueError("local db %r needs table and non-empty content_columns" % name)
 
-        path = self._source_path(path)
+        # Expanded exactly as the query-time readers expand the same entry
+        # (localdb.providers_from_config, the passage lookup): a plain `~`. If
+        # this sweep resolved `~/.hermes/...` against the core's home while they
+        # did not, a profile holding its own copy of the file would project ids
+        # from one database and serve content from the other. Move all three
+        # together.
+        path = os.path.expanduser(path)
         if not os.path.isfile(path):
             raise _ProviderOffline("no database file at %s" % path)
         conn = self._open_local_db(path, bool(spec.get("read_only", True)))
