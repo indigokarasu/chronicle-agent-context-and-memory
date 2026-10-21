@@ -10,6 +10,7 @@ All notable changes to the Chronicle Hermes plugin. Versioning follows the
 **Fixed**
 
 - **Profile paths (#53, #56).** `db_path` and `git_repo` resolve against the active profile's home. An absolute `db_path` is honoured; it used to be ignored and the store went to the default location. A `~/.hermes/profiles/<name>/...` value no longer names the profile twice. The git mirror belongs to the profile; it used to be shared by every profile. The dashboard, the scripts, and the context engine (when Hermes starts it without a home) use the same rules.
+- **Git mirror.** The mirror never created its own repository: it wrote its files and then ran `git add -A` and `git commit` in a folder that was not a repository. When the Hermes home sat inside another git repository, those commands committed into that repository instead, staging its whole working tree. The mirror now creates its repository on first use, runs git only when the folder is its own repository, and stages only the files it just wrote. Files that earlier releases wrote into the mirror folder stay untracked.
 - **`config.yaml` without PyYAML (#57).** On a package-managed Hermes install with no PyYAML in its environment, Chronicle could not read the `memory:` section and silently ran on defaults. It now reads the file with PyYAML, or with the ruamel.yaml parser that Hermes ships when PyYAML is absent. If neither parser can be imported, it logs one warning that names the file and runs on defaults.
 
 **Removed**
@@ -18,7 +19,7 @@ All notable changes to the Chronicle Hermes plugin. Versioning follows the
 
 **Added**
 
-- **`scripts/recall_check.py` (#58).** A read-only report of where a profile's store is and what it holds (`--profile NAME`), and `--canary`, which checks that Chronicle alone recalls a fact in a new session with Hermes' own memory files switched off. The README section "Check that it works" describes both.
+- **`scripts/recall_check.py` (#58).** A read-only report of where a profile's store is and what it holds (`--profile NAME`), and `--canary`, which checks that Chronicle alone recalls a fact in a new session, in a temporary home that has no `MEMORY.md` or `USER.md`. The README section "Check that it works" describes both.
 
 **Migration**
 

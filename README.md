@@ -297,6 +297,7 @@ Every key **inside the `memory:` block below is Chronicle-only**. Chronicle read
 The host (Hermes Agent) owns the rest of `config.yaml`; Chronicle does not read or change host keys.
 
 - `memory.provider: chronicle` is the **host's** slot selector. Hermes reads it to load this plugin; Chronicle never reads it.
+- `memory.memory_enabled` and `memory.user_profile_enabled` are also **host** keys: they switch Hermes' own `MEMORY.md` and `USER.md`. Chronicle does not use them; `recall_check.py` only reports them.
 - Every other key under `memory:` (`db_path`, `embeddings`, `retrieval`, `curation`, …) is Chronicle's own config.
 
 ### Where this config belongs
