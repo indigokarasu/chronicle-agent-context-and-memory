@@ -17,8 +17,10 @@ the store through `engine/paths.py`, and opens it read-only.
 to end (capture a turn that holds a random fact, drain extraction, start a NEW
 session on a freshly opened store, ask for the fact through `chronicle_answer`
 and `chronicle_search`), then deletes the home. It uses the offline hashing
-embedder and opens no network connection, unless `--live-embedder` is given.
-Nothing in your own Hermes home is read or written.
+embedder and opens no network connection, unless `--live-embedder` is given:
+then it uses the embedder the active profile's `memory.embeddings` names, and
+that section of its `config.yaml` is the one thing it reads from your own
+Hermes home. Nothing there is written.
 
 Output is plain `key: value` lines and ends with `PASS` or `FAIL: <reason>`.
 Exit code: 0 on PASS, 1 on FAIL (2 for a usage error). `--json` prints the same
@@ -471,6 +473,17 @@ def _canary_fact(rng: random.Random) -> str:
     return " ".join(str(rng.randrange(10)) for _ in range(6))
 
 
+def _profile_embeddings(home: str) -> Optional[dict]:
+    """The `memory.embeddings` section of `home`'s config.yaml, or None.
+
+    Read with the loader the report uses (`ChronicleCore._load_memory_config`),
+    so `${VAR}` references and `CHRONICLE_EMBED_API_KEY` apply as they do at
+    runtime.
+    """
+    emb = ChronicleCore._load_memory_config(home).get("embeddings")
+    return dict(emb) if isinstance(emb, dict) else None
+
+
 def canary(live_embedder: bool = False, rng: Optional[random.Random] = None) -> Tuple[Rows, str]:
     """Capture a fact, start a new session, and ask for it back. Returns (rows, result).
 
@@ -488,6 +501,12 @@ def canary(live_embedder: bool = False, rng: Optional[random.Random] = None) -> 
     rows.add("mode", "canary")
     rows.add("chronicle", _version())
     failures: List[str] = []
+    # Read before HOME and HERMES_HOME point at the temporary home. That home
+    # has no config.yaml, so from there the live embedder was auto-detected on
+    # localhost, never the endpoint the profile names, and a PASS (which FTS
+    # alone can give) said nothing about it.
+    live_home = resolve_home(None) if live_embedder else ""
+    live_embeddings = _profile_embeddings(live_home) if live_embedder else None
     saved = {k: os.environ.get(k) for k in _CANARY_ENV}
     tmp = tempfile.mkdtemp(prefix="chronicle-recall-check-")
     providers: List[Any] = []
@@ -511,6 +530,14 @@ def canary(live_embedder: bool = False, rng: Optional[random.Random] = None) -> 
                                   "curation": {"drain": {"background": False}}}
         if not live_embedder:
             config["embeddings"] = {"model": "hashing"}
+        else:
+            live_config = os.path.join(live_home, "config.yaml")
+            if live_embeddings is not None:
+                config["embeddings"] = live_embeddings
+                rows.add("embeddings_config", live_config, "%s [memory.embeddings]" % live_config)
+            else:
+                rows.add("embeddings_config", None,
+                         "(none in %s, so a local server is auto-detected)" % live_config)
 
         # Session 1: the turn is captured and its extraction drained.
         first = ChronicleMemoryProvider()
@@ -583,7 +610,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--canary", action="store_true",
                    help="capture a fact, start a new session and recall it, in a temporary home")
     p.add_argument("--live-embedder", action="store_true",
-                   help="with --canary: use the configured embedding server, not the offline one")
+                   help="with --canary: use the embedder the active profile's memory.embeddings "
+                        "names, not the offline one")
     p.add_argument("--json", action="store_true", help="print one JSON object instead of lines")
     return p
 

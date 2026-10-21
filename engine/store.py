@@ -3331,8 +3331,18 @@ class MemoryStore:
         pending are dropped first, so each event is queued exactly once, and
         `meta_key` is set in the same transaction, so the re-queue cannot run
         twice or half-run.
+
+        A call when `meta_key` already holds `meta_value` queues nothing and
+        returns 0. Without that check here, a second call after the mirror had
+        written the first queue would write every event to it a second time;
+        the caller's own check of the key is not the only thing in the way.
+        A different value is another mirror, which starts empty, so it still
+        gets every event.
         """
         with self.transaction() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (meta_key,)).fetchone()
+            if row is not None and row[0] == meta_value:
+                return 0
             conn.execute("DELETE FROM git_queue WHERE committed=0")
             cur = conn.execute("INSERT INTO git_queue(event_id, created_at) "
                                "SELECT event_id, ? FROM events ORDER BY seq", (now_iso(),))

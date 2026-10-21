@@ -41,7 +41,7 @@ from _dashboard_loader import _load
 from _tmp_support import has_yaml_parser, temp_home
 
 
-from engine import cache_map, curation, localdb
+from engine import cache_map, curation, localdb, mentions
 from engine.config import Config
 from engine.paths import DB_REL
 from engine.store import MemoryStore, now_iso
@@ -580,29 +580,184 @@ class TestBuildMentions(_ScriptCase):
             args = mod.parse_args()
         self.assertEqual((args.home, args.db), (self.tmp, "/explicit/c.db"))
 
-    def test_bind_events_go_to_the_store_that_was_read(self):
-        mod = _load_script("build_mentions")
-        other = os.path.join(self.tmp, "other-home")
-        decoy = os.path.join(self.tmp, "decoy-home")
-
-        def args(*argv):
-            with mock.patch.object(sys, "argv", ["build_mentions.py"] + list(argv)):
-                return mod.parse_args()
-
-        # a store at the standard place and no --home: that store's own home
-        self.assertEqual(mod.bind_home(args("--db", os.path.join(other, DB_REL))), other)
-        # --home wins
-        self.assertEqual(
-            mod.bind_home(args("--db", os.path.join(other, DB_REL), "--home", decoy)), decoy)
-        # a store somewhere else cannot say which home it belongs to
-        self.assertEqual(mod.bind_home(args("--db", os.path.join(other, "c.db"))), self.profile)
-        # no --db: the active home
-        self.assertEqual(mod.bind_home(args()), self.profile)
-
     def test_no_store_is_an_error_not_an_empty_database(self):
         rc, out = self.run_main(_load_script("build_mentions"))
         self.assertNotEqual(rc, 0)
         self.assertFalse(os.path.exists(self.profile_db))
+
+
+_BIND_PROVIDER = "contacts"
+_BIND_ENTITY = "ent-fake-1"
+
+
+def _store_with_event(path):
+    """`_make_store`, with the store's sequence counter moved past its event, so
+    a core can append to it."""
+    _make_store(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("UPDATE meta SET value=(SELECT COALESCE(MAX(seq), 0) FROM events) "
+                     "WHERE key='event_seq'")
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _add_entity(path):
+    """Put one entity into the store at `path`, named by a `_BIND_PROVIDER`
+    record through its own id (what `--bind-ids` binds)."""
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("INSERT INTO entities(belief_id, type, name, normalized_name) "
+                     "VALUES(?, 'person', 'Fake Person', 'fake person')", (_BIND_ENTITY,))
+        mentions.ensure_schema(conn)
+        conn.execute("INSERT INTO entity_mentions VALUES(?, ?, ?, 'self', 'id', ?, ?)",
+                     (_BIND_ENTITY, _BIND_PROVIDER + ":" + _BIND_ENTITY, _BIND_PROVIDER,
+                      "i:" + _BIND_ENTITY, now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _entity_store(path, events=True):
+    """A real store holding that one entity, and one event unless `events` is off."""
+    if events:
+        _store_with_event(path)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        MemoryStore(path).close()
+    _add_entity(path)
+    return path
+
+
+def _bind_events(path):
+    """The link_adjudicated events in the store at `path` (0 when there is none)."""
+    if not os.path.isfile(path):
+        return 0
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT count(*) FROM events WHERE type='federated' "
+                            "AND payload LIKE '%link_adjudicated%'").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _event_count(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT count(*) FROM events").fetchone()[0]
+    finally:
+        conn.close()
+
+
+class _Warnings(logging.Handler):
+    """Every WARNING (and above) a logger hands it, as text."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@_NEEDS_YAML
+class TestBuildMentionsBind(_ScriptCase):
+    """`--bind-ids` reads entity ids from one store and appends events that bind
+    them. The events have to land in that same store: anywhere else they name
+    entities that store does not hold, and appended events cannot be taken back."""
+
+    def setUp(self):
+        super().setUp()
+        # The active profile has a store of its own, holding data.
+        _store_with_event(self.profile_db)
+        self.profile_events = _event_count(self.profile_db)
+
+    def bind(self, *argv, git=False):
+        mod = _load_script("build_mentions")
+        with mock.patch.object(sys, "argv", ["build_mentions.py"] + list(argv) + ["--bind-ids"]):
+            a = mod.parse_args()
+        cfg = Config({"embeddings": {"model": "hashing"}, "git": {"enabled": git},
+                      "mentions": {"record_sources": [
+                          {"provider": _BIND_PROVIDER, "fields": {"contact_id": "id"}}]}})
+        conn = sqlite3.connect(a.db)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.bind(cfg, a, conn)
+        finally:
+            conn.close()
+        return a
+
+    def assert_untouched(self, path, events):
+        self.assertFalse(os.path.islink(path), "the store at %s was moved away" % path)
+        self.assertEqual(_event_count(path), events)
+        self.assertEqual(_bind_events(path), 0)
+
+    def test_a_store_outside_any_home_gets_its_own_events(self):
+        db = _entity_store(os.path.join(self.tmp, "elsewhere", "c.db"))
+        self.bind("--db", db)
+        self.assertEqual(_bind_events(db), 1)
+        conn = sqlite3.connect(db)
+        try:
+            ref = conn.execute("SELECT external_ref FROM entities WHERE belief_id=?",
+                               (_BIND_ENTITY,)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(ref, _BIND_PROVIDER + ":" + _BIND_ENTITY)
+        self.assert_untouched(self.profile_db, self.profile_events)
+
+    def test_a_store_without_events_never_takes_the_profiles_store(self):
+        # A core opened on a store with no events, under a home whose own store
+        # has some, takes that store for an older release's copy and moves it.
+        db = _entity_store(os.path.join(self.tmp, "elsewhere", "fresh.db"), events=False)
+        self.bind("--db", db)
+        self.assertEqual(_bind_events(db), 1)
+        self.assert_untouched(self.profile_db, self.profile_events)
+
+    def test_a_store_of_another_home_gets_its_own_events(self):
+        other = os.path.join(self.tmp, "other-home")
+        db = _entity_store(os.path.join(other, DB_REL))
+        self.bind("--db", db)
+        self.assertEqual(_bind_events(db), 1)
+        self.assert_untouched(self.profile_db, self.profile_events)
+
+    def test_the_home_flag_does_not_move_the_events(self):
+        decoy = os.path.join(self.tmp, "decoy-home")
+        decoy_db = _store_with_event(os.path.join(decoy, DB_REL))
+        db = _entity_store(os.path.join(self.tmp, "other-home", DB_REL))
+        self.bind("--db", db, "--home", decoy)
+        self.assertEqual(_bind_events(db), 1)
+        self.assert_untouched(decoy_db, 1)
+        self.assert_untouched(self.profile_db, self.profile_events)
+
+    def test_no_db_flag_binds_in_the_active_profiles_store(self):
+        _add_entity(self.profile_db)
+        a = self.bind()
+        self.assertEqual(a.db, self.profile_db)
+        self.assertEqual(_bind_events(self.profile_db), 1)
+
+    def test_the_events_are_queued_for_the_stores_own_mirror_and_no_mirror_is_made(self):
+        db = _entity_store(os.path.join(self.tmp, "elsewhere", "c.db"))
+        warnings = _Warnings()
+        log = logging.getLogger("chronicle")
+        log.addHandler(warnings)
+        self.addCleanup(log.removeHandler, warnings)
+        self.bind("--db", db, git=True)
+        conn = sqlite3.connect(db)
+        try:
+            queued = conn.execute(
+                "SELECT count(*) FROM git_queue q JOIN events e ON e.event_id=q.event_id "
+                "WHERE e.type='federated' AND q.committed=0").fetchone()[0]
+            marker = conn.execute("SELECT value FROM meta WHERE key='git_mirror_repo'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(queued, 1)
+        # Setting up a mirror (and re-queuing every event for it) is the store's
+        # own runtime's business, under its own home.
+        self.assertIsNone(marker)
+        self.assertEqual(sorted(str(p) for p in Path(self.tmp).rglob(".git")), [])
+        self.assertEqual([m for m in warnings.messages if "git mirror" in m], [])
 
 
 @_NEEDS_YAML

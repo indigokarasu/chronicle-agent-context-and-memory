@@ -589,6 +589,34 @@ class TestGit(Base):
         self.assertEqual(r2.action, "none")
         self.assertEqual(self.store.git_lag(), 25)
 
+    def _commit_queue(self):
+        """The mirror wrote everything queued so far."""
+        conn = self.store._conn()
+        conn.execute("UPDATE git_queue SET committed=1")
+        conn.commit()
+
+    def test_a_second_requeue_for_the_same_mirror_queues_nothing(self):
+        # The store guards itself, not only through its caller: once the first
+        # queue was written out, a second one would put every event into the
+        # same mirror twice.
+        marker = "home:" + GIT_REL
+        self.assertEqual(self.store.requeue_all_for_git("git_mirror_repo", marker), 25)
+        self._commit_queue()
+        rows = self.store.count_rows("git_queue")
+        self.assertEqual(self.store.requeue_all_for_git("git_mirror_repo", marker), 0)
+        self.assertEqual(self.store.git_lag(), 0)
+        self.assertEqual(self.store.count_rows("git_queue"), rows)
+        self.assertEqual(self.store.get_meta("git_mirror_repo"), marker)
+
+    def test_a_requeue_for_another_mirror_still_queues_every_event(self):
+        # A mirror that moves again starts empty, so it needs every event too.
+        self.assertEqual(self.store.requeue_all_for_git("git_mirror_repo", "home:" + GIT_REL), 25)
+        self._commit_queue()
+        elsewhere = os.path.join(self.root, "mirrors", "p")
+        self.assertEqual(self.store.requeue_all_for_git("git_mirror_repo", elsewhere), 25)
+        self.assertEqual(self.store.git_lag(), 25)
+        self.assertEqual(self.store.get_meta("git_mirror_repo"), elsewhere)
+
     def test_the_marker_does_not_hold_where_the_home_is(self):
         # The same profile at another path (a restored home, a fresh temporary
         # home per run) must write the same store, and must not take its own
