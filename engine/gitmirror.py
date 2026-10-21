@@ -16,17 +16,55 @@ import os
 import subprocess
 from pathlib import Path
 
+try:
+    from .paths import GIT_REL, expand_data_path, resolve_home
+except Exception:  # standalone tooling / pytest from the repo root
+    from paths import GIT_REL, expand_data_path, resolve_home
+
 logger = logging.getLogger("chronicle.gitmirror")
+
+#: Batches one `flush()` drains when neither the caller nor the config says.
+DEFAULT_MAX_FLUSH_BATCHES = 10
+
+
+def _run_git(repo: str, *args) -> bool:
+    try:
+        subprocess.run(["git", "-C", repo, *args], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def init_git_repo(repo: str) -> None:
+    """Create `repo` and make it a git repository of its own, if it is not one.
+
+    Without its own `.git`, `git -C <repo> add -A` would act on whatever
+    repository encloses the directory, or fail. Without git installed the
+    directory still receives the JSONL files; they are just not committed.
+    """
+    Path(repo).mkdir(parents=True, exist_ok=True)
+    if not (Path(repo) / ".git").exists():
+        _run_git(repo, "init")
+        _run_git(repo, "config", "user.email", "chronicle@local")
+        _run_git(repo, "config", "user.name", "Chronicle")
 
 
 class GitMirror:
-    def __init__(self, store, cfg):
+    def __init__(self, store, cfg, repo=None):
+        """`repo` is the mirror directory; ChronicleCore passes the profile's own.
+
+        Without it the path is worked out the same way (the configured
+        `git_repo` under the resolved Hermes home). Before 5.12 `~` was
+        expanded against the user's home, so every profile shared one mirror.
+        """
         self.store = store
         self.cfg = cfg
-        self.repo = os.path.expanduser(cfg.get("git_repo", "~/.hermes/commons/db/chronicle/git"))
+        self.repo = repo or expand_data_path(cfg.get("git_repo"), resolve_home(None), GIT_REL)
         self.remote = cfg.get("git_remote")
         self.enabled = cfg.get("git.enabled", True)
         self.max_rows = cfg.get("git.max_commit_rows", 1000)
+        self.max_batches = cfg.get("git.max_flush_batches", DEFAULT_MAX_FLUSH_BATCHES)
         self.encryption_key = os.environ.get("CHRONICLE_GIT_ENCRYPTION_KEY") or cfg.get("git.encryption_key")
 
     def _encrypt_payload(self, text: str) -> str:
@@ -59,28 +97,32 @@ class GitMirror:
         return plain.decode("utf-8")
 
     def _git(self, *args) -> bool:
-        try:
-            subprocess.run(["git", "-C", self.repo, *args], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
+        return _run_git(self.repo, *args)
 
     def init_repo(self):
         if not self.enabled:
             return
-        Path(self.repo).mkdir(parents=True, exist_ok=True)
-        if not (Path(self.repo) / ".git").exists():
-            self._git("init")
-            self._git("config", "user.email", "chronicle@local")
-            self._git("config", "user.name", "Chronicle")
+        init_git_repo(self.repo)
 
-    def flush(self) -> int:
-        """Drain pending git_queue rows → events/YYYY-MM-DD/HHMMSS.jsonl → commit (§26)."""
+    def flush(self, max_batches=None) -> int:
+        """Drain pending git_queue rows → events/YYYY-MM-DD/HHMMSS.jsonl → commit (§26).
+
+        At most `max_batches` commits of `max_commit_rows` each per call
+        (default `git.max_flush_batches`); the rest waits for the next call. A
+        profile that gets its own mirror queues its whole store at once, and
+        draining that in one call would hold the host's shutdown for minutes.
+        """
         if not self.enabled:
             return 0
+        limit = self.max_batches if max_batches is None else max_batches
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = DEFAULT_MAX_FLUSH_BATCHES
         flushed = 0
-        while True:
+        batches = 0
+        while batches < limit:
+            batches += 1
             rows = self.store.get_unflushed_git_events(limit=self.max_rows)
             if not rows:
                 break

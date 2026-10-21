@@ -3343,6 +3343,25 @@ class MemoryStore:
     def git_lag(self) -> int:
         return self.count_rows("git_queue", "committed=0")
 
+    def requeue_all_for_git(self, meta_key: str, meta_value: str) -> int:
+        """Queue every event of this store for the git mirror once; return how many.
+
+        For a store that gets a new mirror of its own: the old mirror holds its
+        past events, the new one would otherwise start empty. Rows still
+        pending are dropped first, so each event is queued exactly once, and
+        `meta_key` is set in the same transaction, so the re-queue cannot run
+        twice or half-run.
+        """
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM git_queue WHERE committed=0")
+            cur = conn.execute("INSERT INTO git_queue(event_id, created_at) "
+                               "SELECT event_id, ? FROM events ORDER BY seq", (now_iso(),))
+            n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (meta_key, meta_value))
+        return n
+
     # -- tombstones --------------------------------------------------------
 
     def is_forbidden(self, content_hash: str) -> bool:
