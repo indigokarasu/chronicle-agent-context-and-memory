@@ -188,6 +188,7 @@ from engine.embeddings import (
     get_embedder,
     is_usable_model_tag,
 )
+from engine.paths import resolve_home
 from engine.vector_index import mirror_unmaintainable as _vec0_unmaintainable
 from engine.vector_index import upsert_observed as _vec0_upsert
 from engine.reducer import (
@@ -596,12 +597,12 @@ def load_manifest(path, tables):
 # the live geometry (W5)
 # --------------------------------------------------------------------------
 def load_config():
-    """Chronicle's own config resolution (DEFAULTS + $HERMES_HOME/config.yaml's
-    `memory:` block), identical to scripts/migrate_vectors.load_config. Never a
-    raw-YAML read that bypasses the defaults — that is how enrich_embeddings.py
-    died on a missing `base_url` while reporting success."""
+    """Chronicle's own config resolution (DEFAULTS + the active Hermes home's
+    config.yaml `memory:` block), identical to scripts/migrate_vectors.load_config.
+    Never a raw-YAML read that bypasses the defaults — that is how
+    enrich_embeddings.py died on a missing `base_url` while reporting success."""
     overrides = {}
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(resolve_home())
     cfg_path = home / "config.yaml"
     if cfg_path.exists():
         try:

@@ -3,9 +3,10 @@
 Chronicle embedding diagnostic — does the currently-selected model actually
 support embeddings?
 
-Reads the embedding config (defaults + $HERMES_HOME/config.yaml `memory.embeddings`
-if present), shows which local servers/models are visible, resolves the embedder
-exactly as Chronicle does at runtime, then runs a STRICT live test embed.
+Reads the embedding config (defaults + `memory.embeddings` from the active Hermes
+home's config.yaml, if present), shows which local servers/models are visible,
+resolves the embedder exactly as Chronicle does at runtime, then runs a STRICT
+live test embed.
 
 Exit codes:  0 = real local model embeds OK   2 = offline hashing selected explicitly
              3 = a model is selected but failed a live embed   1 = diagnostic error
@@ -18,7 +19,6 @@ Usage:  python3 scripts/embedding_check.py
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -36,11 +36,12 @@ from engine.embeddings import (
     endpoint_kind,
     get_embedder,
 )
+from engine.paths import resolve_home
 
 
 def _load_config() -> Config:
     overrides = {}
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(resolve_home())
     cfg_path = home / "config.yaml"
     if cfg_path.exists():
         try:

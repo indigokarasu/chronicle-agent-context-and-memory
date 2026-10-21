@@ -19,6 +19,11 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+try:
+    from .paths import expand_data_path, resolve_home
+except ImportError:  # direct module execution / standalone tooling
+    from paths import expand_data_path, resolve_home
+
 DEFAULT_MAX_CHARS = 2500
 DEFAULT_RELATIVE = ("commons", "data", "chronicle", "chronicle.cache.md")
 
@@ -29,11 +34,17 @@ _SEMANTIC_NOTE_BELOW = 0.95   # say how much is searchable by meaning below this
 
 
 def resolve_path(hermes_home, cfg) -> str:
-    """The map file: `cache_map.path` when set, else under `hermes_home`."""
+    """The map file: `cache_map.path` when set, else under `hermes_home`.
+
+    The provider reads the map and `scripts/build_cache_map.py` writes it. Both
+    go through `expand_data_path`, so `~/.hermes/...` means the home of the
+    store the map describes. Expanded on its own, `~` named the user's
+    directory, so every profile read and wrote one shared map, built from
+    whichever store was mapped last. A missing home means the resolved Hermes
+    home, not the working directory.
+    """
     p = (cfg.get("cache_map.path", "") if cfg is not None else "") or ""
-    if p:
-        return os.path.expanduser(str(p))
-    return str(Path(hermes_home or ".").joinpath(*DEFAULT_RELATIVE))
+    return expand_data_path(str(p), hermes_home or resolve_home(), "/".join(DEFAULT_RELATIVE))
 
 
 def _ro(path):

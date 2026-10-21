@@ -1,6 +1,10 @@
 """Rebuild the mentions index and queue duplicate-entity candidates.
 
-    build_mentions.py --config CONFIG.yaml --db CHRONICLE.db [--dry-run] [--bind-ids]
+    build_mentions.py [--config CONFIG.yaml] [--db CHRONICLE.db] [--home HERMES_HOME]
+                      [--dry-run] [--bind-ids]
+
+Left out, the home is the active Hermes home, the config is its config.yaml and
+the store is the one that home's runtime uses (see engine/paths.py).
 
 Reads every configured source read-only. Writes `entity_mentions` (each
 provider's rows replaced atomically) and `identity_candidates` (idempotent).
@@ -19,24 +23,49 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import mentions          # noqa: E402
 from engine.config import Config     # noqa: E402
+from engine.paths import DB_REL, readable_db_path, resolve_home   # noqa: E402
 
 SHARED_LIMIT = 5   # an identifier shared by more people than this is reported, not paired
 
 
-def main() -> int:
+def parse_args():
+    """The command line, with the home, the config and the store filled in.
+
+    Anything given wins. Left out: the home is the active Hermes home, the config
+    is that home's config.yaml, and the store is the one its runtime uses (or the
+    one an older release left, while it has not been moved yet).
+    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--db", required=True)
-    ap.add_argument("--home", default=os.environ.get("HERMES_HOME", ""))
+    ap.add_argument("--config", default=None, help="default: the home's config.yaml")
+    ap.add_argument("--db", default=None, help="default: the home's store")
+    ap.add_argument("--home", default="", help="the Hermes home; default: the active one")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--bind-ids", action="store_true")
     a = ap.parse_args()
-    with open(a.config) as f:
-        mem = (yaml.safe_load(f) or {}).get("memory") or {}
-    cfg = Config(mem)
+    a.home_given, a.db_given = bool(a.home), bool(a.db)
+    a.home = resolve_home(a.home or None)
+    config_path = a.config or os.path.join(a.home, "config.yaml")
+    a.memory = {}
+    # A config that was named must exist. The home's own may be absent (a fresh
+    # install has none yet), and the defaults then apply.
+    if a.config or os.path.exists(config_path):
+        with open(config_path) as f:
+            a.memory = (yaml.safe_load(f) or {}).get("memory") or {}
+    a.config = config_path
+    if not a.db:
+        a.db = readable_db_path(Config(a.memory).get("db_path"), a.home)
+    return a
+
+
+def main() -> int:
+    a = parse_args()
+    cfg = Config(a.memory)
     if not cfg.get("mentions.enabled", True):
         print("mentions disabled")
         return 0
+    if not os.path.isfile(a.db):
+        print(f"no database at {a.db}", file=sys.stderr)
+        return 2
     r = mentions.Resolver(cfg).load_entities()
     print(f"entities with identifiers: {r.entity_count}, distinct keys: {len(r.key_to_entities)}")
 
@@ -113,12 +142,26 @@ def stub_candidates(conn, db):
     print(f"  same-name groups: {len(groups)}; queued {queued} new stub-merge candidates")
 
 
+def bind_home(a):
+    """The Hermes home whose runtime store the bind events must land in.
+
+    They are written through a `ChronicleCore`, which opens its own home's store.
+    That has to be the store that was just read. So with a store named by `--db`
+    at the standard place, and no `--home`, the home is the one that store
+    belongs to, not whichever home happens to be active.
+    """
+    if not a.home_given and a.db_given:
+        suffix = os.sep + DB_REL.replace("/", os.sep)
+        db = os.path.abspath(a.db)
+        if db.endswith(suffix):
+            return db[:-len(suffix)]
+    return a.home
+
+
 def bind(cfg, a, conn):
     """Bind entity X to the record whose id is X, via link_adjudicated events."""
-    sys.path.insert(0, "/root/.hermes/hermes-agent")
     from engine.core import ChronicleCore
-    home = a.home or os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(a.db))))
-    core = ChronicleCore(home, cfg._explicit if hasattr(cfg, "_explicit") else {})
+    core = ChronicleCore(bind_home(a), cfg._explicit if hasattr(cfg, "_explicit") else {})
     n = 0
     for src in cfg.get("mentions.record_sources", []) or []:
         if "id" not in (src.get("fields") or {}).values():
