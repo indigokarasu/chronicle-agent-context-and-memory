@@ -37,6 +37,7 @@ from engine.embeddings import (
     get_embedder,
 )
 from engine.paths import resolve_home
+from engine.yaml_load import safe_load_file
 
 
 def _load_config() -> Config:
@@ -45,8 +46,7 @@ def _load_config() -> Config:
     cfg_path = home / "config.yaml"
     if cfg_path.exists():
         try:
-            import yaml
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            raw = safe_load_file(cfg_path) or {}
             mem = raw.get("memory")
             if isinstance(mem, dict):
                 overrides = mem

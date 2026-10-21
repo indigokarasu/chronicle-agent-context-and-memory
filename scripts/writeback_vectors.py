@@ -195,6 +195,7 @@ from engine.reducer import (
     projection_vector_text,
     session_vector_text,
 )
+from engine.yaml_load import safe_load_file
 
 MANIFEST_KIND = "chronicle-writeback-manifest"
 MANIFEST_VERSION = 1
@@ -604,8 +605,7 @@ def load_config():
     cfg_path = home / "config.yaml"
     if cfg_path.exists():
         try:
-            import yaml
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            raw = safe_load_file(cfg_path) or {}
             mem = raw.get("memory")
             if isinstance(mem, dict):
                 overrides = mem

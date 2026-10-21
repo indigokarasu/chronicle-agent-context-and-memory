@@ -12,13 +12,12 @@ import argparse
 import os
 import sys
 
-import yaml
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import cache_map          # noqa: E402
 from engine.config import Config      # noqa: E402
 from engine.paths import readable_db_path, resolve_home   # noqa: E402
+from engine.yaml_load import safe_load_file   # noqa: E402
 
 
 def main() -> int:
@@ -36,8 +35,7 @@ def main() -> int:
     # A config that was named must exist. The home's own may be absent (a fresh
     # install has none yet), and the defaults then apply.
     if a.config or os.path.exists(config_path):
-        with open(config_path) as f:
-            mem = (yaml.safe_load(f) or {}).get("memory") or {}
+        mem = (safe_load_file(config_path) or {}).get("memory") or {}
     cfg = Config(mem)
     if not cfg.get("cache_map.enabled", True):
         print("cache_map disabled; nothing written")

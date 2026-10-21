@@ -38,6 +38,7 @@ try:
     from .scheduler import Scheduler
     from .store import MemoryStore, StoreClosed, now_iso
     from .tools import Tools
+    from .yaml_load import YamlUnavailable, safe_load_file
 except ImportError:  # direct module execution / standalone tooling
     import access
     from capture import CaptureEngine, Reaper
@@ -62,6 +63,7 @@ except ImportError:  # direct module execution / standalone tooling
     from scheduler import Scheduler
     from store import MemoryStore, StoreClosed, now_iso
     from tools import Tools
+    from yaml_load import YamlUnavailable, safe_load_file
 
 logger = logging.getLogger("chronicle.core")
 
@@ -212,13 +214,22 @@ class ChronicleCore:
         """The host's initialize_all() does not hand Chronicle a config dict, so
         load the ``memory:`` section from ``<hermes_home>/config.yaml`` ourselves.
         This is what makes embeddings/retrieval settings (e.g. a hosted embeddings
-        endpoint) actually take effect at runtime, matching embedding_check.py."""
+        endpoint) actually take effect at runtime, matching embedding_check.py.
+
+        A host install may have no PyYAML (its own dependency is ruamel.yaml);
+        `yaml_load` reads with either. With neither, the config cannot be read
+        at all, and that is said at WARNING: running on the defaults while the
+        file names another store or endpoint is otherwise invisible."""
         try:
             import os
-            import yaml
             p = Path(hermes_home) / "config.yaml"
             if p.exists():
-                raw = yaml.safe_load(p.read_text()) or {}
+                try:
+                    raw = safe_load_file(p) or {}
+                except YamlUnavailable:
+                    logger.warning("Chronicle: cannot read %s: no YAML parser in this Python; "
+                                   "Chronicle is running on its defaults", p)
+                    return {}
                 mem = raw.get("memory")
                 if isinstance(mem, dict):
                     mem = expand_env_refs(mem)

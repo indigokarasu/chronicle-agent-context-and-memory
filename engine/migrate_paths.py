@@ -31,8 +31,10 @@ from typing import Callable, List, Optional
 
 try:
     from .paths import DB_REL, expand_data_path, has_data, profile_root
+    from .yaml_load import safe_load_file
 except Exception:  # standalone tooling / pytest from the repo root
     from paths import DB_REL, expand_data_path, has_data, profile_root
+    from yaml_load import safe_load_file
 
 logger = logging.getLogger("chronicle.migrate")
 
@@ -162,9 +164,7 @@ def _remove(path: str) -> None:
 
 def _read_yaml(path: str) -> dict:
     try:
-        import yaml  # type: ignore
-        with open(path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+        data = safe_load_file(path) or {}
         return data if isinstance(data, dict) else {}
     except Exception:
         # A config that cannot be read cannot run Chronicle either, so it

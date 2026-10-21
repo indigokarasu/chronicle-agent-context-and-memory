@@ -69,6 +69,7 @@ from engine.paths import (
     resolve_home,
 )
 from engine.store import BELIEF_TABLES
+from engine.yaml_load import safe_load_file
 
 # Stored vectors are packed float32 (engine/embeddings.pack): this many bytes a dimension.
 _BYTES_PER_DIM = 4
@@ -172,19 +173,15 @@ def _read_host_config(home: str) -> Tuple[Optional[dict], str]:
     """The profile's whole `config.yaml` and a one-word-or-so status.
 
     (None, "absent") when there is no file, (None, "not readable: <why>") when
-    there is one and it cannot be read. PyYAML is not in the standard library
-    and a bare system Python may not have it; that must degrade, not crash.
+    there is one and it cannot be read. No YAML parser is in the standard
+    library; `yaml_load` uses PyYAML or ruamel.yaml (what a host install has),
+    and a Python with neither must degrade, not crash.
     """
     path = os.path.join(home, "config.yaml")
     if not os.path.isfile(path):
         return None, "absent"
     try:
-        import yaml  # type: ignore
-    except Exception:
-        return None, "not readable: PyYAML is not installed for this Python"
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+        raw = safe_load_file(path) or {}
     except Exception as e:
         return None, "not readable: %s" % e
     if not isinstance(raw, dict):
