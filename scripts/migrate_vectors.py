@@ -50,10 +50,13 @@ SAFETY PROPERTIES, all of which the tests pin:
     turning transient failures into a report that says "done".
 
 Usage:
-    python3 scripts/migrate_vectors.py <db> [--dry-run] [--batch N]
+    python3 scripts/migrate_vectors.py [<db>] [--dry-run] [--batch N]
                                             [--endpoint URL] [--model NAME]
                                             [--expect-dims N] [--tables T[,T...]]
 
+    <db>          the store to repair. Left out, it is the active Hermes home's
+                  store: the one the runtime opens, or the one an older release
+                  left behind while it has not been moved yet.
     --dry-run     classify only, report counts by (tag, dims) -> action. Opens
                   the database READ-ONLY.
     --batch N     rows per embed + commit batch (default 64, clamped [1, 512]).
@@ -87,7 +90,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
-import os
 import sqlite3
 import sys
 import time
@@ -107,6 +109,7 @@ from engine.embeddings import (
     split_model_tag,
     width_contradiction,
 )
+from engine.paths import readable_db_path, resolve_home
 from engine.reducer import (
     belief_vector_text,
     observed_vector_text,
@@ -176,11 +179,11 @@ _ABORT_AFTER_CONSECUTIVE = 5
 # config / embedder
 # --------------------------------------------------------------------------
 def load_config() -> Config:
-    """Chronicle's own config resolution: DEFAULTS + $HERMES_HOME/config.yaml's
-    `memory:` block, exactly like scripts/embedding_check.py. Never a raw-YAML
-    read that bypasses the defaults."""
+    """Chronicle's own config resolution: DEFAULTS + the active Hermes home's
+    config.yaml `memory:` block, exactly like scripts/embedding_check.py. Never
+    a raw-YAML read that bypasses the defaults."""
     overrides = {}
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    home = Path(resolve_home())
     cfg_path = home / "config.yaml"
     if cfg_path.exists():
         try:
@@ -903,7 +906,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         prog="migrate_vectors.py",
         description="Bulk re-embed every non-canonical vector in a Chronicle store.")
-    ap.add_argument("db", help="path to chronicle.db")
+    ap.add_argument("db", nargs="?", default=None,
+                    help="path to chronicle.db (default: the store of the active Hermes "
+                         "home, found the way the runtime finds it)")
     ap.add_argument("--dry-run", action="store_true",
                     help="classify only; report counts by (tag, dims) -> action")
     ap.add_argument("--batch", type=int, default=_DEFAULT_BATCH,
@@ -924,8 +929,15 @@ def main() -> int:
                          "--tables memory_vectors (belief recall recovers soonest). "
                          "Every table is still processed; this only re-orders them.")
     args = ap.parse_args()
+    db = args.db
+    if not db:
+        # The store the runtime uses, not whatever `~/.hermes` is: a profile has
+        # its own. A store that is still where an older release put it counts,
+        # so this works before and after it has been moved.
+        db = readable_db_path(load_config().get("db_path"), resolve_home())
+        print("using the store at %s" % db)
     try:
-        return migrate(args.db, dry_run=args.dry_run, batch=args.batch,
+        return migrate(db, dry_run=args.dry_run, batch=args.batch,
                        endpoint=args.endpoint, model=args.model, timeout=args.timeout,
                        expect_dims=args.expect_dims, tables=args.tables)
     except ValueError as e:
