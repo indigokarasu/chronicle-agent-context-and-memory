@@ -241,7 +241,7 @@ KEEP_TMP = os.environ.get("CHRONICLE_TEST_KEEP_TMP") == "1"
 #
 # Re-pinning PYTHONUSERBASE keeps every child's IMPORT environment identical to
 # the parent's while leaving the HOME sandbox doing its actual job, which is
-# keeping Chronicle's own `Path.home() / ".hermes"` defaults off the developer's
+# keeping Chronicle's own home defaults (engine/paths.py) off the developer's
 # real home directory.
 _REAL_USER_BASE = os.environ.get("PYTHONUSERBASE") or site.getuserbase()
 
@@ -260,8 +260,10 @@ PINNED_ENV = {
     # (or a child process) at some other checkout.
     "CHRONICLE_DIR": str(_REPO_ROOT),
     # Nothing may reach the developer's real $HOME / ~/.hermes. provider.py and
-    # context.py default hermes_home to `Path.home() / ".hermes"`, which reads
-    # $HOME, so this is load-bearing, not decorative.
+    # context.py resolve a missing hermes_home with engine/paths.resolve_home:
+    # offline that is $HERMES_HOME, else `Path.home() / ".hermes"`, and the old
+    # git-mirror rule (legacy_git_path) expands `~` against $HOME. Both are
+    # pinned here, so this is load-bearing, not decorative.
     "HOME": SESSION_HOME,
     "HERMES_HOME": os.path.join(SESSION_HOME, ".hermes"),
     "XDG_CACHE_HOME": os.path.join(SESSION_HOME, ".cache"),

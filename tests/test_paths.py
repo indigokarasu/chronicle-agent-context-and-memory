@@ -84,6 +84,23 @@ def _make_db(path, *, events_table=True, rows=0, wal=False):
         conn.close()
 
 
+def _make_sidecar_free_wal_store(path, *, rows, events_table=True, keep=()):
+    """A store in WAL mode with its -wal (and, unless kept, its -shm) removed.
+
+    That is what a clean close of the last connection leaves on standard builds,
+    and what a copy or restore of the main file alone leaves on any build.
+    """
+    _make_db(path, rows=rows, wal=True, events_table=events_table)
+    for suffix in ("-wal", "-shm"):
+        if suffix in keep:
+            if not os.path.exists(path + suffix):
+                open(path + suffix, "wb").close()
+        elif os.path.exists(path + suffix):
+            os.unlink(path + suffix)
+    with open(path, "rb") as fh:
+        assert fh.read(20)[18:20] == b"\x02\x02", "not in WAL mode"
+
+
 class _Capture(logging.Handler):
     def __init__(self):
         super().__init__(level=logging.DEBUG)
@@ -539,6 +556,75 @@ class TestHasData(_HomeCase):
         _make_db(path, rows=1)
         self.assertTrue(has_data(Path(path)))
 
+    def test_a_wal_store_whose_sidecars_are_gone_is_seen(self):
+        # The shape a clean last close leaves on standard builds (and a copy or
+        # restore of the main file alone): WAL mode in the header, no -wal. A
+        # read-only open of it fails on some builds, because it may not create
+        # the -shm it needs, and on others leaves a -wal and a -shm behind.
+        # Read as "no data", the migration would skip the move and open an
+        # empty store at the new path.
+        for i, kept in enumerate(((), ("-shm",))):
+            with self.subTest(kept=kept):
+                path = os.path.join(self.tmp, "case%d" % i, "chronicle.db")
+                _make_sidecar_free_wal_store(path, rows=2, keep=kept)
+                self.assertTrue(has_data(path))
+                self.assertEqual(sorted(os.listdir(os.path.dirname(path))),
+                                 sorted(["chronicle.db"] + ["chronicle.db" + s for s in kept]))
+
+    def test_a_wal_store_whose_sidecars_are_gone_creates_nothing(self):
+        path = self._db()
+        _make_sidecar_free_wal_store(path, rows=1)
+        before = (os.path.getsize(path), os.stat(path).st_mtime_ns)
+        self.assertTrue(has_data(path))
+        self.assertEqual(os.listdir(os.path.dirname(path)), ["chronicle.db"])
+        self.assertEqual((os.path.getsize(path), os.stat(path).st_mtime_ns), before)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores directory permissions")
+    def test_a_wal_store_whose_sidecars_are_gone_in_a_read_only_directory(self):
+        # A read-only mount, or a dashboard run by a user who may read the store
+        # but not write next to it: no build can create the -shm there.
+        path = self._db()
+        _make_sidecar_free_wal_store(path, rows=1)
+        folder = os.path.dirname(path)
+        os.chmod(folder, 0o555)
+        self.addCleanup(os.chmod, folder, 0o755)
+        self.assertTrue(has_data(path))
+        self.assertEqual(os.listdir(folder), ["chronicle.db"])
+
+    def test_a_wal_store_whose_sidecars_are_gone_still_needs_a_row(self):
+        path = self._db("empty.db")
+        _make_sidecar_free_wal_store(path, rows=0)
+        self.assertFalse(has_data(path))
+        path = self._db("other.db")
+        _make_sidecar_free_wal_store(path, rows=0, events_table=False)
+        self.assertFalse(has_data(path))
+
+    def test_only_a_wal_file_with_no_wal_on_disk_is_read_unlocked(self):
+        # `immutable=1` skips locking and the -wal, so it is exact only when no
+        # -wal exists and the file is in WAL mode (writers then only touch the
+        # main file in a checkpoint). A file in rollback mode may be mid-write
+        # under a lock, and a -wal can hold rows the main file does not have.
+        wal_free = self._db("walfree.db")
+        _make_sidecar_free_wal_store(wal_free, rows=1)
+        rollback = self._db("rollback.db")
+        _make_db(rollback, rows=1)
+        live = self._db("live.db")
+        _make_db(live, rows=1, wal=True)
+        writer = sqlite3.connect(live)
+        self.addCleanup(writer.close)
+        writer.execute("SELECT 1 FROM events").fetchall()
+        self.assertTrue(os.path.exists(live + "-wal"))
+        expected = {wal_free: True, rollback: False, live: False}
+        for path, unlocked in expected.items():
+            with self.subTest(path=os.path.basename(path)):
+                with mock.patch.object(paths.sqlite3, "connect", wraps=sqlite3.connect) as spy:
+                    self.assertTrue(has_data(path))
+                uris = [c.args[0] for c in spy.call_args_list]
+                self.assertTrue(uris)
+                self.assertTrue(all(u.startswith("file:") and "mode=ro" in u for u in uris), uris)
+                self.assertEqual(["immutable=1" in u for u in uris], [unlocked] * len(uris), uris)
+
 
 # --------------------------------------------------------------------------
 # readable_db_path
@@ -584,6 +670,15 @@ class TestReadableDbPath(_HomeCase):
         self.assertFalse(os.path.exists(self.new))
         self.assertFalse(os.path.exists(self.legacy))
         self.assertFalse(os.path.exists(os.path.join(self.profile, "commons")))
+
+    def test_a_cleanly_closed_wal_store_is_found_at_either_path(self):
+        # WAL mode with the -wal and -shm gone: a dashboard must still find it,
+        # not fall through to an empty new location.
+        _make_sidecar_free_wal_store(self.legacy, rows=2)
+        self.assertEqual(readable_db_path(self.VALUE, self.profile), self.legacy)
+        self.assertFalse(os.path.exists(self.new))
+        _make_sidecar_free_wal_store(self.new, rows=1)
+        self.assertEqual(readable_db_path(self.VALUE, self.profile), self.new)
 
     def test_absolute_value_falls_back_to_the_legacy_default(self):
         # 5.11.1 ignored an absolute db_path and wrote to the default instead.
