@@ -483,6 +483,7 @@ def _move(new: str, legacy: str, resume: bool) -> MigrationResult:
         # here on the data is only reachable as `new`: nothing may be undone.
         tmp = legacy + ".symlink-tmp"
         _remove(tmp)
+        symlink_error = None
         try:
             os.symlink(new, tmp)
             linked = True
