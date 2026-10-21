@@ -383,10 +383,11 @@ class TestReportMode(_Case):
         self.assertEqual(pairs["db_path"], os.path.join(self.profile, "custom", "chronicle.db"))
 
     def test_an_unreadable_config_degrades_instead_of_crashing(self):
-        # A bare system Python may not have PyYAML.
+        # A bare Python may have neither PyYAML nor ruamel.yaml; block both, or
+        # the ruamel fallback reads the file and this tests nothing.
         _write_config(self.profile, "memory:\n  provider: chronicle\n")
         _build_store(self.profile)
-        with mock.patch.dict(sys.modules, {"yaml": None}):
+        with mock.patch.dict(sys.modules, {"yaml": None, "ruamel": None, "ruamel.yaml": None}):
             code, out, _ = self.run_script("--profile", "p")
         pairs, notes, result = _parse(out)
         self.assertEqual((code, result), (0, "PASS"), out)
