@@ -16,8 +16,8 @@ float16 matrix -- half the bytes of the float32 blobs (a 768-wide store of
 
 WHY NOT sqlite-vec. Its vec0 index is filled only by NEW writes and is never
 backfilled, so switching it on over a populated store hides every vector
-already stored (see engine/vector_index.py). The owner chose this cache instead
-(2026-09-18 21:03).
+already stored. That backend has since been removed. The owner chose this cache
+instead (2026-09-18 21:03).
 
 STALENESS. Other processes write the same store (the gateway captures turns
 while the dashboard reads), so the cache checks the table on every use: row

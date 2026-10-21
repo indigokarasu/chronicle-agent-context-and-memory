@@ -117,7 +117,7 @@ class _SeededStore(unittest.TestCase):
         cls.embedder = HashingEmbedder(dimensions=DIMS)
         cls.engine = RetrievalEngine(
             cls.store, Config({"embeddings": {"model": "hashing", "dimensions": DIMS}}),
-            embedder=cls.embedder, vector_index=None)
+            embedder=cls.embedder)
 
         rng = random.Random(20260910)
         blob_of = _Blobs(20260910)

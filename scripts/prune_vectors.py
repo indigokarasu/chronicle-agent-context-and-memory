@@ -13,11 +13,6 @@ statement per prefix — never a Python-side id list, whose IN(?,?,...) blows
 SQLITE_LIMIT_VARIABLE_NUMBER (32766 on a stock build) for any prefix matching
 more events than that.
 
-Also mirrors the delete into the optional sqlite-vec ANN index (§27
-vector_index:, u5), if one was ever populated on this db -- best-effort, via
-engine.vector_index.delete_matching on the SAME connection/predicate, so a
-pruned session's vectors don't linger in vec0 after this script has run.
-
 §H2: the pruned events' doc2query EXCERPT proxies go too. Those rows are keyed
 by event_id under kind='observed' (embeddings.doc2query.excerpts, off by
 default) and, since H2 wired them through the raw retrieval channel, a surviving
@@ -35,8 +30,8 @@ it unrecoverable on every run) and still costs a row in every brute-force scan.
 One production store held both kinds: 18,394 vectors of events removed by a
 manual purge (events only leave the log by hand; no Chronicle code deletes
 them), and 7,612 vectors keyed to `asserted` and `signal` events, written by an
-older build, which carry no excerpt to embed. The same excerpt-proxy and
-ANN-mirror cleanup applies.
+older build, which carry no excerpt to embed. The same excerpt-proxy
+cleanup applies.
 
 Usage:  python3 scripts/prune_vectors.py --db PATH [--session-prefix P]... [--orphans] [--dry-run]
 
@@ -50,12 +45,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from engine.vector_index import delete_matching
-
 # Rows to prune: observed_vectors joined to events by event_id, session prefix match.
-# vec0 carries the same event_id column, so this predicate applies unchanged there.
 _MATCH = "event_id IN (SELECT event_id FROM events WHERE session_id LIKE ? || '%')"
 # The same predicate over query_proxy_vectors (§H2), whose excerpt rows key the
 # event id in `belief_id` and are distinguished from belief proxies by kind.
@@ -63,9 +53,7 @@ _PROXY_MATCH = ("kind='observed' AND belief_id IN "
                 "(SELECT event_id FROM events WHERE session_id LIKE ? || '%')")
 
 
-# Orphans (--orphans): no observed event behind the row. `NOT IN` rather than a
-# correlated NOT EXISTS so the SAME fragment applies to vec0, whose table name
-# differs.
+# Orphans (--orphans): no observed event behind the row.
 _OBSERVED_IDS = "(SELECT event_id FROM events WHERE type='observed')"
 _ORPHAN_MATCH = "event_id NOT IN " + _OBSERVED_IDS
 _ORPHAN_PROXY_MATCH = "kind='observed' AND belief_id NOT IN " + _OBSERVED_IDS
@@ -84,7 +72,6 @@ def prune_orphans(db_path: str, dry_run: bool = False) -> int:
                             + _ORPHAN_PROXY_MATCH)
         else:
             n = conn.execute("DELETE FROM observed_vectors WHERE " + _ORPHAN_MATCH).rowcount
-            delete_matching(conn, _ORPHAN_MATCH, ())  # best-effort ANN-mirror cleanup
             p = _proxy_rows(conn, "DELETE FROM query_proxy_vectors WHERE " + _ORPHAN_PROXY_MATCH)
             conn.commit()
         print(f"  orphans (no observed event in the log): {n} vectors, {p} excerpt proxies")
@@ -118,7 +105,6 @@ def prune_vectors(db_path: str, prefixes: list[str], dry_run: bool = False) -> i
                 p = _count_proxies(conn, prefix)
             else:
                 n = conn.execute("DELETE FROM observed_vectors WHERE " + _MATCH, (prefix,)).rowcount
-                delete_matching(conn, _MATCH, (prefix,))  # best-effort ANN-mirror cleanup
                 p = _delete_proxies(conn, prefix)
             total += n
             print(f"  {prefix!r}: {n} vectors, {p} excerpt proxies")

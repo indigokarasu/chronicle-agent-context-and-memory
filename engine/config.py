@@ -79,6 +79,14 @@ DORMANT: list[tuple[str, Callable[[Any], bool], str]] = [
     ("retrieval.predictive_prefetch", lambda v: bool(v),
      "Predictive prefetch — no background warm-cache path exists; the "
      "synchronous `prefetch` tool is unaffected"),
+    # The sqlite-vec backend is gone. Declared rather than deleted for the same
+    # reason as predictive_prefetch: an old config that names it must not have
+    # the setting vanish silently, leaving the operator believing an ANN index
+    # is serving their queries. Only the sqlite-vec value is a broken promise;
+    # `bruteforce` (the default) is what actually runs, so it stays quiet.
+    ("vector_index.backend", lambda v: str(v).strip().lower() == "sqlite-vec",
+     "sqlite-vec is no longer supported; vector search uses the in-memory cache "
+     "and the brute-force scan, and this setting is ignored"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -249,6 +257,12 @@ DECLARED_DORMANT: dict[str, str] = {
         "query synonym expansion -- synonym detection not wired",
     "retrieval.query_understanding.decompose":
         "query decomposition -- multi-clause strategy not implemented",
+
+    # -- vector search ------------------------------------------------------
+    "vector_index.backend":
+        "vector search has one implementation (the in-memory cache over the "
+        "brute-force scan); the removed `sqlite-vec` value is ignored and warned "
+        "about at boot",
 
     # -- sources ------------------------------------------------------------
     "sources.hermes_hooks.enabled":
@@ -453,10 +467,17 @@ DEFAULTS: dict[str, Any] = {
                    # a fresh deployment is not left to discover and configure the
                    # exclusion itself.
                    "skip_automation": True},
-    # A12: `bruteforce_ceiling` was declared here and read by nothing. There is
-    # exactly one index backend (engine/vector_index.py brute force); a ceiling
-    # past which a nonexistent ANN backend takes over is not a knob, it is a
-    # claim. Deleted rather than declared dormant: it promises a second backend.
+    # INERT: vector search has one implementation, the in-memory float16 cache
+    # over the paged brute-force scan (engine/vector_cache.py), and nothing
+    # selects between backends. `backend: sqlite-vec` used to switch on an ANN
+    # mirror (a vec0 table) that only new writes filled, so it answered queries
+    # from a partial index. The key stays declared so an old config that sets it
+    # still loads; DORMANT warns once per process when it names sqlite-vec, so
+    # an operator is not left believing an index is serving queries. A vec0
+    # table left in an existing store is never queried or written, and can stay
+    # or be dropped by hand.
+    # (A12 removed `bruteforce_ceiling` earlier: it promised a second backend
+    # that does not exist.)
     "vector_index": {"backend": "bruteforce"},
 
     # §15.8 (issue #5): the declarative users/agents access topology. can_read's

@@ -194,7 +194,7 @@ class TestNothingCompressWritesWaitsOnTheEmbedder(unittest.TestCase):
         self.eng.update_model("test-model", context_length=3000)
         core = self.eng.core
         self.stalled = _StalledEmbedder()
-        for obj in (core, core.reducer, core.retrieval, core.vector_index):
+        for obj in (core, core.reducer, core.retrieval):
             if hasattr(obj, "embedder"):
                 obj.embedder = self.stalled
 
