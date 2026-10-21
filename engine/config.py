@@ -1482,8 +1482,15 @@ DEFAULTS: dict[str, Any] = {
     # would not promise a key the code consults. None means "no client-side
     # payload encryption"; CHRONICLE_GIT_ENCRYPTION_KEY takes precedence over it,
     # and remains the right place to put an actual secret.
+    #
+    # `max_flush_batches` bounds one GitMirror.flush() to that many commits of
+    # `max_commit_rows` events. A profile that moves to its own mirror queues
+    # its whole store for it at once; unbounded, the flush at the host's
+    # shutdown would write and commit all of it before the host could exit.
+    # What is left is written by the next flush.
     "git": {"enabled": True, "max_commit_rows": 1000, "max_lag_minutes": 30,
-            "snapshot_interval": "0 * * * *", "encryption_key": None},
+            "snapshot_interval": "0 * * * *", "encryption_key": None,
+            "max_flush_batches": 10},
 
     # Context-engine slot (§27 context:)
     "context_engine": {

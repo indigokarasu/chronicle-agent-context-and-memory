@@ -30,6 +30,8 @@ try:
     from .interaction_patterns import InteractionPatternMiner
     from .learning import LearningLoop
     from .localdb import register_local_dbs
+    from .migrate_paths import settle_db_path, settle_git_repo
+    from .paths import DB_REL, GIT_REL, expand_data_path, legacy_db_path, legacy_git_path, resolve_home
     from .reasoning import EpistemicModel, ReasoningLayer
     from .reducer import Reducer
     from .retrieval import RetrievalEngine
@@ -53,6 +55,8 @@ except ImportError:  # direct module execution / standalone tooling
     from interaction_patterns import InteractionPatternMiner
     from learning import LearningLoop
     from localdb import register_local_dbs
+    from migrate_paths import settle_db_path, settle_git_repo
+    from paths import DB_REL, GIT_REL, expand_data_path, legacy_db_path, legacy_git_path, resolve_home
     from reasoning import EpistemicModel, ReasoningLayer
     from reducer import Reducer
     from retrieval import RetrievalEngine
@@ -82,6 +86,7 @@ class ChronicleCore:
         constructor, and which one answers decides which embedder this core
         holds. Pass `embeddings.NullProbe()` (or `StaticProbe({...})`) to make
         construction socket-free and machine-independent."""
+        hermes_home = resolve_home(hermes_home)
         self.hermes_home = hermes_home
         self.embedder_probe = embedder_probe
         self.cfg = Config(config or {})
@@ -105,9 +110,19 @@ class ChronicleCore:
         self._drain_thread_lock = threading.Lock()
         self.active_principal = "default"
 
-        db_path = self.cfg.get("db_path") or str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
-        db_path = db_path.replace("~/.hermes", str(Path(hermes_home))) if db_path.startswith("~/.hermes") \
-            else str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
+        # The store is opened where the config says (engine/paths.py). A store
+        # an older release left elsewhere -- it ignored an absolute db_path and
+        # named a profile twice -- is moved here first when that is safe; when
+        # it is not, `settle_db_path` returns the old path and the store is used
+        # there, exactly as that release did.
+        db_cfg = self.cfg.get("db_path")
+        self.store_migration = settle_db_path(expand_data_path(db_cfg, hermes_home, DB_REL),
+                                              legacy_db_path(db_cfg, hermes_home),
+                                              home=hermes_home)
+        db_path = self.store_migration.path
+        if self.store_migration.action != "none":
+            logger.info("Chronicle store: %s, opening %s%s", self.store_migration.action, db_path,
+                        (" (%s)" % self.store_migration.detail) if self.store_migration.detail else "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.store = MemoryStore(db_path)
@@ -148,7 +163,14 @@ class ChronicleCore:
         self.interaction_patterns = InteractionPatternMiner(self.store)
         self.epistemic = EpistemicModel(self.store, self.cfg)
         self.reasoning = ReasoningLayer(self)
-        self.gitmirror = GitMirror(self.store, self.cfg)
+        # Each profile mirrors to its own repo. One that used the shared mirror
+        # of older releases gets all of its events queued for its own, once.
+        git_cfg = self.cfg.get("git_repo")
+        git_repo = expand_data_path(git_cfg, hermes_home, GIT_REL)
+        self.git_migration = settle_git_repo(git_repo, legacy_git_path(git_cfg), self.store,
+                                             enabled=bool(self.cfg.get("git.enabled", True)),
+                                             remote=self.cfg.get("git_remote"))
+        self.gitmirror = GitMirror(self.store, self.cfg, repo=git_repo)
         # Host-model piggyback registry (§H1). Constructing it is free — the
         # constructor stores two references and touches neither SQLite nor
         # config — so it is safe on the default path, where host_model.piggyback
@@ -183,13 +205,16 @@ class ChronicleCore:
 
     @classmethod
     def get(cls, hermes_home: str, config: dict | None = None, embedder_probe=None) -> ChronicleCore:
+        # Keyed by the resolved home: "", None, a trailing slash or a `~`
+        # spelling of one home must find the same core, not open a second one
+        # (or one for the default profile) over the same store.
+        key = resolve_home(hermes_home)
         with cls._lock:
-            if hermes_home not in cls._instances:
+            if key not in cls._instances:
                 if config is None:
-                    config = cls._load_memory_config(hermes_home)
-                cls._instances[hermes_home] = cls(hermes_home, config,
-                                                  embedder_probe=embedder_probe)
-            return cls._instances[hermes_home]
+                    config = cls._load_memory_config(key)
+                cls._instances[key] = cls(key, config, embedder_probe=embedder_probe)
+            return cls._instances[key]
 
     @staticmethod
     def _load_memory_config(hermes_home: str) -> dict:
