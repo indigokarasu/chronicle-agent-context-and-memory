@@ -233,7 +233,7 @@ def run_path(which, path, rows, nq, limit):
     store = seed(path, rows)
     cfg = Config({"embeddings": {"model": "hashing", "dimensions": QUERY_DIMS}})
     embedder = HashingEmbedder(dimensions=QUERY_DIMS)
-    engine = RetrievalEngine(store, cfg, embedder=embedder, vector_index=None)
+    engine = RetrievalEngine(store, cfg, embedder=embedder)
     qs = _queries(nq, embedder)
 
     if which == "old":

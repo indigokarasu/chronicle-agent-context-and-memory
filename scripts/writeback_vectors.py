@@ -189,8 +189,6 @@ from engine.embeddings import (
     is_usable_model_tag,
 )
 from engine.paths import resolve_home
-from engine.vector_index import mirror_unmaintainable as _vec0_unmaintainable
-from engine.vector_index import upsert_observed as _vec0_upsert
 from engine.reducer import (
     belief_vector_text,
     observed_vector_text,
@@ -920,23 +918,6 @@ class WriteBack:
                 if not cur.rowcount:
                     self._note("skipped-changed", ident)
                     continue
-                # Keep the vec0 ANN mirror (engine/vector_index.py) in step with the
-                # row just rewritten. MemoryStore does this on the normal write path;
-                # this tool writes raw SQL, so it must do it itself.
-                #
-                # UPSERT the corrected blob -- NOT delete. An earlier revision
-                # deleted the mirror entry on the theory that retrieval "falls
-                # through to the paged scan" when the ANN has nothing. That is true
-                # only when KNN returns NOTHING AT ALL. retrieve_raw takes a
-                # nonempty KNN result INSTEAD of the paged scan, and a row missing
-                # from a partly-filled mirror is then never a vector candidate
-                # unless full-text search finds it -- so deleting turned "ranked on
-                # a stale embedding" into "not found". Same transaction, never
-                # commits, never creates vec0, and a no-op when sqlite-vec cannot
-                # load here or vec0's width differs (the engine disables ANN on
-                # that mismatch itself).
-                if table == "observed_vectors":
-                    _vec0_upsert(self.live, key[0], new_blob)
                 applied_rows.append({"k": list(key), "h": _hex(sha_blob(new_blob))})
                 # Counted into LOCALS, banked after COMMIT. A later row in this
                 # same batch can raise Refused (W5), and the handler rolls the
@@ -1244,13 +1225,6 @@ def writeback(live_db, copy_db, manifest_path=None, dry_run=False,
         print("manifest       : %s  (%d rows, built %s)"
               % (manifest_path, sum((header.get("row_counts") or {}).values()),
                  header.get("created_at")))
-        # REFUSE, not warn. An earlier revision printed a warning and carried
-        # on: the rows changed, upsert_observed() quietly returned 0, and the
-        # mirror kept the pre-image -- the silent partial state W1-W8 exist to
-        # rule out. Checked before WriteBack is built, so nothing has been
-        # written, and in dry-run too, which must predict the real run.
-        if _vec0_unmaintainable(live):
-            raise Refused("this database has a vec0 ANN mirror, but this Python's sqlite3 cannot load sqlite-vec, so the mirror cannot be kept equal to observed_vectors. A process that CAN load it trusts a nonempty KNN result instead of scanning the table, and would go on serving the embeddings this tool is about to replace. The mirror cannot be dropped or edited without the extension either. Re-run under a Python whose sqlite3 can load sqlite-vec.")
         print("active tag     : %s" % active_tag)
         print("expected width : %d dims (%d bytes)" % (expect_len // 4, expect_len))
         print("mode           : %s" % ("DRY RUN (live opened read-only, nothing written)"

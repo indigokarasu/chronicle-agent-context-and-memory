@@ -430,7 +430,6 @@ class MemoryStore:
         self._local = threading.local()
         self._write_lock = threading.RLock()
         self.reducer = None  # set by ChronicleCore; enables inline reduce on append (I7)
-        self.vector_index = None  # set by ChronicleCore; optional ANN index for fast KNN
         self.cfg = None  # set by ChronicleCore; config object for reading PRAGMA values
         self._lock_waits = 0
         self._lock_acqs = 0
@@ -1521,21 +1520,11 @@ class MemoryStore:
             conn.execute("INSERT OR REPLACE INTO observed_vectors(event_id,embedding,model,owner,created_at) "
                          "VALUES(?,?,?,?,?)", (event_id, embedding, model, owner,
                                                created_at or now_iso()))
-            # Mirror into the optional ANN index (§27 vector_index, u5), on the
-            # SAME connection/transaction -- this can be nested arbitrarily deep
-            # inside append_event's single re-entrant transaction (I7), so it
-            # must never commit independently (see vector_index.py docstring).
-            if self.vector_index:
-                try:
-                    self.vector_index.add_observed_vector(conn, event_id, embedding)
-                except Exception as e:
-                    logger.warning("Failed to update vector_index for %s: %s", event_id, e)
 
     def delete_observed_vector(self, event_id: str):
-        """Drop a single observed event's vector (both the brute-force row and
-        its ANN mirror). Used where a raw event stops being retrievable outright
-        -- e.g. §20.5 unlearn/forbidden content -- as opposed to
-        prune_observed_vectors's bulk keep-list rebuild.
+        """Drop a single observed event's vector. Used where a raw event stops
+        being retrievable outright -- e.g. §20.5 unlearn/forbidden content --
+        as opposed to prune_observed_vectors's bulk keep-list rebuild.
 
         §H2: the event's doc2query EXCERPT proxies go with it. Those rows are
         keyed by event_id under kind='observed' and, now that the excerpt tier
@@ -1547,11 +1536,6 @@ class MemoryStore:
         with self.transaction() as conn:
             conn.execute("DELETE FROM observed_vectors WHERE event_id=?", (event_id,))
             self.delete_excerpt_proxies(event_id)   # re-entrant: same transaction
-            if self.vector_index:
-                try:
-                    self.vector_index.delete_observed_vector(conn, event_id)
-                except Exception as e:
-                    logger.warning("Failed to delete vector_index entry for %s: %s", event_id, e)
 
     def add_memory_vector(self, belief_id: str, kind: str, embedding: bytes, model: str,
                           created_at: str = ""):
@@ -2126,15 +2110,11 @@ class MemoryStore:
             yield batch
 
     def get_observed_vectors_by_ids(self, event_ids) -> dict[str, dict]:
-        """Stored vectors for specific events, keyed by event_id (§24.4, u5).
+        """Stored vectors for specific events, keyed by event_id (§24.4).
 
-        Random access is what the paged scan never needs and the ANN fast path
-        cannot do without: `iter_observed_vectors_paged` visits EVERY row, so
-        retrieve_raw's paged branch credits every already-scored FTS hit as a
-        side effect of scanning past it, while a bounded KNN window reaches
-        only its own top-k. Without a by-id lookup an FTS hit outside that
-        window silently loses its whole vector contribution. Chunked to stay
-        under SQLITE_MAX_VARIABLE_NUMBER; ids with no vector are simply absent.
+        Random access, for callers that already hold a set of event ids and
+        must not scan the table to find their vectors. Chunked to stay under
+        SQLITE_MAX_VARIABLE_NUMBER; ids with no vector are simply absent.
         """
         out: dict[str, dict] = {}
         ids = [e for e in dict.fromkeys(event_ids) if e]
@@ -3874,11 +3854,6 @@ class MemoryStore:
             conn.execute("DELETE FROM belief_fts")
             # The replay that follows indexes every user-side row again.
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('observed_user_fts_ready','1')")
-            if self.vector_index:
-                try:
-                    self.vector_index.prune_observed_vectors(conn, set())  # keep nothing -- full rebuild
-                except Exception as e:
-                    logger.warning("Failed to clear vector_index on truncate: %s", e)
 
 
 # -- helpers --------------------------------------------------------------

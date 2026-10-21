@@ -59,18 +59,10 @@ class _FakeVectorStore:
         return out
 
 
-class _NoIndex:
-    """A disabled ANN index — keeps RetrievalEngine.__init__ from building a
-    real VectorIndex against a bare store."""
-
-    def is_enabled(self):
-        return False
-
-
 def _engine(vectors=None, overrides=None, store=None):
     cfg = Config(overrides or {})
     return RetrievalEngine(store if store is not None else _FakeVectorStore(vectors or {}),
-                           cfg, embedder=None, vector_index=_NoIndex())
+                           cfg, embedder=None)
 
 
 def _cand(belief_id, score):
@@ -342,8 +334,7 @@ class TestRerankThroughSearch(unittest.TestCase):
     def _search(self, blend=None, embedder=_FIXED, limit=6):
         overrides = {} if blend is None else {"retrieval": {"rerank_blend": blend}}
         eng = RetrievalEngine(self.store, Config(overrides),
-                              embedder=_FixedEmbedder() if embedder is _FIXED else embedder,
-                              vector_index=_NoIndex())
+                              embedder=_FixedEmbedder() if embedder is _FIXED else embedder)
         return eng.search(QUERY, limit=limit)
 
     def test_fts_really_does_rank_the_irrelevant_keyword_match_first(self):

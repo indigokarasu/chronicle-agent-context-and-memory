@@ -38,7 +38,6 @@ try:
     from .scheduler import Scheduler
     from .store import MemoryStore, StoreClosed, now_iso
     from .tools import Tools
-    from .vector_index import VectorIndex
 except ImportError:  # direct module execution / standalone tooling
     import access
     from capture import CaptureEngine, Reaper
@@ -63,7 +62,6 @@ except ImportError:  # direct module execution / standalone tooling
     from scheduler import Scheduler
     from store import MemoryStore, StoreClosed, now_iso
     from tools import Tools
-    from vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.core")
 
@@ -138,13 +136,6 @@ class ChronicleCore:
                                      self.cfg.get("embeddings.task_prefixes"),
                                      self.cfg.get("embeddings.allow_remote"),
                                      probe=embedder_probe)
-        # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
-        # the store (add/delete/prune on write) and retrieval (KNN on read); see
-        # vector_index.py and RetrievalEngine.__init__ for why sharing matters.
-        # Dimensions come from the ACTIVE embedder, not a separate config knob,
-        # so the vec0 column always matches what's actually being written.
-        self.vector_index = VectorIndex(self.store, self.cfg, embedder=self.embedder)
-        self.store.vector_index = self.vector_index
         self.reducer = Reducer(self.store, self.embedder, self.cfg)
         self.store.reducer = self.reducer                       # inline reduce on append (I7)
         self.capture = CaptureEngine(self.store, self.reducer,
@@ -153,8 +144,7 @@ class ChronicleCore:
         self.extractor = make_extractor(self.cfg)
         self.derivation = DerivationEngine(self.store, self.cfg, self.capture.append)
         self.federation = CapabilityRegistry(self.store, self.cfg)
-        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation,
-                                         vector_index=self.vector_index)
+        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation)
         self.forgetting = ForgettingEngine(self.store, self.cfg, self.capture.append)
         self.health = HealthEngine(self)
         self.learning = LearningLoop(self)
@@ -523,8 +513,8 @@ class ChronicleCore:
     def diagnostics(self) -> dict:
         """Comprehensive system diagnostics for agents and operators.
 
-        Reports database stats, vector index configuration, pending background
-        work, embedding mode, active principal, and component state in one place.
+        Reports database stats, vector count, pending background work,
+        embedding mode, active principal, and component state in one place.
         """
         events_count = 0
         beliefs_count = 0
@@ -536,15 +526,13 @@ class ChronicleCore:
         except Exception:
             pass
 
-        vector_info = {}
-        if hasattr(self, "vector_index") and self.vector_index:
-            try:
-                vector_info = {
-                    "backend": getattr(self.vector_index, "backend", "unknown"),
-                    "total_vectors": self.vector_index.count(),
-                }
-            except Exception as e:
-                vector_info = {"backend": "error", "error": str(e)}
+        # Brute force is the only vector backend. The old report asked an index
+        # object for a count it never defined, so it always said "error".
+        vector_info = {"backend": "bruteforce"}
+        try:
+            vector_info["total_vectors"] = self.store.count_rows("observed_vectors")
+        except Exception as e:
+            vector_info = {"backend": "error", "error": str(e)}
 
         return {
             "active_principal": self.active_principal,
