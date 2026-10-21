@@ -160,7 +160,6 @@ def bind_home(a):
 
 def bind(cfg, a, conn):
     """Bind entity X to the record whose id is X, via link_adjudicated events."""
-    sys.path.insert(0, "/root/.hermes/hermes-agent")
     from engine.core import ChronicleCore
     core = ChronicleCore(bind_home(a), cfg._explicit if hasattr(cfg, "_explicit") else {})
     n = 0

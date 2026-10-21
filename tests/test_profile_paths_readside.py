@@ -717,5 +717,19 @@ class TestNoDirectEnvironmentReads(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class TestNoServerPathsInScripts(unittest.TestCase):
+    """The scripts ship in a public repository and run from a checkout anywhere.
+    A path to one machine's install does nothing on any other and names a host
+    layout that is not the project's to publish."""
+
+    def test_no_script_names_an_absolute_install_path(self):
+        offenders = []
+        for path in sorted(_SCRIPTS.glob("*.py")):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if '"/root' in line or "'/root" in line:
+                    offenders.append("%s:%d" % (path.name, number))
+        self.assertEqual(offenders, [])
+
+
 if __name__ == "__main__":
     unittest.main()
