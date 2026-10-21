@@ -159,7 +159,8 @@ class ChronicleCore:
         git_repo = expand_data_path(git_cfg, hermes_home, GIT_REL)
         self.git_migration = settle_git_repo(git_repo, legacy_git_path(git_cfg), self.store,
                                              enabled=bool(self.cfg.get("git.enabled", True)),
-                                             remote=self.cfg.get("git_remote"))
+                                             remote=self.cfg.get("git_remote"),
+                                             home=hermes_home)
         self.gitmirror = GitMirror(self.store, self.cfg, repo=git_repo)
         # Host-model piggyback registry (§H1). Constructing it is free — the
         # constructor stores two references and touches neither SQLite nor

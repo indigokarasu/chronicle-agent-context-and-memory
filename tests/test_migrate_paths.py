@@ -564,21 +564,57 @@ class TestGit(Base):
         with open(os.path.join(self.shared, "events", "other.jsonl"), "w") as fh:
             fh.write("{}\n")
 
+    def settle_git(self, repo=None, store=None, home=None):
+        return settle_git_repo(repo or self.repo, self.shared, store or self.store,
+                               enabled=True, remote=None, home=home or self.home)
+
     def test_requeues_every_event_exactly_once_and_only_once(self):
-        r = settle_git_repo(self.repo, self.shared, self.store, enabled=True, remote=None)
+        r = self.settle_git()
         self.assertEqual((r.action, r.path), ("copied", self.repo))
         self.assertEqual(self.store.git_lag(), 25)
         pending = self.store._conn().execute(
             "SELECT COUNT(DISTINCT event_id) FROM git_queue WHERE committed=0").fetchone()[0]
         self.assertEqual(pending, 25)
-        self.assertEqual(self.store.get_meta("git_mirror_repo"), os.path.realpath(self.repo))
+        self.assertEqual(self.store.get_meta("git_mirror_repo"), "home:" + GIT_REL)
         self.assertTrue(os.path.isdir(self.repo))
         warns = self.log.at(logging.WARNING)
         self.assertEqual(len(warns), 1)
         self.assertIn(self.shared, warns[0].getMessage())
-        r2 = settle_git_repo(self.repo, self.shared, self.store, enabled=True, remote=None)
+        r2 = self.settle_git()
         self.assertEqual(r2.action, "none")
         self.assertEqual(self.store.git_lag(), 25)
+
+    def test_the_marker_does_not_hold_where_the_home_is(self):
+        # The same profile at another path (a restored home, a fresh temporary
+        # home per run) must write the same store, and must not take its own
+        # mirror for a new one and queue every event again.
+        other_home = os.path.join(self.root, "restored", "p")
+        other = MemoryStore(seed_store(os.path.join(other_home, DB_REL), 3))
+        self.addCleanup(other.close)
+        self.settle_git()
+        self.settle_git(os.path.join(other_home, GIT_REL), other, other_home)
+        self.assertEqual(other.get_meta("git_mirror_repo"), self.store.get_meta("git_mirror_repo"))
+        self.assertNotIn(self.root, self.store.get_meta("git_mirror_repo"))
+
+    def test_a_home_reached_through_a_symlink_is_the_same_mirror(self):
+        self.settle_git()
+        alias = os.path.join(self.root, "alias-home")
+        os.symlink(self.home, alias)
+        r = self.settle_git(os.path.join(alias, GIT_REL), home=alias)
+        self.assertEqual(r.action, "none")
+        self.assertEqual(self.store.git_lag(), 25)
+
+    def test_a_mirror_outside_the_home_is_recorded_by_its_realpath(self):
+        # A sibling whose name starts with the home's name is not inside it.
+        for repo in (os.path.join(self.root, "mirrors", "p"), self.home + "-old/git"):
+            r = self.settle_git(repo)
+            self.assertEqual(r.path, repo)
+            self.assertEqual(self.store.get_meta("git_mirror_repo"), os.path.realpath(repo))
+            self.assertEqual(self.settle_git(repo).action, "none")
+
+    def test_no_home_records_the_realpath(self):
+        settle_git_repo(self.repo, self.shared, self.store, enabled=True, remote=None)
+        self.assertEqual(self.store.get_meta("git_mirror_repo"), os.path.realpath(self.repo))
 
     def test_the_legacy_mirror_is_untouched(self):
         before = sorted(os.listdir(os.path.join(self.shared, "events")))
