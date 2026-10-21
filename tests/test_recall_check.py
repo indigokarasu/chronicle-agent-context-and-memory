@@ -560,6 +560,37 @@ class TestCanary(_CanaryCase):
         self.assertIsNone(seen["env"], "the flag must not force the offline embedder")
         self.assertNotEqual(seen["model"], "hashing")
 
+    @_NEEDS_YAML
+    def test_the_live_embedder_flag_uses_the_profiles_embeddings_section(self):
+        # The canary moves HOME and HERMES_HOME to its temporary home, which has
+        # no config.yaml. The profile's own section has to be read before that,
+        # or a configured endpoint is never the one that is checked.
+        url = "http://embeddings.invalid/v1"
+        _write_config(os.path.join(self.user_home, ".hermes"),
+                      "memory:\n  embeddings:\n    model: example-embed-model\n"
+                      "    base_url: %s\n" % url)
+        from engine import core as core_mod
+        real = core_mod.get_embedder
+        seen = []
+
+        def spy(model, dimensions=None, base_url=None, *args, **kw):
+            seen.append((model, base_url))
+            return real("hashing")
+
+        with mock.patch.dict(sys.modules, {"hermes_constants": None}), \
+                mock.patch.object(core_mod, "get_embedder", spy):
+            code, pairs, result, out = self.run_canary("--live-embedder")
+            live = list(seen)
+            del seen[:]
+            offline_code, _, offline_result, offline_out = self.run_canary()
+        self.assertEqual((code, result), (0, "PASS"), out)
+        self.assertEqual(set(live), {("example-embed-model", url)})
+        self.assertEqual(pairs["embeddings_config"], "%s [memory.embeddings]"
+                         % os.path.join(self.user_home, ".hermes", "config.yaml"))
+        # Without the flag the section is not used: offline, and no network.
+        self.assertEqual((offline_code, offline_result), (0, "PASS"), offline_out)
+        self.assertEqual(set(seen), {("hashing", None)})
+
     def test_it_goes_red_when_retrieval_returns_nothing(self):
         from engine.retrieval import RetrievalEngine
         empty_answer = {"answer": "", "abstain": True, "sources": [], "confidence": 0.0,
