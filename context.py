@@ -17,7 +17,10 @@ import re
 import threading
 import time
 from contextlib import nullcontext
-from pathlib import Path
+# Unused here since the home moved to engine.paths, but kept: the test suite
+# patches `context.Path.home` to keep a bare engine's lazy-init default inside a
+# temp dir, and that patch fails with AttributeError if this name is gone.
+from pathlib import Path  # noqa: F401
 from typing import Any
 
 try:  # real Hermes base when present …
@@ -303,6 +306,11 @@ except Exception:  # … else top-level layout (plugin-package vs. flat checkout
             tombstone span_id/digest needs."""
             return _hashlib.blake2b((s or "").encode("utf-8"), digest_size=32).hexdigest()
 
+try:  # the one rule for "which Hermes home", shared with the provider and store …
+    from .engine.paths import resolve_home  # type: ignore
+except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
+    from engine.paths import resolve_home
+
 try:  # deterministic, no-model extraction for the checkpoint digest (§R7) …
     from .engine.extraction import HeuristicExtractor  # type: ignore
 except Exception:  # … else top-level layout (plugin-package vs. flat checkout)
@@ -354,8 +362,9 @@ _ENTITY_RESOLVE_CAP = 6
 
 
 def _default_hermes_home() -> str:
-    """Real path a caller-omitted hermes_home resolves to (on_session_start's
-    default, and compress()'s lazy-init default -- R1).
+    """Real path a caller-omitted hermes_home resolves to when this engine has
+    no earlier home to keep (the first on_session_start, and compress()'s
+    lazy-init default -- R1).
 
     "~/.hermes" is a display convention, not a filesystem path: nothing
     downstream (ChronicleCore.get / ChronicleCore.__init__) expands `~`, so
@@ -363,11 +372,15 @@ def _default_hermes_home() -> str:
     and silently resolving *relative to the process's cwd* -- a real,
     persistent SQLite store at ./~/.hermes/... wherever the host happened to
     be running from, not the user's actual home. Computed fresh on every call
-    (not baked into a parameter default) so it tracks Path.home() rather than
-    whatever HOME was set to at import time -- same convention as
-    provider.py's `hermes_home or str(Path.home() / ".hermes")`.
+    (not baked into a parameter default) so it tracks the environment of the
+    moment rather than whatever HOME was set to at import time.
+
+    `resolve_home` asks the host first, because the host knows the active
+    profile; the old `Path.home() / ".hermes"` always meant the DEFAULT
+    profile, so a named profile's engine that reached this default bound the
+    default profile's store. The provider uses the same resolver.
     """
-    return str(Path.home() / ".hermes")
+    return resolve_home(None)
 
 
 # Lazy re-init policy. An init failure is a moment, not a verdict: on 2026-08-02
@@ -520,9 +533,22 @@ class ChronicleContextEngine(ContextEngine):
 
     # lifecycle
     def on_session_start(self, session_id, *, hermes_home=None, principal_id="default", config=None, **kw):
-        # None (not passed / explicitly cleared) resolves to the real home
-        # directory here, at call time -- see _default_hermes_home().
-        hermes_home = hermes_home or _default_hermes_home()
+        # A start that names no home keeps the home this engine already serves.
+        # After a compression the host starts the child session with
+        # on_session_start(child, boundary_reason="compression", ...) and no
+        # hermes_home. Resolving a default there moved a named profile's
+        # conversation onto the default profile's core and store from the
+        # first compression on, with nothing in the log to say so. The config
+        # given with that home stays with it, so a retry after a failed first
+        # init rebuilds the same core rather than one built from defaults.
+        # Only a start with no earlier home resolves one (_default_hermes_home).
+        prior = self._init_args or {}
+        if not hermes_home and prior.get("hermes_home"):
+            hermes_home = resolve_home(prior["hermes_home"])
+            if config is None:
+                config = prior.get("config")
+        else:
+            hermes_home = resolve_home(hermes_home)
         self._session_id = session_id
         self._principal_id = principal_id
         self._host_context = {k: str(kw[k]) for k in ("agent_context", "platform") if kw.get(k)}

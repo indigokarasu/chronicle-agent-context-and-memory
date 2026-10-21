@@ -30,13 +30,15 @@ try:
     from .interaction_patterns import InteractionPatternMiner
     from .learning import LearningLoop
     from .localdb import register_local_dbs
+    from .migrate_paths import settle_db_path, settle_git_repo
+    from .paths import DB_REL, GIT_REL, expand_data_path, legacy_db_path, legacy_git_path, resolve_home
     from .reasoning import EpistemicModel, ReasoningLayer
     from .reducer import Reducer
     from .retrieval import RetrievalEngine
     from .scheduler import Scheduler
     from .store import MemoryStore, StoreClosed, now_iso
     from .tools import Tools
-    from .vector_index import VectorIndex
+    from .yaml_load import YamlUnavailable, safe_load_file
 except ImportError:  # direct module execution / standalone tooling
     import access
     from capture import CaptureEngine, Reaper
@@ -53,13 +55,15 @@ except ImportError:  # direct module execution / standalone tooling
     from interaction_patterns import InteractionPatternMiner
     from learning import LearningLoop
     from localdb import register_local_dbs
+    from migrate_paths import settle_db_path, settle_git_repo
+    from paths import DB_REL, GIT_REL, expand_data_path, legacy_db_path, legacy_git_path, resolve_home
     from reasoning import EpistemicModel, ReasoningLayer
     from reducer import Reducer
     from retrieval import RetrievalEngine
     from scheduler import Scheduler
     from store import MemoryStore, StoreClosed, now_iso
     from tools import Tools
-    from vector_index import VectorIndex
+    from yaml_load import YamlUnavailable, safe_load_file
 
 logger = logging.getLogger("chronicle.core")
 
@@ -82,6 +86,7 @@ class ChronicleCore:
         constructor, and which one answers decides which embedder this core
         holds. Pass `embeddings.NullProbe()` (or `StaticProbe({...})`) to make
         construction socket-free and machine-independent."""
+        hermes_home = resolve_home(hermes_home)
         self.hermes_home = hermes_home
         self.embedder_probe = embedder_probe
         self.cfg = Config(config or {})
@@ -105,9 +110,19 @@ class ChronicleCore:
         self._drain_thread_lock = threading.Lock()
         self.active_principal = "default"
 
-        db_path = self.cfg.get("db_path") or str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
-        db_path = db_path.replace("~/.hermes", str(Path(hermes_home))) if db_path.startswith("~/.hermes") \
-            else str(Path(hermes_home) / "commons/db/chronicle/chronicle.db")
+        # The store is opened where the config says (engine/paths.py). A store
+        # an older release left elsewhere -- it ignored an absolute db_path and
+        # named a profile twice -- is moved here first when that is safe; when
+        # it is not, `settle_db_path` returns the old path and the store is used
+        # there, exactly as that release did.
+        db_cfg = self.cfg.get("db_path")
+        self.store_migration = settle_db_path(expand_data_path(db_cfg, hermes_home, DB_REL),
+                                              legacy_db_path(db_cfg, hermes_home),
+                                              home=hermes_home)
+        db_path = self.store_migration.path
+        if self.store_migration.action != "none":
+            logger.info("Chronicle store: %s, opening %s%s", self.store_migration.action, db_path,
+                        (" (%s)" % self.store_migration.detail) if self.store_migration.detail else "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self.store = MemoryStore(db_path)
@@ -123,13 +138,6 @@ class ChronicleCore:
                                      self.cfg.get("embeddings.task_prefixes"),
                                      self.cfg.get("embeddings.allow_remote"),
                                      probe=embedder_probe)
-        # Optional ANN index (§27 vector_index:, u5) -- ONE instance, shared by
-        # the store (add/delete/prune on write) and retrieval (KNN on read); see
-        # vector_index.py and RetrievalEngine.__init__ for why sharing matters.
-        # Dimensions come from the ACTIVE embedder, not a separate config knob,
-        # so the vec0 column always matches what's actually being written.
-        self.vector_index = VectorIndex(self.store, self.cfg, embedder=self.embedder)
-        self.store.vector_index = self.vector_index
         self.reducer = Reducer(self.store, self.embedder, self.cfg)
         self.store.reducer = self.reducer                       # inline reduce on append (I7)
         self.capture = CaptureEngine(self.store, self.reducer,
@@ -138,8 +146,7 @@ class ChronicleCore:
         self.extractor = make_extractor(self.cfg)
         self.derivation = DerivationEngine(self.store, self.cfg, self.capture.append)
         self.federation = CapabilityRegistry(self.store, self.cfg)
-        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation,
-                                         vector_index=self.vector_index)
+        self.retrieval = RetrievalEngine(self.store, self.cfg, self.embedder, self.derivation)
         self.forgetting = ForgettingEngine(self.store, self.cfg, self.capture.append)
         self.health = HealthEngine(self)
         self.learning = LearningLoop(self)
@@ -148,7 +155,15 @@ class ChronicleCore:
         self.interaction_patterns = InteractionPatternMiner(self.store)
         self.epistemic = EpistemicModel(self.store, self.cfg)
         self.reasoning = ReasoningLayer(self)
-        self.gitmirror = GitMirror(self.store, self.cfg)
+        # Each profile mirrors to its own repo. One that used the shared mirror
+        # of older releases gets all of its events queued for its own, once.
+        git_cfg = self.cfg.get("git_repo")
+        git_repo = expand_data_path(git_cfg, hermes_home, GIT_REL)
+        self.git_migration = settle_git_repo(git_repo, legacy_git_path(git_cfg), self.store,
+                                             enabled=bool(self.cfg.get("git.enabled", True)),
+                                             remote=self.cfg.get("git_remote"),
+                                             home=hermes_home)
+        self.gitmirror = GitMirror(self.store, self.cfg, repo=git_repo)
         # Host-model piggyback registry (§H1). Constructing it is free — the
         # constructor stores two references and touches neither SQLite nor
         # config — so it is safe on the default path, where host_model.piggyback
@@ -183,26 +198,38 @@ class ChronicleCore:
 
     @classmethod
     def get(cls, hermes_home: str, config: dict | None = None, embedder_probe=None) -> ChronicleCore:
+        # Keyed by the resolved home: "", None, a trailing slash or a `~`
+        # spelling of one home must find the same core, not open a second one
+        # (or one for the default profile) over the same store.
+        key = resolve_home(hermes_home)
         with cls._lock:
-            if hermes_home not in cls._instances:
+            if key not in cls._instances:
                 if config is None:
-                    config = cls._load_memory_config(hermes_home)
-                cls._instances[hermes_home] = cls(hermes_home, config,
-                                                  embedder_probe=embedder_probe)
-            return cls._instances[hermes_home]
+                    config = cls._load_memory_config(key)
+                cls._instances[key] = cls(key, config, embedder_probe=embedder_probe)
+            return cls._instances[key]
 
     @staticmethod
     def _load_memory_config(hermes_home: str) -> dict:
         """The host's initialize_all() does not hand Chronicle a config dict, so
         load the ``memory:`` section from ``<hermes_home>/config.yaml`` ourselves.
         This is what makes embeddings/retrieval settings (e.g. a hosted embeddings
-        endpoint) actually take effect at runtime, matching embedding_check.py."""
+        endpoint) actually take effect at runtime, matching embedding_check.py.
+
+        A host install may have no PyYAML (its own dependency is ruamel.yaml);
+        `yaml_load` reads with either. With neither, the config cannot be read
+        at all, and that is said at WARNING: running on the defaults while the
+        file names another store or endpoint is otherwise invisible."""
         try:
             import os
-            import yaml
             p = Path(hermes_home) / "config.yaml"
             if p.exists():
-                raw = yaml.safe_load(p.read_text()) or {}
+                try:
+                    raw = safe_load_file(p) or {}
+                except YamlUnavailable:
+                    logger.warning("Chronicle: cannot read %s: no YAML parser in this Python; "
+                                   "Chronicle is running on its defaults", p)
+                    return {}
                 mem = raw.get("memory")
                 if isinstance(mem, dict):
                     mem = expand_env_refs(mem)
@@ -498,8 +525,8 @@ class ChronicleCore:
     def diagnostics(self) -> dict:
         """Comprehensive system diagnostics for agents and operators.
 
-        Reports database stats, vector index configuration, pending background
-        work, embedding mode, active principal, and component state in one place.
+        Reports database stats, vector count, pending background work,
+        embedding mode, active principal, and component state in one place.
         """
         events_count = 0
         beliefs_count = 0
@@ -511,15 +538,13 @@ class ChronicleCore:
         except Exception:
             pass
 
-        vector_info = {}
-        if hasattr(self, "vector_index") and self.vector_index:
-            try:
-                vector_info = {
-                    "backend": getattr(self.vector_index, "backend", "unknown"),
-                    "total_vectors": self.vector_index.count(),
-                }
-            except Exception as e:
-                vector_info = {"backend": "error", "error": str(e)}
+        # Brute force is the only vector backend. The old report asked an index
+        # object for a count it never defined, so it always said "error".
+        vector_info = {"backend": "bruteforce"}
+        try:
+            vector_info["total_vectors"] = self.store.count_rows("observed_vectors")
+        except Exception as e:
+            vector_info = {"backend": "error", "error": str(e)}
 
         return {
             "active_principal": self.active_principal,

@@ -51,6 +51,7 @@ from .embeddings import (
     pack,
     unpack,
 )
+from .paths import expand_data_path, resolve_home
 from .reducer import (
     belief_vector_text,
     is_duplicate_copy,
@@ -199,6 +200,26 @@ class CurationWorker:
         self.core = core
         self.store = core.store
         self.cfg = core.cfg
+
+    def _source_path(self, value) -> str:
+        """Where a configured source path (a journal directory) points for THIS
+        core's Hermes home.
+
+        `~/.hermes/...` means the home the core runs in, as it does for the
+        store. Expanded on its own, `~` named the user's directory, which under a
+        profile is the default profile's. Where nothing exists at the new meaning
+        but something does at the old one, the old one is used: a source that was
+        read before must not go silent because a profile now resolves the same
+        words to a different directory.
+        """
+        home = getattr(self.core, "hermes_home", None) or resolve_home()
+        value = str(value).strip()
+        path = expand_data_path(value, home, "")
+        if not os.path.exists(path):
+            old = os.path.expanduser(value)
+            if old != path and os.path.exists(old):
+                return old
+        return path
 
     # -- loop --------------------------------------------------------------
 
@@ -1138,7 +1159,9 @@ class CurationWorker:
         """OCAS journals → observed events, deduped by content addressing (§14.1)."""
         paths = self.cfg.get("sources.ocas_journals.paths", [])
         for path in paths:
-            path = os.path.expanduser(path)
+            if not str(path).strip():
+                continue   # an empty entry would otherwise mean the Hermes home itself
+            path = self._source_path(path)
             if not os.path.isdir(path):
                 continue
             for fn in sorted(os.listdir(path)):
@@ -1223,6 +1246,12 @@ class CurationWorker:
         if not table or not content_cols:
             raise ValueError("local db %r needs table and non-empty content_columns" % name)
 
+        # Expanded exactly as the query-time readers expand the same entry
+        # (localdb.providers_from_config, the passage lookup): a plain `~`. If
+        # this sweep resolved `~/.hermes/...` against the core's home while they
+        # did not, a profile holding its own copy of the file would project ids
+        # from one database and serve content from the other. Move all three
+        # together.
         path = os.path.expanduser(path)
         if not os.path.isfile(path):
             raise _ProviderOffline("no database file at %s" % path)

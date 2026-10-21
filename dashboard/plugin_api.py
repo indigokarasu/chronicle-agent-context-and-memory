@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -57,15 +56,49 @@ def _resolve_version() -> str:
 _VERSION = _resolve_version()
 
 
+def _load_engine_module(name: str):
+    """`engine/<name>.py`, loaded by file path.
+
+    It is read by path for the same reason `_resolve_version` reads plugin.yaml
+    by path: this file is mounted without a parent package, and importing the
+    engine package would run its whole import chain (and, by putting the plugin
+    root on ``sys.path``, shadow generically named modules for the dashboard
+    process). Only modules that import nothing from the plugin are loaded this
+    way, so loading one alone is safe.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "engine" / ("%s.py" % name)
+    spec = importlib.util.spec_from_file_location("chronicle_dashboard_%s" % name, str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_paths():
+    """`engine/paths.py`: the Hermes home and the data paths are worked out in
+    that one module, so the dashboard and the runtime cannot disagree about
+    which store a profile uses."""
+    return _load_engine_module("paths")
+
+
+_paths = _load_paths()
+# The profile's config.yaml is read the way the runtime reads it: a host
+# install with ruamel.yaml and no PyYAML would otherwise show the default
+# store instead of the configured one.
+_yaml = _load_engine_module("yaml_load")
+
+
 def _profile_home(profile: Optional[str] = None) -> Path:
-    """Resolve the Hermes profile home for a selected dashboard profile."""
-    base = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-    if base.parent.name == "profiles":
-        root = base.parent.parent
-    elif (base / "profiles").is_dir():
-        root = base
-    else:
-        root = base
+    """Resolve the Hermes profile home for a selected dashboard profile.
+
+    The starting point is the host's own idea of the home (`resolve_home`), not
+    ``$HERMES_HOME``: a dashboard started from a shell that never exported the
+    variable would otherwise read ``~/.hermes`` and show another profile's, or
+    no, store. The root is found from there, so a dashboard started as one
+    profile can still select its siblings.
+    """
+    root = Path(_paths.profile_root(_paths.resolve_home()))
     if not profile or profile == "default":
         return root
     candidate = root / "profiles" / profile
@@ -77,33 +110,33 @@ def _profile_home(profile: Optional[str] = None) -> Path:
 def _get_db_path(profile: Optional[str] = None) -> Optional[Path]:
     """Locate the Chronicle SQLite database.
 
-    Honours the active profile's configured ``memory.db_path`` (including the
-    ``~/.hermes`` / profile expansion the runtime applies) and falls back to
-    the legacy locations for compatibility. ``profile`` selects which Hermes
-    profile's configuration is inspected for multi-profile dashboards.
+    Honours the active profile's configured ``memory.db_path`` and finds it the
+    way the runtime does (``engine.paths``): ``~/.hermes`` means the profile
+    home, and a path that names the profile twice is read without the second
+    mention. A store the runtime has not moved yet is still found at its old
+    location, so the dashboard shows the data instead of an empty store. Then
+    falls back to the older layouts. ``profile`` selects which Hermes profile's
+    configuration is inspected for multi-profile dashboards.
     """
     if not isinstance(profile, str):
         profile = None
     home = _profile_home(profile)
-    # Configured path first.
+    configured = None
     cfg_path = home / "config.yaml"
     try:
-        import yaml
         if cfg_path.exists():
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
+            raw = _yaml.safe_load_file(cfg_path) or {}
             mem = raw.get("memory") if isinstance(raw, dict) else None
             if isinstance(mem, dict):
-                db_path_str = mem.get("db_path")
-                if isinstance(db_path_str, str) and db_path_str.strip():
-                    db_path = db_path_str.strip()
-                    # Mirror ChronicleCore's ~/.hermes -> profile home expansion.
-                    if db_path.startswith("~/.hermes"):
-                        db_path = str(Path(home) / db_path[len("~/.hermes"):].lstrip("/"))
-                    p = Path(db_path).expanduser()
-                    if not p.is_absolute():
-                        p = home / p
-                    if p.exists():
-                        return p
+                value = mem.get("db_path")
+                if isinstance(value, str) and value.strip():
+                    configured = value.strip()
+    except Exception:
+        pass
+    try:
+        p = Path(_paths.readable_db_path(configured, str(home)))
+        if p.exists():
+            return p
     except Exception:
         pass
     for rel in ["commons/db/chronicle/chronicle.db", "commons/db/chronicle.db", "chronicle.db"]:

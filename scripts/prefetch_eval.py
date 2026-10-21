@@ -41,6 +41,11 @@ Deterministic and read-only by default:
 
 Usage:
     python3 scripts/prefetch_eval.py [--with-embedder] <config.yaml> <chronicle.db> [questions.json]
+    python3 scripts/prefetch_eval.py [--with-embedder] [--home HERMES_HOME]
+
+With no paths, this evaluates the active Hermes home (or `--home`): its
+config.yaml and the store its runtime uses (or the one an older release left,
+while it has not been moved yet). Paths given on the command line always win.
 
 `config.yaml` is a Hermes-style config file (a top-level `memory:` section) or
 a bare memory-config mapping — either is accepted, so a hand-written eval
@@ -66,6 +71,7 @@ store) shows exactly which stage lost the evidence, not just the final total.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -75,6 +81,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from engine.core import ChronicleCore
 from engine.embeddings import NullProbe
+from engine.paths import readable_db_path, resolve_home
+from engine.yaml_load import safe_load_file
 
 # F1b: NullProbe (the default below) forces DegradedEmbedder, so every
 # relevance-gate item with no vector is kept as "no vector" rather than
@@ -85,6 +93,7 @@ from engine.embeddings import NullProbe
 # real turn. Off by default: this script's whole point is a deterministic,
 # socket-free run, and most callers still want that.
 WITH_EMBEDDER_FLAG = "--with-embedder"
+HOME_FLAG = "--home"
 
 # Two questions per category named in the brief -- people, places, purchases,
 # schedule, documents. Deliberately generic: no names, places or products, so
@@ -141,8 +150,7 @@ def _load_memory_config(config_path: str) -> dict:
     """Same shape `ChronicleCore._load_memory_config` reads from a live
     `config.yaml`: a top-level `memory:` section. A bare memory-shaped mapping
     (no `memory:` wrapper) is accepted too, for a hand-written eval config."""
-    import yaml
-    raw = yaml.safe_load(Path(config_path).read_text()) or {}
+    raw = safe_load_file(config_path) or {}
     if not isinstance(raw, dict):
         return {}
     mem = raw.get("memory")
@@ -153,22 +161,23 @@ def _engine_for(config_path: str, store_path: str, with_embedder: bool = False) 
     """Build a `ChronicleCore` bound to exactly `store_path`, no matter what
     `db_path` (if any) `config_path` declares.
 
-    `ChronicleCore.__init__` (engine/core.py) resolves `db_path` in a way that
-    only ever accepts an override starting with the literal string
-    `"~/.hermes"` — any other explicit `db_path` is silently DISCARDED in
-    favor of `<hermes_home>/commons/db/chronicle/chronicle.db`. That
-    resolution is out of scope for this task (R1 touches federated.py,
-    config.py and this script only), so rather than fight it: pass the
-    sentinel `db_path` it does honor, `"~/.hermes"` verbatim, and pass
-    `store_path` itself as `hermes_home`. The substitution
-    `"~/.hermes" -> str(Path(hermes_home))` then resolves to exactly
-    `store_path`, with no other part of construction touched -- `hermes_home`
-    is read nowhere else before `get_context()` runs (this script never calls
-    `initialize()`, `start_sources()`, or anything that would read it as a
-    real Hermes home directory).
+    The core takes its store from `db_path`, relative to its Hermes home, and
+    `~/.hermes` in that value means the home itself. So pass `"~/.hermes"`
+    verbatim as `db_path` and `store_path` itself as `hermes_home`: the value
+    then names exactly `store_path`, whatever else the config says and however
+    the core reads other `db_path` forms. `hermes_home` is read nowhere else
+    before `get_context()` runs (this script never calls `initialize()`,
+    `start_sources()`, or anything that would read it as a real Hermes home
+    directory).
+
+    That stand-in is not a real home, and the git mirror takes its repository
+    from the home and exports events from the store. An evaluation writes
+    nothing to its store, so the mirror is switched off.
     """
     cfg = _load_memory_config(config_path)
     cfg["db_path"] = "~/.hermes"
+    git = cfg.get("git")
+    cfg["git"] = dict(git if isinstance(git, dict) else {}, enabled=False)
     probe = None if with_embedder else NullProbe()
     return ChronicleCore.get(store_path, cfg, embedder_probe=probe)
 
@@ -242,16 +251,49 @@ def evaluate(core: ChronicleCore, questions: list, principal: str = "default") -
             gate.get("federated", 0)))
 
 
+def _home_defaults(home):
+    """(config.yaml, store) of a Hermes home, or None with a message when there is none.
+
+    The store is the one the runtime uses, or the one an older release left
+    there while it has not been moved. Used only when no paths were given.
+    """
+    home = resolve_home(home)
+    config_path = os.path.join(home, "config.yaml")
+    if not os.path.isfile(config_path):
+        print("no config at %s" % config_path, file=sys.stderr)
+        return None
+    store_path = readable_db_path(_load_memory_config(config_path).get("db_path"), home)
+    if not os.path.isfile(store_path):
+        print("no database at %s" % store_path, file=sys.stderr)
+        return None
+    return config_path, store_path
+
+
 def main(argv=None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+    argv = list(sys.argv[1:] if argv is None else argv)
     with_embedder = WITH_EMBEDDER_FLAG in argv
     if with_embedder:
         argv = [a for a in argv if a != WITH_EMBEDDER_FLAG]
-    if len(argv) < 2:
+    home = None
+    if HOME_FLAG in argv:
+        at = argv.index(HOME_FLAG)
+        if at + 1 >= len(argv):
+            print(__doc__)
+            return 2
+        home = argv[at + 1]
+        del argv[at:at + 2]
+    if not argv:
+        defaults = _home_defaults(home)
+        if defaults is None:
+            return 2
+        config_path, store_path = defaults
+        questions_path = None
+    elif len(argv) < 2:
         print(__doc__)
         return 2
-    config_path, store_path = argv[0], argv[1]
-    questions_path = argv[2] if len(argv) > 2 else None
+    else:
+        config_path, store_path = argv[0], argv[1]
+        questions_path = argv[2] if len(argv) > 2 else None
 
     if questions_path:
         loaded = json.loads(Path(questions_path).read_text())

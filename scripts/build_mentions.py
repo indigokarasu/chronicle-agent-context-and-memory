@@ -1,6 +1,10 @@
 """Rebuild the mentions index and queue duplicate-entity candidates.
 
-    build_mentions.py --config CONFIG.yaml --db CHRONICLE.db [--dry-run] [--bind-ids]
+    build_mentions.py [--config CONFIG.yaml] [--db CHRONICLE.db] [--home HERMES_HOME]
+                      [--dry-run] [--bind-ids]
+
+Left out, the home is the active Hermes home, the config is its config.yaml and
+the store is the one that home's runtime uses (see engine/paths.py).
 
 Reads every configured source read-only. Writes `entity_mentions` (each
 provider's rows replaced atomically) and `identity_candidates` (idempotent).
@@ -13,30 +17,52 @@ import os
 import sqlite3
 import sys
 
-import yaml
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import mentions          # noqa: E402
 from engine.config import Config     # noqa: E402
+from engine.paths import readable_db_path, resolve_home   # noqa: E402
+from engine.yaml_load import safe_load_file   # noqa: E402
 
 SHARED_LIMIT = 5   # an identifier shared by more people than this is reported, not paired
 
 
-def main() -> int:
+def parse_args():
+    """The command line, with the home, the config and the store filled in.
+
+    Anything given wins. Left out: the home is the active Hermes home, the config
+    is that home's config.yaml, and the store is the one its runtime uses (or the
+    one an older release left, while it has not been moved yet).
+    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--db", required=True)
-    ap.add_argument("--home", default=os.environ.get("HERMES_HOME", ""))
+    ap.add_argument("--config", default=None, help="default: the home's config.yaml")
+    ap.add_argument("--db", default=None, help="default: the home's store")
+    ap.add_argument("--home", default="", help="the Hermes home; default: the active one")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--bind-ids", action="store_true")
     a = ap.parse_args()
-    with open(a.config) as f:
-        mem = (yaml.safe_load(f) or {}).get("memory") or {}
-    cfg = Config(mem)
+    a.home = resolve_home(a.home or None)
+    config_path = a.config or os.path.join(a.home, "config.yaml")
+    a.memory = {}
+    # A config that was named must exist. The home's own may be absent (a fresh
+    # install has none yet), and the defaults then apply.
+    if a.config or os.path.exists(config_path):
+        a.memory = (safe_load_file(config_path) or {}).get("memory") or {}
+    a.config = config_path
+    if not a.db:
+        a.db = readable_db_path(Config(a.memory).get("db_path"), a.home)
+    return a
+
+
+def main() -> int:
+    a = parse_args()
+    cfg = Config(a.memory)
     if not cfg.get("mentions.enabled", True):
         print("mentions disabled")
         return 0
+    if not os.path.isfile(a.db):
+        print(f"no database at {a.db}", file=sys.stderr)
+        return 2
     r = mentions.Resolver(cfg).load_entities()
     print(f"entities with identifiers: {r.entity_count}, distinct keys: {len(r.key_to_entities)}")
 
@@ -113,12 +139,50 @@ def stub_candidates(conn, db):
     print(f"  same-name groups: {len(groups)}; queued {queued} new stub-merge candidates")
 
 
+def bind_core(cfg, a):
+    """A core whose store is exactly the one that was read (`a.db`).
+
+    The entity ids come from `a.db`, so the events that bind them must land in
+    `a.db`: in any other store they name entities it does not hold, and an
+    appended event cannot be taken back. `db_path` is `a.db`, absolute, and
+    every other value of the config is kept.
+
+    The core's home is `a.db` too, not a Hermes home. For an absolute
+    `db_path`, a core takes the standard store of its home
+    (`<home>/commons/db/chronicle/chronicle.db`) for the place a release
+    before 5.12 kept it. When that file holds events, the core opens it
+    instead of `db_path` (both hold events) or moves it onto `db_path` (`a.db`
+    holds none yet). Under a real home that file is the home's own store: the
+    events then landed in it, or it was taken from its profile. Under a file
+    no store can be.
+
+    Such a home gives no place for the git mirror, and setting up a mirror
+    queues every event of the store for it. So this core sets up no mirror;
+    that is for the store's own runtime, under its own home. The events it
+    appends are still queued for the mirror when the config enables one.
+    """
+    from engine.core import ChronicleCore
+    db = os.path.abspath(a.db)
+    explicit = dict(cfg._explicit) if hasattr(cfg, "_explicit") else {}
+    explicit["db_path"] = db
+    git = explicit.get("git")
+    explicit["git"] = dict(git if isinstance(git, dict) else {}, enabled=False)
+    core = ChronicleCore(db, explicit)
+    core.store.queue_git = bool(cfg.get("git.enabled", True))
+    return core
+
+
 def bind(cfg, a, conn):
     """Bind entity X to the record whose id is X, via link_adjudicated events."""
-    sys.path.insert(0, "/root/.hermes/hermes-agent")
-    from engine.core import ChronicleCore
-    home = a.home or os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(a.db))))
-    core = ChronicleCore(home, cfg._explicit if hasattr(cfg, "_explicit") else {})
+    core = bind_core(cfg, a)
+    try:
+        _bind_all(core, cfg, conn)
+    finally:
+        core.close()
+
+
+def _bind_all(core, cfg, conn):
+    """Emit one link_adjudicated event per entity a record names by its own id."""
     n = 0
     for src in cfg.get("mentions.record_sources", []) or []:
         if "id" not in (src.get("fields") or {}).values():

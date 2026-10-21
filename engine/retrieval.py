@@ -31,7 +31,7 @@ from . import speaker as _spk
 from .config import DEFAULTS, check_abstain_gate
 from . import embeddings as _embeddings
 from .embeddings import (CONTEXT_BUDGET, batch_cosine, budget_chars, cosine,
-                         estimate_tokens, pack, unpack, wrong_dim_indices)
+                         estimate_tokens, unpack, wrong_dim_indices)
 from . import passages as _passages
 from .federated import FederatedChannel
 from .localdb import LocalDBProvider, providers_from_config
@@ -45,8 +45,6 @@ from .serialize import belief_id as compute_belief_id
 from .store import KIND_TABLE, now_iso, word_tokens
 from .substance import EVENT_PREDICATES as _EVENT_PREDICATES
 from .trust import Calibrator, confidence_summary
-from .vector_index import MAX_K as KNN_MAX_K
-from .vector_index import VectorIndex
 
 logger = logging.getLogger("chronicle.retrieval")
 
@@ -691,8 +689,7 @@ class RetrievalEngine:
     # like retrieval.mmr_lambda.
     _MMR_POOL_OVERFETCH = 1.5
 
-    def __init__(self, store, cfg=None, embedder=None, derivation=None, active_principal="default",
-                 vector_index=None):
+    def __init__(self, store, cfg=None, embedder=None, derivation=None, active_principal="default"):
         self.store = store
         self.cfg = cfg
         self.embedder = embedder
@@ -722,21 +719,6 @@ class RetrievalEngine:
         self._vec_w = cfg.get("retrieval.vector_weight", 0.6) if cfg else 0.6
         self._gate = cfg.get("retrieval.read_and_answer.confidence_gate", 0.55) if cfg else 0.55
         self._miss_threshold = cfg.get("retrieval.miss_threshold", 0.15) if cfg else 0.15
-        # Optional ANN index (sqlite-vec backend) for fast KNN lookup (§27, u5).
-        # Reuse the store's own instance when one exists -- ChronicleCore builds
-        # exactly one and assigns it to both store.vector_index (writes) and here
-        # (reads), so they share ONE `dims`/sticky-failure state instead of two
-        # independently-probing duplicates. Falls back to building a fresh one
-        # only for callers that construct a RetrievalEngine directly against a
-        # bare store that was never wired to a core (tests, scripts).
-        if vector_index is not None:
-            self.vector_index = vector_index
-        elif getattr(store, "vector_index", None) is not None:
-            self.vector_index = store.vector_index
-        elif cfg is not None:
-            self.vector_index = VectorIndex(store, cfg, embedder=embedder)
-        else:
-            self.vector_index = None
         # Support gate (I8, §18.4). Gate + thresholds picked by
         # scripts/sweep_abstain.py; defaults mirror DEFAULTS["retrieval"] so an
         # engine built without a Config behaves the same.
@@ -2145,96 +2127,12 @@ class RetrievalEngine:
             vec_heap: list[tuple] = []  # (score, seq, event_id, excerpt, owner) — min-heap on score
             seq = 0
 
-            # Optional ANN fast path (§27 vector_index:, u5). vec0's KNN MATCH
-            # replaces the paged scan only for NEW candidates; the FTS hits
-            # already in `scored` are credited separately, below, because a
-            # bounded window cannot be relied on to contain them. Anything that
-            # comes back empty (unconfigured, library absent, no loadable-
-            # extension support, vec0 never created, nothing above the floor)
-            # falls through to the paged scan exactly as before.
-            knn_results = []
-            query_bytes = None
-            if self.vector_index is not None and self.vector_index.is_enabled():
-                try:
-                    query_bytes = pack(q["embedding"])
-                    knn_results = self.vector_index.retrieve_knn(query_bytes, limit * 2)
-                except Exception as e:
-                    logger.warning("vector_index KNN failed (%s); using the paged scan", e)
-                    knn_results = []
-
-            if knn_results:
-                # (1) Every FTS hit gets the SAME `_vec_w * cos` the paged scan
-                #     would have given it — same batch_cosine arithmetic on the
-                #     same stored blob, same `> 0.1` floor, same ACL check —
-                #     fetched by id instead of stumbled over mid-scan. Skipping
-                #     this is not a rounding difference: an FTS hit just outside
-                #     the KNN window loses its ENTIRE vector contribution and
-                #     drops out of the top-k the paged path returns it in.
-                vrows = self.store.get_observed_vectors_by_ids(list(scored))
-                self._note_wrong_dim_rows(q["embedding"], list(vrows.values()), "event_id", "raw")
-                fids = [eid for eid in scored if eid in vrows]
-                fsims = batch_cosine(q["embedding"], [vrows[eid]["embedding"] for eid in fids])
-                for eid, sim in zip(fids, fsims):
-                    if sim > 0.1 and access.can_read(access.DEFAULT_ACL, vrows[eid].get("owner"), principal):
-                        scored[eid]["score"] += self._vec_w * sim
-
-                # (2) New candidates compete for the same fixed-size heap the
-                #     paged scan fills, on the same terms.
-                seen = set()
-
-                def _consider(eid, sim):
-                    nonlocal seq
-                    if sim <= 0.1 or eid in scored or eid in seen:
-                        return
-                    seen.add(eid)
-                    contribution = self._vec_w * sim
-                    if len(vec_heap) >= limit and contribution <= vec_heap[0][0]:
-                        return  # can't displace the current floor; skip the event fetch
-                    # Owner off the event, not observed_vectors: the row is
-                    # fetched here anyway (for the excerpt) and the reducer
-                    # copies event.owner into observed_vectors.owner in the same
-                    # breath, so the two are the same value and the paged scan's
-                    # ACL decision is reproduced exactly, one query cheaper.
-                    ev = self.store.get_event(eid)
-                    if not ev or not access.can_read(access.DEFAULT_ACL, ev["owner"], principal):
-                        return
-                    p = json.loads(ev["payload"]) if isinstance(ev["payload"], str) else (ev["payload"] or {})
-                    entry = (contribution, seq, eid, p.get("excerpt", ""), ev["owner"])
-                    seq += 1
-                    if len(vec_heap) < limit:
-                        heapq.heappush(vec_heap, entry)
-                    else:
-                        heapq.heapreplace(vec_heap, entry)
-
-                # Window size: FTS puts at most `limit` ids into `scored`, and
-                # every KNN row landing there is consumed by (1) rather than the
-                # heap, so 2·limit rows still leave `limit` new candidates — the
-                # exact heap capacity. ACL filtering is the one thing that can
-                # prune below it (the 0.1 floor cannot: rows arrive similarity-
-                # descending, so once it bites it bites for the whole tail), so
-                # widen until the heap is full, the floor is crossed, or vec0 is
-                # exhausted. Rows are re-fetched, not appended, because a wider k
-                # returns a superset from the top — `seen` makes re-processing an
-                # already-considered id a no-op regardless of tie ordering.
-                k, pos = limit * 2, 0
-                while True:
-                    for eid, sim in knn_results[pos:]:
-                        _consider(eid, sim)
-                    pos = len(knn_results)
-                    if (len(vec_heap) >= limit or len(knn_results) < k
-                            or knn_results[-1][1] <= 0.1 or k >= KNN_MAX_K):
-                        break
-                    k = min(k * 2, KNN_MAX_K)
-                    wider = self.vector_index.retrieve_knn(query_bytes, k)
-                    if len(wider) <= pos:
-                        break  # vec0 has nothing more to offer
-                    knn_results, pos = wider, 0
-            elif self._raw_from_cache(q["embedding"], scored, vec_heap, limit, principal,
-                                      exclude_automation):
+            if self._raw_from_cache(q["embedding"], scored, vec_heap, limit, principal,
+                                    exclude_automation):
                 pass   # the in-memory float16 copy served the scan (vector_cache.py)
             else:
-                # Paged brute-force scan (§24.3) — the default, and the fallback
-                # whenever the ANN path is unavailable or came back empty.
+                # Paged brute-force scan (§24.3) — the fallback whenever the
+                # in-memory copy cannot serve (disabled, cold, or over budget).
                 self._note_wrong_dim_table(q["embedding"], "observed_vectors",
                                            "event_id", "raw")
                 for batch in self.store.iter_observed_vectors_paged(

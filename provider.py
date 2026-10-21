@@ -46,6 +46,15 @@ def _load_core():
     return ChronicleCore
 
 
+def _load_paths():
+    """engine.paths, dual-mode like every other engine import here."""
+    try:
+        from .engine import paths  # plugin-package context
+    except Exception:
+        from engine import paths  # top-level (dev/tests)
+    return paths
+
+
 def _load_hostmodel():
     """engine.hostmodel, dual-mode like every other engine import here."""
     try:
@@ -162,7 +171,12 @@ class ChronicleMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id, *, hermes_home=None, principal_id="default", config=None, **kw):
         ChronicleCore = _load_core()
-        hermes_home = hermes_home or str(Path.home() / ".hermes")
+        # The shared resolver, not a local `or ~/.hermes`. That fallback skipped
+        # the host's own answer, which knows the active profile, so a named
+        # profile with no home passed bound the default profile's store; and a
+        # given home with `~` in it was used unexpanded, so the store landed
+        # relative to the working directory.
+        hermes_home = _load_paths().resolve_home(hermes_home)
         self.core = ChronicleCore.get(hermes_home, config)
         self.core.has_memory_provider = True
         # Hermes calls on_turn_start inside the user's turn: curation runs beside
