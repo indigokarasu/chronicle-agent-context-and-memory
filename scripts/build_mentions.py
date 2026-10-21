@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import mentions          # noqa: E402
 from engine.config import Config     # noqa: E402
-from engine.paths import DB_REL, readable_db_path, resolve_home   # noqa: E402
+from engine.paths import readable_db_path, resolve_home   # noqa: E402
 from engine.yaml_load import safe_load_file   # noqa: E402
 
 SHARED_LIMIT = 5   # an identifier shared by more people than this is reported, not paired
@@ -41,7 +41,6 @@ def parse_args():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--bind-ids", action="store_true")
     a = ap.parse_args()
-    a.home_given, a.db_given = bool(a.home), bool(a.db)
     a.home = resolve_home(a.home or None)
     config_path = a.config or os.path.join(a.home, "config.yaml")
     a.memory = {}
@@ -140,26 +139,50 @@ def stub_candidates(conn, db):
     print(f"  same-name groups: {len(groups)}; queued {queued} new stub-merge candidates")
 
 
-def bind_home(a):
-    """The Hermes home whose runtime store the bind events must land in.
+def bind_core(cfg, a):
+    """A core whose store is exactly the one that was read (`a.db`).
 
-    They are written through a `ChronicleCore`, which opens its own home's store.
-    That has to be the store that was just read. So with a store named by `--db`
-    at the standard place, and no `--home`, the home is the one that store
-    belongs to, not whichever home happens to be active.
+    The entity ids come from `a.db`, so the events that bind them must land in
+    `a.db`: in any other store they name entities it does not hold, and an
+    appended event cannot be taken back. `db_path` is `a.db`, absolute, and
+    every other value of the config is kept.
+
+    The core's home is `a.db` too, not a Hermes home. For an absolute
+    `db_path`, a core takes the standard store of its home
+    (`<home>/commons/db/chronicle/chronicle.db`) for the place a release
+    before 5.12 kept it. When that file holds events, the core opens it
+    instead of `db_path` (both hold events) or moves it onto `db_path` (`a.db`
+    holds none yet). Under a real home that file is the home's own store: the
+    events then landed in it, or it was taken from its profile. Under a file
+    no store can be.
+
+    Such a home gives no place for the git mirror, and setting up a mirror
+    queues every event of the store for it. So this core sets up no mirror;
+    that is for the store's own runtime, under its own home. The events it
+    appends are still queued for the mirror when the config enables one.
     """
-    if not a.home_given and a.db_given:
-        suffix = os.sep + DB_REL.replace("/", os.sep)
-        db = os.path.abspath(a.db)
-        if db.endswith(suffix):
-            return db[:-len(suffix)]
-    return a.home
+    from engine.core import ChronicleCore
+    db = os.path.abspath(a.db)
+    explicit = dict(cfg._explicit) if hasattr(cfg, "_explicit") else {}
+    explicit["db_path"] = db
+    git = explicit.get("git")
+    explicit["git"] = dict(git if isinstance(git, dict) else {}, enabled=False)
+    core = ChronicleCore(db, explicit)
+    core.store.queue_git = bool(cfg.get("git.enabled", True))
+    return core
 
 
 def bind(cfg, a, conn):
     """Bind entity X to the record whose id is X, via link_adjudicated events."""
-    from engine.core import ChronicleCore
-    core = ChronicleCore(bind_home(a), cfg._explicit if hasattr(cfg, "_explicit") else {})
+    core = bind_core(cfg, a)
+    try:
+        _bind_all(core, cfg, conn)
+    finally:
+        core.close()
+
+
+def _bind_all(core, cfg, conn):
+    """Emit one link_adjudicated event per entity a record names by its own id."""
     n = 0
     for src in cfg.get("mentions.record_sources", []) or []:
         if "id" not in (src.get("fields") or {}).values():
