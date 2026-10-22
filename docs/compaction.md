@@ -23,7 +23,7 @@ When the context engine is selected, Hermes hands it compaction: it calls the en
   in a conversation role (a mid-conversation `system` message would become
   the system prompt on Anthropic's API):
   `[CONTEXT COMPACTION — REFERENCE ONLY] Chronicle folded …`, listing the
-  user's folded requests verbatim, one line per folded tool step (the command
+  user's folded requests verbatim (any credential value masked), one line per folded tool step (the command
   and its output or error), facts stated in them, memory recalled for a focus
   (or passed by Hermes as `memory_context`), and the ids of anything there was
   no room to show.

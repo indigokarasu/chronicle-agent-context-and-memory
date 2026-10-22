@@ -8,7 +8,7 @@ and no background thread: on a hook call the `Scheduler` (`engine/scheduler.py`)
 compares each schedule's cron string against a persisted watermark
 (`maintenance_runs`) and enqueues **at most one** due job onto the ordinary
 curation queue, inside a wall-clock budget (`maintenance.budget_ms`, default
-5ms; a call with nothing due costs ~0.08ms and executes no SQL at all). The work
+5ms; a call with nothing due costs ~0.08ms and, once the first call has set the scheduler's anchor, executes no SQL at all). The work
 itself is then done by the existing bounded per-turn drain, on the ordinary
 `append_event` write path. An empty cron string disables a schedule; so does
 an unparseable one, loudly. `core.maintenance_status()` reports last-run and
@@ -25,7 +25,7 @@ Six maintenance jobs are scheduled, each on its own cadence:
 | CSP consistency sweep | `health.consistency_sweep.schedule` | `0 * * * *` (hourly) | Single-cardinality predicates with more than one active value (§21). Hourly so contradictions surface quickly without waiting for the daily health run. |
 | Health / self-heal | `health.schedule` | `0 4 * * *` (daily 04:00 UTC) | Auditor, Tier-1 self-heal, embedder-mismatch heal and federate sweep (§21). Runs at 04:00, deliberately offset from identity (05:00) so a hook call never has to choose between two due jobs. |
 | Session-index backfill | `curation.sweep_schedule` | `0 * * * *` (hourly) | Backfills index rows for ended sessions that have none (issue #6). Hourly, independent of health. |
-| Identity sweep | `identity.schedule` | `0 5 * * *` (daily 05:00 UTC) | Exact-name sweep that **proposes merge candidates only** — it never merges automatically (§...). Gated on `identity.enabled`, which also gates the mention-driven proposal path since both write to the same queue. |
+| Identity sweep | `identity.schedule` | `0 5 * * *` (daily 05:00 UTC) | Exact-name sweep that **proposes merge candidates only** — it never merges automatically (§E7). Gated on `identity.enabled`, which also gates the mention-driven proposal path since both write to the same queue. |
 
 **Identity is adjudicated, never inferred.** The `identity` sweep exists to ask
 questions, not answer them: an exact `(normalized_name, owner, domain)`

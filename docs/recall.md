@@ -7,9 +7,10 @@ with more than three content words needs two of them in an item. A shorter
 message's single shared word is often a coincidence ("system health check" and
 a prescription's `health_event`), so such a match must also be near the
 message in meaning: the item's stored vector against the message's (a short
-item with none is embedded on the spot, a few per turn), within a second and a
-half of quick requests to the embedder (`retrieval.prefetch_min_similarity`;
-measured per model, 0.65 for nomic-embed-text); a match nothing can vouch for,
+item with none is embedded on the spot, a few per turn, within a second and a
+half of quick requests to the embedder), at or above
+`retrieval.prefetch_min_similarity` (measured per model, 0.65 for
+nomic-embed-text); a match nothing can vouch for,
 with the embedder busy or down, is left out. Two or three shared words get the
 same check at their own floor (0.60), and there the words decide when there is
 no vector to compare. The gate reads only the person's words, not the host's

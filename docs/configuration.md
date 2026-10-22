@@ -4,7 +4,7 @@ Set in `~/.hermes/config.yaml` (single bot) or `~/.hermes/profiles/<name>/config
 
 ## What is Chronicle-only vs. standard config
 
-Every key **inside the `memory:` block below is Chronicle-only**. Chronicle reads only that block.
+Every key **inside the `memory:` block below is Chronicle-only**, except the three host keys named next. Chronicle reads only that block.
 The host (Hermes Agent) owns the rest of `config.yaml`; Chronicle does not read or change host keys.
 
 - `memory.provider: chronicle` is the **host's** slot selector. Hermes reads it to load this plugin; Chronicle never reads it.

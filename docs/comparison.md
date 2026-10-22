@@ -49,5 +49,5 @@ but still needs model, embedding, and graph backends.
 This compares documented integration and deployment surfaces, not retrieval
 quality: [Hermes provider API](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin),
 [Mem0 for Hermes](https://docs.mem0.ai/integrations/hermes),
-[Hindsight provider](https://github.com/NousResearch/hermes-agent/tree/main/plugins/memory/hindsight),
+[Hindsight provider](https://hermes-agent.nousresearch.com/docs/plugins/hindsight),
 and [Graphiti MCP](https://help.getzep.com/graphiti/getting-started/mcp-server).
