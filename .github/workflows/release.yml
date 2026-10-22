@@ -50,7 +50,7 @@ jobs:
           mkdir -p dist/chronicle/dashboard
           cp __init__.py _base.py context.py provider.py plugin.yaml LICENSE README.md dist/chronicle/
           cp -R engine dist/chronicle/
-          # the README's "Check that it works" runs this from the plugin folder
+          # docs/operations.md "Check that it works" runs this from the plugin folder
           mkdir -p dist/chronicle/scripts
           cp scripts/recall_check.py dist/chronicle/scripts/
           cp dashboard/manifest.json dashboard/plugin_api.py dist/chronicle/dashboard/

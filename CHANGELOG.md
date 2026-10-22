@@ -3,6 +3,12 @@
 All notable changes to the Chronicle Hermes plugin. Versioning follows the
 `version` in `plugin.yaml`.
 
+## Unreleased — the README is a front door; the reference lives in docs/
+
+**Docs**
+
+- **README restructured.** The README now reads in the order a visitor needs it: why, a two-minute install, what the two plugin slots add, how Chronicle compares, the companion skills, and a map of the documentation. Every reference section moved, unchanged, into `docs/`: `configuration.md`, `operations.md`, `security.md`, `skills.md`, `comparison.md`, `compaction.md`, `recall.md`, `maintenance.md` and `architecture.md`. The README's two tool lists, which disagreed, are now one list.
+
 ## 5.12.0
 
 **Profile paths follow the active profile, and the sqlite-vec backend is removed.**
