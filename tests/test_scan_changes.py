@@ -6,6 +6,7 @@ Values are assembled at run time so this file never contains a match itself.
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -56,8 +57,11 @@ class TestFindings(unittest.TestCase):
 class TestAddedLinesOnly(unittest.TestCase):
     def test_only_new_lines_are_scanned(self):
         with tempfile.TemporaryDirectory() as d:
+            git_path = shutil.which("git")
+            if not git_path:
+                self.skipTest("git not found in PATH")
             def git(*a):
-                subprocess.run(["git", *a], cwd=d, check=True, capture_output=True,
+                subprocess.run([git_path, *a], cwd=d, check=True, capture_output=True,
                                env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
                                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
                                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
@@ -65,7 +69,7 @@ class TestAddedLinesOnly(unittest.TestCase):
             Path(d, "old.py").write_text("old = '%s'\n" % GH)
             git("add", "-A")
             git("commit", "-q", "-m", "base")
-            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d, capture_output=True, text=True).stdout.strip()
+            base = subprocess.run([git_path, "rev-parse", "HEAD"], cwd=d, capture_output=True, text=True).stdout.strip()
             Path(d, "new.py").write_text("ok = 1\nmail = '%s'\n" % MAIL)
             git("add", "-A")
             git("commit", "-q", "-m", "change")
