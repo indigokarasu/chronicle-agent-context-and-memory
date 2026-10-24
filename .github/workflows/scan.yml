@@ -1,0 +1,42 @@
+name: scan
+
+# Checks the lines each change adds for secrets (tokens, keys, private key blocks,
+# credentials in URLs) and for personal data outside tests/ (real e-mail addresses,
+# public IP addresses). Plain pull_request, so a fork's code runs with a read-only
+# token and no secrets. See .github/scripts/scan_changes.py.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: secrets and personal data in added lines
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # the added lines are found against the base commit
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Scan
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          base="${PR_BASE:-$PUSH_BEFORE}"
+          # a new branch's first push has no "before" commit: scan its last commit
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+          python .github/scripts/scan_changes.py --base "$base"
